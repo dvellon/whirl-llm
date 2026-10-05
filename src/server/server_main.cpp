@@ -604,6 +604,28 @@ int serveMain(int argc, char** argv, const char* program) {
                  static_cast<double>(embd_pinned) / 1048576.0);
         }
 
+        // WHIRL_DRAFT_MODEL: DFlash2 drafter GGUF, loaded and checked against the target (not run
+        // yet); turns on the hidden capture of its target layers (WHIRL_DFLASH_CAPTURE_ROWS rows,
+        // default the drafter's window or 2048). Unset: nothing changes.
+        if (auto dm = env("DRAFT_MODEL")) {
+            const hip::MemInfo d0 = hip::memInfo();
+            const gguf::File df = gguf::File::open(*dm);
+            qwen35::LoadStats ds;
+            const std::uint64_t wb = model.loadDrafter(df, ds);
+            const auto& dc = model.dflash->cfg;
+            const std::uint32_t rows = static_cast<std::uint32_t>(
+                std::stoul(env("DFLASH_CAPTURE_ROWS").value_or(std::to_string(dc.window > 0 ? dc.window : 2048u))));
+            model.enableCapture(rows);
+            const hip::MemInfo d1 = hip::memInfo();
+            std::string tl;
+            for (const std::uint32_t l : dc.target_layers) tl += (tl.empty() ? "" : ",") + std::to_string(l);
+            logI("draft model {}: DFlash2, {} layers, block {}, window {}, target layers {}, weights {:.2f} GiB, capture {} rows ({:.0f} MiB), "
+                 "VRAM +{:.2f} GiB (not run yet)",
+                 *dm, dc.n_layer, dc.block, dc.window, tl, static_cast<double>(wb) / (1024.0 * 1024.0 * 1024.0), model.cap_rows,
+                 static_cast<double>(dc.target_layers.size()) * model.cap_rows * cfg.n_embd * 4 / (1024.0 * 1024.0),
+                 static_cast<double>(d0.free > d1.free ? d0.free - d1.free : 0) / (1024.0 * 1024.0 * 1024.0));
+        }
+
         // same knobs as the CLI
         if (env("NO_FUSE")) model.no_fuse = true;
         if (env("FLOAT_GEMV")) model.float_gemv = true;

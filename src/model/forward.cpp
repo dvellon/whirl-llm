@@ -1253,6 +1253,16 @@ void Model::mtpEnqueue(DevPtr hidden, std::span<const u32> tokens, DevPtr dev_to
                 I(draft_slot), I(draft_n_min), draft_p_min, map);
 }
 
+// DFlash2 capture: x (the input of layer li) for the last min(n, cap_rows) rows into li's slot.
+void Model::captureLayerInput(std::size_t li, u32 n) {
+    if (!cap_buf || li >= cap_slot.size() || cap_slot[li] < 0 || n == 0) return;
+    const u64 E = cfg.n_embd;
+    const u32 c = std::min(n, cap_rows);
+    hip::copyAsync(cap_buf + static_cast<u64>(cap_slot[li]) * cap_rows * E * 4, x + static_cast<u64>(n - c) * E * 4,
+                   static_cast<std::size_t>(c) * E * 4, stream);
+    cap_n = c;
+}
+
 // Apply sequence s's kept verify rows to its recurrent state (replay mode).
 void Model::commitSeq(u32 s) {
     if (!gdn_replay || s >= seqs.size()) return;
@@ -1686,9 +1696,12 @@ void Model::run(u32 n) {
     mark(OpClass::embed);
 
     const u32 E = cfg.n_embd;
+    // DFlash2 drafter features: x at the input of its target layers (a copy on the stream; the
+    // trunk's arithmetic is untouched)
     for (std::size_t i = 0; i < layers.size(); ++i) {
         const Layer& L = layers[i];
         bool gdn_in2 = false;  // x16b holds this layer's normed input as f16 for [beta; alpha]
+        if (cap_buf) captureLayerInput(i, n);
         if (fused(n)) {
             rmsnormQ8(x, L.attn_norm, h, n);
         } else if (L.kind == LayerKind::attn) {
@@ -1881,6 +1894,7 @@ void Model::run(u32 n) {
         else
             ffnBlock(L.post_norm, L.ffn_gate, L.ffn_up, L.ffn_down, n);
     }
+    if (cap_buf) captureLayerInput(layers.size(), n);  // id n_layer: the last layer's output
     if (keep_hidden) rmsnorm(x, output_norm, hn, E, n, E, E);
     if (!psegs.empty()) return;  // prefillSegs: per-segment logits from x
     if (keep_hidden && all_logits && n <= small_max) {

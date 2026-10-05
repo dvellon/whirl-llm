@@ -755,6 +755,23 @@ void printProfile(const char* label, q::Profile& p, std::size_t n_tok) {
 
 
 // Runtime A/B switches shared by chat and bench (WHIRL_FLOAT_GEMV, ...).
+// WHIRL_DRAFT_MODEL: DFlash2 drafter GGUF, loaded and checked against the target (not run yet),
+// plus the hidden capture of its target layers. Unset: nothing changes.
+void loadDraftModelEnv(q::Model& m) {
+    const auto dm = envGet("DRAFT_MODEL");
+    if (!dm || m.dflash) return;
+    const hip::MemInfo d0 = hip::memInfo();
+    const gguf::File df = gguf::File::open(*dm);
+    q::LoadStats ds;
+    const u64 wb = m.loadDrafter(df, ds);
+    const auto& dc = m.dflash->cfg;
+    m.enableCapture(envU32("DFLASH_CAPTURE_ROWS").value_or(dc.window > 0 ? dc.window : 2048u));
+    const hip::MemInfo d1 = hip::memInfo();
+    std::fprintf(stderr, "draft model %s: DFlash2, %u layers, block %u, weights %.2f GiB, capture %u rows, VRAM +%.2f GiB (not run yet)\n",
+                 dm->c_str(), dc.n_layer, dc.block, static_cast<double>(wb) / (1024.0 * 1024.0 * 1024.0), m.cap_rows,
+                 static_cast<double>(d0.free > d1.free ? d0.free - d1.free : 0) / (1024.0 * 1024.0 * 1024.0));
+}
+
 void applyRuntimeEnv(q::Model& m) {
     if (envGet("FLOAT_GEMV")) m.float_gemv = true;
     q::applyGemvEnv(m);
@@ -764,6 +781,7 @@ void applyRuntimeEnv(q::Model& m) {
     if (envGet("NO_FUSE")) m.no_fuse = true;
     if (auto v = envU32("DRAFT_WINDOW")) m.draft_window = *v;
     if (auto v = envU32("DRAFT_WINDOW_MIN")) m.draft_window_min = *v;
+    loadDraftModelEnv(m);
     if (envGet("NAIVE_ATTN")) m.naive_attn = true;
     if (auto v = envGet("ATTN_WIDE"); v && *v == "0") m.attn_wide = false;
     if (auto v = envGet("ATTN_DQ4"); v && *v == "0") m.attn_dq4 = false;
@@ -1749,6 +1767,7 @@ int cmdSelftest(const Args& a) {
     ok = m.checkGemvBitwise(log) && ok;
     ok = m.checkPrefillInvariance(log) && ok;
     ok = m.checkPreciseDecode(log) && ok;
+    ok = m.checkCapture(log) && ok;
     const u32 grp = std::max<u32>(1, 16 / (m.cfg.n_head / m.cfg.n_head_kv));
     ok = m.checkAttnGroups(log, 1000, grp) && ok;
     ok = m.checkAttnGroups(log, 1023, grp) && ok;

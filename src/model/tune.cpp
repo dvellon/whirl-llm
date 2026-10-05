@@ -636,6 +636,32 @@ bool Model::checkPreciseDecode(std::string& log) {
 
 // attn_wsplit consistency: the grouped (verify) launch must give every query
 // the same partials, bit for bit, as its own one-query launch.
+bool Model::checkCapture(std::string& log) {
+    // capture slots for the embeddings, a middle layer and the last layer output
+    const std::vector<u32> keep_ids = dflash ? dflash->cfg.target_layers : std::vector<u32>{};
+    const u32 keep_rows = cap_rows;
+    const std::vector<u32> ids = {0, cfg.n_layer / 2, cfg.n_layer};
+    const u32 rows = std::min<u32>(256, max_batch), n = std::min<u32>(300, max_batch);
+    enableCaptureLayers(ids, rows);
+    const u32 c = std::min(n, rows);
+    const u64 E = cfg.n_embd;
+    bool ok = true;
+    for (std::size_t j = 0; j < ids.size(); ++j) {
+        const std::vector<float> xs = randomNormal(static_cast<std::size_t>(n) * E, 31 + static_cast<u32>(j));
+        hip::upload(x, xs.data(), xs.size() * 4);
+        captureLayerInput(ids[j], n);
+        hip::streamSync(stream);
+        std::vector<float> got(static_cast<std::size_t>(c) * E);
+        hip::download(got.data(), cap_buf + static_cast<u64>(j) * cap_rows * E * 4, got.size() * 4);
+        ok = ok && cap_n == c && std::memcmp(got.data(), xs.data() + static_cast<std::size_t>(n - c) * E, got.size() * 4) == 0;
+    }
+    log += fmt("    DFlash2 hidden capture (layer inputs 0 / %u / %u, last %u of %u rows) == x: %s\n", cfg.n_layer / 2, cfg.n_layer, c, n,
+               ok ? "ok" : "FAIL");
+    if (!keep_ids.empty() && keep_rows > 0) enableCaptureLayers(keep_ids, keep_rows);
+    else disableCapture();
+    return ok;
+}
+
 bool Model::checkAttnGroups(std::string& log, u32 p0, u32 n, bool wide) {
     const u32 hd = cfg.head_dim;
     if (k.attn_wsplit1 == nullptr || hd != 256) return true;

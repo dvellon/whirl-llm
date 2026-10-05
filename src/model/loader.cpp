@@ -882,6 +882,73 @@ void Model::restoreSeqSnapshot(u32 s, u32 set) {
     }
 }
 
+u64 Model::loadDrafter(const gguf::File& f, LoadStats& stats) {
+    DFlashConfig dc = DFlashConfig::fromGguf(f);
+    dc.validate(cfg, f);
+    const std::size_t staging_len = 64u << 20;
+    auto* staging = static_cast<std::uint8_t*>(hip::hostMalloc(staging_len));
+    struct StagingFree {
+        void* p;
+        ~StagingFree() { hip::hostFree(p); }
+    } staging_free{staging};
+    const u64 bytes0 = stats.bytes;
+    Loader ld{*this, f, Reader(f.path()), staging, staging_len, stats};
+    auto d = std::make_unique<DFlashW>();
+    d->cfg = dc;
+    d->fc = ld.mat("fc.weight");
+    d->enc_norm = ld.vec("enc.output_norm.weight");
+    d->out_norm = ld.vec("output_norm.weight");
+    d->sel_prev = ld.mat("selector_predecessor.weight");
+    d->sel_next = ld.mat("selector_successor.weight");
+    d->sel_hidden = ld.mat("selector_hidden.weight");
+    d->layers.resize(dc.n_layer);
+    for (u32 il = 0; il < dc.n_layer; ++il) {
+        DFlashLayerW& w = d->layers[il];
+        auto n = [&](const char* s) { return Loader::bn(il, s); };
+        w.attn_norm = ld.vec(n("attn_norm.weight"));
+        w.ffn_norm = ld.vec(n("ffn_norm.weight"));
+        w.q_norm = ld.vec(n("attn_q_norm.weight"));
+        w.k_norm = ld.vec(n("attn_k_norm.weight"));
+        w.q = ld.mat(n("attn_q.weight"));
+        w.k = ld.mat(n("attn_k.weight"));
+        w.v = ld.mat(n("attn_v.weight"));
+        w.o = ld.mat(n("attn_output.weight"));
+        w.gate = ld.mat(n("ffn_gate.weight"));
+        w.up = ld.mat(n("ffn_up.weight"));
+        w.down = ld.mat(n("ffn_down.weight"));
+        w.attn_conv_proj = ld.mat(n("attn_conv_proj.weight"));
+        w.ffn_conv_proj = ld.mat(n("ffn_conv_proj.weight"));
+        w.attn_conv_base = ld.vec(n("attn_conv_base"));
+        w.ffn_conv_base = ld.vec(n("ffn_conv_base"));
+    }
+    hip::sync();
+    d->bytes = stats.bytes - bytes0;
+    dflash = std::move(d);
+    return dflash->bytes;
+}
+
+void Model::enableCapture(u32 rows) {
+    if (dflash) enableCaptureLayers(dflash->cfg.target_layers, rows);
+}
+
+void Model::enableCaptureLayers(std::span<const u32> ids, u32 rows) {
+    disableCapture();
+    if (ids.empty() || rows == 0) return;
+    cap_slot.assign(cfg.n_layer + 1, -1);
+    for (std::size_t j = 0; j < ids.size(); ++j)
+        if (ids[j] <= cfg.n_layer) cap_slot[ids[j]] = static_cast<i32>(j);
+    cap_rows = std::min(rows, max_batch);
+    cap_buf = allocZero(static_cast<u64>(ids.size()) * cap_rows * cfg.n_embd * 4);
+}
+
+void Model::disableCapture() {
+    if (cap_buf) freeAlloc(cap_buf);
+    cap_buf = 0;
+    cap_rows = 0;
+    cap_n = 0;
+    cap_slot.clear();
+}
+
 Mat Model::requantQ4k(const Mat& w) {
     // Q6_K (Q4_K_M files) or Q8_0 (e.g. the Swift MXFP4 files' MTP block)
     const hip::Function f = w.ty == GgmlType::q6_k ? k.requant_q6k_q4k : w.ty == GgmlType::q8_0 ? k.requant_q80_q4k : nullptr;

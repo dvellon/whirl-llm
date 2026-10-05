@@ -347,6 +347,7 @@ constexpr EnvDoc k_env[] = {
     {"Speculative decoding (output always equals plain greedy)", "MTP_FULLHEAD=1", "drafts use the full output head", C | B | S},
     {"Speculative decoding (output always equals plain greedy)", "DRAFT_VOCAB=off|64k|48k|FILE|N", "draft head over a frequency subset of the vocabulary (default: the embedded 64k subset on dense qwen35 models with a 248320-token vocabulary; off = full head; 48k = draft_vocab\\subset_48k.bin next to the exe; FILE = uint32 ids), or the first N rows", C | S},
     {"Speculative decoding (output always equals plain greedy)", "DRAFT_WINDOW=W, DRAFT_WINDOW_MIN=N", "MTP draft attention over the first 256 + last W positions once the context reaches N (defaults W = 16384, N = 65536); W = 0: off", C | S},
+    {"Speculative decoding (output always equals plain greedy)", "DRAFT_MODEL=FILE, DFLASH_CAPTURE_ROWS=N", "DFlash2 drafter GGUF: loaded and checked against the model, target-layer hidden capture on (not used for drafting yet)", C | S},
     {"Speculative decoding (output always equals plain greedy)", "NGRAM=0", "no n-gram (prompt-lookup) drafts", C | B | S},
     {"Speculative decoding (output always equals plain greedy)", "NGRAM_MIN=N", "minimum matched suffix for an n-gram draft (default 3)", C | B | S},
     {"Speculative decoding (output always equals plain greedy)", "NGRAM_SLOPE=X", "prior cost of one more n-gram verify row, relative to a 1-draft cycle (default 0.015; Radeon 8060S 0.12)", C | B | S},
