@@ -229,6 +229,13 @@ struct Slot : cache::SlotCache {
     std::uint32_t d_prev = 0;     // MTP drafts of this slot in its last MTP cycle
     qwen35::NgramPolicy ng;
     std::uint32_t ng_cycles = 0;
+    // DFlash2 (--draft dflash): the drafter context of this slot holds positions dfl_lo .. dfl_hi - 1
+    // as one unbroken run (rows below dfl_lo may exist but follow a gap); acceptance by draft
+    // position and the mean draft count of its blocks
+    std::uint32_t dfl_lo = 0, dfl_hi = 0;
+    qwen35::DraftAccept dfl_acc;
+    float dfl_nd = 0;
+    std::uint32_t dfl_cycles = 0;
     std::array<std::uint32_t, max_small_batch + 1> batch{};
     std::size_t n_batch = 0;
     std::uint32_t last_log_n = 0;
@@ -280,6 +287,13 @@ struct EngineOptions {
     std::uint32_t parallel = 4;
     chat::TemplateKind tmpl = chat::TemplateKind::a;
     bool use_mtp = false;
+    // --draft dflash: DFlash2 drafts instead of MTP (the backend has the drafter; use_mtp is false)
+    bool use_dflash = false;
+    float dfl_p_min = 0;
+    std::uint32_t dfl_n_min = 0;
+    // a slot drafts with DFlash2 once its drafter context has an unbroken run of at least
+    // min(pos, dfl_warm) rows ending at pos (after a restore whose features are gone)
+    std::uint32_t dfl_warm = 64;
     std::uint32_t n_draft = 3;
     float p_min = 0;
     std::uint32_t n_min = 0;
@@ -385,6 +399,10 @@ public:
         // SSD tier: bytes written since start, bytes not written (shared
         // blocks), bytes in use, superseded sessions trimmed
         std::uint64_t ssd_written = 0, ssd_dedup = 0, ssd_used = 0, ssd_entries = 0, superseded = 0;
+        // DFlash2: cycles that drafted with it, its drafts / accepted, cycles of a slot whose drafter
+        // context was not ready (no DFlash2 drafts), positions without features (forward rows
+        // outside the capture, restores)
+        std::uint64_t dfl_cycles = 0, dfl_drafted = 0, dfl_accepted = 0, dfl_cold = 0, dfl_gap = 0;
     };
     Stats stats() const;
 
@@ -394,7 +412,7 @@ private:
     // checkpoints
     void saveCkpt(Slot& sl, std::uint32_t pos, const char* kind, std::optional<DevPtr> hid, std::optional<DevPtr> logits);
     void loadCkpt(const Ckpt& c);
-    static void dropCache(Slot& sl);
+    void dropCache(Slot& sl);
     void freePages(Slot& sl);
     // pages
     std::optional<std::int32_t> takeFreePage();
@@ -458,6 +476,11 @@ private:
     void decodeCycle(std::span<Slot* const> act_in);
     void splitDrafts(std::span<Slot* const> act, std::uint32_t nd, std::uint32_t rows, std::span<std::uint32_t> nd_m);
     std::uint32_t draftCap(std::uint32_t A);
+    // DFlash2 drafter context of a slot
+    std::uint32_t draftRoom() const;
+    void dflReset(Slot& sl, std::uint32_t at);
+    void dflIngest(Slot& sl, std::uint32_t run_rows, std::uint32_t r0, std::uint32_t n, std::uint32_t pos0);
+    bool dflReady(const Slot& sl) const;
     void finishJob(Slot& sl);
     // host tiers
     void waitSpill(Slot& sl);
@@ -502,6 +525,8 @@ private:
     std::array<qwen35::CycleCost, gdn_max_seg + 1> ccost_{};
     std::array<bool, gdn_max_seg + 1> ccost_primed_{};
     qwen35::DraftAccept dpool_{};
+    // DFlash2 cycle times by decoding slots (drafting included), keyed by the largest draft count
+    std::array<qwen35::DraftTiming, gdn_max_seg + 1> dtiming_{};
     std::unique_ptr<CycleProf> prof_;
     std::uint32_t n_cycles_ = 0;
     // most rows of one batched verify (ServerModel::verifyRows: 16, or 32 with the wide GEMV path)
@@ -542,6 +567,7 @@ private:
     TimePoint stat_t0_{};
     std::uint64_t stat_tokens_ = 0, stat_cycles_ = 0, stat_rows_ = 0, stat_slots_ = 0, stat_drafts_ = 0,
                   stat_prefill_tok_ = 0, stat_seg_batches_ = 0, stat_seg_chunks_ = 0;
+    std::uint64_t stat_dfl_cycles_ = 0, stat_dfl_drafted_ = 0, stat_dfl_accepted_ = 0, stat_dfl_cold_ = 0, stat_dfl_gap_ = 0;
     std::vector<std::uint32_t> crlf_norm_;
     // host tiers
     tier::Tier* tier_ = nullptr;

@@ -387,4 +387,14 @@ void DFlashConfig::validate(const Config& t, const gguf::File& f) const {
     }
 }
 
+std::string dflashIncompatible(const gguf::File& target, const gguf::File& draft) {
+    try {
+        const Config t = Config::fromGguf(target);
+        DFlashConfig::fromGguf(draft).validate(t, draft);
+    } catch (const std::exception& ex) {
+        return ex.what();
+    }
+    return {};
+}
+
 }  // namespace whirl::qwen35

@@ -620,6 +620,54 @@ void testDFlashConfig() {
     check(code([&] { (void)q::DFlashConfig::fromGguf(gguf::File::parse(img_mask)); }) == "MissingKey", "DFlash2 config: mask token required");
 }
 
+// a target header (qwen35 / qwen35moe) for dflashIncompatible: metadata + token_embd only
+GgufImage targetImage(const char* arch, std::uint32_t embd, std::uint32_t vocab, std::uint32_t layers) {
+    GgufImage g;
+    const std::string a = arch;
+    const bool moe = a == "qwen35moe";
+    g.kvString("general.architecture", a);
+    g.kvU32(a + ".block_count", layers + 1);
+    g.kvU32(a + ".nextn_predict_layers", 1);
+    g.kvU32(a + ".embedding_length", embd);
+    if (moe) {
+        g.kvU32(a + ".expert_feed_forward_length", 32);
+        g.kvU32(a + ".expert_count", 8);
+        g.kvU32(a + ".expert_used_count", 2);
+    } else {
+        g.kvU32(a + ".feed_forward_length", 128);
+    }
+    g.kvU32(a + ".attention.head_count", 4);
+    g.kvU32(a + ".attention.head_count_kv", 2);
+    g.kvU32(a + ".attention.key_length", 16);
+    g.kvU32(a + ".rope.dimension_count", 16);
+    g.kvF32(a + ".rope.freq_base", 1e7f);
+    g.kvF32(a + ".attention.layer_norm_rms_epsilon", 1e-6f);
+    g.kvU32(a + ".ssm.conv_kernel", 4);
+    g.kvU32(a + ".ssm.state_size", 16);
+    g.kvU32(a + ".ssm.group_count", 2);
+    g.kvU32(a + ".ssm.time_step_rank", 4);
+    g.kvU32(a + ".ssm.inner_size", 64);
+    g.tensor("token_embd.weight", embd, vocab);
+    return g;
+}
+
+// --draft dflash: the header-only fit check before loading (a MoE target without a drafter of
+// its size keeps MTP)
+void testDFlashCompat() {
+    const auto draft = dflashImage(64, 100).build();
+    const gguf::File df = gguf::File::parse(draft);
+    const auto dense = targetImage("qwen35", 64, 100, 8).build();
+    check(q::dflashIncompatible(gguf::File::parse(dense), df).empty(), "dflashIncompatible: matching dense target");
+    const auto moe = targetImage("qwen35moe", 32, 100, 8).build();
+    const std::string why = q::dflashIncompatible(gguf::File::parse(moe), df);
+    check(why.find("DraftModelMismatch") != std::string::npos, "dflashIncompatible: MoE target of another size rejected");
+    const auto shallow = targetImage("qwen35", 64, 100, 4).build();
+    check(!q::dflashIncompatible(gguf::File::parse(shallow), df).empty(), "dflashIncompatible: target layers beyond the target rejected");
+    const auto not_draft = dflashImage(64, 100, true, "qwen35").build();
+    check(q::dflashIncompatible(gguf::File::parse(dense), gguf::File::parse(not_draft)).find("UnsupportedArch") != std::string::npos,
+          "dflashIncompatible: a non-dflash draft file rejected");
+}
+
 void testNgram() {
     q::Ngram ng;
     // history: "1 2 3 4 5 6 7 8 9" then "... 1 2 3" -> drafts 4 5 6 ...
@@ -1023,6 +1071,7 @@ int main() {
     testDraftVocab();
     testDraftWindowArg();
     testDFlashConfig();
+    testDFlashCompat();
     testCycleCost();
     testSlotAccept();
     testAllocDrafts();

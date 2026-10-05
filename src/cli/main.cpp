@@ -85,8 +85,8 @@ const char* k_help_chat =
     "usage: whirl chat MODEL.gguf \"PROMPT\" | @PROMPT_FILE [options]\n"
     "\n"
     "Greedy generation for one prompt, wrapped in the Qwen chat template. With an MTP head in\n"
-    "the model the decode is speculative (MTP + n-gram drafts); the output is identical to\n"
-    "plain greedy decoding.\n"
+    "the model the decode is speculative (MTP + n-gram drafts, or DFlash2 + n-gram drafts with\n"
+    "--draft dflash); the output is identical to plain greedy decoding.\n"
     "\n"
     "options:\n"
     "  \"PROMPT\" | @FILE           prompt text, or @path of a UTF-8 file holding it (long prompts)\n"
@@ -97,6 +97,9 @@ const char* k_help_chat =
     "  --raw                      no chat template: the prompt text is tokenized as is\n"
     "  --tokens ID,ID,...         token ids instead of a prompt (no template)\n"
     "  --out FILE                 write the last prompt position's logits (f32) to FILE (no MTP)\n"
+    "  --draft mtp|dflash         draft source (default mtp). dflash: the DFlash2 drafter GGUF in\n"
+    "                             WHIRL_DRAFT_MODEL drafts up to block - 1 tokens per cycle (n-gram drafts\n"
+    "                             stay on); the MTP block is not loaded. Without a matching drafter: mtp\n"
     "  --mmproj MMPROJ.gguf       vision encoder (Qwen3-VL style mmproj, F16 / BF16) for --image\n"
     "  --image IMAGE              an image placed before the prompt text (repeatable; needs --mmproj)\n"
     "  --device SPEC              GPU: r9700 (default), 8060s, an index, or a name / gfx substring\n"
@@ -114,8 +117,9 @@ const char* k_help_bench =
     "  --prefill N,N,...          prefill sizes in tokens (default 2048,8192,32768)\n"
     "  --decode N                 tokens to generate per decode mode (default 256)\n"
     "  --prompt TEXT | @FILE      prompt of the decode runs (default: a zh/en coding question)\n"
-    "  --modes M,M,...            decode modes: mtp-ngram (MTP + n-gram drafts), mtp, plain\n"
-    "                             (default mtp-ngram,mtp,plain)\n"
+    "  --modes M,M,...            decode modes: mtp-ngram (MTP + n-gram drafts), mtp, plain; with\n"
+    "                             --draft dflash: dflash-ngram, dflash, plain (default: all three)\n"
+    "  --draft mtp|dflash         draft source (default mtp; dflash: WHIRL_DRAFT_MODEL, see whirl chat)\n"
     "  --no-think / --think       thinking off / on for the decode prompt (default on)\n"
     "  --device SPEC              GPU: r9700 (default), 8060s, an index, or a name / gfx substring\n"
     WHIRL_HELP_MODES
@@ -225,7 +229,8 @@ struct Args {
 };
 
 bool takesValue(const std::string& o) {
-    static const char* v[] = {"--max-tokens", "--ctx", "--tokens", "--out", "--device", "--prefill", "--decode", "--prompt", "--modes", "--mmproj", "--suite"};
+    static const char* v[] = {"--max-tokens", "--ctx", "--tokens", "--out", "--device", "--prefill", "--decode", "--prompt", "--modes", "--mmproj", "--suite",
+                              "--draft"};
     for (const char* s : v)
         if (o == s) return true;
     return false;
@@ -439,6 +444,9 @@ struct ChatOpts {
     bool ngram_force = false;
     bool ngram_debug = false;
     bool print_text = true;
+    // --draft dflash: DFlash2 walk cutoffs (WHIRL_DFLASH_PMIN / WHIRL_DFLASH_NMIN)
+    float dfl_p_min = 0;
+    u32 dfl_n_min = 0;
 };
 
 struct DecodeResult {
@@ -751,6 +759,136 @@ DecodeResult specDecode(q::Model& model, const Tok& tok, u32 first, u32 n_prompt
     return res;
 }
 
+// Speculative decoding with DFlash2 drafts (+ n-gram drafts): one draft block per cycle against
+// the drafter context of slot 0, a verify of the literal drafts (the n-gram path's bitwise verify),
+// then the kept rows' captured features go into the context. Output = plain greedy decoding.
+DecodeResult dflashDecode(q::Model& model, const Tok& tok, u32 first, u32 n_prompt, const ChatOpts& opt, std::span<const u32> prompt_ids) {
+    DecodeResult res;
+    Streamer st{tok, opt.stream};
+    std::vector<u32>& generated = res.tokens;
+    u32 next = first;
+    u32 p = n_prompt;  // position of `next`
+    const u32 max_d = !model.fusedDecode() ? 1 : std::min<u32>(model.dfr->block - 1, q::max_ng_drafts);
+    u32 ng_max = opt.ngram_max > 0 ? std::min(opt.ngram_max, q::max_ng_drafts) : q::max_ng_drafts;
+    if (!model.fusedDecode()) ng_max = 1;
+    {
+        // a recurrent-state snapshot set per draft row: take them if they fit in free VRAM with
+        // room to spare, else draft at most what exists
+        const u32 want = std::max(max_d, opt.ngram ? ng_max : 0u);
+        if (want > model.snap_sets) {
+            u64 per = 0;
+            for (u32 i = 0; i < model.cfg.n_layer; ++i)
+                if (model.ssm_state[i] != 0) per += model.convBytes() + model.ssmBytes();
+            const hip::MemInfo mem = hip::memInfo();
+            const u64 extra = static_cast<u64>(want - model.snap_sets) * per;
+            if (mem.free > extra + (1536ull << 20)) model.ensureSnapshots(want);
+        }
+    }
+    const u32 d_max = std::min(max_d, std::max<u32>(model.snap_sets, 1));
+    ng_max = std::min(ng_max, std::max<u32>(model.snap_sets, 1));
+    q::DraftAccept dacc;
+    q::DraftTiming timing;  // DFlash2 cycle times (drafting included) by draft count
+    float nd_ema = static_cast<float>(d_max);
+    std::array<u32, q::max_drafts> pos_tries{}, pos_hits{};
+    q::NgramPolicy ngp;
+    std::vector<u32> hist;
+    if (opt.ngram) {
+        ngp.ng.norm = tok.crlfToLf();
+        hist.assign(prompt_ids.begin(), prompt_ids.end());
+        hist.push_back(first);
+    }
+    u32 cycles = 0, accepted = 0, drafted = 0, ng_cycles = 0, ng_drafted = 0, ng_accepted = 0;
+    double t_draft = 0, t_verify = 0;
+    std::size_t verify_tokens = 0;
+    bool done = false;
+    auto emit = [&](u32 t) {
+        if (t == tok.im_end || t == tok.eot) return true;
+        generated.push_back(t);
+        return generated.size() >= opt.max_tokens;
+    };
+    Timer timer;
+    timer.begin();
+    TpsTrace tps;
+    tps.start(opt.trace_tps);
+    done = emit(next);
+    while (!done && p + 2 < opt.max_ctx) {
+        const double c0 = nowMs();
+        const u32 room = std::min<u32>(std::max(d_max, ng_max), opt.max_ctx - (p + 2));
+        std::array<u32, q::max_ng_drafts> dr{};
+        u32 nd = 0;
+        bool is_ng = false;
+        if (opt.ngram && room > 0) {
+            const q::Ngram::Match mt = ngp.propose(hist, opt.ngram_min, std::span<u32>(dr.data(), std::min(room, ng_max)));
+            if (mt.n > 0) {
+                const u32 dn = std::min({d_max, room, static_cast<u32>(std::lround(nd_ema))});
+                const auto t = timing.estimate(dn);
+                const float alt = t ? dacc.expected(dn) / *t : 0.0f;
+                nd = opt.ngram_force ? static_cast<u32>(mt.n) : ngp.choose(mt.n, mt.mlen, alt, timing);
+                is_ng = nd > 0;
+            }
+        }
+        if (!is_ng && room > 0) {
+            const std::vector<u32> d = model.dflashDraft(0, next, p, opt.dfl_p_min, opt.dfl_n_min);
+            nd_ema = 0.8f * nd_ema + 0.2f * static_cast<float>(d.size());
+            nd = std::min({static_cast<u32>(d.size()), d_max, room});
+            std::copy(d.begin(), d.begin() + nd, dr.begin());
+        }
+        model.verifyEnqueueEx(next, nd, std::span<const u32>(dr.data(), nd), p);
+        verify_tokens += nd + 1;
+        const double c1 = nowMs();
+        std::array<u32, q::max_small_batch> outv{};
+        (void)model.readCycle(std::span<u32>(outv.data(), nd + 1), std::span<u32>(outv.data(), 0));
+        const double c2 = nowMs();
+        t_draft += c1 - c0;
+        t_verify += c2 - c1;
+        cycles += 1;
+        drafted += nd;
+        u32 acc = 0;
+        while (acc < nd && outv[acc] == dr[acc]) acc += 1;
+        accepted += acc;
+        if (is_ng) {
+            ng_cycles += 1;
+            ng_drafted += nd;
+            ng_accepted += acc;
+            ngp.timing.update(nd, static_cast<float>(c2 - c0));
+        } else {
+            for (u32 kk = 0; kk < std::min(acc + 1, nd); ++kk) pos_tries[kk] += 1;
+            for (u32 kk = 0; kk < acc; ++kk) pos_hits[kk] += 1;
+            if (nd > 0) dacc.update(nd, acc);
+            timing.update(nd, static_cast<float>(c2 - c0));
+        }
+        // the verify ran nd + 1 rows: keep acc + 1 of them, and their features
+        if (acc < nd) model.restoreSnapshot(acc + 1);
+        model.dflashIngest(0, model.cap_buf, model.cap_rows, model.cap_n - (nd + 1), acc + 1, p);
+        for (u32 r = 0; r < acc + 1; ++r) {
+            if (!done) done = emit(outv[r]);
+            if (opt.ngram) hist.push_back(outv[r]);
+        }
+        next = outv[acc];
+        p += acc + 1;
+        tps.tick(generated.size());
+        st.update(generated);
+    }
+    res.decode_ms = timer.end();
+    if (!opt.stream && opt.print_text) out(tok.decode(generated));
+    res.cycles = cycles;
+    res.accepted = accepted;
+    res.drafted = drafted;
+    res.verify_tokens = verify_tokens;
+    res.pos_tries = pos_tries;
+    res.pos_hits = pos_hits;
+    res.ng_cycles = ng_cycles;
+    res.ng_drafted = ng_drafted;
+    res.ng_accepted = ng_accepted;
+    res.ng_alpha = {ngp.acc[0].alpha[0], ngp.acc[1].alpha[0], ngp.acc[2].alpha[0]};
+    res.t_draft = t_draft;
+    res.t_verify = t_verify;
+    res.n_draft = d_max;
+    res.p_min = opt.dfl_p_min;
+    res.n_min = opt.dfl_n_min;
+    return res;
+}
+
 void printProfile(const char* label, q::Profile& p, std::size_t n_tok) {
     p.flush();
     double total = 0;
@@ -769,8 +907,28 @@ void printProfile(const char* label, q::Profile& p, std::size_t n_tok) {
 
 
 // Runtime A/B switches shared by chat and bench (WHIRL_FLOAT_GEMV, ...).
-// WHIRL_DRAFT_MODEL: DFlash2 drafter GGUF, loaded and checked against the target (not run yet),
-// plus the hidden capture of its target layers. Unset: nothing changes.
+// --draft dflash: true when WHIRL_DRAFT_MODEL holds a DFlash2 drafter that fits this model
+// (headers only, before loading); otherwise a warning and the MTP drafts.
+bool wantDFlash(const Args& a, const gguf::File& f) {
+    const std::string mode = a.get("--draft") ? *a.get("--draft") : std::string("mtp");
+    if (mode != "mtp" && mode != "dflash") throw std::runtime_error("--draft must be mtp or dflash");
+    if (mode == "mtp") return false;
+    const auto dm = envGet("DRAFT_MODEL");
+    if (!dm) {
+        std::fprintf(stderr, "warning: --draft dflash needs the DFlash2 drafter GGUF in WHIRL_DRAFT_MODEL: using MTP drafts\n");
+        return false;
+    }
+    const gguf::File df = gguf::File::open(*dm);
+    const std::string why = q::dflashIncompatible(f, df);
+    if (!why.empty()) {
+        std::fprintf(stderr, "warning: --draft dflash: %s does not fit this model (%s): using MTP drafts\n", dm->c_str(), why.c_str());
+        return false;
+    }
+    return true;
+}
+
+// WHIRL_DRAFT_MODEL (--draft dflash): DFlash2 drafter GGUF, the hidden capture of its target layers
+// and the drafter context of one sequence.
 void loadDraftModelEnv(q::Model& m) {
     const auto dm = envGet("DRAFT_MODEL");
     if (!dm || m.dflash) return;
@@ -780,8 +938,9 @@ void loadDraftModelEnv(q::Model& m) {
     const u64 wb = m.loadDrafter(df, ds);
     const auto& dc = m.dflash->cfg;
     m.enableCapture(envU32("DFLASH_CAPTURE_ROWS").value_or(dc.window > 0 ? dc.window : 2048u));
+    m.dflashSetup(1, m.cap_rows);
     const hip::MemInfo d1 = hip::memInfo();
-    std::fprintf(stderr, "draft model %s: DFlash2, %u layers, block %u, weights %.2f GiB, capture %u rows, VRAM +%.2f GiB (not run yet)\n",
+    std::fprintf(stderr, "draft model %s: DFlash2, %u layers, block %u, weights %.2f GiB, capture %u rows, VRAM +%.2f GiB (MTP block not loaded)\n",
                  dm->c_str(), dc.n_layer, dc.block, static_cast<double>(wb) / (1024.0 * 1024.0 * 1024.0), m.cap_rows,
                  static_cast<double>(d0.free > d1.free ? d0.free - d1.free : 0) / (1024.0 * 1024.0 * 1024.0));
 }
@@ -795,7 +954,6 @@ void applyRuntimeEnv(q::Model& m) {
     if (envGet("NO_FUSE")) m.no_fuse = true;
     if (auto v = envU32("DRAFT_WINDOW")) m.draft_window = *v;
     if (auto v = envU32("DRAFT_WINDOW_MIN")) m.draft_window_min = *v;
-    loadDraftModelEnv(m);
     if (envGet("NAIVE_ATTN")) m.naive_attn = true;
     if (auto v = envGet("ATTN_WIDE"); v && *v == "0") m.attn_wide = false;
     if (auto v = envGet("ATTN_DQ4"); v && *v == "0") m.attn_dq4 = false;
@@ -828,13 +986,15 @@ whirl::numerics::Request modeRequest(const Args& a) {
 }
 
 // ctx_explicit: the context was asked for (--ctx / WHIRL_MAX_CTX, bench sizes): precise f16 KV that
-// does not fit refuses instead of shrinking to at least min_ctx tokens
-Loaded loadModel(const Args& a, const gguf::File& f, u32 max_ctx, bool ctx_explicit = true, u32 min_ctx = 0) {
+// does not fit refuses instead of shrinking to at least min_ctx tokens. no_mtp: --draft dflash
+// (the MTP block is not loaded; the DFlash2 drafter drafts instead)
+Loaded loadModel(const Args& a, const gguf::File& f, u32 max_ctx, bool ctx_explicit = true, u32 min_ctx = 0, bool no_mtp = false) {
     Loaded L;
     q::LoadOptions lo;
     lo.numerics = modeRequest(a);
     lo.ctx_explicit = ctx_explicit;
     lo.min_ctx = min_ctx;
+    lo.no_mtp = no_mtp;
     if (auto v = envU32("PREFILL_BATCH")) lo.max_batch = std::max(q::max_batch_default, std::min(q::max_batch_limit, *v));
     lo.kv_mode = q::kvModeFromEnv().value_or(q::KvMode::automatic);
     L.model = q::Model::load(f, max_ctx, L.stats, lo);
@@ -912,11 +1072,23 @@ ChatOpts mtpOpts(const q::Model& model, ChatOpts base, u32* drafts_out) {
     return base;
 }
 
-void printSpecSummary(const DecodeResult& r, std::size_t n_prompt, double prefill_ms, const ChatOpts& opt) {
+// --draft dflash: the walk cutoffs and the n-gram switches (the same environment as MTP)
+ChatOpts dflashOpts(ChatOpts base) {
+    if (auto v = envGet("DFLASH_PMIN")) base.dfl_p_min = std::stof(*v);
+    if (auto v = envGet("DFLASH_NMIN")) base.dfl_n_min = static_cast<u32>(std::strtoul(v->c_str(), nullptr, 10));
+    if (auto v = envGet("NGRAM")) base.ngram = *v != "0";
+    if (auto v = envGet("NGRAM_MIN")) base.ngram_min = static_cast<u32>(std::strtoul(v->c_str(), nullptr, 10));
+    if (auto v = envGet("NGRAM_MAX")) base.ngram_max = static_cast<u32>(std::strtoul(v->c_str(), nullptr, 10));
+    if (auto v = envGet("NGRAM_FORCE")) base.ngram_force = *v != "0";
+    return base;
+}
+
+void printSpecSummary(const DecodeResult& r, std::size_t n_prompt, double prefill_ms, const ChatOpts& opt, const char* kind = "MTP spec") {
     const std::size_t n_gen = r.tokens.size();
+    const bool mtp = std::string_view(kind) == "MTP spec";
     out(fmt("\n\n  prefill: %zu tok in %.0f ms (%.1f tok/s)\n", n_prompt, prefill_ms, n_prompt * 1000.0 / prefill_ms));
-    out(fmt("  decode (MTP spec, max %u min %u p-min %.2f%s): %zu tok in %.0f ms (%.2f tok/s); %u verify cycles, drafts %u/%u accepted (%.2f tok/cycle)\n",
-            r.n_draft, r.n_min, r.p_min, opt.mtp_auto ? " auto" : opt.mtp_adapt > 0 ? " adaptive" : "", n_gen, r.decode_ms, n_gen * 1000.0 / r.decode_ms,
+    out(fmt("  decode (%s, max %u min %u p-min %.2f%s): %zu tok in %.0f ms (%.2f tok/s); %u verify cycles, drafts %u/%u accepted (%.2f tok/cycle)\n",
+            kind, r.n_draft, r.n_min, r.p_min, !mtp ? "" : opt.mtp_auto ? " auto" : opt.mtp_adapt > 0 ? " adaptive" : "", n_gen, r.decode_ms, n_gen * 1000.0 / r.decode_ms,
             r.cycles, r.accepted, r.drafted, r.cycles > 0 ? static_cast<double>(n_gen) / r.cycles : 0.0));
     if (r.cycles > 0) {
         std::string line = "  acceptance by draft position (accepted/reached):";
@@ -1024,7 +1196,8 @@ int cmdChat(const Args& a) {
     if (ids.size() + opt.max_tokens > opt.max_ctx) throw q::ModelError("ContextTooLong");
 
     const bool ctx_given = a.get("--ctx") != nullptr || envU32("MAX_CTX").has_value();
-    Loaded L = loadModel(a, f, opt.max_ctx, ctx_given, static_cast<u32>(ids.size()) + opt.max_tokens);
+    const bool use_dflash = logits_out == nullptr && wantDFlash(a, f);
+    Loaded L = loadModel(a, f, opt.max_ctx, ctx_given, static_cast<u32>(ids.size()) + opt.max_tokens, use_dflash);
     opt.max_ctx = L.model->max_ctx;  // precise: may be lowered to what f16 KV fits
     q::Model& model = *L.model;
     {
@@ -1070,6 +1243,7 @@ int cmdChat(const Args& a) {
     const bool profiling = envGet("PROFILE").has_value();
     if (profiling) model.prof = &prof;
     applyRuntimeEnv(model);
+    if (use_dflash) loadDraftModelEnv(model);
 
     // MTP speculative decode is exact greedy: on whenever the checkpoint has a nextn
     // layer; WHIRL_MTP=0 turns it off.
@@ -1107,6 +1281,8 @@ int cmdChat(const Args& a) {
                 model.forward(std::span<const u32>(ids).subspan(off, n), static_cast<u32>(off));
             model.all_logits = false;
             model.keep_hidden = false;
+            // DFlash2 context: the chunk's captured rows (its last cap_n positions)
+            if (use_dflash) model.dflashIngest(0, model.cap_buf, model.cap_rows, 0, model.cap_n, static_cast<u32>(off + n - model.cap_n));
             if (dumping) {
                 const std::size_t V = model.cfg.n_vocab;
                 hip::download(row_f32.data(), model.logits, n * V * 4);
@@ -1149,6 +1325,22 @@ int cmdChat(const Args& a) {
     if (moe_dump_path) writeFile(*moe_dump_path, std::string_view(reinterpret_cast<const char*>(moe_ids.data()), moe_ids.size() * 4));
     const u32 next = model.beginDecode(static_cast<u32>(ids.size()));
     const double prefill_ms = timer.end();
+    if (use_dflash) {
+        if (profiling) {
+            printProfile("prefill", prof, ids.size());
+            prof.reset();
+        }
+        const ChatOpts dopt = dflashOpts(opt);
+        const DecodeResult r = dflashDecode(model, tok, next, static_cast<u32>(ids.size()), dopt, ids);
+        printSpecSummary(r, ids.size(), prefill_ms, dopt, "DFlash2 spec");
+        if (envGet("PRINT_IDS")) {
+            std::string s = "  ids:";
+            for (u32 t : r.tokens) s += " " + std::to_string(t);
+            out(s + fmt("\n  hash: %016llx\n", static_cast<unsigned long long>(fnv(r.tokens))));
+        }
+        if (profiling) printProfile("verify (per verified token)", prof, r.verify_tokens);
+        return 0;
+    }
     if (use_mtp) {
         if (profiling) {
             printProfile("prefill", prof, ids.size());
@@ -1213,6 +1405,8 @@ int cmdBench(const Args& a) {
     if (auto v = a.get("--prefill")) sizes = parseIds(*v);
     const u32 n_dec = a.get("--decode") ? static_cast<u32>(std::stoul(*a.get("--decode"))) : 256;
     std::vector<std::string> modes = {"mtp-ngram", "mtp", "plain"};
+    const bool dflash_req = a.get("--draft") && *a.get("--draft") == "dflash";
+    if (dflash_req) modes = {"dflash-ngram", "dflash", "plain"};
     if (auto v = a.get("--modes")) {
         modes.clear();
         std::size_t p = 0;
@@ -1236,7 +1430,9 @@ int cmdBench(const Args& a) {
     u32 max_size = 0;
     for (u32 s : sizes) max_size = std::max(max_size, s);
     const u32 ctx = std::max<u32>(max_size + 64, static_cast<u32>(dec_ids.size()) + n_dec + 64);
-    Loaded L = loadModel(a, f, ctx);
+    const bool use_dflash = wantDFlash(a, f);
+    if (dflash_req && !use_dflash && !a.get("--modes")) modes = {"mtp-ngram", "mtp", "plain"};
+    Loaded L = loadModel(a, f, ctx, true, 0, use_dflash);
     q::Model& model = *L.model;
     {
         std::string log;
@@ -1246,6 +1442,7 @@ int cmdBench(const Args& a) {
     if (envFlag("MTP_Q4", true)) model.requantMtpQ4();
     loadLog(model, L.stats);
     applyRuntimeEnv(model);
+    if (use_dflash) loadDraftModelEnv(model);
     const bool has_mtp = model.mtp.has_value() && envFlag("MTP", true);
 
     // prefill sweep: a long mixed zh/en coding text, truncated to each size
@@ -1307,13 +1504,24 @@ int cmdBench(const Args& a) {
     if (has_mtp) applyDraftVocab(model, tok.t);
     std::optional<u64> ref_hash;
     for (const std::string& mode : modes) {
-        if (mode != "plain" && !has_mtp) continue;
+        const bool dfl_mode = mode == "dflash" || mode == "dflash-ngram";
+        if (dfl_mode ? !use_dflash : (mode != "plain" && !has_mtp)) continue;
         model.reset();
         model.decode_graph.reset();
         Timer pt;
         pt.begin();
         if (mode == "plain") {
             model.prefill(dec_ids, 0);
+        } else if (dfl_mode) {
+            // a fresh drafter context, filled chunk by chunk from the capture
+            model.dflashTrim(0, 0);
+            std::size_t off = 0;
+            while (off < dec_ids.size()) {
+                const std::size_t n = std::min<std::size_t>(dec_ids.size() - off, model.max_batch);
+                model.forward(std::span<const u32>(dec_ids).subspan(off, n), static_cast<u32>(off));
+                model.dflashIngest(0, model.cap_buf, model.cap_rows, 0, model.cap_n, static_cast<u32>(off + n - model.cap_n));
+                off += n;
+            }
         } else {
             std::size_t off = 0;
             while (off < dec_ids.size()) {
@@ -1333,6 +1541,14 @@ int cmdBench(const Args& a) {
             r = plainDecode(model, tok, next, dec_ids.size(), po);
             const double tps = r.steps > 0 ? r.steps * 1000.0 / r.decode_ms : 0;
             out(fmt("\n    plain (no MTP)  : %4u tok in %7.0f ms  %7.2f tok/s  hash %016llx\n", r.steps, r.decode_ms, tps,
+                    static_cast<unsigned long long>(fnv(r.tokens))));
+        } else if (dfl_mode) {
+            ChatOpts dop = dflashOpts(opt);
+            dop.ngram = mode == "dflash-ngram";
+            r = dflashDecode(model, tok, next, static_cast<u32>(dec_ids.size()), dop, dec_ids);
+            out(fmt("\n    %-16s: %4zu tok in %7.0f ms  %7.2f tok/s  %.2f tok/cycle  drafts %u/%u  hash %016llx\n",
+                    mode == "dflash" ? "DFlash2" : "DFlash2 + n-gram", r.tokens.size(), r.decode_ms, r.tokens.size() * 1000.0 / r.decode_ms,
+                    r.cycles ? static_cast<double>(r.tokens.size()) / r.cycles : 0.0, r.accepted, r.drafted,
                     static_cast<unsigned long long>(fnv(r.tokens))));
         } else {
             u32 drafts = 0;

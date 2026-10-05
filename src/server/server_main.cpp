@@ -128,6 +128,11 @@ const char* kHelpBody =
     "                           4-bit KV, relaxed MTP acceptance). --balance=fp8,kvq8 picks items; --mode M;\n"
     "                           WHIRL_MODE\n"
     "  --mtp-drafts N           MTP drafts per cycle, 1..10 (fixed count; default: per model type)\n"
+    "  --draft mtp|dflash       draft source of the speculative decode (default mtp). dflash: the DFlash2\n"
+    "                           drafter GGUF in WHIRL_DRAFT_MODEL (block 8: up to 7 drafts per cycle);\n"
+    "                           the MTP block is then not loaded and the KV pool grows by its share.\n"
+    "                           A model without a matching drafter (e.g. a MoE model) keeps mtp.\n"
+    "                           n-gram drafts stay on in both modes; outputs equal plain greedy decoding\n"
     "  --decode-min-tps N       while other requests prefill, keep every streaming (decoding) request\n"
     "                           at >= N tok/s by limiting prefill forwards (default 20; 0 = off:\n"
     "                           prefill forwards are not limited)\n"
@@ -166,6 +171,7 @@ struct Options {
     bool parallel_given = false;  // --parallel / -np on the command line
     std::optional<std::uint32_t> ctx_per_slot;
     std::optional<std::uint32_t> mtp_drafts;
+    std::string draft = "mtp";
     std::optional<std::uint32_t> decode_min_tps;
     std::optional<std::string> log_file;
     std::optional<std::string> alias;
@@ -362,7 +368,10 @@ int serveMain(int argc, char** argv, const char* program) {
         else if (auto v4b = argValue(args, i, "-np")) { opt.parallel = parseNum<std::uint32_t>(*v4b, "--parallel"); opt.parallel_given = true; }
         else if (auto v5 = argValue(args, i, "--mtp-drafts"))
             opt.mtp_drafts = std::clamp(parseNum<std::uint32_t>(*v5, "--mtp-drafts"), 1u, qwen35::max_drafts);
-        else if (auto v5b = argValue(args, i, "--decode-min-tps"))
+        else if (auto v5c = argValue(args, i, "--draft")) {
+            if (*v5c != "mtp" && *v5c != "dflash") die("invalid --draft " + *v5c + " (mtp or dflash)");
+            opt.draft = *v5c;
+        } else if (auto v5b = argValue(args, i, "--decode-min-tps"))
             opt.decode_min_tps = parseNum<std::uint32_t>(*v5b, "--decode-min-tps");
         else if (auto v6 = argValue(args, i, "--ctx-per-slot")) opt.ctx_per_slot = parseNum<std::uint32_t>(*v6, "--ctx-per-slot");
         else if (auto v7 = argValue(args, i, "--log-file")) opt.log_file = *v7;
@@ -574,6 +583,28 @@ int serveMain(int argc, char** argv, const char* program) {
             const std::size_t mb = lo.max_batch > prefill_merge ? lo.max_batch - prefill_merge : 0;
             prefill_exec = std::max(prefill_chunk, std::min(prefill_exec / prefill_chunk * prefill_chunk, mb / prefill_chunk * prefill_chunk));
         }
+        // --draft dflash: check the drafter against the target before loading (headers only); a
+        // model without a matching drafter keeps the MTP drafts
+        bool use_dflash = false;
+        std::optional<gguf::File> dfile;
+        if (opt.draft == "dflash") {
+            const auto dm = env("DRAFT_MODEL");
+            if (!dm) {
+                logW("--draft dflash needs the DFlash2 drafter GGUF in WHIRL_DRAFT_MODEL: using MTP drafts");
+            } else {
+                dfile.emplace(gguf::File::open(*dm));
+                const std::string why = qwen35::dflashIncompatible(f, *dfile);
+                if (why.empty()) {
+                    use_dflash = true;
+                    lo.no_mtp = true;
+                } else {
+                    logW("--draft dflash: {} does not fit this model ({}): using MTP drafts", *dm, why);
+                    dfile.reset();
+                }
+            }
+        } else if (env("DRAFT_MODEL")) {
+            logW("WHIRL_DRAFT_MODEL is set but --draft is mtp: the DFlash2 drafter is not loaded");
+        }
         std::unique_ptr<qwen35::Model> mp = qwen35::Model::load(f, 0, stats, lo);
         qwen35::Model& model = *mp;
         {
@@ -604,12 +635,12 @@ int serveMain(int argc, char** argv, const char* program) {
                  static_cast<double>(embd_pinned) / 1048576.0);
         }
 
-        // WHIRL_DRAFT_MODEL: DFlash2 drafter GGUF, loaded and checked against the target (not run
-        // yet); turns on the hidden capture of its target layers (WHIRL_DFLASH_CAPTURE_ROWS rows,
-        // default the drafter's window or 2048). Unset: nothing changes.
-        if (auto dm = env("DRAFT_MODEL")) {
+        // --draft dflash: the DFlash2 drafter (WHIRL_DRAFT_MODEL) and the hidden capture of its target
+        // layers (WHIRL_DFLASH_CAPTURE_ROWS rows, default the drafter's window or 2048)
+        if (use_dflash) {
+            const std::string dm = *env("DRAFT_MODEL");
             const hip::MemInfo d0 = hip::memInfo();
-            const gguf::File df = gguf::File::open(*dm);
+            const gguf::File& df = *dfile;
             qwen35::LoadStats ds;
             const std::uint64_t wb = model.loadDrafter(df, ds);
             const auto& dc = model.dflash->cfg;
@@ -620,8 +651,8 @@ int serveMain(int argc, char** argv, const char* program) {
             std::string tl;
             for (const std::uint32_t l : dc.target_layers) tl += (tl.empty() ? "" : ",") + std::to_string(l);
             logI("draft model {}: DFlash2, {} layers, block {}, window {}, target layers {}, weights {:.2f} GiB, capture {} rows ({:.0f} MiB), "
-                 "VRAM +{:.2f} GiB (not run yet)",
-                 *dm, dc.n_layer, dc.block, dc.window, tl, static_cast<double>(wb) / (1024.0 * 1024.0 * 1024.0), model.cap_rows,
+                 "VRAM +{:.2f} GiB; MTP block not loaded",
+                 dm, dc.n_layer, dc.block, dc.window, tl, static_cast<double>(wb) / (1024.0 * 1024.0 * 1024.0), model.cap_rows,
                  static_cast<double>(dc.target_layers.size()) * model.cap_rows * cfg.n_embd * 4 / (1024.0 * 1024.0),
                  static_cast<double>(d0.free > d1.free ? d0.free - d1.free : 0) / (1024.0 * 1024.0 * 1024.0));
         }
@@ -717,6 +748,8 @@ int serveMain(int argc, char** argv, const char* program) {
             std::string tbl;
             for (std::uint32_t k = 1; k <= opt.parallel; ++k) tbl += (k > 1 ? ", " : "") + std::to_string(batch_drafts[k]);
             logI("MTP under load: max drafts per cycle with 1..{} decoding slots: {{ {} }}", opt.parallel, tbl);
+        } else if (use_dflash) {
+            logI("MTP speculative decoding: off (--draft dflash)");
         } else {
             logI("MTP speculative decoding: off{}", !model.mtp ? " (no nextn layer)" : " (WHIRL_MTP=0)");
         }
@@ -725,6 +758,19 @@ int serveMain(int argc, char** argv, const char* program) {
         model.gdn_replay = envOn("GDN_REPLAY", true);
         const hip::MemInfo mem_s0 = hip::memInfo();
         model.setupSeqs(opt.parallel, slot_ctx);
+        if (use_dflash) {
+            // per-slot drafter context rings and the draft scratch (before the KV pool: it is sized
+            // from the VRAM left after them)
+            const hip::MemInfo r0 = hip::memInfo();
+            model.dflashSetup(opt.parallel, model.cap_rows);
+            const hip::MemInfo r1 = hip::memInfo();
+            logI("DFlash2 speculative decoding: on, block {} (up to {} drafts per cycle), context ring {} rows x {} slots, VRAM +{:.0f} MiB; "
+                 "p-min {:.2f}, n-min {}; n-gram drafts {}",
+                 model.dfr->block, model.dfr->block - 1, model.dfr->ring, opt.parallel,
+                 static_cast<double>(r0.free > r1.free ? r0.free - r1.free : 0) / (1024.0 * 1024.0),
+                 static_cast<double>(std::stof(env("DFLASH_PMIN").value_or("0"))), envU32("DFLASH_NMIN", 0),
+                 envOn("NGRAM", true) ? "on (chosen per cycle by the cost model)" : "off");
+        }
         if (model.gdn_replay) {
             logI("DeltaNet verify: replay of kept rows ({:.1f} MiB per slot), no snapshot sets",
                  static_cast<double>(model.pendLayerBytes() * model.gdn_ord[cfg.n_layer - 1]) / (1024.0 * 1024.0));
@@ -771,6 +817,15 @@ int serveMain(int argc, char** argv, const char* program) {
         eo.use_mtp = use_mtp;
         eo.spec_sample = model.num_plan.on(numerics::Item::specsample);
         eo.relax = model.relax;
+        eo.use_dflash = use_dflash;
+        if (auto v = env("DFLASH_PMIN")) {
+            try {
+                eo.dfl_p_min = std::stof(*v);
+            } catch (const std::exception&) {
+            }
+        }
+        eo.dfl_n_min = envU32("DFLASH_NMIN", 0);
+        eo.dfl_warm = envU32("DFLASH_WARM", 64);
         eo.n_draft = drafts;
         eo.p_min = p_min;
         eo.n_min = n_min;
@@ -789,6 +844,14 @@ int serveMain(int argc, char** argv, const char* program) {
         eo.ngram_force = envOn("NGRAM_FORCE", false);
         // WHIRL_SLOT_DRAFTS: 0 / unset uniform, 1 marginal-gain swaps, 2 cost-model allocation
         if (auto v = env("SLOT_DRAFTS")) eo.slot_drafts = *v == "2" ? 2u : (*v != "0" ? 1u : 0u);
+        if (use_dflash) {
+            // MTP-only settings: the per-slot MTP draft allocation, the draft-head vocabulary subset and
+            // the MTP draft attention window have nothing to act on without the MTP block
+            if (eo.slot_drafts != 0) logW("WHIRL_SLOT_DRAFTS ignored with --draft dflash (it allocates MTP drafts)");
+            eo.slot_drafts = 0;
+            if (env("DRAFT_VOCAB") || env("DRAFT_WINDOW") || env("DRAFT_WINDOW_MIN"))
+                logI("WHIRL_DRAFT_VOCAB / WHIRL_DRAFT_WINDOW not used with --draft dflash (MTP draft head only)");
+        }
         eo.trace_nd = env("TRACE_ND").has_value();
         eo.loop_log = env("LOOP_LOG").has_value();
         eo.tier_verify = env("TIER_VERIFY").has_value();
@@ -968,10 +1031,11 @@ int serveMain(int argc, char** argv, const char* program) {
             const double st_mib = static_cast<double>(n_gdn * (conv_bytes + ssm_bytes)) / (1024.0 * 1024.0);
             const double snap_mib = st_mib * model.snap_sets;
             logI("kv pool: {} tokens ({} pages of {}), {} KV{}, {:.1f} KiB/token, {:.2f} GiB, shared by {} slots; max {} tokens per "
-                 "request",
+                 "request{}",
                  model.pool_pages * kv_page, model.pool_pages, kv_page, model.kvName(), kv_note, static_cast<double>(per_tok) / 1024.0,
                  static_cast<double>(per_tok * model.pool_pages * kv_page) / (1024.0 * 1024.0 * 1024.0), opt.parallel,
-                 std::min<std::uint64_t>(slot_ctx_eff, static_cast<std::uint64_t>(model.pool_pages) * kv_page));
+                 std::min<std::uint64_t>(slot_ctx_eff, static_cast<std::uint64_t>(model.pool_pages) * kv_page),
+                 use_dflash ? " (--draft dflash: no MTP KV layer; the drafter's weights and rings came first)" : "");
             logI("slots: {}; per slot: recurrent state {:.1f} MiB, prefix checkpoints {:.1f} MiB; shared: {} snapshot sets {:.1f} MiB",
                  opt.parallel, st_mib, ck_mb * static_cast<double>(n_ck), model.snap_sets, snap_mib);
         }

@@ -565,7 +565,7 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
             m.ssm_state[il] = m.allocZero(static_cast<u64>(cfg.n_v_heads) * cfg.d_state * cfg.headV() * 4);
         }
     }
-    if (cfg.n_nextn > 0 && f.tensor(Loader::bn(cfg.n_layer, "nextn.eh_proj.weight")) != nullptr) {
+    if (!opt.no_mtp && cfg.n_nextn > 0 && f.tensor(Loader::bn(cfg.n_layer, "nextn.eh_proj.weight")) != nullptr) {
         const u32 il = cfg.n_layer;
         auto n = [&](const char* s) { return Loader::bn(il, s); };
         MtpW w;

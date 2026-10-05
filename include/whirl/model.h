@@ -275,7 +275,7 @@ enum class KvMode { automatic, f16, q8, q8h, q8v, q4 };
 std::optional<KvMode> kvModeFromEnv();
 
 // ---- DFlash2 block-diffusion drafter (arch "dflash"; z-lab DFlash2, llama.cpp names):
-// loaded next to the target (WHIRL_DRAFT_MODEL / --draft-model), not run yet.
+// loaded next to the target (WHIRL_DRAFT_MODEL), drafts with `--draft dflash`.
 struct DFlashConfig {
     std::uint32_t n_layer = 0, n_embd = 0, n_head = 0, n_head_kv = 0, head_dim = 0, n_ff = 0;
     std::uint32_t block = 0, conv_k = 0, conv_group = 0, sel_rank = 0, sel_topk = 0, window = 0;
@@ -288,6 +288,10 @@ struct DFlashConfig {
     // Throws ModelError unless it fits the target (hidden size, layer ids, vocabulary, tensors).
     void validate(const Config& target, const gguf::File& f) const;
 };
+
+// Before loading anything: empty when the DFlash2 drafter `draft` fits the target model `target`
+// (both GGUF headers only), else the reason (e.g. a MoE target such as Ornith has no drafter).
+std::string dflashIncompatible(const gguf::File& target, const gguf::File& draft);
 
 struct DFlashLayerW {
     DevPtr attn_norm = 0, ffn_norm = 0, q_norm = 0, k_norm = 0;
@@ -338,6 +342,8 @@ struct LoadOptions {
     std::uint32_t min_ctx = 0;
     // Optional external code object file (development: WHIRL_CODE_OBJECT).
     std::string code_object;
+    // Skip the MTP (nextn) block: no weights, no KV layer (--draft dflash drafts with DFlash2).
+    bool no_mtp = false;
 };
 
 // VRAM Model::load will take, estimated from the GGUF header before any
@@ -1081,14 +1087,15 @@ AllocResult allocDrafts(std::span<const AllocSlot> slots, const CycleCost& cost,
                         std::span<const std::uint32_t> prev, float x = 0.03f);
 
 class Model;
-// The DFlash2 drafter's interface for the speculative loop (not wired in yet): features come from
+// The DFlash2 drafter's interface for the speculative loop (`--draft dflash`): features come from
 // the target's hidden capture (Model::enableCapture), one draft block per call.
 class DFlashDrafter {
 public:
     DFlashDrafter(Model& m, std::uint32_t slots);
     // after a target forward: rows row0 .. row0 + n - 1 of its capture are positions pos0 ..
     void ingest(std::uint32_t slot, std::uint32_t row0, std::uint32_t n, std::uint32_t pos0);
-    std::vector<std::uint32_t> draft(std::uint32_t slot, std::uint32_t anchor, std::uint32_t pos);
+    std::vector<std::uint32_t> draft(std::uint32_t slot, std::uint32_t anchor, std::uint32_t pos, float p_min = 0,
+                                     std::uint32_t n_min = 0);
     void trim(std::uint32_t slot, std::uint32_t keep);
 
 private:

@@ -140,6 +140,7 @@ public:
         eo.ctx = su.mc.slot_ctx;
         if (eo.model_name.empty()) eo.model_name = "mock";
         eo.use_mtp = su.mc.mtp && eo.use_mtp;
+        eo.use_dflash = su.mc.dflash && eo.use_dflash;
         engine_ = std::make_unique<Engine>(*model_, ops_, tok(), eo);
         engine_->allocState();
         engine_->initPool();
@@ -986,6 +987,180 @@ void testPrefixCacheMultiTurn() {
     CHECK_EQ(srv.model().hidMismatch(), 0u);
 }
 
+// --draft dflash: no MTP block, DFlash2 drafts (mock drafter: the true continuation from the
+// context row before the anchor, wrong with probability dfl_miss)
+ServerSetup dflashSetup(bool ngram) {
+    ServerSetup su = baseSetup(false);
+    su.mc.dflash = true;
+    su.eo.use_dflash = true;
+    su.eo.ngram = ngram;
+    return su;
+}
+
+// DFlash2 drafts: outputs == the greedy reference, the drafter context only ever holds the
+// sequence's own rows, drafts are used and mostly accepted
+void testDFlashGreedy() {
+    for (double miss : {0.0, 0.3}) {
+        ServerSetup su = dflashSetup(false);
+        su.mc.dfl_miss = miss;
+        TestServer srv(su);
+        for (std::uint32_t n : {5u, 300u, 1500u, 5000u}) {
+            const auto p = makePrompt(n, 40 + n);
+            const auto ref = srv.model().greedyReference(p, 120, true);
+            auto r = srv.post("/v1/completions", completionBody(p, 120, n == 300));
+            CHECK_EQ(r.status, 200);
+            CHECK_EQ(n == 300 ? streamText(r, false) : completionText(r), decode(ref));
+        }
+        const Engine::Stats st = srv.engine().stats();
+        CHECK(st.dfl_cycles > 0);
+        CHECK(st.dfl_drafted > 0);
+        // without wrong drafts every draft of a block is accepted (up to the max_tokens budget)
+        if (miss == 0.0) CHECK(st.dfl_accepted * 10 >= st.dfl_drafted * 9);
+        // the context follows every cycle (no cold slot): DFlash2 drafts carry most of the
+        // 4 x 120 generated tokens
+        if (miss == 0.0) CHECK(st.dfl_accepted >= 300);
+        CHECK_EQ(st.dfl_cold, 0u);
+        if (miss > 0) CHECK(st.dfl_accepted > 0 && st.dfl_accepted < st.dfl_drafted);
+        CHECK_EQ(st.dfl_gap, 0u);
+        CHECK_EQ(srv.model().poison(), 0u);
+        CHECK_EQ(srv.model().dflBad(), 0u);
+        CHECK_EQ(srv.model().dflStale(), 0u);
+    }
+    // sampling (temperature > 0): a deterministic draft is accepted iff it is the sampled token,
+    // so a seeded request gives the same text with and without DFlash2 drafts
+    {
+        TestServer a(dflashSetup(false));
+        ServerSetup su_plain = baseSetup(false);
+        su_plain.eo.ngram = false;
+        TestServer b(su_plain);
+        const auto p = makePrompt(400, 77);
+        const std::string body = std::format("{{\"prompt\":{},\"max_tokens\":60,\"temperature\":0.8,\"seed\":5,\"ignore_eos\":true}}", idsJson(p));
+        auto ra = a.post("/v1/completions", body);
+        auto rb = b.post("/v1/completions", body);
+        CHECK_EQ(ra.status, 200);
+        CHECK_EQ(completionText(ra), completionText(rb));
+        CHECK(a.engine().stats().dfl_cycles > 0);
+    }
+}
+
+// n-gram and DFlash2 drafts in the same requests (a repetitive toy model: the output cycles, so
+// n-gram matches appear and the cost model switches between the two); several slots at once
+void testDFlashNgram() {
+    ServerSetup su = dflashSetup(true);
+    su.mc.markov = 24;
+    su.mc.dfl_miss = 0.5;
+    su.eo.trace_nd = true;
+    TestServer srv(su);
+    g_log.clear();
+    std::vector<std::vector<std::uint32_t>> prompts;
+    for (std::uint32_t i = 0; i < 6; ++i) prompts.push_back(makePrompt(300 + 211 * i, 500 + i));
+    std::vector<std::string> got(prompts.size());
+    std::vector<std::thread> th;
+    for (std::size_t i = 0; i < prompts.size(); ++i)
+        th.emplace_back([&, i] { got[i] = completionText(srv.post("/v1/completions", completionBody(prompts[i], 300))); });
+    for (auto& t : th) t.join();
+    for (std::size_t i = 0; i < prompts.size(); ++i) CHECK_EQ(got[i], decode(srv.model().greedyReference(prompts[i], 300, true)));
+    const Engine::Stats st = srv.engine().stats();
+    CHECK(st.dfl_cycles > 0);
+    // cycles with n-gram drafts and cycles with DFlash2 drafts both occurred
+    const std::size_t cyc = g_log.count("trace | cycle");
+    CHECK(cyc > 0 && g_log.count("| n-gram 0 |") < cyc);
+    CHECK(g_log.count("| dflash 0 |") < cyc);
+    CHECK_EQ(srv.model().poison(), 0u);
+    CHECK_EQ(srv.model().dflBad(), 0u);
+    CHECK_EQ(srv.model().dflStale(), 0u);
+}
+
+// rollback and restore: prefix reuse in the same slot keeps the drafter rows below the reused
+// length (rows past it go), a shared prefix checkpoint / host tier restore brings no drafter rows
+// (the slot warms up again); every output still equals the cold reference
+void testDFlashRollback() {
+    ServerSetup su = dflashSetup(false);
+    su.mc.parallel = 2;
+    su.eo.dfl_warm = 32;
+    TestServer srv(su);
+    // multi-turn in one slot: turn 2 = turn 1 + output + new text; then a branch that rewinds into turn 1
+    const auto p1 = makePrompt(2500, 61);
+    auto r1 = srv.post("/v1/completions", completionBody(p1, 80));
+    const auto o1 = srv.model().greedyReference(p1, 80, true);
+    CHECK_EQ(completionText(r1), decode(o1));
+    std::vector<std::uint32_t> p2 = p1;
+    p2.insert(p2.end(), o1.begin(), o1.end());
+    const auto p2b = makePrompt(static_cast<std::uint32_t>(p2.size() + 300), 62, p2);
+    auto r2 = srv.post("/v1/completions", completionBody(p2b, 80));
+    CHECK_EQ(completionText(r2), decode(srv.model().greedyReference(p2b, 80, true)));
+    CHECK(cachedTokens(r2) >= p1.size());
+    const std::vector<std::uint32_t> p3(p1.begin(), p1.begin() + 1800);
+    const auto p3b = makePrompt(2100, 63, p3);
+    auto r3 = srv.post("/v1/completions", completionBody(p3b, 80));
+    CHECK_EQ(completionText(r3), decode(srv.model().greedyReference(p3b, 80, true)));
+    // the same long system prompt from several requests: shared prefix checkpoints
+    const auto sys = makePrompt(3000, 64);
+    std::vector<std::string> got(3);
+    std::vector<std::vector<std::uint32_t>> ps;
+    for (std::uint32_t i = 0; i < 3; ++i) ps.push_back(makePrompt(3000 + 100 + 50 * i, 70 + i, sys));
+    for (std::uint32_t i = 0; i < 3; ++i) got[i] = completionText(srv.post("/v1/completions", completionBody(ps[i], 60)));
+    for (std::uint32_t i = 0; i < 3; ++i) CHECK_EQ(got[i], decode(srv.model().greedyReference(ps[i], 60, true)));
+    const Engine::Stats st = srv.engine().stats();
+    CHECK(st.spe_hits >= 1);
+    CHECK(st.dfl_cycles > 0);
+    CHECK_EQ(srv.model().poison(), 0u);
+    CHECK_EQ(srv.model().dflBad(), 0u);
+    CHECK_EQ(srv.model().dflStale(), 0u);
+    {
+        // a shared checkpoint brings no drafter rows: with a warm-up longer than the new text the
+        // slot verifies without DFlash2 drafts (cold cycles) and still matches the reference
+        ServerSetup sw = dflashSetup(false);
+        sw.eo.dfl_warm = 2000;  // the shared checkpoint is @2048, ~1150 rows follow it
+        TestServer w(sw);
+        std::vector<std::string> g(3);
+        for (std::uint32_t i = 0; i < 3; ++i) g[i] = completionText(w.post("/v1/completions", completionBody(ps[i], 60)));
+        for (std::uint32_t i = 0; i < 3; ++i) CHECK_EQ(g[i], decode(w.model().greedyReference(ps[i], 60, true)));
+        CHECK(w.engine().stats().spe_hits >= 1);
+        CHECK(w.engine().stats().dfl_cold > 0);
+        CHECK_EQ(w.model().dflStale(), 0u);
+    }
+}
+
+// host tier restore with DFlash2: the restored session has KV and state but no drafter rows (reset
+// at the restore point); outputs equal the reference and no stale row reaches a draft
+void testDFlashTier() {
+    std::filesystem::path base;
+    if (const char* t = std::getenv("WHIRL_TEST_TMP"); t && *t) base = std::filesystem::path(widen(t));
+    else base = std::filesystem::temp_directory_path() / L"whirl-tests";
+    const std::string dir = narrow((base / L"server_test_dflash_ssd").wstring());
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    ServerSetup su = dflashSetup(false);
+    su.mc.parallel = 1;  // B runs in A's slot: its drafter rows must not survive A's restore
+    su.mc.slot_ctx = 8192;
+    su.mc.pool_tokens = 4096;
+    su.tier = true;
+    su.ssd_dir = dir;
+    su.tier_min = 512;
+    const auto pa = makePrompt(3000, 601);
+    const auto pb = makePrompt(3200, 602);
+    {
+        TestServer srv(su);
+        g_log.clear();
+        const auto outa = srv.model().greedyReference(pa, 40, true);
+        CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pa, 40))), decode(outa));
+        CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pb, 40))), decode(srv.model().greedyReference(pb, 40, true)));
+        std::vector<std::uint32_t> pa2 = pa;
+        pa2.insert(pa2.end(), outa.begin(), outa.end());
+        pa2 = makePrompt(static_cast<std::uint32_t>(pa2.size() + 300), 603, pa2);
+        auto r3 = srv.post("/v1/completions", completionBody(pa2, 40));
+        CHECK_EQ(completionText(r3), decode(srv.model().greedyReference(pa2, 40, true)));
+        CHECK(srv.tierp()->stats.restores_ram >= 1);
+        CHECK(srv.engine().stats().dfl_cycles > 0);
+        CHECK_EQ(srv.model().poison(), 0u);
+        CHECK_EQ(srv.model().dflBad(), 0u);
+        CHECK_EQ(srv.model().dflStale(), 0u);
+    }
+    std::filesystem::remove_all(dir, ec);
+}
+
 // concurrent requests (more than slots): every output equals its reference
 void testConcurrency(std::uint32_t parallel, std::uint32_t n_req, bool mtp, double floor_tps = 0, std::uint32_t slot_drafts = 0) {
     ServerSetup su = baseSetup(mtp);
@@ -1763,6 +1938,10 @@ int main(int argc, char** argv) {
         {"concurrency", [] { testConcurrency(4, 12, true); }},
         {"concurrency16", [] { testConcurrency(16, 24, true); }},
         {"concurrency_nomtp", [] { testConcurrency(4, 8, false); }},
+        {"dflash_greedy", testDFlashGreedy},
+        {"dflash_ngram", testDFlashNgram},
+        {"dflash_rollback", testDFlashRollback},
+        {"dflash_tier", testDFlashTier},
         {"concurrency_floor", [] { testConcurrency(4, 12, true, 20); }},
         {"slot_draft_plan", testSlotDraftPlan},
         {"slot_drafts_one_slot", testSlotDraftsOneSlot},

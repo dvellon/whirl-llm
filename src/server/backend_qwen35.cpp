@@ -116,6 +116,17 @@ public:
     }
     void profileStop() override { m_.prof = nullptr; }
     std::uint32_t verifyRows() const override { return m_.verifyRows(); }
+    bool hasDFlash() const override { return m_.dfr != nullptr; }
+    std::uint32_t dflashMaxDrafts() const override { return m_.dfr ? m_.dfr->block - 1 : 0; }
+    std::uint32_t captureN() const override { return m_.cap_buf ? m_.cap_n : 0; }
+    void dflashIngest(std::uint32_t s, std::uint32_t row0, std::uint32_t n, std::uint32_t pos0) override {
+        if (m_.cap_buf) m_.dflashIngest(s, m_.cap_buf, m_.cap_rows, row0, n, pos0);
+    }
+    std::vector<std::uint32_t> dflashDraft(std::uint32_t s, std::uint32_t anchor, std::uint32_t pos, float p_min,
+                                           std::uint32_t n_min) override {
+        return m_.dflashDraft(s, anchor, pos, p_min, n_min);
+    }
+    void dflashTrim(std::uint32_t s, std::uint32_t keep) override { m_.dflashTrim(s, keep); }
     void profileFlush(std::size_t slots) override {
         if (prof_mtp_[slots]) prof_mtp_[slots]->flush();
         if (prof_ver_[slots]) prof_ver_[slots]->flush();

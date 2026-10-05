@@ -129,6 +129,26 @@ public:
     virtual const char* profileClassName(std::size_t i) const { (void)i; return "?"; }
     // most rows of one batched verify / MTP step (qwen35::max_verify_rows with the wide GEMV path)
     virtual std::uint32_t verifyRows() const { return qwen35::max_small_batch; }
+
+    // ---- DFlash2 drafter (--draft dflash; see Model::dflash*). Defaults: no drafter.
+    virtual bool hasDFlash() const { return false; }
+    // most drafts of one block (block - 1)
+    virtual std::uint32_t dflashMaxDrafts() const { return 0; }
+    // the latest forward / verify of n rows captured the target features of its last captureN()
+    // rows: capture row c is row n - captureN() + c
+    virtual std::uint32_t captureN() const { return 0; }
+    // context rows of slot s at positions pos0 .. pos0 + n - 1 from capture rows row0 .. row0 + n - 1
+    virtual void dflashIngest(std::uint32_t s, std::uint32_t row0, std::uint32_t n, std::uint32_t pos0) {
+        (void)s, (void)row0, (void)n, (void)pos0;
+    }
+    // one block [anchor, MASK...] at pos .. against slot s's context: up to dflashMaxDrafts() drafts
+    virtual std::vector<std::uint32_t> dflashDraft(std::uint32_t s, std::uint32_t anchor, std::uint32_t pos, float p_min,
+                                                   std::uint32_t n_min) {
+        (void)s, (void)anchor, (void)pos, (void)p_min, (void)n_min;
+        return {};
+    }
+    // forget slot s's context rows at positions >= keep
+    virtual void dflashTrim(std::uint32_t s, std::uint32_t keep) { (void)s, (void)keep; }
 };
 
 // Production backend over a loaded qwen35::Model (setupSeqs / allocKvPool done).
