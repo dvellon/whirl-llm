@@ -377,6 +377,14 @@ void DFlashConfig::validate(const Config& t, const gguf::File& f) const {
     if (conv_k == 0 || conv_group == 0 || n_embd % conv_group != 0) bad("dynamic convolution parameters");
     if (n_head == 0 || n_head_kv == 0 || n_head % n_head_kv != 0 || head_dim == 0) bad("attention heads");
     if (mask_id >= t.n_vocab) bad("mask token " + std::to_string(mask_id) + " >= vocabulary " + std::to_string(t.n_vocab));
+    // kernel limits (kernels/dflash.hip): attention keys = context ring (the sliding window, 2048 without
+    // one) + block, one thread per head dimension, the selector lattice has 32 x top-k threads per block
+    const std::uint64_t keys = static_cast<std::uint64_t>(window > 0 ? window : 2048) + block;
+    if (keys > static_cast<std::uint64_t>(kernels::kDFlashMaxKeys))
+        bad("attention window " + std::to_string(window) + " + block " + std::to_string(block) + " = " + std::to_string(keys) +
+            " keys > the drafter attention limit " + std::to_string(kernels::kDFlashMaxKeys));
+    if (head_dim > 256) bad("head_dim " + std::to_string(head_dim) + " > 256 (one thread per dimension)");
+    if (sel_topk > 16) bad("selector top-k " + std::to_string(sel_topk) + " > 16 (dflash_lattice: 32 x top-k threads <= 512)");
     const gguf::TensorInfo* fc = f.tensor("fc.weight");
     if (!fc || fc->ne[0] != static_cast<std::uint64_t>(target_layers.size()) * n_embd || fc->ne[1] != n_embd)
         bad("fc.weight is not [" + std::to_string(target_layers.size() * n_embd) + ", " + std::to_string(n_embd) + "]");

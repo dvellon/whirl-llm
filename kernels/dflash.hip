@@ -134,7 +134,9 @@ extern "C" __global__ void dflash_walk(const float *lat, const int *cand, int P,
 // qpos + t; a context key is visible iff 0 <= cpos < qpos and (window == 0 or
 // qpos + t - cpos < window); every block key is visible. out [B][nh][hd].
 // grid (nh, B), block hd (one thread per dimension; hd <= 256, W + B <= 2304).
-#define DF_MAXK 2304
+// Longer rings (W + B > DF_MAXK, e.g. a 4096-row window with 16-row blocks) use
+// dflash_attn_long below; this kernel stays as it is for every drafter that fits.
+#define DF_MAXK 2304  // = kernels::kDFlashAttnKeys
 extern "C" __global__ void __launch_bounds__(256)
     dflash_attn(const float *q, const float *kb, const float *vb, const float *kc, const float *vc, const int *cpos, int W, int B,
                 int nh, int nkv, int hd, int qpos, int window, float scale, float *out) {
@@ -183,4 +185,74 @@ extern "C" __global__ void __launch_bounds__(256)
         }
         out[((size_t)t * nh + h) * hd + tid] = o / l;
     }
+}
+
+// dflash_attn for W + B > DF_MAXK (C-52): the keys in chunks of DF_MAXK with the
+// softmax combined online. Per chunk the same steps as dflash_attn (scores,
+// block max, exp, block sum, the thread's output dimension); the chunks are
+// merged with the running max: m' = max(m, m_c), l = l e^(m - m') + l_c e^(m_c - m'),
+// o likewise; out = o / l. A chunk with no visible key is skipped (the block's own
+// keys are always visible, so l > 0). The LDS use is that of dflash_attn
+// (DF_MAXK + 256 floats); same grid / block, no limit on W.
+extern "C" __global__ void __launch_bounds__(256)
+    dflash_attn_long(const float *q, const float *kb, const float *vb, const float *kc, const float *vc, const int *cpos, int W, int B,
+                     int nh, int nkv, int hd, int qpos, int window, float scale, float *out) {
+    __shared__ float qs[256];
+    __shared__ float sc[DF_MAXK];
+    const int h = blockIdx.x, t = blockIdx.y, g = h / (nh / nkv), tid = threadIdx.x;
+    const int my_pos = qpos + t, nk = W + B;
+    if (tid < hd) qs[tid] = q[((size_t)t * nh + h) * hd + tid];
+    __syncthreads();
+    float m_run = -INFINITY, l_run = 0.f, o_run = 0.f;
+    for (int c0 = 0; c0 < nk; c0 += DF_MAXK) {
+        const int nc = min(nk - c0, DF_MAXK);
+        float mloc = -INFINITY;
+        for (int j = tid; j < nc; j += blockDim.x) {
+            const int k = c0 + j;
+            const float *kr;
+            bool vis;
+            if (k < W) {
+                const int p = cpos[k];
+                vis = p >= 0 && p < qpos && (window == 0 || my_pos - p < window);
+                kr = kc + ((size_t)k * nkv + g) * hd;
+            } else {
+                vis = true;
+                kr = kb + ((size_t)(k - W) * nkv + g) * hd;
+            }
+            float s = -INFINITY;
+            if (vis) {
+                float d = 0.f;
+                for (int i = 0; i < hd; ++i) d += qs[i] * kr[i];
+                s = d * scale;
+            }
+            sc[j] = s;
+            mloc = fmaxf(mloc, s);
+        }
+        const float m = block_max(mloc);  // uniform across the block
+        if (m == -INFINITY) continue;     // no visible key in this chunk (sc[] was not read: no barrier needed)
+        float lloc = 0.f;
+        for (int j = tid; j < nc; j += blockDim.x) {
+            const float e = sc[j] == -INFINITY ? 0.f : __expf(sc[j] - m);
+            sc[j] = e;
+            lloc += e;
+        }
+        const float l = block_sum(lloc);  // block_sum's barriers also publish sc[]
+        float o = 0.f;
+        if (tid < hd) {
+            for (int j = 0; j < nc; ++j) {
+                const float p = sc[j];
+                if (p == 0.f) continue;
+                const int k = c0 + j;
+                const float *vr = k < W ? vc + ((size_t)k * nkv + g) * hd : vb + ((size_t)(k - W) * nkv + g) * hd;
+                o += p * vr[tid];
+            }
+        }
+        const float mn = fmaxf(m_run, m);
+        const float a = __expf(m_run - mn), b = __expf(m - mn);  // m_run = -inf: a = 0
+        l_run = l_run * a + l * b;
+        o_run = o_run * a + o * b;
+        m_run = mn;
+        __syncthreads();  // every thread has read sc[] before the next chunk writes it
+    }
+    if (tid < hd) out[((size_t)t * nh + h) * hd + tid] = o_run / l_run;
 }

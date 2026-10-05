@@ -33,6 +33,11 @@ void Model::dflashSetup(u32 slots, u32 ingest_rows, bool debug) {
     auto r = std::make_unique<DFlashRun>();
     r->ring = c.window > 0 ? c.window : 2048;
     r->block = c.block;
+    // keys of the drafter attention: dflash_attn holds up to kDFlashAttnKeys, longer rings (e.g. Ornith's
+    // 4096-row window) need dflash_attn_long (validate() already refused anything past kDFlashMaxKeys)
+    if (r->ring + r->block > static_cast<u32>(kernels::kDFlashAttnKeys) && !k.dflash_attn_long)
+        throw ModelError("MissingKernel", "dflash_attn_long (DFlash2 window " + std::to_string(r->ring) + " + block " +
+                                              std::to_string(r->block) + " > " + std::to_string(kernels::kDFlashAttnKeys) + " keys)");
     r->ingest_rows = std::max<u32>(1, std::min(ingest_rows, r->ring));
     const u64 E = c.n_embd, B = c.block, P = B - 1, kvw = static_cast<u64>(c.n_head_kv) * c.head_dim;
     const u64 qw = static_cast<u64>(c.n_head) * c.head_dim, ds = dflash->layers[0].attn_conv_proj.nrows, V = output.nrows;
@@ -178,6 +183,8 @@ std::vector<u32> Model::dflashDraft(u32 slot, u32 anchor, u32 pos, float p_min, 
     hip::upload(r.pos, ph.data(), ph.size() * 4);
     hip::launch(k.get_rows[static_cast<std::size_t>(tok_embd.ty) % n_types], D(8, B), D(128), 0, stream, tok_embd.ptr, tok_embd.row_bytes,
                 r.ids, r.x, I(E));
+    // rings that fit dflash_attn keep it (unchanged); longer ones take the chunked dflash_attn_long
+    const auto& attn = r.ring + B > static_cast<u32>(kernels::kDFlashAttnKeys) ? k.dflash_attn_long : k.dflash_attn;
     for (u32 l = 0; l < c.n_layer; ++l) {
         const DFlashLayerW& w = dflash->layers[l];
         const u32 dsa = w.attn_conv_proj.nrows, dsf = w.ffn_conv_proj.nrows;
@@ -192,7 +199,7 @@ std::vector<u32> Model::dflashDraft(u32 slot, u32 anchor, u32 pos, float p_min, 
         norm(r.kb, w.k_norm, r.kb, hd, B * nkv);
         hip::launch(k.rope_neox, D(nh, B), D(64), 0, stream, r.q, r.pos, I(hd), I(qw), I(hd), theta_scale);
         hip::launch(k.rope_neox, D(nkv, B), D(64), 0, stream, r.kb, r.pos, I(hd), I(kvw), I(hd), theta_scale);
-        hip::launch(k.dflash_attn, D(nh, B), D(hd), 0, stream, r.q, r.kb, r.vb, sc.kc[l], sc.vc[l], sc.cpos, I(r.ring), I(B), I(nh), I(nkv),
+        hip::launch(attn, D(nh, B), D(hd), 0, stream, r.q, r.kb, r.vb, sc.kc[l], sc.vc[l], sc.cpos, I(r.ring), I(B), I(nh), I(nkv),
                     I(hd), I(pos), I(c.window), 1.0f / std::sqrt(static_cast<float>(hd)), r.att);
         mm(w.o, r.att, r.o, B, false);
         conv(r.o, r.dyn, w.attn_conv_base, r.h, dsa, 1);

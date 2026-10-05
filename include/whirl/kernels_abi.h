@@ -134,7 +134,8 @@
 //   dflash_lattice(cand, unary, gate, prev_cb, next_cb, u64 cb_rb, int q8, int R, int K, int anchor, lat)
 //   dflash_walk(lat, cand, int P, int K, float p_min, int n_min, int* out)
 //   dflash_attn(q, kb, vb, kc, vc, const int* cpos, int W, int B, int nh, int nkv, int hd, int qpos, int window,
-//               float scale, out)                                    (grid (nh, B), block hd)
+//               float scale, out)                                    (grid (nh, B), block hd; W + B <= kDFlashAttnKeys)
+//   dflash_attn_long(same arguments)                                  (W + B > kDFlashAttnKeys: chunked, online softmax)
 //  mixture of experts:
 //   moe_logits_f32(W, x, out, R, C, n, skip)
 //   moe_topk(logits, ld, h, shw, ids, w, sg, R, K, E)
@@ -200,6 +201,8 @@ inline constexpr int kGdnMaxSnap = 15;       // GDN_MAX_SNAP
 inline constexpr int kMaxSmallBatch = 16;    // multi-token GEMV / small-batch kernels: 2..16 tokens
 inline constexpr int kMaxVerifyRows = 32;    // rows of one batched verify / MTP step (gemvx_v6_* past 16)
 inline constexpr int kMaxDrafts = 10;        // MTP drafts per verify cycle
+inline constexpr int kDFlashAttnKeys = 2304;  // DF_MAXK: keys (context ring + block) of dflash_attn; more: dflash_attn_long
+inline constexpr int kDFlashMaxKeys = 65536;  // host limit on ring + block for dflash_attn_long (ring VRAM, int indexing)
 inline constexpr int kGemm3Bm = 256, kGemm3Bn = 256, kGemm3Threads = 512;  // GEMM3_*
 inline constexpr int kMoeBm = 128, kMoeBn = 64;                            // MOE_BM, gemm_moe_* token tile
 inline constexpr int kMoeBn32 = 32;                                        // gemm_moe32_* token tile
@@ -482,7 +485,7 @@ struct KernelTable {
     F gdn_conv_par{}, gdn_conv_state{}, rmsnorm_q8{}, silu_mul_q8{}, gdn_ab_q8_0{};
     F gdn_conv_l2{}, gdn_step_norm{}, requant_q6k_q4k{}, requant_q6k_d2{}, requant_q80_q4k{};
     F copy_rows_map{};  // optional
-    F dflash_conv{}, dflash_topk{}, dflash_lattice{}, dflash_walk{}, dflash_attn{};  // optional (DFlash2 drafter)
+    F dflash_conv{}, dflash_topk{}, dflash_lattice{}, dflash_walk{}, dflash_attn{}, dflash_attn_long{};  // optional (DFlash2 drafter)
     F set_tokens{}, argmax_rows{}, argmax_prob{}, draft_pick{};
     F set_rows{}, rmsnorm_q8_rows{}, argmax_rows_to{}, draft_pick_rows{};
     F draft_sample_rows{};  // optional (null: specsample skipped)

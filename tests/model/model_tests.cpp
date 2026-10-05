@@ -618,6 +618,30 @@ void testDFlashConfig() {
     check(code([&] { (void)q::DFlashConfig::fromGguf(gguf::File::parse(img_arch)); }) == "UnsupportedArch", "DFlash2 config: arch whitelist");
     const auto img_mask = dflashImage(64, 100, false).build();
     check(code([&] { (void)q::DFlashConfig::fromGguf(gguf::File::parse(img_mask)); }) == "MissingKey", "DFlash2 config: mask token required");
+    // kernel limits (C-52): attention keys = window (2048 without one) + block, head_dim, selector top-k
+    auto limited = [&](auto edit) {
+        q::DFlashConfig c2 = c;
+        edit(c2);
+        return code([&] { c2.validate(t, f); });
+    };
+    check(limited([](q::DFlashConfig& x) { x.window = 4096, x.block = 16; }).empty(), "DFlash2 config: Ornith's window 4096 + block 16 accepted");
+    check(limited([](q::DFlashConfig& x) { x.window = 0; }).empty(), "DFlash2 config: no window (ring 2048) accepted");
+    check(limited([](q::DFlashConfig& x) { x.window = whirl::kernels::kDFlashMaxKeys - 8; }).empty(),
+          "DFlash2 config: window + block == the attention limit accepted");
+    check(limited([](q::DFlashConfig& x) { x.window = whirl::kernels::kDFlashMaxKeys - 7; }) == "DraftModelMismatch",
+          "DFlash2 config: window + block past the attention limit rejected");
+    check(limited([](q::DFlashConfig& x) { x.head_dim = 512; }) == "DraftModelMismatch", "DFlash2 config: head_dim > 256 rejected");
+    check(limited([](q::DFlashConfig& x) { x.sel_topk = 32; }) == "DraftModelMismatch", "DFlash2 config: selector top-k > 16 rejected");
+    bool msg = false;
+    try {
+        q::DFlashConfig c2 = c;
+        c2.window = 70000;
+        c2.validate(t, f);
+    } catch (const q::ModelError& e) {
+        const std::string w = e.what();
+        msg = w.find("70008") != std::string::npos && w.find(std::to_string(whirl::kernels::kDFlashMaxKeys)) != std::string::npos;
+    }
+    check(msg, "DFlash2 config: the refusal names the keys needed and the limit");
 }
 
 // a target header (qwen35 / qwen35moe) for dflashIncompatible: metadata + token_embd only

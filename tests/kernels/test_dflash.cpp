@@ -5,6 +5,7 @@
 //   * dflash_lattice: f32 and Q8_0 codebooks, anchor row for position 0
 //   * dflash_walk: same tokens as the CPU walk on the same lattice (p-min / n-min)
 //   * dflash_attn: drafter attention over the context ring + block, vs CPU
+//   * dflash_attn_long: the same past kDFlashAttnKeys keys (chunked); == dflash_attn bitwise on one chunk
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
@@ -129,17 +130,20 @@ void testDflash(Ctx& c) {
         c.rep.add(cmpExact("dflash_topk repeatable (two runs)", got_i[1], got_i[0], Kind::invariant));
     }
     // ---- drafter attention: context ring (with empty rows, rows past the anchor and rows outside
-    // the window) plus the block's own rows, GQA 32 / 8, head_dim 128
-    if (c.k.dflash_attn) {
-        const int B = 8, nh = 32, nkv = 8, hd = 128, W = 256, window = 200, qpos = 300;
+    // the window) plus the block's own rows, GQA 32 / 8, head_dim 128. dflash_attn_long (C-52): on the
+    // same ring it is one chunk and must equal dflash_attn bit for bit (its merge is l * e^0 + 0, o * e^0
+    // + 0); past kDFlashAttnKeys (Ornith's 4096-row window, 16-row blocks) it is checked against the CPU,
+    // also with a first chunk that has no visible key (skipped).
+    auto attnCase = [&](const char* what, const auto& fn, int B, int W, int window, int qpos, auto cposOf, std::vector<float>* got_out) {
+        const int nh = 32, nkv = 8, hd = 128;
         const std::vector<float> q = c.randn(static_cast<std::size_t>(B) * nh * hd), kb = c.randn(static_cast<std::size_t>(B) * nkv * hd),
                                  vb = c.randn(static_cast<std::size_t>(B) * nkv * hd), kc = c.randn(static_cast<std::size_t>(W) * nkv * hd),
                                  vc = c.randn(static_cast<std::size_t>(W) * nkv * hd);
         std::vector<int> cpos(static_cast<std::size_t>(W));
-        for (int i = 0; i < W; ++i) cpos[static_cast<std::size_t>(i)] = i % 17 == 3 ? -1 : (i < 250 ? 50 + i : qpos + i - 250);  // empty / past
+        for (int i = 0; i < W; ++i) cpos[static_cast<std::size_t>(i)] = cposOf(i);
         Buf dq(q), dkb(kb), dvb(vb), dkc(kc), dvc(vc), dcp(cpos), dout(q.size() * 4);
         const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-        hip::launch(c.k.dflash_attn, {static_cast<unsigned>(nh), static_cast<unsigned>(B), 1}, {static_cast<unsigned>(hd), 1, 1}, 0, c.s, dq.p(),
+        hip::launch(fn, {static_cast<unsigned>(nh), static_cast<unsigned>(B), 1}, {static_cast<unsigned>(hd), 1, 1}, 0, c.s, dq.p(),
                     dkb.p(), dvb.p(), dkc.p(), dvc.p(), dcp.p(), W, B, nh, nkv, hd, qpos, window, scale, dout.p());
         c.sync();
         std::vector<double> ref(q.size()), sc(q.size());
@@ -153,7 +157,7 @@ void testDflash(Ctx& c) {
                     const float* kr;
                     if (k < W) {
                         const int p = cpos[static_cast<std::size_t>(k)];
-                        if (p < 0 || p >= qpos || qpos + t - p >= window) continue;
+                        if (p < 0 || p >= qpos || (window != 0 && qpos + t - p >= window)) continue;
                         kr = kc.data() + (static_cast<std::size_t>(k) * nkv + g) * hd;
                     } else {
                         kr = kb.data() + (static_cast<std::size_t>(k - W) * nkv + g) * hd;
@@ -181,8 +185,30 @@ void testDflash(Ctx& c) {
                     sc[(static_cast<std::size_t>(t) * nh + h) * hd + d] = a / l;
                 }
             }
-        c.rep.add(cmpTol("dflash_attn vs CPU (ring 256 with empty / future / out-of-window rows, block 8, GQA 32/8, hd 128)",
-                         dout.down<float>(ref.size()), ref, sc, 1e-4, 1e-6));
+        const std::vector<float> got = dout.down<float>(ref.size());
+        c.rep.add(cmpTol(what, got, ref, sc, 1e-4, 1e-6));
+        if (got_out) *got_out = got;
+    };
+    // the original case: ring 256 with empty / future / out-of-window rows, block 8
+    auto cpos256 = [](int i) { return i % 17 == 3 ? -1 : (i < 250 ? 50 + i : 300 + i - 250); };
+    if (c.k.dflash_attn) {
+        std::vector<float> a, b;
+        c.rng.seed(77);
+        attnCase("dflash_attn vs CPU (ring 256 with empty / future / out-of-window rows, block 8, GQA 32/8, hd 128)", c.k.dflash_attn, 8, 256,
+                 200, 300, cpos256, &a);
+        if (c.k.dflash_attn_long) {
+            c.rng.seed(77);  // the same inputs
+            attnCase("dflash_attn_long vs CPU (same ring: one chunk)", c.k.dflash_attn_long, 8, 256, 200, 300, cpos256, &b);
+            c.rep.add(cmpExact("dflash_attn_long == dflash_attn bitwise when the keys fit one chunk", b, a, Kind::invariant));
+        }
+    }
+    if (c.k.dflash_attn_long) {
+        // Ornith's drafter: 4096-row window, 16-row blocks: 4112 keys > kDFlashAttnKeys (two chunks)
+        attnCase("dflash_attn_long vs CPU (ring 4096, window 4096, block 16: 2 chunks, empty / future / out-of-window rows)",
+                 c.k.dflash_attn_long, 16, 4096, 4096, 5000, [](int i) { return i % 29 == 5 ? -1 : (i < 4090 ? 950 + i : 5000 + i); }, nullptr);
+        // a first chunk without any visible key (all ring rows of chunk 0 empty), so only chunk 1 and the block count
+        attnCase("dflash_attn_long vs CPU (ring 4096, first chunk all empty: skipped)", c.k.dflash_attn_long, 16, 4096, 0, 9000,
+                 [](int i) { return i < whirl::kernels::kDFlashAttnKeys ? -1 : 4000 + i; }, nullptr);
     }
     // ---- selector lattice (f32 and Q8_0 codebooks) and the walk
     {
