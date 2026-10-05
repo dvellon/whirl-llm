@@ -342,6 +342,10 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
     k.set_rpos = L.opt("set_rpos");
     for (int nt = 1; nt <= kMaxSmallBatch; ++nt) k.gemv_d2[nt - 1] = L.opt("gemv_d2_nt" + std::to_string(nt));
     k.copy_rows_map = L.opt("copy_rows_map");
+    k.dflash_conv = L.opt("dflash_conv");
+    k.dflash_topk = L.opt("dflash_topk");
+    k.dflash_lattice = L.opt("dflash_lattice");
+    k.dflash_walk = L.opt("dflash_walk");
 
     // MXFP4: every lookup optional (the fp8 / whole-block expert kernels are gfx1201 only).
     {
