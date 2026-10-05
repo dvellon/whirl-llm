@@ -133,6 +133,8 @@
 //   dflash_topk(x, int n, int ld, int k, int* ids, float* vals)       (key order, ties -> smaller id)
 //   dflash_lattice(cand, unary, gate, prev_cb, next_cb, u64 cb_rb, int q8, int R, int K, int anchor, lat)
 //   dflash_walk(lat, cand, int P, int K, float p_min, int n_min, int* out)
+//   dflash_attn(q, kb, vb, kc, vc, const int* cpos, int W, int B, int nh, int nkv, int hd, int qpos, int window,
+//               float scale, out)                                    (grid (nh, B), block hd)
 //  mixture of experts:
 //   moe_logits_f32(W, x, out, R, C, n, skip)
 //   moe_topk(logits, ld, h, shw, ids, w, sg, R, K, E)
@@ -480,7 +482,7 @@ struct KernelTable {
     F gdn_conv_par{}, gdn_conv_state{}, rmsnorm_q8{}, silu_mul_q8{}, gdn_ab_q8_0{};
     F gdn_conv_l2{}, gdn_step_norm{}, requant_q6k_q4k{}, requant_q6k_d2{}, requant_q80_q4k{};
     F copy_rows_map{};  // optional
-    F dflash_conv{}, dflash_topk{}, dflash_lattice{}, dflash_walk{};  // optional (DFlash2 drafter)
+    F dflash_conv{}, dflash_topk{}, dflash_lattice{}, dflash_walk{}, dflash_attn{};  // optional (DFlash2 drafter)
     F set_tokens{}, argmax_rows{}, argmax_prob{}, draft_pick{};
     F set_rows{}, rmsnorm_q8_rows{}, argmax_rows_to{}, draft_pick_rows{};
     F draft_sample_rows{};  // optional (null: specsample skipped)

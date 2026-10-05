@@ -4,6 +4,7 @@
 //   * dflash_topk: key order with ties to the smaller index, NaN never chosen, repeatable
 //   * dflash_lattice: f32 and Q8_0 codebooks, anchor row for position 0
 //   * dflash_walk: same tokens as the CPU walk on the same lattice (p-min / n-min)
+//   * dflash_attn: drafter attention over the context ring + block, vs CPU
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
@@ -126,6 +127,62 @@ void testDflash(Ctx& c) {
         c.rep.add(cmpExact("dflash_topk ids (key order, ties -> smaller index, NaN skipped)", got_i[0], ref_i));
         c.rep.add(cmpExact("dflash_topk values", dv.down<float>(ref_v.size()), ref_v));
         c.rep.add(cmpExact("dflash_topk repeatable (two runs)", got_i[1], got_i[0], Kind::invariant));
+    }
+    // ---- drafter attention: context ring (with empty rows, rows past the anchor and rows outside
+    // the window) plus the block's own rows, GQA 32 / 8, head_dim 128
+    if (c.k.dflash_attn) {
+        const int B = 8, nh = 32, nkv = 8, hd = 128, W = 256, window = 200, qpos = 300;
+        const std::vector<float> q = c.randn(static_cast<std::size_t>(B) * nh * hd), kb = c.randn(static_cast<std::size_t>(B) * nkv * hd),
+                                 vb = c.randn(static_cast<std::size_t>(B) * nkv * hd), kc = c.randn(static_cast<std::size_t>(W) * nkv * hd),
+                                 vc = c.randn(static_cast<std::size_t>(W) * nkv * hd);
+        std::vector<int> cpos(static_cast<std::size_t>(W));
+        for (int i = 0; i < W; ++i) cpos[static_cast<std::size_t>(i)] = i % 17 == 3 ? -1 : (i < 250 ? 50 + i : qpos + i - 250);  // empty / past
+        Buf dq(q), dkb(kb), dvb(vb), dkc(kc), dvc(vc), dcp(cpos), dout(q.size() * 4);
+        const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+        hip::launch(c.k.dflash_attn, {static_cast<unsigned>(nh), static_cast<unsigned>(B), 1}, {static_cast<unsigned>(hd), 1, 1}, 0, c.s, dq.p(),
+                    dkb.p(), dvb.p(), dkc.p(), dvc.p(), dcp.p(), W, B, nh, nkv, hd, qpos, window, scale, dout.p());
+        c.sync();
+        std::vector<double> ref(q.size()), sc(q.size());
+        for (int t = 0; t < B; ++t)
+            for (int h = 0; h < nh; ++h) {
+                const int g = h / (nh / nkv);
+                const float* qv = q.data() + (static_cast<std::size_t>(t) * nh + h) * hd;
+                std::vector<double> s(static_cast<std::size_t>(W + B), -INFINITY);
+                double m = -INFINITY;
+                for (int k = 0; k < W + B; ++k) {
+                    const float* kr;
+                    if (k < W) {
+                        const int p = cpos[static_cast<std::size_t>(k)];
+                        if (p < 0 || p >= qpos || qpos + t - p >= window) continue;
+                        kr = kc.data() + (static_cast<std::size_t>(k) * nkv + g) * hd;
+                    } else {
+                        kr = kb.data() + (static_cast<std::size_t>(k - W) * nkv + g) * hd;
+                    }
+                    double d = 0;
+                    for (int i = 0; i < hd; ++i) d += static_cast<double>(qv[i]) * kr[i];
+                    s[static_cast<std::size_t>(k)] = d * scale;
+                    m = std::max(m, s[static_cast<std::size_t>(k)]);
+                }
+                double l = 0;
+                for (double& x : s) {
+                    x = std::isinf(x) ? 0.0 : std::exp(x - m);
+                    l += x;
+                }
+                for (int d = 0; d < hd; ++d) {
+                    double o = 0, a = 0;
+                    for (int k = 0; k < W + B; ++k) {
+                        const double p = s[static_cast<std::size_t>(k)];
+                        if (p == 0) continue;
+                        const float v = k < W ? vc[(static_cast<std::size_t>(k) * nkv + g) * hd + d] : vb[(static_cast<std::size_t>(k - W) * nkv + g) * hd + d];
+                        o += p * v;
+                        a += p * std::fabs(v);
+                    }
+                    ref[(static_cast<std::size_t>(t) * nh + h) * hd + d] = o / l;
+                    sc[(static_cast<std::size_t>(t) * nh + h) * hd + d] = a / l;
+                }
+            }
+        c.rep.add(cmpTol("dflash_attn vs CPU (ring 256 with empty / future / out-of-window rows, block 8, GQA 32/8, hd 128)",
+                         dout.down<float>(ref.size()), ref, sc, 1e-4, 1e-6));
     }
     // ---- selector lattice (f32 and Q8_0 codebooks) and the walk
     {

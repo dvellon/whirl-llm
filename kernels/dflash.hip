@@ -127,3 +127,60 @@ extern "C" __global__ void dflash_walk(const float *lat, const int *cand, int P,
     }
     out[0] = n < n_min ? 0 : n;
 }
+
+// Drafter attention, non-causal over the context ring plus the block's own rows.
+// q [B][nh][hd], kb / vb [B][nkv][hd] (the block), kc / vc [W][nkv][hd] (context
+// ring, f32), cpos [W] = position of each ring row (-1 empty). Query row t sits at
+// qpos + t; a context key is visible iff 0 <= cpos < qpos and (window == 0 or
+// qpos + t - cpos < window); every block key is visible. out [B][nh][hd].
+// grid (nh, B), block hd (one thread per dimension; hd <= 256, W + B <= 2304).
+#define DF_MAXK 2304
+extern "C" __global__ void __launch_bounds__(256)
+    dflash_attn(const float *q, const float *kb, const float *vb, const float *kc, const float *vc, const int *cpos, int W, int B,
+                int nh, int nkv, int hd, int qpos, int window, float scale, float *out) {
+    __shared__ float qs[256];
+    __shared__ float sc[DF_MAXK];
+    const int h = blockIdx.x, t = blockIdx.y, g = h / (nh / nkv), tid = threadIdx.x;
+    const int my_pos = qpos + t, nk = W + B;
+    if (tid < hd) qs[tid] = q[((size_t)t * nh + h) * hd + tid];
+    __syncthreads();
+    float mloc = -INFINITY;
+    for (int k = tid; k < nk; k += blockDim.x) {
+        const float *kr;
+        bool vis;
+        if (k < W) {
+            const int p = cpos[k];
+            vis = p >= 0 && p < qpos && (window == 0 || my_pos - p < window);
+            kr = kc + ((size_t)k * nkv + g) * hd;
+        } else {
+            vis = true;
+            kr = kb + ((size_t)(k - W) * nkv + g) * hd;
+        }
+        float s = -INFINITY;
+        if (vis) {
+            float d = 0.f;
+            for (int i = 0; i < hd; ++i) d += qs[i] * kr[i];
+            s = d * scale;
+        }
+        sc[k] = s;
+        mloc = fmaxf(mloc, s);
+    }
+    const float m = block_max(mloc);
+    float lloc = 0.f;
+    for (int k = tid; k < nk; k += blockDim.x) {
+        const float e = sc[k] == -INFINITY ? 0.f : __expf(sc[k] - m);
+        sc[k] = e;
+        lloc += e;
+    }
+    const float l = block_sum(lloc);  // block_sum's barriers also publish sc[]
+    if (tid < hd) {
+        float o = 0.f;
+        for (int k = 0; k < nk; ++k) {
+            const float p = sc[k];
+            if (p == 0.f) continue;
+            const float *vr = k < W ? vc + ((size_t)k * nkv + g) * hd : vb + ((size_t)(k - W) * nkv + g) * hd;
+            o += p * vr[tid];
+        }
+        out[((size_t)t * nh + h) * hd + tid] = o / l;
+    }
+}

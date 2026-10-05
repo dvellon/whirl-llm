@@ -307,6 +307,22 @@ struct DFlashW {
     std::uint64_t bytes = 0;    // weights in VRAM
 };
 
+// DFlash2 drafter run state (dflashSetup): per-slot context ring and the scratch of one draft block.
+struct DFlashSlotCtx {
+    std::vector<DevPtr> kc, vc;        // per drafter layer: [ring][n_head_kv][head_dim] f32 (RoPE'd K, V)
+    DevPtr cpos = 0;                   // [ring] i32: position of each ring row, -1 = empty
+    std::vector<std::int32_t> cpos_h;  // host mirror of cpos
+};
+
+struct DFlashRun {
+    std::uint32_t ring = 0, block = 0, ingest_rows = 0;
+    DevPtr ids = 0, pos = 0, x = 0, h = 0, h2 = 0, dyn = 0, q = 0, kb = 0, vb = 0, att = 0, o = 0, g = 0, u = 0, e = 0;
+    DevPtr logits = 0, cand = 0, unary = 0, gate = 0, lat = 0, out = 0;
+    DevPtr ing_g = 0, ing_k = 0, ing_v = 0, ing_pos = 0;
+    DevPtr dbg = 0;  // when set: [n_layer][block][n_embd] hidden after each drafter layer (dflash-check)
+    std::vector<DFlashSlotCtx> slots;
+};
+
 struct LoadOptions {
     // Prefill batch (rows per forward) the buffers are sized for.
     std::uint32_t max_batch = max_batch_default;
@@ -640,6 +656,22 @@ public:
     void captureLayerInput(std::size_t li, std::uint32_t n);
     // selftest: the capture copies exactly x for each slot (random x, no forward needed).
     bool checkCapture(std::string& log);
+
+    // ---- DFlash2 drafter forward (src/model/dflash.cpp); needs loadDrafter and the dflash_* kernels
+    std::unique_ptr<DFlashRun> dfr;
+    // Buffers for `slots` contexts (ring = the drafter's window, else 2048) and ingest batches of
+    // up to `ingest_rows` rows; `debug` keeps every layer's block hidden for dflash-check.
+    void dflashSetup(std::uint32_t slots, std::uint32_t ingest_rows, bool debug = false);
+    // Context rows for positions pos0 .. pos0 + n - 1 from target features in layer-major layout
+    // (feature of row r, target layer j at feats + (j * stride + r) * n_embd floats): fc + norm,
+    // then each layer's K (k_norm, RoPE) and V into the slot's ring.
+    void dflashIngest(std::uint32_t slot, DevPtr feats, std::uint32_t stride, std::uint32_t row0, std::uint32_t n, std::uint32_t pos0);
+    // One draft block [anchor, MASK x (block - 1)] at positions pos .. pos + block - 1 against the
+    // slot's context (< pos): up to block - 1 draft tokens (greedy lattice walk; p-min / n-min).
+    std::vector<std::uint32_t> dflashDraft(std::uint32_t slot, std::uint32_t anchor, std::uint32_t pos, float p_min = 0,
+                                           std::uint32_t n_min = 0);
+    // Forget context rows at positions >= keep (rejected drafts, rollback).
+    void dflashTrim(std::uint32_t slot, std::uint32_t keep);
     std::uint32_t moe_bn_force = 0;
     std::vector<std::int32_t>* moe_dump = nullptr;
     std::uint32_t ff_scratch = 0;
@@ -1047,6 +1079,21 @@ struct AllocResult {
 // or acceptances so close that u is already optimal.
 AllocResult allocDrafts(std::span<const AllocSlot> slots, const CycleCost& cost, AllocBudget budget, std::uint32_t uniform,
                         std::span<const std::uint32_t> prev, float x = 0.03f);
+
+class Model;
+// The DFlash2 drafter's interface for the speculative loop (not wired in yet): features come from
+// the target's hidden capture (Model::enableCapture), one draft block per call.
+class DFlashDrafter {
+public:
+    DFlashDrafter(Model& m, std::uint32_t slots);
+    // after a target forward: rows row0 .. row0 + n - 1 of its capture are positions pos0 ..
+    void ingest(std::uint32_t slot, std::uint32_t row0, std::uint32_t n, std::uint32_t pos0);
+    std::vector<std::uint32_t> draft(std::uint32_t slot, std::uint32_t anchor, std::uint32_t pos);
+    void trim(std::uint32_t slot, std::uint32_t keep);
+
+private:
+    Model& m_;
+};
 
 class Ngram {
 public:

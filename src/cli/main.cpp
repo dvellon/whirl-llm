@@ -35,6 +35,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -58,6 +59,7 @@ const char* k_help_main =
     "  selftest MODEL.gguf        bitwise self-checks of the GPU kernels on the model's own weights\n"
     "  seqtest MODEL.gguf         check the multi-request (server) paths against single-request runs\n"
     "  golden MODEL.gguf          print per-step output hashes of fixed prompts (regression gate, developers)\n"
+    "  dflash-check MODEL DRAFT DIR  DFlash2 drafter forward vs reference values (tools/dflash_ref)\n"
     "  vis-encode MMPROJ IMAGE    encode one image with a vision encoder (diagnostic)\n"
     "  help [COMMAND | env]       this text, the options of COMMAND, or every environment variable\n"
     "\n"
@@ -139,6 +141,18 @@ const char* k_help_golden =
     "decode steps, MTP decode (fixed drafts; forced n-gram drafts). pair: two sequences on the\n"
     "server paths (segmented prefill, batched rows, batched verify, one batched MTP cycle).\n"
     "tools/golden/golden.ps1 records these under tests/golden/<arch>/ and diffs later runs.\n";
+const char* k_help_dflash_check =
+    "usage: whirl dflash-check MODEL.gguf DRAFT.gguf REFDIR [--device SPEC]\n"
+    "\n"
+    "Runs the DFlash2 drafter (DRAFT.gguf) of MODEL.gguf on reference inputs and compares each layer's\n"
+    "block hidden state, the final norm and the drafts with reference values (whirl-cloud\n"
+    "tools/dflash_ref: ref_drafter.py, then export_check.py writes REFDIR = meta.txt, feats.f32 in\n"
+    "layer-major order, hidden_l<i>.f32, final_norm.f32, drafts.i32). Prints relative errors; exit 1\n"
+    "if a layer differs by more than 3e-2 (Q8_0 weights, int8 GEMV activations).\n"
+    "\n"
+    "options:\n"
+    "  --device SPEC              GPU: r9700 (default), 8060s, an index, or a name / gfx substring\n"
+    "  -h, --help                 this text\n";
 
 const char* k_help_seqtest =
     "usage: whirl seqtest MODEL.gguf [--decode N] [--device SPEC]\n"
@@ -1747,6 +1761,86 @@ int cmdGolden(const Args& a) {
     if (suite == "single") return goldenSingle(a, f, tok, n_dec);
     if (suite == "pair") return goldenPair(a, f, tok, n_dec);
     throw std::runtime_error("golden: --suite must be single or pair");
+// whirl dflash-check MODEL DRAFT REFDIR: drafter forward vs reference values
+std::string readBinFile(const std::string& path) {
+    std::FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) throw std::runtime_error("dflash-check: cannot open " + path);
+    std::string s;
+    char buf[1 << 16];
+    for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, fp)) > 0;) s.append(buf, n);
+    std::fclose(fp);
+    return s;
+}
+
+int cmdDflashCheck(const Args& a) {
+    if (a.pos.size() < 3) throw std::runtime_error("dflash-check: usage: whirl dflash-check MODEL.gguf DRAFT.gguf REFDIR");
+    gguf::File f = gguf::File::open(a.pos[0]);
+    selectDevice(a, nullptr);
+    Loaded L = loadModel(f, 4096);
+    q::Model& m = *L.model;
+    const gguf::File df = gguf::File::open(a.pos[1]);
+    q::LoadStats ds;
+    m.loadDrafter(df, ds);
+    const std::string dir = a.pos[2];
+    std::map<std::string, long long> meta;
+    {
+        const std::string t = readBinFile(dir + "/meta.txt");
+        std::size_t p = 0;
+        while (p < t.size()) {
+            std::size_t e = t.find('\n', p);
+            if (e == std::string::npos) e = t.size();
+            const std::string line = t.substr(p, e - p);
+            const std::size_t sp = line.find(' ');
+            if (sp != std::string::npos) meta[line.substr(0, sp)] = std::stoll(line.substr(sp + 1));
+            p = e + 1;
+        }
+    }
+    for (const char* key : {"n_ctx", "ctx_pos0", "anchor", "anchor_pos"})
+        if (!meta.count(key)) throw std::runtime_error(std::string("dflash-check: meta.txt has no ") + key);
+    const auto& dc = m.dflash->cfg;
+    const u64 E = dc.n_embd;
+    const u32 n_ctx = static_cast<u32>(meta["n_ctx"]), B = dc.block;
+    const std::string feats = readBinFile(dir + "/feats.f32");
+    if (feats.size() != dc.target_layers.size() * n_ctx * E * 4)
+        throw std::runtime_error("dflash-check: feats.f32 is not [target layers][n_ctx][n_embd] f32");
+    m.dflashSetup(1, std::max<u32>(1, n_ctx), true);
+    const hip::DevPtr fd = m.alloc(feats.size());
+    hip::upload(fd, feats.data(), feats.size());
+    m.dflashIngest(0, fd, n_ctx, 0, n_ctx, static_cast<u32>(meta["ctx_pos0"]));
+    const std::vector<u32> drafts = m.dflashDraft(0, static_cast<u32>(meta["anchor"]), static_cast<u32>(meta["anchor_pos"]));
+    bool ok = true;
+    std::vector<float> got(static_cast<std::size_t>(B) * E);
+    auto compare = [&](const std::string& name, hip::DevPtr src, const std::string& file) {
+        hip::download(got.data(), src, got.size() * 4);
+        const std::string rs = readBinFile(dir + "/" + file);
+        if (rs.size() != got.size() * 4) throw std::runtime_error("dflash-check: " + file + " is not [block][n_embd] f32");
+        const float* ref = reinterpret_cast<const float*>(rs.data());
+        double num = 0, den = 0, mx = 0;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            const double d = static_cast<double>(got[i]) - ref[i];
+            num += d * d;
+            den += static_cast<double>(ref[i]) * ref[i];
+            mx = std::max(mx, std::fabs(d));
+        }
+        const double rel = std::sqrt(num / std::max(den, 1e-30));
+        const bool pass = rel < 3e-2;
+        ok = ok && pass;
+        out(fmt("  %-12s rel. error %.3e, max abs %.3e  %s\n", name.c_str(), rel, mx, pass ? "ok" : "FAIL"));
+    };
+    for (u32 l = 0; l < dc.n_layer; ++l)
+        compare("layer " + std::to_string(l), m.dfr->dbg + static_cast<u64>(l) * B * E * 4, "hidden_l" + std::to_string(l) + ".f32");
+    compare("final norm", m.dfr->e, "final_norm.f32");
+    const std::string dr = readBinFile(dir + "/drafts.i32");
+    const auto* rd = reinterpret_cast<const std::int32_t*>(dr.data());
+    const std::size_t n_ref = dr.size() / 4;
+    std::size_t same = 0;
+    while (same < n_ref && same < drafts.size() && static_cast<u32>(rd[same]) == drafts[same]) ++same;
+    std::string gs, rs2;
+    for (u32 t : drafts) gs += " " + std::to_string(t);
+    for (std::size_t i = 0; i < n_ref; ++i) rs2 += " " + std::to_string(rd[i]);
+    out(fmt("  drafts: whirl%s | reference%s | common prefix %zu of %zu\n", gs.c_str(), rs2.c_str(), same, n_ref));
+    out(ok ? "dflash-check: ok\n" : "dflash-check: FAIL\n");
+    return ok ? 0 : 1;
 }
 
 int cmdSelftest(const Args& a) {
@@ -1819,6 +1913,7 @@ const char* commandHelp(const std::string& cmd) {
     if (cmd == "selftest") return k_help_selftest;
     if (cmd == "seqtest") return k_help_seqtest;
     if (cmd == "golden") return k_help_golden;
+    if (cmd == "dflash-check") return k_help_dflash_check;
     if (cmd == "devices") return k_help_devices;
     if (cmd == "vis-encode") return k_help_vis;
     return nullptr;
@@ -1829,6 +1924,7 @@ unsigned commandScope(const std::string& cmd) {
     if (cmd == "bench") return app::sc_bench;
     if (cmd == "selftest") return app::sc_selftest;
     if (cmd == "seqtest" || cmd == "golden") return app::sc_seqtest;
+    if (cmd == "dflash-check") return app::sc_selftest;
     if (cmd == "vis-encode") return app::sc_vis;
     return 0;
 }
@@ -1879,7 +1975,7 @@ int wmain(int argc, wchar_t** wargv) {
         out(app::versionText("whirl"));
         return app::exit_ok;
     }
-    static const char* known[] = {"chat", "bench", "selftest", "seqtest", "golden", "devices", "serve", "vis-encode"};
+    static const char* known[] = {"chat", "bench", "selftest", "seqtest", "golden", "dflash-check", "devices", "serve", "vis-encode"};
     bool is_known = false;
     for (const char* k : known) is_known = is_known || cmd == k;
     if (!is_known) {
@@ -1926,6 +2022,7 @@ int wmain(int argc, wchar_t** wargv) {
         if (cmd == "selftest") return cmdSelftest(a);
         if (cmd == "seqtest") return cmdSeqtest(a);
         if (cmd == "golden") return cmdGolden(a);
+        if (cmd == "dflash-check") return cmdDflashCheck(a);
         if (cmd == "devices") return cmdDevices();
         std::fputs(k_help_main, stderr);
         return app::exit_usage;

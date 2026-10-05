@@ -346,6 +346,7 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
     k.dflash_topk = L.opt("dflash_topk");
     k.dflash_lattice = L.opt("dflash_lattice");
     k.dflash_walk = L.opt("dflash_walk");
+    k.dflash_attn = L.opt("dflash_attn");
 
     // MXFP4: every lookup optional (the fp8 / whole-block expert kernels are gfx1201 only).
     {
