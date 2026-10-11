@@ -9,13 +9,20 @@
 # Exit code: 0 all match, 1 mismatch (first differing step per file printed), 2 a run failed / setup error.
 # Model files: $env:WHIRL_GOLDEN_DENSE / $env:WHIRL_GOLDEN_MOE, else the default LM Studio paths below.
 # The executable: -Exe, else build\Release\whirl.exe of this checkout.
-# A golden file stores the model file name and size; check refuses a different model.
+# A golden file stores the model file name and size; check refuses a different model. The model is
+# also identified by a hash of its size + first and last 4 MiB (tests/golden/models.txt, written by record).
+# The gate cannot pass vacuously: an empty model / mode / suite list, a run without "G" lines, an
+# empty reference file, or a suite ngram run that never drafted from the n-gram table (ng_cycles=0)
+# is an error (exit 2). The runner clears every WHIRL_* environment variable (a stray WHIRL_HIP_DEVICE
+# or WHIRL_MODE would change what is measured; --device selects the GPU) and restores them on exit.
+# Suites: single, pair; ngram (forced n-gram MTP drafts on a copy-the-text prompt) is part of the
+# default for gfx1201 only until the gfx1151 references are recorded.
 param(
     [Parameter(Mandatory = $true, Position = 0)][ValidateSet("check", "record")][string]$Action,
     [ValidateSet("gfx1201", "gfx1151")][string]$Arch = "gfx1201",
     [string[]]$Models = @("dense", "moe"),
     [string[]]$Modes = @("precise", "balance", "fast"),
-    [string[]]$Suites = @("single", "pair"),
+    [string[]]$Suites = @(),
     [string]$Exe = "",
     [string]$Out = ""   # check: also keep the new outputs here (default: a temp folder)
 )
@@ -27,11 +34,25 @@ if (-not (Test-Path $Exe)) { Write-Host "golden: no executable at $Exe (build fi
 $Models = @($Models | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 $Modes = @($Modes | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 $Suites = @($Suites | ForEach-Object { $_ -split "," } | Where-Object { $_ })
+if ($Suites.Count -eq 0 -and -not $PSBoundParameters.ContainsKey("Suites")) {
+    $Suites = if ($Arch -eq "gfx1201") { @("single", "pair", "ngram") } else { @("single", "pair") }
+}
+if ($Models.Count -eq 0 -or $Modes.Count -eq 0 -or $Suites.Count -eq 0) {
+    Write-Host "golden: empty model / mode / suite list (models=$($Models.Count) modes=$($Modes.Count) suites=$($Suites.Count)): nothing would be checked"
+    exit 2
+}
+foreach ($s in $Suites) { if ($s -notin @("single", "pair", "ngram")) { Write-Host "golden: unknown suite '$s'"; exit 2 } }
 
 $lms = Join-Path $env:USERPROFILE ".lmstudio\models"
 $modelPath = @{
     dense = if ($env:WHIRL_GOLDEN_DENSE) { $env:WHIRL_GOLDEN_DENSE } else { Join-Path $lms "unsloth\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-Q4_K_M.gguf" }
     moe   = if ($env:WHIRL_GOLDEN_MOE) { $env:WHIRL_GOLDEN_MOE } else { Join-Path $lms "ornith-ai\Ornith-1.5-35B-A3B-MXFP4\Ornith-1.5-35B-A3B-MXFP4.gguf" }
+}
+# (model paths above were read from WHIRL_GOLDEN_*; now drop every WHIRL_* variable, restored in the finally below)
+$savedEnv = @{}
+foreach ($v in @(Get-ChildItem Env: | Where-Object { $_.Name -like "WHIRL_*" -and $_.Name -ne "WHIRL_R9700_LOCK_HELD" })) {
+    $savedEnv[$v.Name] = $v.Value
+    [Environment]::SetEnvironmentVariable($v.Name, $null)
 }
 if (-not $env:AMD_LOG_LEVEL) { $env:AMD_LOG_LEVEL = "1" }
 $goldDir = Join-Path $root "tests\golden\$Arch"
@@ -63,12 +84,44 @@ function FieldDiff([string]$a, [string]$b) {
     return ($d -join "; ")
 }
 
-$fail = 0; $err = 0; $t0 = Get-Date
+# size + first and last 4 MiB, SHA-256 (a renamed or re-quantized file of the same size still differs)
+function ModelHash([string]$path) {
+    $fs = [System.IO.File]::OpenRead($path)
+    try {
+        $len = $fs.Length
+        $n = [int][Math]::Min([long]4194304, $len)
+        $head = New-Object byte[] $n
+        [void]$fs.Read($head, 0, $n)
+        $tail = New-Object byte[] $n
+        [void]$fs.Seek($len - $n, [System.IO.SeekOrigin]::Begin)
+        [void]$fs.Read($tail, 0, $n)
+        $all = New-Object byte[] (2 * $n + 8)
+        [Array]::Copy($head, 0, $all, 0, $n)
+        [Array]::Copy($tail, 0, $all, $n, $n)
+        [Array]::Copy([BitConverter]::GetBytes([long]$len), 0, $all, 2 * $n, 8)
+        return ([BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($all)) -replace "-", "").ToLower()
+    } finally { $fs.Dispose() }
+}
+$hashFile = Join-Path $root "tests\golden\models.txt"
+$hashes = @{}
+if (Test-Path $hashFile) { foreach ($l in (Get-Content $hashFile)) { $p = $l -split " "; if ($p.Count -ge 4) { $hashes[$p[0]] = $p } } }
+$hashesChanged = $false
+
+$fail = 0; $err = 0; $ran = 0; $t0 = Get-Date
+try {
 foreach ($mk in $Models) {
     $mp = $modelPath[$mk]
     if (-not $mp -or -not (Test-Path $mp)) { Write-Host "golden: model '$mk' not found ($mp)"; $err++; continue }
     $mi = Get-Item $mp
     $mline = "G model file=$($mi.Name) bytes=$($mi.Length)"
+    $mh = ModelHash $mp
+    if ($Action -eq "record") {
+        $hashes[$mk] = @($mk, $mi.Name, "$($mi.Length)", $mh); $hashesChanged = $true
+    } elseif (-not $hashes.ContainsKey($mk)) {
+        Write-Host "golden: no recorded hash for model '$mk' in $hashFile (run record)"; $err++; continue
+    } elseif ($hashes[$mk][1] -ne $mi.Name -or $hashes[$mk][2] -ne "$($mi.Length)" -or $hashes[$mk][3] -ne $mh) {
+        Write-Host "golden: model '$mk' ($mp) is not the recorded file (name/size/hash differ from $hashFile)"; $err++; continue
+    }
     foreach ($mode in $Modes) {
         foreach ($suite in $Suites) {
             $name = "$mk/${mode}_$suite"
@@ -76,7 +129,8 @@ foreach ($mk in $Models) {
             $raw = & $Exe golden $mp --suite $suite "--$mode" --device $Arch 2>&1 | ForEach-Object { "$_" }
             $rc = $LASTEXITCODE
             $sec = ((Get-Date) - $ts).TotalSeconds
-            $lines = @($mline) + @($raw | Where-Object { $_ -like "G *" })
+            $glines = @($raw | Where-Object { $_ -like "G *" })
+            $lines = @($mline) + $glines
             $new = Join-Path $Out "$mk`_${mode}_$suite.txt"
             [System.IO.File]::WriteAllLines($new, [string[]]$lines)
             $diag = @($raw | Where-Object { $_ -notlike "G *" })
@@ -87,6 +141,22 @@ foreach ($mk in $Models) {
                 if ($diag -match "hipError.*719|719.*hip|hip.*719") { Write-Host "golden: hipError 719, stopping"; exit 2 }
                 continue
             }
+            # a run that printed (almost) nothing must not become, or be compared with, a reference
+            if ($glines.Count -lt 2 -or -not ($glines[0] -like "G header *")) {
+                Write-Host ("FAIL  {0,-24} no golden output ({1} G lines)" -f $name, $glines.Count)
+                $diag | Select-Object -Last 10 | ForEach-Object { Write-Host "      $_" }
+                $err++
+                continue
+            }
+            if ($suite -eq "ngram") {
+                $ng = @($glines | Where-Object { $_ -match "ng_cycles=(\d+)" } | ForEach-Object { [int]$Matches[1] })
+                if ($ng.Count -eq 0 -or ($ng | Measure-Object -Maximum).Maximum -le 0) {
+                    Write-Host ("FAIL  {0,-24} the n-gram path was not exercised (ng_cycles=0): the case proves nothing" -f $name)
+                    $err++
+                    continue
+                }
+            }
+            $ran++
             $gold = Join-Path $goldDir "$mk\${mode}_$suite.txt"
             if ($Action -eq "record") {
                 New-Item -ItemType Directory -Force (Split-Path $gold) | Out-Null
@@ -96,6 +166,7 @@ foreach ($mk in $Models) {
             }
             if (-not (Test-Path $gold)) { Write-Host "MISS  $name (no golden file $gold; run record)"; $err++; continue }
             $ref = @(Get-Content $gold)
+            if ($ref.Count -lt 3) { Write-Host "FAIL  $name golden file $gold is empty or has no step lines"; $err++; continue }
             $bad = $null
             for ($i = 0; $i -lt [Math]::Max($ref.Count, $lines.Count); $i++) {
                 $x = if ($i -lt $ref.Count) { $ref[$i] } else { "(missing)" }
@@ -123,7 +194,14 @@ foreach ($mk in $Models) {
         }
     }
 }
+} finally {
+    foreach ($k in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $savedEnv[$k]) }
+}
+if ($hashesChanged -and $err -eq 0) {
+    [System.IO.File]::WriteAllLines($hashFile, [string[]]@($hashes.Keys | Sort-Object | ForEach-Object { $hashes[$_] -join " " }))
+}
 $tot = ((Get-Date) - $t0).TotalSeconds
+if ($ran -eq 0) { Write-Host "golden: no case ran: refusing to report success"; exit 2 }
 if ($err -gt 0) { Write-Host ("golden {0} {1}: {2} run(s) failed, {3} mismatch(es), {4:N0} s" -f $Action, $Arch, $err, $fail, $tot); exit 2 }
 if ($fail -gt 0) { Write-Host ("golden check {0}: {1} mismatch(es), {2:N0} s" -f $Arch, $fail, $tot); exit 1 }
 Write-Host ("golden {0} {1}: ok, {2:N0} s" -f $Action, $Arch, $tot)

@@ -6,8 +6,10 @@ architecture: `<arch>/<model>/<mode>_<suite>.txt`. Record and check them with
 
 | Arch | State |
 |---|---|
-| gfx1201 (R9700) | recorded |
-| gfx1151 (Radeon 8060S) | recorded |
+| gfx1201 (R9700) | recorded (suites single, pair, ngram) |
+| gfx1151 (Radeon 8060S) | recorded (suites single, pair; suite ngram not yet) |
 
 Do not edit these files by hand. A commit that changes output on purpose re-records them and
 says `golden update: <reason>` in its message.
+
+`models.txt` holds the name, size and hash (size + first and last 4 MiB, SHA-256) of the two models the references were recorded with; `golden.ps1 check` refuses another file.

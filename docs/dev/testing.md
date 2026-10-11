@@ -47,6 +47,16 @@ Each reference file stores the model's file name and size, so a check against a 
 fails on the first line. Modes: `--precise`, `--balance`, `--fast`. The fast mode loses precision
 (quantized KV, relaxed acceptance) but is still deterministic, so it can be hashed too.
 
+The gate cannot pass vacuously (FIX-REVIEW2). An empty model, mode or suite list, a run that printed no
+`G` lines, a reference file with no step lines, and a model file that differs from the recorded one (name,
+size and a hash of its size plus first and last 4 MiB, kept in `tests/golden/models.txt` and rewritten by
+`record`) all exit 2. The script clears every `WHIRL_*` environment variable before the runs (a stray
+`WHIRL_HIP_DEVICE` or `WHIRL_MODE` would change what is measured; `--device` picks the GPU) and restores
+them afterwards. Suites: `single`, `pair`, and `ngram` (the forced n-gram MTP drafts on a copy-the-text
+prompt; the runner fails the case when `ng_cycles` is 0, because the n-gram case of `single` never drafts on
+its prompt). `ngram` needs a model with an MTP head and is in the default list for gfx1201 only, until its
+gfx1151 references are recorded on the Radeon 8060S (`golden.ps1 record -Arch gfx1151 -Suites ngram`).
+
 Reference files are kept per architecture, at `tests/golden/<arch>/<model>/<mode>_<suite>.txt`.
 gfx1201 and gfx1151 use different kernels and tuning tables, so their outputs differ.
 

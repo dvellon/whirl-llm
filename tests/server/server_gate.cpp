@@ -930,6 +930,10 @@ void suiteFastStream() {
         }
     }
     ServerLease s("fast_stream", {}, env);
+    // FS-001: the suite is only evidence for the boundary fix when MTP drafts really run and the
+    // repeats really resume from the prefix cache; otherwise equal texts prove nothing
+    check("fast_stream: MTP speculative decoding is on (model has a nextn layer, WHIRL_MTP != 0)",
+          s->logCount("MTP speculative decoding: on") >= 1);
     for (const Case& c : cases) {
         // non-stream / stream twice each: #0 is cold (or a shared-prefix resume), the
         // others resume from this prompt's own checkpoints (full hit or think-open)
@@ -946,6 +950,9 @@ void suiteFastStream() {
                     continue;
                 }
             }
+            if (i > 0)
+                check(std::format("fast_stream: {} #{} resumed from the prefix cache (cached tokens > 0)", c.key, i), r.cached > 0,
+                      std::format("cached {} of {}", r.cached, r.prompt));
             const ChatResult& want = c.shared ? first : ref[c.key];
             check(std::format("fast_stream: {} #{} ({}) == {}", c.key, i, st ? "stream" : "non-stream", c.shared ? "#0" : "cold"),
                   r.status == 200 && r.content == want.content && r.reasoning == want.reasoning && r.finish == want.finish, brief(r));

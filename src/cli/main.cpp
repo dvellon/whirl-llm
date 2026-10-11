@@ -132,7 +132,7 @@ const char* k_help_selftest =
     "  -h, --help                 this text\n";
 
 const char* k_help_golden =
-    "usage: whirl golden MODEL.gguf [--suite single|pair] [--decode N] [mode] [--device SPEC]\n"
+    "usage: whirl golden MODEL.gguf [--suite single|pair|ngram] [--decode N] [mode] [--device SPEC]\n"
     "\n"
     "Runs fixed prompts and prints one 'G ...' line per step: top-5 ids and the FNV-1a hash\n"
     "of the logits, generated token streams. single: plain prefill (short + 4000 tokens),\n"
@@ -1500,7 +1500,10 @@ std::vector<u32> goldenLongIds(const Tok& tok, std::size_t n) {
     return ids;
 }
 
-int goldenSingle(const Args& a, const gguf::File& f, const Tok& tok, u32 n_dec) {
+// ngram_only (suite ngram): only the forced n-gram MTP case, on a prompt that asks the model to copy a
+// text (its own reply then repeats the prompt, so n-gram drafts really run: the runner fails the case
+// when ng_cycles is 0). The suite single's prompt has no repetition (its n-gram case never drafts).
+int goldenSingle(const Args& a, const gguf::File& f, const Tok& tok, u32 n_dec, bool ngram_only = false) {
     Loaded L = loadModel(a, f, 8192);
     q::Model& m = *L.model;
     {
@@ -1512,7 +1515,8 @@ int goldenSingle(const Args& a, const gguf::File& f, const Tok& tok, u32 n_dec) 
     applyRuntimeEnv(m);
     gout(fmt("info kv=%s max_ctx=%u mtp=%d fused=%d", m.kvName(), m.max_ctx, mtp ? 1 : 0, m.fusedDecode() ? 1 : 0));
     GoldenRow gr;
-    const std::vector<u32> sp = tok.encode(chatWrap(k_golden_short, false));
+    const std::vector<u32> sp = tok.encode(chatWrap(
+        ngram_only ? std::string("Copy the following text word for word, twice, and add nothing else.\n\n") + k_bench_text : std::string(k_golden_short), false));
     const std::vector<u32> lp = goldenLongIds(tok, 4000);
     auto* tk = static_cast<std::int32_t*>(hip::hostMalloc(4));
     // plain chunked prefill, then the pipelined decode step chat runs (graph / fused path)
@@ -1536,9 +1540,12 @@ int goldenSingle(const Args& a, const gguf::File& f, const Tok& tok, u32 n_dec) 
         }
         gout(streamLine(name, gen));
     };
-    plain("short", sp, n_dec);
-    plain("long4k", lp, 8);
+    if (!ngram_only) {
+        plain("short", sp, n_dec);
+        plain("long4k", lp, 8);
+    }
     hip::hostFree(tk);
+    if (ngram_only && !mtp) throw std::runtime_error("golden: suite ngram needs a model with an MTP head (and WHIRL_MTP != 0)");
     if (mtp) {
         bool head = false;
         auto spec = [&](const char* name, bool ngram) {
@@ -1572,7 +1579,7 @@ int goldenSingle(const Args& a, const gguf::File& f, const Tok& tok, u32 n_dec) 
                      r.ng_accepted));
             gout(streamLine(name, r.tokens));
         };
-        spec("mtp", false);
+        if (!ngram_only) spec("mtp", false);
         spec("mtp_ngram", true);
     }
     return 0;
@@ -1728,7 +1735,8 @@ int cmdGolden(const Args& a) {
     gout(fmt("header format=1 suite=%s decode=%u", suite.c_str(), n_dec));
     if (suite == "single") return goldenSingle(a, f, tok, n_dec);
     if (suite == "pair") return goldenPair(a, f, tok, n_dec);
-    throw std::runtime_error("golden: --suite must be single or pair");
+    if (suite == "ngram") return goldenSingle(a, f, tok, n_dec, true);
+    throw std::runtime_error("golden: --suite must be single, pair or ngram");
 }
 
 int cmdSelftest(const Args& a) {
