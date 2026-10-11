@@ -1369,6 +1369,68 @@ static void testLockFailClosed(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+// TIER-DEP-CYCLE: A owns the shared prefix and B references it. A is then rewritten to B's
+// content; its new blocks must not become references to B (A <-> B), otherwise dropping either
+// one recursed forever. Also: a cycle that already exists is survivable (guard in dropSsdCopy).
+static void testDedupCycle(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 970;
+    const auto sys = freshToks(2560, seed);  // 10 pages
+    const auto tz = freshToks(1500, seed);
+    const auto ty = freshToks(1500, seed);
+    Sess a(ops, 24), b(ops, 24);
+    a.toks = sys;
+    a.toks.insert(a.toks.end(), tz.begin(), tz.end());
+    b.toks = sys;
+    b.toks.insert(b.toks.end(), ty.begin(), ty.end());
+    auto t = Tier::create(ops, 256ull << 20, 21, 0);
+    t->start(env.cfg(4ull << 30), kLay, 91);
+    spillSess(*t, a, 0);
+    CHECK(tickIdle(*t));
+    spillSess(*t, b, 0);
+    CHECK(tickIdle(*t));
+    const std::uint64_t id_a = a.id, id_b = b.id;
+    CHECK(t->dependentsOf(a.e).size() == 1);  // B references A's prefix blocks
+    // A regenerates its tail to exactly B's content (in place, from the end of the prefix)
+    a.toks = b.toks;
+    spillSess(*t, a, 2560);
+    CHECK(tickIdle(*t));
+    Entry* ea = t->find(id_a);
+    Entry* eb = t->find(id_b);
+    CHECK(ea != nullptr && eb != nullptr && ea->ssd.has_value() && eb->ssd.has_value());
+    if (!ea || !eb || !ea->ssd || !eb->ssd) return;
+    std::size_t a_refs_b = 0;
+    for (const BlkRef& r : ea->ssd->tbl) a_refs_b += r.owner == id_b ? 1 : 0;
+    CHECK(a_refs_b == 0);                          // no A -> B reference while B -> A exists
+    CHECK(t->dependentsOf(eb).empty());            // nothing depends on B
+    CHECK(t->dependentClosure(ea).size() <= 1);    // B at most; never A itself
+    CHECK(restoreMatches(*t, ops, ea, a));
+    CHECK(tickIdle(*t));
+    eb = t->find(id_b);
+    if (eb) CHECK(restoreMatches(*t, ops, eb, b));
+    CHECK(tickIdle(*t));
+    // force a cycle (what an older build could have left on disk) and remove an entry in it:
+    // must terminate and leave a consistent tier
+    ea = t->find(id_a);
+    eb = t->find(id_b);
+    if (ea && eb && ea->ssd && eb->ssd && !ea->ssd->tbl.empty() && !eb->ssd->tbl.empty()) {
+        BlkRef ra = ea->ssd->tbl.back();
+        ra.owner = id_b;
+        ea->ssd->tbl.back() = ra;
+        BlkRef rb = eb->ssd->tbl.back();
+        rb.owner = id_a;
+        eb->ssd->tbl.back() = rb;
+        CHECK(!t->dependentClosure(ea).empty());
+        CHECK(std::find(t->dependentClosure(ea).begin(), t->dependentClosure(ea).end(), id_a) != t->dependentClosure(ea).end());
+        t->removeEntry(ea);  // used to recurse until the stack overflowed
+        CHECK(t->find(id_a) == nullptr);
+    }
+    t.reset();
+    fs::remove_all(dir, ec);
+}
+
 static void testSupersedeTrim(MockDeviceOps& ops, const fs::path& dir) {
     std::error_code ec;
     fs::remove_all(dir, ec);
@@ -1611,6 +1673,8 @@ int main(int argc, char** argv) {
     testRestoreCopyThrows(ops, dir);
     std::printf("-- %s\n", "testLockFailClosed");
     testLockFailClosed(ops, dir);
+    std::printf("-- %s\n", "testDedupCycle");
+    testDedupCycle(ops, dir);
     std::printf("-- %s\n", "testSupersedeTrim");
     testSupersedeTrim(ops, dir);
     std::printf("-- %s\n", "testWorkflows");

@@ -285,6 +285,9 @@ public:
     std::uint64_t trimTo(Entry* e, std::uint32_t keep);
     // Entries whose SSD block table references blocks e owns.
     std::vector<Entry*> dependentsOf(const Entry* e) const;
+    // Ids of every entry that depends on e directly or through other entries (e itself only if
+    // the dependency graph has a cycle through it).
+    std::vector<std::uint64_t> dependentClosure(const Entry* e) const;
 
     // Arena blocks for logical blocks [lb0, lb1) of e (allocating what is missing).
     bool ensureBlocks(Entry* e, std::size_t lb0, std::size_t lb1);
@@ -384,6 +387,7 @@ private:
     void validateRefs();
     bool ssdDroppable(const Entry* e, int depth = 0) const;
     void dropSsdCopy(Entry* e);
+    std::vector<std::uint64_t> dropping_;  // ids whose dropSsdCopy is running (a dependency cycle must not recurse forever)
     void touchOwners(const Entry* e);
     void gcOwners();
     std::uint64_t allocBytes(const Entry* e, std::size_t n_ref) const;

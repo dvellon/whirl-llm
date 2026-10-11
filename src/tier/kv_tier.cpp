@@ -888,6 +888,21 @@ std::vector<Entry*> Tier::dependentsOf(const Entry* e) const {
     return v;
 }
 
+std::vector<std::uint64_t> Tier::dependentClosure(const Entry* e) const {
+    std::vector<std::uint64_t> seen;
+    std::vector<const Entry*> work{e};
+    while (!work.empty()) {
+        const Entry* x = work.back();
+        work.pop_back();
+        for (const Entry* d : dependentsOf(x)) {
+            if (std::find(seen.begin(), seen.end(), d->id) != seen.end()) continue;
+            seen.push_back(d->id);
+            work.push_back(d);
+        }
+    }
+    return seen;
+}
+
 namespace {
 bool jobRefs(const Job* j, std::uint64_t id) {
     if (j->kind != JobKind::write || j->finished.load(std::memory_order_acquire)) return false;
@@ -912,6 +927,12 @@ bool Tier::ssdDroppable(const Entry* e, int depth) const {
 // with IO running is marked stale and dropped when its job completes.
 void Tier::dropSsdCopy(Entry* e) {
     if (!e->ssd || !contains(e)) return;
+    // entries referencing each other (a cycle left by an older build) must not recurse forever:
+    // an entry already being dropped up the stack is skipped
+    const std::uint64_t id = e->id;
+    if (std::find(dropping_.begin(), dropping_.end(), id) != dropping_.end()) return;
+    dropping_.push_back(id);
+    ScopeExit pop_guard{[&] { dropping_.erase(std::find(dropping_.begin(), dropping_.end(), id)); }};
     for (Entry* d : dependentsOf(e)) dropSsdCopy(d);
     if (!contains(e) || !e->ssd) return;
     if (e->io_busy) {
@@ -1237,10 +1258,14 @@ void Tier::startWrite(Entry* e) {
     // reference candidates: the SSD entry sharing the longest token prefix;
     // only blocks wholly inside the shared full pages
     if (cfg.dedup && n_blk > 0) {
+        // never reference an entry that (transitively) references e: e -> b -> e would be a cycle,
+        // and dropping either one would have to drop the other first
+        const std::vector<std::uint64_t> dep = e->ssd ? dependentClosure(e) : std::vector<std::uint64_t>{};
+        const auto dependsOnE = [&](std::uint64_t id) { return std::find(dep.begin(), dep.end(), id) != dep.end(); };
         const Entry* base = nullptr;
         std::size_t best = 0;
         for (const Entry* b : entries) {
-            if (b == e || !b->ssd || b->io_busy || b->ssd_stale || b->ssd->tbl.empty()) continue;
+            if (b == e || !b->ssd || b->io_busy || b->ssd_stale || b->ssd->tbl.empty() || dependsOnE(b->id)) continue;
             const auto& bt = b->ssd->tokens;
             const std::size_t lim = std::min<std::size_t>(bt.size(), e->n_tok);
             std::size_t l = 0;
@@ -1262,7 +1287,7 @@ void Tier::startWrite(Entry* e) {
                     r.owner = base->id;
                     r.owner_lb = b_lb0 + static_cast<std::uint32_t>(k);
                 }
-                if (r.owner == e->id) continue;
+                if (r.owner == e->id || dependsOnE(r.owner)) continue;
                 const Entry* o = r.owner == base->id ? base : find(r.owner);
                 if (o == nullptr || !o->ssd || o->io_busy || o->ssd_stale) continue;
                 j->rows[k] = r;
@@ -1598,6 +1623,18 @@ void Tier::validateRefs() {
                 log_fn(fmt("kv tier: SSD entry %016llx references a block no longer on SSD; dropped",
                            static_cast<unsigned long long>(e->id)));
             removeEntry(e);  // also drops entries referencing its blocks
+            again = true;
+            break;
+        }
+        if (again) continue;
+        // entries referencing each other (older builds could write that): drop one member of a cycle
+        for (Entry* e : entries) {
+            if (!e->ssd) continue;
+            const auto dep = dependentClosure(e);
+            if (std::find(dep.begin(), dep.end(), e->id) == dep.end()) continue;
+            if (log_fn)
+                log_fn(fmt("kv tier: SSD entry %016llx is part of a reference cycle; dropped", static_cast<unsigned long long>(e->id)));
+            removeEntry(e);
             again = true;
             break;
         }
