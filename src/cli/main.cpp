@@ -761,6 +761,112 @@ DecodeResult specDecode(q::Model& model, const Tok& tok, u32 first, u32 n_prompt
     return res;
 }
 
+// WHIRL_DFLASH_T2=N (developers, DFLASH-T2): after N DFlash2 decode cycles, compare the drafter's ring (K/V of every
+// layer, ingested via the 1-8 row path) with a fresh prefill of the same token sequence (big-n ingest), and the 7 drafts.
+void dflashT2Check(q::Model& model, const std::vector<u32>& seq, u32 n_prompt, u32 next, u32 p, u32 cycles,
+                   const std::vector<std::vector<float>>& dfeat) {
+    q::DFlashRun& r = *model.dfr;
+    const q::DFlashConfig& c = model.dflash->cfg;
+    const std::size_t kvw = static_cast<std::size_t>(c.n_head_kv) * c.head_dim;
+    auto snap = [&](std::vector<std::vector<float>>& kk, std::vector<std::vector<float>>& vv, std::vector<std::int32_t>& cp) {
+        hip::sync();
+        kk.assign(c.n_layer, {});
+        vv.assign(c.n_layer, {});
+        for (u32 l = 0; l < c.n_layer; ++l) {
+            kk[l].resize(r.ring * kvw);
+            vv[l].resize(r.ring * kvw);
+            hip::download(kk[l].data(), r.slots[0].kc[l], kk[l].size() * 4);
+            hip::download(vv[l].data(), r.slots[0].vc[l], vv[l].size() * 4);
+        }
+        cp = r.slots[0].cpos_h;
+    };
+    std::vector<std::vector<float>> ka, va, kb, vb;
+    std::vector<std::int32_t> ca, cb;
+    snap(ka, va, ca);
+    const std::vector<u32> da = model.dflashDraft(0, next, p, 0.0f, 0);
+    // B: the same captured decode-time features re-ingested in one big batch (f16 GEMM path)
+    std::vector<std::vector<float>> kc2, vc2;
+    std::vector<std::int32_t> cc2;
+    {
+        const std::size_t E = c.n_embd, nl = c.target_layers.size(), R = p - n_prompt;
+        std::vector<float> lm(nl * R * E);
+        for (std::size_t j = 0; j < nl; ++j) std::memcpy(lm.data() + j * R * E, dfeat[j].data(), R * E * 4);
+        const auto d = hip::malloc(lm.size() * 4);
+        hip::upload(d, lm.data(), lm.size() * 4);
+        model.dflashIngest(0, d, static_cast<u32>(R), 0, static_cast<u32>(R), n_prompt);
+        hip::sync();
+        hip::free(d);
+        snap(kc2, vc2, cc2);
+    }
+    std::fprintf(stderr, "T2: after %u cycles: p=%u n_prompt=%u seq=%zu ring=%u layers=%u\n", cycles, p, n_prompt, seq.size(), r.ring, c.n_layer);
+    // fresh prefill of positions 0..p-1 (seq.size() == p)
+    model.reset();
+    model.decode_graph.reset();
+    model.dflashTrim(0, 0);
+    std::size_t off = 0;
+    while (off < seq.size()) {
+        const std::size_t n = std::min<std::size_t>(seq.size() - off, model.max_batch);
+        model.forward(std::span<const u32>(seq).subspan(off, n), static_cast<u32>(off));
+        model.dflashIngest(0, model.cap_buf, model.cap_rows, 0, model.cap_n, static_cast<u32>(off + n - model.cap_n));
+        off += n;
+    }
+    snap(kb, vb, cb);
+    const std::vector<u32> db = model.dflashDraft(0, next, p, 0.0f, 0);
+    u32 miss = 0, nvalid = 0;
+    for (std::size_t i = 0; i < ca.size(); ++i) {
+        if (ca[i] != cb[i]) miss++;
+        if (ca[i] >= 0) nvalid++;
+    }
+    std::fprintf(stderr, "T2: valid ring rows %u (decode) ; cpos mismatches vs prefill %u\n", nvalid, miss);
+    double worst = 0;
+    for (int which = 0; which < 3; ++which) {
+    // which 0: decode ring vs fresh prefill (the pass criterion); 1: decode ring vs same-features big-n ingest; 2: big-n ingest vs fresh prefill
+    const auto& KA = which == 2 ? kc2 : ka;
+    const auto& VA = which == 2 ? vc2 : va;
+    const auto& KB = which == 1 ? kc2 : kb;
+    const auto& VB = which == 1 ? vc2 : vb;
+    const char* nm = which == 0 ? "decode-vs-prefill" : which == 1 ? "decode-vs-reingest(same feats)" : "reingest-vs-prefill(feature diff)";
+    double wmax = 0;
+    for (u32 l = 0; l < c.n_layer; ++l) {
+        for (int kv = 0; kv < 2; ++kv) {
+            const auto& A = kv ? VA[l] : KA[l];
+            const auto& B = kv ? VB[l] : KB[l];
+            double mx_pr = 0, mx_dc = 0, sum_pr = 0, sum_dc = 0;
+            u32 n_pr = 0, n_dc = 0, w_pr = 0, w_dc = 0;
+            for (u32 i = 0; i < r.ring; ++i) {
+                if (ca[i] < 0 || cb[i] < 0) continue;
+                double num = 0, den = 0;
+                for (std::size_t j = 0; j < kvw; ++j) {
+                    const double a = A[i * kvw + j], b = B[i * kvw + j];
+                    num += (a - b) * (a - b);
+                    den += b * b;
+                }
+                const double e = std::sqrt(num / std::max(den, 1e-30));
+                if (static_cast<u32>(ca[i]) < n_prompt) {
+                    sum_pr += e; n_pr++;
+                    if (e > mx_pr) { mx_pr = e; w_pr = static_cast<u32>(ca[i]); }
+                } else {
+                    sum_dc += e; n_dc++;
+                    if (e > mx_dc) { mx_dc = e; w_dc = static_cast<u32>(ca[i]); }
+                }
+            }
+            wmax = std::max(wmax, std::max(mx_pr, mx_dc));
+            std::fprintf(stderr, "T2[%s]: L%u %c  prompt rows(%u) max %.3e @%u mean %.3e | decode rows(%u) max %.3e @%u mean %.3e\n", nm, l, kv ? 'V' : 'K', n_pr, mx_pr, w_pr,
+                         n_pr ? sum_pr / n_pr : 0.0, n_dc, mx_dc, w_dc, n_dc ? sum_dc / n_dc : 0.0);
+        }
+    }
+    std::fprintf(stderr, "T2[%s]: MAX %.3e\n", nm, wmax);
+    if (which == 0) worst = wmax;
+    }
+    u32 same = 0;
+    for (std::size_t i = 0; i < std::min(da.size(), db.size()); ++i) same += da[i] == db[i];
+    std::string sa, sb;
+    for (u32 t : da) sa += " " + std::to_string(t);
+    for (u32 t : db) sb += " " + std::to_string(t);
+    std::fprintf(stderr, "T2: drafts decode:%s\nT2: drafts prefill:%s\n", sa.c_str(), sb.c_str());
+    std::fprintf(stderr, "T2: RESULT cycles=%u max_rel_err=%.3e drafts_same=%u/%zu (sizes %zu/%zu)\n", cycles, worst, same, std::max(da.size(), db.size()), da.size(), db.size());
+}
+
 // Speculative decoding with DFlash2 drafts (+ n-gram drafts): one draft block per cycle against
 // the drafter context of slot 0, a verify of the literal drafts (the n-gram path's bitwise verify),
 // then the kept rows' captured features go into the context. Output = plain greedy decoding.
@@ -810,6 +916,8 @@ DecodeResult dflashDecode(q::Model& model, const Tok& tok, u32 first, u32 n_prom
         generated.push_back(t);
         return generated.size() >= opt.max_tokens;
     };
+    const u32 t2_at = envU32("DFLASH_T2").value_or(0);
+    std::vector<std::vector<float>> t2_feat;
     Timer timer;
     timer.begin();
     TpsTrace tps;
@@ -863,6 +971,16 @@ DecodeResult dflashDecode(q::Model& model, const Tok& tok, u32 first, u32 n_prom
         }
         // the verify ran nd + 1 rows: keep acc + 1 of them, and their features
         if (acc < nd) model.restoreSnapshot(acc + 1);
+        if (t2_at > 0) {
+            const std::size_t E = model.dflash->cfg.n_embd;
+            t2_feat.resize(model.dflash->cfg.target_layers.size());
+            for (std::size_t j = 0; j < t2_feat.size(); ++j) {
+                const std::size_t o = t2_feat[j].size();
+                t2_feat[j].resize(o + (acc + 1) * E);
+                hip::sync();
+                hip::download(t2_feat[j].data() + o, model.cap_buf + (j * model.cap_rows + (model.cap_n - (nd + 1))) * E * 4, (acc + 1) * E * 4);
+            }
+        }
         model.dflashIngest(0, model.cap_buf, model.cap_rows, model.cap_n - (nd + 1), acc + 1, p);
         for (u32 r = 0; r < acc + 1; ++r) {
             if (!done) done = emit(outv[r]);
@@ -872,6 +990,12 @@ DecodeResult dflashDecode(q::Model& model, const Tok& tok, u32 first, u32 n_prom
         p += acc + 1;
         tps.tick(generated.size());
         st.update(generated);
+        if (t2_at > 0 && cycles >= t2_at && !done) {
+            std::vector<u32> seq(prompt_ids.begin(), prompt_ids.end());
+            seq.insert(seq.end(), generated.begin(), generated.end() - 1);
+            dflashT2Check(model, seq, n_prompt, next, p, cycles, t2_feat);
+            break;
+        }
     }
     res.decode_ms = timer.end();
     if (!opt.stream && opt.print_text) out(tok.decode(generated));
