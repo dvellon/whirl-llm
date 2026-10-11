@@ -1184,6 +1184,96 @@ static void testModesLock(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+// MAIN-001: a truncated SSD file is never restored as valid KV. Cut at startup (header only, mid
+// payload, last sector) the entry is not indexed and the file is removed; cut after the index the
+// read job fails (restore failed -> cold prefill). A legal partial last block stays restorable.
+static void testSsdTruncated(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    const std::uint64_t fp = hashStr(0xcbf29ce484222325ull, "model-trunc");
+    const std::uint32_t nck = 2, pages = 7;  // the file ends inside its last block
+    const std::uint64_t fb = fileBytesOf(nck, pages);
+    DevSlot src(ops, nck, pages);
+    src.fill(77);
+    const auto toks = makeTokens(1700, 21);
+    std::uint64_t id = 0;
+    {
+        auto t = Tier::create(ops, 32ull << 20, 5, 0);
+        t->start(env.cfg(1ull << 30), kLay, fp);
+        Entry* e = spill(*t, src, toks);
+        CHECK(e != nullptr);
+        if (!e) return;
+        id = e->id;
+        CHECK(tickIdle(*t));
+    }
+    const fs::path f = entryFile(dir, fp, id);
+    CHECK(fs::exists(f) && fs::file_size(f) == fb);
+    const fs::path bak = dir / L"backup.bin";
+    fs::copy_file(f, bak, fs::copy_options::overwrite_existing, ec);
+    const auto restoreFull = [&] {
+        fs::remove(f, ec);
+        fs::copy_file(bak, f, fs::copy_options::overwrite_existing, ec);
+    };
+    const std::uint64_t cuts[] = {header_bytes,                            // header only
+                                  kLay.dataOff() + 4 * block_bytes,        // mid payload (block aligned)
+                                  kLay.dataOff() + 4 * block_bytes + sector,  // mid block
+                                  fb - sector};                           // last sector missing
+    for (const std::uint64_t cut : cuts) {
+        restoreFull();
+        fs::resize_file(f, cut, ec);
+        CHECK(!ec && fs::file_size(f) == cut);
+        auto t = Tier::create(ops, 32ull << 20, 6, 0);
+        t->start(env.cfg(1ull << 30), kLay, fp);
+        CHECK(t->ssdEntries() == 0 && t->find(id) == nullptr);
+        CHECK(!fs::exists(f));  // dropped like any other corrupt file
+        CHECK(t->ssd_bytes == 0);
+    }
+    // cut after the index (the file changes under a running server): the restore fails cleanly
+    for (const std::uint64_t cut : cuts) {
+        if (cut < kLay.dataOff()) continue;  // the header read at restore time is not part of the job
+        restoreFull();
+        auto t = Tier::create(ops, 32ull << 20, 7, 0);
+        t->start(env.cfg(1ull << 30), kLay, fp);
+        Entry* e = t->find(id);
+        CHECK(e != nullptr && t->ssdEntries() == 1);
+        if (!e) continue;
+        fs::resize_file(f, cut, ec);
+        CHECK(!ec);
+        DevSlot dst(ops, nck, pages);
+        std::size_t nm = 0;
+        const auto sp = dst.spans(e, 1, &nm);
+        Restore* r = t->beginRestore(e, sp, nm);
+        CHECK(r != nullptr);
+        if (r) {
+            CHECK(!runRestore(*t, r) && r->failed);
+            t->endRestore(r);
+        }
+        tickIdle(*t);
+    }
+    // control: the intact file (partial last block) still restores byte-identical
+    restoreFull();
+    {
+        auto t = Tier::create(ops, 32ull << 20, 8, 0);
+        t->start(env.cfg(1ull << 30), kLay, fp);
+        Entry* e = t->find(id);
+        CHECK(e != nullptr && t->ssdEntries() == 1);
+        if (e) {
+            DevSlot dst(ops, nck, pages);
+            std::size_t nm = 0;
+            const auto sp = dst.spans(e, 1, &nm);
+            Restore* r = t->beginRestore(e, sp, nm);
+            CHECK(r != nullptr);
+            if (r) {
+                CHECK(runRestore(*t, r));
+                t->endRestore(r);
+                CHECK(dst.ckEq(src, 0) && dst.ckEq(src, 1) && dst.kvEq(src));
+            }
+        }
+    }
+    fs::remove_all(dir, ec);
+}
+
 static void testSupersedeTrim(MockDeviceOps& ops, const fs::path& dir) {
     std::error_code ec;
     fs::remove_all(dir, ec);
@@ -1420,6 +1510,8 @@ int main(int argc, char** argv) {
     testOwnerRewrite(ops, dir);
     std::printf("-- %s\n", "testModesLock");
     testModesLock(ops, dir);
+    std::printf("-- %s\n", "testSsdTruncated");
+    testSsdTruncated(ops, dir);
     std::printf("-- %s\n", "testSupersedeTrim");
     testSupersedeTrim(ops, dir);
     std::printf("-- %s\n", "testWorkflows");

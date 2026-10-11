@@ -131,6 +131,9 @@ struct Job {
     // (logical block, arena block address) to write / read, ascending
     std::vector<std::uint32_t> lbs;
     std::vector<std::uint64_t> ptrs;
+    // read: bytes block i of the job must deliver (the file's valid extent inside the block); a
+    // shorter read (truncated file, EOF) fails the job instead of leaving stale arena bytes
+    std::vector<std::uint32_t> need;
     std::atomic<std::uint32_t> done{0};
     std::atomic<bool> finished{false};
     std::atomic<bool> failed{false};
@@ -1028,6 +1031,13 @@ void Tier::readSources(Job* j, const Entry* e) {
     j->paths.assign(1, filePath(e->id));
     j->src.clear();
     j->src_lb.clear();
+    j->need.clear();
+    // logical size of e's own file (what indexFile / the write path produce)
+    const std::uint64_t own_bytes =
+        e->ssd ? alignUp(lay.dataOff() + static_cast<std::uint64_t>(e->ssd->nck) * lay.ckStride() +
+                             static_cast<std::uint64_t>(e->ssd->pages) * lay.page_bytes,
+                         sector)
+               : 0;
     std::vector<std::uint64_t> ids{e->id};
     const std::uint32_t lb0 = e->ssd ? static_cast<std::uint32_t>(static_cast<std::uint64_t>(e->ssd->nck) * lay.ckStride() / block_bytes) : 0;
     for (const std::uint32_t lb : j->lbs) {
@@ -1046,6 +1056,11 @@ void Tier::readSources(Job* j, const Entry* e) {
         }
         j->src.push_back(si);
         j->src_lb.push_back(sl);
+        // own blocks: up to the end of the file's extent (the last block may be partial); a block
+        // borrowed from another file is a full block (only full blocks are shared)
+        j->need.push_back(si != 0 ? static_cast<std::uint32_t>(block_bytes)
+                                  : static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                        block_bytes, satSub(own_bytes, j->data_off + static_cast<std::uint64_t>(sl) * block_bytes))));
     }
     for (std::size_t i = 1; i < ids.size(); ++i) {
         if (Entry* o = find(ids[i])) {
@@ -1419,6 +1434,7 @@ bool Tier::tick() {
 // ---- startup index ----------------------------------------------------------------
 
 void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<IndexItem>& order) {
+    const std::uint64_t logical_size = size;  // the directory entry's size (sparse files: includes the holes)
     bool del = false;
     ScopeExit del_guard{[&] {
         if (del) DeleteFileW(pw.c_str());
@@ -1447,6 +1463,14 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
         }
         if (hd.valid == 0 || hd.n_tok == 0 || hd.n_tok > lay.tok_cap || hd.nck > max_ck || hd.ck_stride != lay.ckStride() ||
             hd.page_bytes != lay.page_bytes || hd.data_off != lay.dataOff()) {
+            del = true;
+            return;
+        }
+        // the payload must be all there: a file cut short (disk full, external truncation) would
+        // restore stale bytes as KV / a checkpoint. Longer is fine (a trimmed entry keeps its file).
+        const std::uint64_t want_bytes = alignUp(
+            lay.dataOff() + static_cast<std::uint64_t>(hd.nck) * lay.ckStride() + static_cast<std::uint64_t>(hd.pages) * lay.page_bytes, sector);
+        if (logical_size < want_bytes) {
             del = true;
             return;
         }
@@ -1485,7 +1509,7 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
         sn.pages = hd.pages;
         sn.ck = e->ck;
         sn.tokens = std::move(toks);
-        sn.file_bytes = size;
+        sn.file_bytes = want_bytes;  // logical size (size below is the allocated part for sparse files)
         sn.alloc_bytes = size;
         sn.tbl = std::move(tbl);
         e->ssd = std::move(sn);
@@ -1677,13 +1701,19 @@ void Tier::runJob(Job* j) {
                 }
                 if (!ok) break;
                 const std::size_t k = done % read_qd;
+                DWORD r = 0;  // bytes delivered (0 past the end of the file)
                 if (!eof[k]) {
-                    DWORD r = 0;
                     if (GetOverlappedResult(fhOf(done), &ov[k], &r, TRUE) == 0 && GetLastError() != ERROR_HANDLE_EOF) {
                         ok = false;
                         done += 1;
                         break;
                     }
+                }
+                // EOF or a short read of a block the file must hold: the file was cut short
+                if (done < j->need.size() && r < j->need[done]) {
+                    ok = false;
+                    done += 1;
+                    break;
                 }
                 done += 1;
                 j->done.store(static_cast<std::uint32_t>(done), std::memory_order_release);
