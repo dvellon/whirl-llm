@@ -433,7 +433,7 @@ bool Model::floatGemvN(const Mat& w, u32 n) const {
 // Precise decode: the f16 GEMM choice for n <= gvMax() rows. Every choice computes the
 // same bits (checkPrefillInvariance), so this only picks a kernel that suits a few rows:
 // the small-batch WMMA GEMM on the raw quantized bytes (gemms) with the narrowest token
-// tile that holds n (then the most row blocks), else the tuned fused config (gemm_c on
+// tile that holds n (then the most row blocks; on gfx1151 the widest, see below), else the tuned fused config (gemm_c on
 // the quantized bytes) - never the whole-matrix dequant into w16. WHIRL_PREC_GS=<slot>
 // forces a gemms slot (timing experiments).
 u32 Model::precChoice(const Mat& w, u32 n) const {
@@ -461,7 +461,10 @@ u32 Model::precChoice(const Mat& w, u32 n) const {
                 continue;
             }
             // both hold n: narrower tile, then smaller row block; neither: wider tile
-            if (c_fits ? (c.bn < b.bn || (c.bn == b.bn && c.bm < b.bm)) : c.bn > b.bn) best = static_cast<int>(si);
+            // (gfx1151, GEMVH-2: the widest row block of a tile width is the fastest - gemms_c0 128 x 32 beats c5 64 x 32 by
+            // 30-40% at n <= 32 - so ties go to the larger BM there; the other targets keep the narrower row block)
+            const bool tie_bigger_bm = arch == hip::Arch::gfx1151;
+            if (c_fits ? (c.bn < b.bn || (c.bn == b.bn && (tie_bigger_bm ? c.bm > b.bm : c.bm < b.bm))) : c.bn > b.bn) best = static_cast<int>(si);
         }
         if (best >= 0) return static_cast<u32>(2 * G + best);
     }

@@ -11,6 +11,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
+#include <string>
+#include <vector>
 
 #include "kt.h"
 
@@ -99,13 +103,36 @@ void benchGemvh(Ctx& c) {
         int nrows, ncols;
         const char* what;
     };
-    const Shape shapes[] = {
-        {QType::q4_k, 5120, 5120, "attn proj 5120x5120"}, {QType::q4_k, 17408, 5120, "ffn gate/up 17408x5120"},
-        {QType::q6_k, 5120, 17408, "ffn down 5120x17408"}, {QType::q6_k, 5120, 5120, "5120x5120"},
-        {QType::q8_0, 5120, 5120, "5120x5120"},            {QType::q5_k, 5120, 5120, "5120x5120"},
-        {QType::q6_k, 248320, 5120, "lm head 248320x5120"}, {QType::mxfp4, 5120, 5120, "5120x5120"},
-        {QType::iq4_xs, 5120, 5120, "5120x5120"},
+    std::vector<Shape> shapes = {
+        {QType::q4_k, 5120, 5120, "5120x5120"},      {QType::q4_k, 17408, 5120, "17408x5120 ffn up"}, {QType::q4_k, 5120, 17408, "5120x17408 ffn down"},
+        {QType::q5_k, 5120, 5120, "5120x5120"},      {QType::q5_k, 17408, 5120, "17408x5120 ffn up"}, {QType::q5_k, 5120, 17408, "5120x17408 ffn down"},
+        {QType::q6_k, 5120, 5120, "5120x5120"},      {QType::q6_k, 17408, 5120, "17408x5120 ffn up"}, {QType::q6_k, 5120, 17408, "5120x17408 ffn down"},
+        {QType::q6_k, 248320, 5120, "lm head 248320x5120"},
+        {QType::q8_0, 5120, 5120, "5120x5120"},      {QType::mxfp4, 5120, 5120, "5120x5120"},        {QType::iq4_xs, 5120, 5120, "5120x5120"},
+        {QType::iq4_xs, 17408, 5120, "17408x5120 ffn up"}, {QType::iq4_xs, 5120, 17408, "5120x17408 ffn down"},
+        {QType::q5_k, 10240, 5120, "10240x5120 qkv"}, {QType::q5_k, 5120, 6144, "5120x6144 ssm out"},
     };
+    // WHIRL_KT_GEMVH_SHAPES=<type>:<nrows>:<ncols>[,..] replaces the list (development)
+    if (const char* e = std::getenv("WHIRL_KT_GEMVH_SHAPES")) {
+        shapes.clear();
+        static std::vector<std::string> names;
+        names.reserve(64);
+        const std::string vs = e;
+        for (std::size_t a = 0; a < vs.size();) {
+            std::size_t b = vs.find(',', a);
+            if (b == std::string::npos) b = vs.size();
+            const std::string it = vs.substr(a, b - a);
+            const std::size_t p1 = it.find(':'), p2 = it.find(':', p1 + 1);
+            if (p1 != std::string::npos && p2 != std::string::npos) {
+                QType t = QType::q4_k;
+                for (QType cand : wk::kAllTypes)
+                    if (it.substr(0, p1) == wk::typeSuffix(cand)) t = cand;
+                names.push_back(it.substr(p1 + 1));
+                shapes.push_back({t, std::atoi(it.substr(p1 + 1, p2 - p1 - 1).c_str()), std::atoi(it.substr(p2 + 1).c_str()), names.back().c_str()});
+            }
+            a = b + 1;
+        }
+    }
     std::printf("   (peak reference %.0f GB/s)\n", peak);
     // kernel development: WHIRL_KT_GEMVH_HSACO=<code object> WHIRL_KT_GEMVH_VARS=<prefix>:<rows per block>:<threads>[,..]
     // times <prefix>_<type> from that code object next to the built-in kernels (and checks it bitwise against gemvh2);
@@ -155,7 +182,7 @@ void benchGemvh(Ctx& c) {
         if (!c.k.gemvh[ti]) continue;
         const HostMat m = randomMat(c, sh.t, sh.nrows, sh.ncols);
         // enough copies that the weights never stay in the 32 MB MALL between calls
-        const int copies = std::max<int>(1, std::min<int>(16, static_cast<int>((192u << 20) / m.data.size())));
+        const int copies = std::max<int>(1, std::min<int>(48, static_cast<int>((640u << 20) / m.data.size())));
         std::vector<Buf> ws;
         for (int i = 0; i < copies; ++i) ws.emplace_back(m.data);
         Buf x16 = makeX16(c, 32, sh.ncols);
@@ -201,8 +228,11 @@ void benchGemvh(Ctx& c) {
             }
             for (const V& v : vs) {
                 auto launch = [&](int i) {
+                    // WHIRL_KT_GEMVH_GRIDDIV=<d>: development variants (persistent tile loop) get 1/d of the blocks
+                    const int gdiv = (!v.tok_x && v.name != "gemvh" && v.name != "gemvh2" && std::getenv("WHIRL_KT_GEMVH_GRIDDIV"))
+                                         ? std::max(1, std::atoi(std::getenv("WHIRL_KT_GEMVH_GRIDDIV"))) : 1;
                     const hip::Dim3 grid = v.tok_x ? hip::Dim3{cdiv(nt, v.bn), cdiv(sh.nrows, v.bm), 1}
-                                                   : hip::Dim3{cdiv(sh.nrows, v.bm), cdiv(nt, v.bn), 1};
+                                                   : hip::Dim3{cdiv(cdiv(sh.nrows, v.bm), gdiv), cdiv(nt, v.bn), 1};
                     hip::launch(v.f, grid, {static_cast<unsigned>(v.nth), 1, 1}, 0, c.s, ws[static_cast<std::size_t>(i % copies)].p(), m.row_bytes,
                                 x16.p(), y.p(), sh.ncols, sh.nrows, nt, 0);
                 };
