@@ -328,11 +328,11 @@ std::string streamText(const HttpResult& r, bool chat, std::string* finish = nul
 // ---------------------------------------------------------------------------
 // unit tests
 
-// CONC-8S: MTP draft caps under load with DeltaNet snapshot sets (gfx1151, no replay) equal the
-// replay path's {8, 7, 4, 3}; the literal (n-gram) drafts keep the old budget (8 sets)
+// CONC-8S: MTP draft caps under load with DeltaNet snapshot sets (gfx1151, no replay): with relaxacc
+// the replay path's {8, 7, 4, 3} (literal drafts keep the old 8-set budget); exact acceptance: 8 / k
 void testDraftCaps() {
     const std::array<std::uint32_t, qwen35::gdn_max_seg + 1> def = {0, 8, 7, 4, 3, 2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
-    const SnapDraftCaps a = snapshotDraftCaps(def, 8, 4, false, std::nullopt);
+    const SnapDraftCaps a = snapshotDraftCaps(def, 8, 4, false, std::nullopt, true);
     CHECK_EQ(a.caps[1], 8u);
     CHECK_EQ(a.caps[2], 7u);
     CHECK_EQ(a.caps[3], 4u);
@@ -342,22 +342,29 @@ void testDraftCaps() {
     CHECK_EQ(a.lit_sets, 8u);  // what the old caps allocated (n-gram budget unchanged)
     for (std::uint32_t k = 1; k <= 4; ++k) CHECK(k * a.caps[k] <= qwen35::gdn_max_snap);
     // fixed 3 drafts: 3 per cycle at every load (old: 2 with 3-4 slots)
-    const SnapDraftCaps b = snapshotDraftCaps(def, 3, 4, false, std::nullopt);
+    const SnapDraftCaps b = snapshotDraftCaps(def, 3, 4, false, std::nullopt, true);
     CHECK_EQ(std::min(b.caps[4], 3u), 3u);
     CHECK_EQ(std::min(b.caps[3], 3u), 3u);
     CHECK_EQ(b.sets, 12u);
     CHECK_EQ(b.lit_sets, 8u);
     // one slot: nothing changes
-    const SnapDraftCaps c = snapshotDraftCaps(def, 8, 1, false, std::nullopt);
+    const SnapDraftCaps c = snapshotDraftCaps(def, 8, 1, false, std::nullopt, true);
     CHECK_EQ(c.sets, 8u);
     CHECK_EQ(c.lit_sets, 8u);
     // WHIRL_MTP_BATCH_DRAFTS: used as given, literal drafts may use all sets; WHIRL_SNAP_SETS raises both
-    const SnapDraftCaps d = snapshotDraftCaps(def, 8, 4, true, std::nullopt);
+    const SnapDraftCaps d = snapshotDraftCaps(def, 8, 4, true, std::nullopt, true);
     CHECK_EQ(d.caps[4], 3u);
     CHECK_EQ(d.lit_sets, 0u);
-    const SnapDraftCaps e = snapshotDraftCaps(def, 8, 1, false, 12u);
+    const SnapDraftCaps e = snapshotDraftCaps(def, 8, 1, false, 12u, true);
     CHECK_EQ(e.sets, 12u);
     CHECK_EQ(e.lit_sets, 12u);
+    // exact acceptance (precise / balance, fast with WHIRL_RELAX=0): the old 8 / k caps, all sets
+    const SnapDraftCaps f = snapshotDraftCaps(def, 8, 4, false, std::nullopt, false);
+    CHECK_EQ(f.caps[2], 4u);
+    CHECK_EQ(f.caps[3], 2u);
+    CHECK_EQ(f.caps[4], 2u);
+    CHECK_EQ(f.sets, 8u);
+    CHECK_EQ(f.lit_sets, 0u);
 }
 
 void testProtocol() {

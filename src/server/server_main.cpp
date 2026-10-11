@@ -805,7 +805,7 @@ int serveMain(int argc, char** argv, const char* program) {
                 }
                 snap_env = x;
             }
-            const SnapDraftCaps sc = snapshotDraftCaps(batch_drafts, drafts, opt.parallel, bd_env.has_value(), snap_env);
+            const SnapDraftCaps sc = snapshotDraftCaps(batch_drafts, drafts, opt.parallel, bd_env.has_value(), snap_env, model.relax.on);
             batch_drafts = sc.caps;
             lit_snap_sets = sc.lit_sets;
             model.ensureSnapshots(sc.sets);
