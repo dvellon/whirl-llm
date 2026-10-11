@@ -7,7 +7,7 @@ architecture: `<arch>/<model>/<mode>_<suite>.txt`. Record and check them with
 | Arch | State |
 |---|---|
 | gfx1201 (R9700) | recorded (suites single, pair, ngram) |
-| gfx1151 (Radeon 8060S) | recorded (suites single, pair; suite ngram not yet) |
+| gfx1151 (Radeon 8060S) | recorded (suites single, pair, ngram) |
 
 Do not edit these files by hand. A commit that changes output on purpose re-records them and
 says `golden update: <reason>` in its message.
