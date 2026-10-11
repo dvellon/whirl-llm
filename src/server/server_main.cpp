@@ -16,6 +16,7 @@
 #include "tier/kv_tier.h"
 #include "tier/ram_size.h"
 #include "whirl/common.h"
+#include "whirl/dflash_policy.h"
 #include "whirl/gguf.h"
 #include "whirl/hip.h"
 #include "whirl/model.h"
@@ -584,26 +585,22 @@ int serveMain(int argc, char** argv, const char* program) {
             prefill_exec = std::max(prefill_chunk, std::min(prefill_exec / prefill_chunk * prefill_chunk, mb / prefill_chunk * prefill_chunk));
         }
         // --draft dflash: check the drafter against the target before loading (headers only); a
-        // model without a matching drafter keeps the MTP drafts
+        // model without a matching drafter keeps the MTP drafts (whirl/dflash_policy.h)
         bool use_dflash = false;
         std::optional<gguf::File> dfile;
-        if (opt.draft == "dflash") {
+        {
             const auto dm = env("DRAFT_MODEL");
-            if (!dm) {
-                logW("--draft dflash needs the DFlash2 drafter GGUF in WHIRL_DRAFT_MODEL: using MTP drafts");
-            } else {
+            const auto src = *whirl::dflash::parseSource(opt.draft);
+            std::string why;
+            if (src == whirl::dflash::Source::dflash && dm) {
                 dfile.emplace(gguf::File::open(*dm));
-                const std::string why = qwen35::dflashIncompatible(f, *dfile);
-                if (why.empty()) {
-                    use_dflash = true;
-                    lo.no_mtp = true;
-                } else {
-                    logW("--draft dflash: {} does not fit this model ({}): using MTP drafts", *dm, why);
-                    dfile.reset();
-                }
+                why = qwen35::dflashIncompatible(f, *dfile);
             }
-        } else if (env("DRAFT_MODEL")) {
-            logW("WHIRL_DRAFT_MODEL is set but --draft is mtp: the DFlash2 drafter is not loaded");
+            const whirl::dflash::Choice ch = whirl::dflash::choose(src, dm, why, true);
+            if (!ch.warning.empty()) logW("{}", ch.warning);
+            use_dflash = ch.source == whirl::dflash::Source::dflash;
+            if (use_dflash) lo.no_mtp = true;
+            else dfile.reset();
         }
         std::unique_ptr<qwen35::Model> mp = qwen35::Model::load(f, 0, stats, lo);
         qwen35::Model& model = *mp;
@@ -637,6 +634,17 @@ int serveMain(int argc, char** argv, const char* program) {
 
         // --draft dflash: the DFlash2 drafter (WHIRL_DRAFT_MODEL) and the hidden capture of its target
         // layers (WHIRL_DFLASH_CAPTURE_ROWS rows, default the drafter's window or 2048)
+        if (use_dflash && !model.mtp_skipped) {
+            // the code object has no DFlash2 kernels: Model::load kept the MTP block
+            logW("{} (missing: {})", whirl::dflash::choose(whirl::dflash::Source::dflash, env("DRAFT_MODEL"), "", false).warning,
+                 model.dflashMissingKernel());
+            use_dflash = false;
+            dfile.reset();
+        }
+        std::vector<std::string> dfl_warn;
+        const whirl::dflash::Params dfl_par = whirl::dflash::parseParams([](const char* n) { return env(n); }, dfl_warn);
+        if (use_dflash)
+            for (const std::string& w : dfl_warn) logW("{}", w);
         if (use_dflash) {
             const std::string dm = *env("DRAFT_MODEL");
             const hip::MemInfo d0 = hip::memInfo();
@@ -644,9 +652,7 @@ int serveMain(int argc, char** argv, const char* program) {
             qwen35::LoadStats ds;
             const std::uint64_t wb = model.loadDrafter(df, ds);
             const auto& dc = model.dflash->cfg;
-            const std::uint32_t rows = static_cast<std::uint32_t>(
-                std::stoul(env("DFLASH_CAPTURE_ROWS").value_or(std::to_string(dc.window > 0 ? dc.window : 2048u))));
-            model.enableCapture(rows);
+            model.enableCapture(whirl::dflash::captureRows(dfl_par, dc.window, model.max_batch));
             const hip::MemInfo d1 = hip::memInfo();
             std::string tl;
             for (const std::uint32_t l : dc.target_layers) tl += (tl.empty() ? "" : ",") + std::to_string(l);
@@ -768,7 +774,7 @@ int serveMain(int argc, char** argv, const char* program) {
                  "p-min {:.2f}, n-min {}; n-gram drafts {}",
                  model.dfr->block, model.dfr->block - 1, model.dfr->ring, opt.parallel,
                  static_cast<double>(r0.free > r1.free ? r0.free - r1.free : 0) / (1024.0 * 1024.0),
-                 static_cast<double>(std::stof(env("DFLASH_PMIN").value_or("0"))), envU32("DFLASH_NMIN", 0),
+                 static_cast<double>(dfl_par.p_min), dfl_par.n_min,
                  envOn("NGRAM", true) ? "on (chosen per cycle by the cost model)" : "off");
         }
         if (model.gdn_replay) {
@@ -818,14 +824,15 @@ int serveMain(int argc, char** argv, const char* program) {
         eo.spec_sample = model.num_plan.on(numerics::Item::specsample);
         eo.relax = model.relax;
         eo.use_dflash = use_dflash;
-        if (auto v = env("DFLASH_PMIN")) {
-            try {
-                eo.dfl_p_min = std::stof(*v);
-            } catch (const std::exception&) {
-            }
+        eo.dfl_p_min = dfl_par.p_min;
+        eo.dfl_n_min = dfl_par.n_min;
+        eo.dfl_warm = dfl_par.warm;
+        if (use_dflash && eo.relax.on) {  // whirl::dflash::relaxApplies: MTP drafts only
+            // relaxacc relaxes MTP drafts only; DFlash2 and n-gram drafts keep exact acceptance, so
+            // the fast mode's other items (4-bit KV, ...) stay and the decode equals greedy of them
+            logI("relaxacc: not used with --draft dflash (DFlash2 / n-gram drafts keep exact acceptance)");
+            eo.relax.on = false;
         }
-        eo.dfl_n_min = envU32("DFLASH_NMIN", 0);
-        eo.dfl_warm = envU32("DFLASH_WARM", 64);
         eo.n_draft = drafts;
         eo.p_min = p_min;
         eo.n_min = n_min;

@@ -343,6 +343,8 @@ struct LoadOptions {
     // Optional external code object file (development: WHIRL_CODE_OBJECT).
     std::string code_object;
     // Skip the MTP (nextn) block: no weights, no KV layer (--draft dflash drafts with DFlash2).
+    // Ignored when the code object lacks the DFlash2 kernels (Model::mtp_skipped stays false):
+    // the caller then falls back to the MTP drafts.
     bool no_mtp = false;
 };
 
@@ -665,6 +667,11 @@ public:
 
     // ---- DFlash2 drafter forward (src/model/dflash.cpp); needs loadDrafter and the dflash_* kernels
     std::unique_ptr<DFlashRun> dfr;
+    // First kernel the drafter forward needs that the code object lacks ("" = all present). Both
+    // kernel sets carry kernels/dflash.hip; an old WHIRL_CODE_OBJECT may not.
+    std::string dflashMissingKernel() const;
+    // Model::load with LoadOptions::no_mtp skipped the MTP block (false: kernels missing, MTP loaded)
+    bool mtp_skipped = false;
     // Buffers for `slots` contexts (ring = the drafter's window, else 2048) and ingest batches of
     // up to `ingest_rows` rows; `debug` keeps every layer's block hidden for dflash-check.
     void dflashSetup(std::uint32_t slots, std::uint32_t ingest_rows, bool debug = false);

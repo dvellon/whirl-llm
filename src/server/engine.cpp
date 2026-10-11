@@ -6,6 +6,7 @@
 
 #include "cache/tier_adapter.h"
 #include "log.h"
+#include "whirl/dflash_policy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -383,27 +384,16 @@ void Engine::dflReset(Slot& sl, std::uint32_t at) {
 // slot sl: ingest those whose features were captured.
 void Engine::dflIngest(Slot& sl, std::uint32_t run_rows, std::uint32_t r0, std::uint32_t n, std::uint32_t pos0) {
     if (!opt_.use_dflash || n == 0) return;
-    const std::uint32_t cn = std::min(m_.captureN(), run_rows);
-    const std::uint32_t c0 = run_rows - cn;  // first captured row
-    const std::uint32_t a = std::max(r0, c0), b = r0 + n;
-    if (a >= b) {
-        // nothing of this slot's rows in the capture
-        stat_dfl_gap_ += n;
-        return;
-    }
-    const std::uint32_t p = pos0 + (a - r0);
-    if (p > sl.dfl_hi) {
-        stat_dfl_gap_ += p - sl.dfl_hi;
-        sl.dfl_lo = p;
-    } else if (p < sl.dfl_lo) {
-        sl.dfl_lo = p;
-    }
-    m_.dflashIngest(sl.id, a - c0, b - a, p);
-    sl.dfl_hi = pos0 + n;
+    ::whirl::dflash::Range rg{sl.dfl_lo, sl.dfl_hi};
+    const ::whirl::dflash::Ingest g = ::whirl::dflash::planIngest(rg, m_.captureN(), run_rows, r0, n, pos0);
+    stat_dfl_gap_ += g.gap;
+    if (g.any) m_.dflashIngest(sl.id, g.cap_row, g.n, g.pos);
+    sl.dfl_lo = rg.lo;
+    sl.dfl_hi = rg.hi;
 }
 
 bool Engine::dflReady(const Slot& sl) const {
-    return opt_.use_dflash && sl.dfl_hi == sl.pos && sl.pos - sl.dfl_lo >= std::min(sl.pos, opt_.dfl_warm);
+    return opt_.use_dflash && ::whirl::dflash::ready(::whirl::dflash::Range{sl.dfl_lo, sl.dfl_hi}, sl.pos, opt_.dfl_warm);
 }
 
 void Engine::freePages(Slot& sl) {
@@ -1754,8 +1744,7 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
     // DFlash2: drafts per slot within the shared verify rows / snapshot sets
     std::uint32_t dfl_lim = 0;
     if (opt_.use_dflash) {
-        dfl_lim = std::min({m_.dflashMaxDrafts(), qwen35::max_ng_drafts, snap_cap / Au, vrows_ / Au > 0 ? vrows_ / Au - 1 : 0u});
-        if (!m_.fusedDecode()) dfl_lim = std::min(dfl_lim, 1u);
+        dfl_lim = ::whirl::dflash::draftLimit(m_.dflashMaxDrafts() + 1, qwen35::max_ng_drafts, snap_cap, vrows_, Au, m_.fusedDecode());
     }
     const qwen35::DraftTiming& dtm = dtiming_[std::min<std::size_t>(A, gdn_max_seg)];
     if (opt_.ngram && (opt_.use_mtp || opt_.use_dflash)) {

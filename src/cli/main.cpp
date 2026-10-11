@@ -12,6 +12,7 @@
 // n-gram co-drafter) follow the WHIRL Zig research prototype (gguf_cli.zig).
 
 #include "whirl/common.h"
+#include "whirl/dflash_policy.h"
 #include "whirl/gguf.h"
 #include "whirl/hip.h"
 #include "whirl/model.h"
@@ -791,6 +792,8 @@ DecodeResult dflashDecode(q::Model& model, const Tok& tok, u32 first, u32 n_prom
     float nd_ema = static_cast<float>(d_max);
     std::array<u32, q::max_drafts> pos_tries{}, pos_hits{};
     q::NgramPolicy ngp;
+    ngp.verify_slope = opt.ngram_slope;
+    ngp.reset();
     std::vector<u32> hist;
     if (opt.ngram) {
         ngp.ng.norm = tok.crlfToLf();
@@ -908,41 +911,49 @@ void printProfile(const char* label, q::Profile& p, std::size_t n_tok) {
 
 // Runtime A/B switches shared by chat and bench (WHIRL_FLOAT_GEMV, ...).
 // --draft dflash: true when WHIRL_DRAFT_MODEL holds a DFlash2 drafter that fits this model
-// (headers only, before loading); otherwise a warning and the MTP drafts.
+// (headers only, before loading); otherwise a warning and the MTP drafts (whirl/dflash_policy.h).
 bool wantDFlash(const Args& a, const gguf::File& f) {
     const std::string mode = a.get("--draft") ? *a.get("--draft") : std::string("mtp");
-    if (mode != "mtp" && mode != "dflash") throw std::runtime_error("--draft must be mtp or dflash");
-    if (mode == "mtp") return false;
+    const auto src = whirl::dflash::parseSource(mode);
+    if (!src) throw std::runtime_error("--draft must be mtp or dflash");
     const auto dm = envGet("DRAFT_MODEL");
-    if (!dm) {
-        std::fprintf(stderr, "warning: --draft dflash needs the DFlash2 drafter GGUF in WHIRL_DRAFT_MODEL: using MTP drafts\n");
-        return false;
-    }
-    const gguf::File df = gguf::File::open(*dm);
-    const std::string why = q::dflashIncompatible(f, df);
-    if (!why.empty()) {
-        std::fprintf(stderr, "warning: --draft dflash: %s does not fit this model (%s): using MTP drafts\n", dm->c_str(), why.c_str());
-        return false;
-    }
-    return true;
+    std::string why;
+    if (*src == whirl::dflash::Source::dflash && dm) why = q::dflashIncompatible(f, gguf::File::open(*dm));
+    const whirl::dflash::Choice c = whirl::dflash::choose(*src, dm, why, true);
+    if (!c.warning.empty()) std::fprintf(stderr, "warning: %s
+", c.warning.c_str());
+    return c.source == whirl::dflash::Source::dflash;
 }
 
 // WHIRL_DRAFT_MODEL (--draft dflash): DFlash2 drafter GGUF, the hidden capture of its target layers
-// and the drafter context of one sequence.
-void loadDraftModelEnv(q::Model& m) {
+// and the drafter context of one sequence. false: the code object has no DFlash2 kernels, so
+// Model::load kept the MTP block (warning printed; the caller drafts with MTP).
+bool loadDraftModelEnv(q::Model& m) {
+    if (!m.mtp_skipped) {
+        const whirl::dflash::Choice c = whirl::dflash::choose(whirl::dflash::Source::dflash, envGet("DRAFT_MODEL"), "", false);
+        std::fprintf(stderr, "warning: %s (missing: %s)
+", c.warning.c_str(), m.dflashMissingKernel().c_str());
+        return false;
+    }
     const auto dm = envGet("DRAFT_MODEL");
-    if (!dm || m.dflash) return;
+    if (!dm || m.dflash) return m.dflash != nullptr;
+    std::vector<std::string> warn;
+    const whirl::dflash::Params dp = whirl::dflash::parseParams([](const char* n) { return envGet(n); }, warn);
+    for (const std::string& w : warn) std::fprintf(stderr, "warning: %s
+", w.c_str());
     const hip::MemInfo d0 = hip::memInfo();
     const gguf::File df = gguf::File::open(*dm);
     q::LoadStats ds;
     const u64 wb = m.loadDrafter(df, ds);
     const auto& dc = m.dflash->cfg;
-    m.enableCapture(envU32("DFLASH_CAPTURE_ROWS").value_or(dc.window > 0 ? dc.window : 2048u));
+    m.enableCapture(whirl::dflash::captureRows(dp, dc.window, m.max_batch));
     m.dflashSetup(1, m.cap_rows);
     const hip::MemInfo d1 = hip::memInfo();
-    std::fprintf(stderr, "draft model %s: DFlash2, %u layers, block %u, weights %.2f GiB, capture %u rows, VRAM +%.2f GiB (MTP block not loaded)\n",
+    std::fprintf(stderr, "draft model %s: DFlash2, %u layers, block %u, weights %.2f GiB, capture %u rows, VRAM +%.2f GiB (MTP block not loaded)
+",
                  dm->c_str(), dc.n_layer, dc.block, static_cast<double>(wb) / (1024.0 * 1024.0 * 1024.0), m.cap_rows,
                  static_cast<double>(d0.free > d1.free ? d0.free - d1.free : 0) / (1024.0 * 1024.0 * 1024.0));
+    return true;
 }
 
 void applyRuntimeEnv(q::Model& m) {
@@ -1072,14 +1083,17 @@ ChatOpts mtpOpts(const q::Model& model, ChatOpts base, u32* drafts_out) {
     return base;
 }
 
-// --draft dflash: the walk cutoffs and the n-gram switches (the same environment as MTP)
-ChatOpts dflashOpts(ChatOpts base) {
-    if (auto v = envGet("DFLASH_PMIN")) base.dfl_p_min = std::stof(*v);
-    if (auto v = envGet("DFLASH_NMIN")) base.dfl_n_min = static_cast<u32>(std::strtoul(v->c_str(), nullptr, 10));
-    if (auto v = envGet("NGRAM")) base.ngram = *v != "0";
-    if (auto v = envGet("NGRAM_MIN")) base.ngram_min = static_cast<u32>(std::strtoul(v->c_str(), nullptr, 10));
-    if (auto v = envGet("NGRAM_MAX")) base.ngram_max = static_cast<u32>(std::strtoul(v->c_str(), nullptr, 10));
-    if (auto v = envGet("NGRAM_FORCE")) base.ngram_force = *v != "0";
+// --draft dflash: the walk cutoffs (whirl/dflash_policy.h) and the n-gram settings, with the same
+// per-model defaults and environment as the MTP path (mtpOpts)
+ChatOpts dflashOpts(const q::Model& model, ChatOpts base) {
+    u32 unused = 0;
+    base = mtpOpts(model, base, &unused);
+    std::vector<std::string> warn;
+    const whirl::dflash::Params dp = whirl::dflash::parseParams([](const char* n) { return envGet(n); }, warn);
+    for (const std::string& w : warn) std::fprintf(stderr, "warning: %s
+", w.c_str());
+    base.dfl_p_min = dp.p_min;
+    base.dfl_n_min = dp.n_min;
     return base;
 }
 
@@ -1196,7 +1210,7 @@ int cmdChat(const Args& a) {
     if (ids.size() + opt.max_tokens > opt.max_ctx) throw q::ModelError("ContextTooLong");
 
     const bool ctx_given = a.get("--ctx") != nullptr || envU32("MAX_CTX").has_value();
-    const bool use_dflash = logits_out == nullptr && wantDFlash(a, f);
+    bool use_dflash = logits_out == nullptr && wantDFlash(a, f);
     Loaded L = loadModel(a, f, opt.max_ctx, ctx_given, static_cast<u32>(ids.size()) + opt.max_tokens, use_dflash);
     opt.max_ctx = L.model->max_ctx;  // precise: may be lowered to what f16 KV fits
     q::Model& model = *L.model;
@@ -1243,7 +1257,7 @@ int cmdChat(const Args& a) {
     const bool profiling = envGet("PROFILE").has_value();
     if (profiling) model.prof = &prof;
     applyRuntimeEnv(model);
-    if (use_dflash) loadDraftModelEnv(model);
+    if (use_dflash) use_dflash = loadDraftModelEnv(model);
 
     // MTP speculative decode is exact greedy: on whenever the checkpoint has a nextn
     // layer; WHIRL_MTP=0 turns it off.
@@ -1330,7 +1344,7 @@ int cmdChat(const Args& a) {
             printProfile("prefill", prof, ids.size());
             prof.reset();
         }
-        const ChatOpts dopt = dflashOpts(opt);
+        const ChatOpts dopt = dflashOpts(model, opt);
         const DecodeResult r = dflashDecode(model, tok, next, static_cast<u32>(ids.size()), dopt, ids);
         printSpecSummary(r, ids.size(), prefill_ms, dopt, "DFlash2 spec");
         if (envGet("PRINT_IDS")) {
@@ -1430,7 +1444,7 @@ int cmdBench(const Args& a) {
     u32 max_size = 0;
     for (u32 s : sizes) max_size = std::max(max_size, s);
     const u32 ctx = std::max<u32>(max_size + 64, static_cast<u32>(dec_ids.size()) + n_dec + 64);
-    const bool use_dflash = wantDFlash(a, f);
+    bool use_dflash = wantDFlash(a, f);
     if (dflash_req && !use_dflash && !a.get("--modes")) modes = {"mtp-ngram", "mtp", "plain"};
     Loaded L = loadModel(a, f, ctx, true, 0, use_dflash);
     q::Model& model = *L.model;
@@ -1442,7 +1456,10 @@ int cmdBench(const Args& a) {
     if (envFlag("MTP_Q4", true)) model.requantMtpQ4();
     loadLog(model, L.stats);
     applyRuntimeEnv(model);
-    if (use_dflash) loadDraftModelEnv(model);
+    if (use_dflash) {
+        use_dflash = loadDraftModelEnv(model);
+        if (!use_dflash && !a.get("--modes")) modes = {"mtp-ngram", "mtp", "plain"};
+    }
     const bool has_mtp = model.mtp.has_value() && envFlag("MTP", true);
 
     // prefill sweep: a long mixed zh/en coding text, truncated to each size
@@ -1543,7 +1560,7 @@ int cmdBench(const Args& a) {
             out(fmt("\n    plain (no MTP)  : %4u tok in %7.0f ms  %7.2f tok/s  hash %016llx\n", r.steps, r.decode_ms, tps,
                     static_cast<unsigned long long>(fnv(r.tokens))));
         } else if (dfl_mode) {
-            ChatOpts dop = dflashOpts(opt);
+            ChatOpts dop = dflashOpts(model, opt);
             dop.ngram = mode == "dflash-ngram";
             r = dflashDecode(model, tok, next, static_cast<u32>(dec_ids.size()), dop, dec_ids);
             out(fmt("\n    %-16s: %4zu tok in %7.0f ms  %7.2f tok/s  %.2f tok/cycle  drafts %u/%u  hash %016llx\n",
@@ -1992,7 +2009,7 @@ int cmdDflashCheck(const Args& a) {
     if (a.pos.size() < 3) throw std::runtime_error("dflash-check: usage: whirl dflash-check MODEL.gguf DRAFT.gguf REFDIR");
     gguf::File f = gguf::File::open(a.pos[0]);
     selectDevice(a, nullptr);
-    Loaded L = loadModel(f, 4096);
+    Loaded L = loadModel(a, f, 4096);
     q::Model& m = *L.model;
     const gguf::File df = gguf::File::open(a.pos[1]);
     q::LoadStats ds;

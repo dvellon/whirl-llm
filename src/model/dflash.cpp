@@ -6,6 +6,7 @@
 // (whirl chat / bench) and ServerModel (whirl-server).
 
 #include "whirl/model.h"
+#include "whirl/dflash_policy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -24,14 +25,24 @@ inline i32 I(u64 v) { return static_cast<i32>(v); }
 
 }  // namespace
 
+std::string Model::dflashMissingKernel() const {
+    const std::pair<const char*, hip::Function> need[] = {{"dflash_conv", k.dflash_conv},   {"dflash_topk", k.dflash_topk},
+                                                          {"dflash_lattice", k.dflash_lattice}, {"dflash_walk", k.dflash_walk},
+                                                          {"dflash_attn", k.dflash_attn},   {"rope_neox", k.rope_neox},
+                                                          {"add_inplace", k.add_inplace},   {"silu_mul", k.silu_mul},
+                                                          {"rmsnorm", k.rmsnorm}};
+    for (const auto& [name, f] : need)
+        if (f == nullptr) return name;
+    if (k.get_rows[static_cast<std::size_t>(tok_embd.ty) % n_types] == nullptr) return "get_rows";
+    return {};
+}
+
 void Model::dflashSetup(u32 slots, u32 ingest_rows, bool debug) {
     if (!dflash) throw ModelError("NoDraftModel", "dflashSetup before loadDrafter");
-    if (!k.dflash_conv || !k.dflash_topk || !k.dflash_lattice || !k.dflash_walk || !k.dflash_attn || !k.rope_neox || !k.add_inplace ||
-        !k.silu_mul || !k.get_rows[static_cast<std::size_t>(tok_embd.ty) % n_types])
-        throw ModelError("MissingKernel", "dflash_* (DFlash2 drafter kernels)");
+    if (const std::string miss = dflashMissingKernel(); !miss.empty()) throw ModelError("MissingKernel", miss + " (DFlash2 drafter kernels)");
     const DFlashConfig& c = dflash->cfg;
     auto r = std::make_unique<DFlashRun>();
-    r->ring = c.window > 0 ? c.window : 2048;
+    r->ring = ::whirl::dflash::ringRows(c.window);
     r->block = c.block;
     // keys of the drafter attention: dflash_attn holds up to kDFlashAttnKeys, longer rings (e.g. Ornith's
     // 4096-row window) need dflash_attn_long (validate() already refused anything past kDFlashMaxKeys)
@@ -125,12 +136,12 @@ void Model::dflashIngest(u32 slot, DevPtr feats, u32 stride, u32 row0, u32 n, u3
             hip::launch(k.rope_neox, D(c.n_head_kv, m), D(64), 0, stream, r.ing_k, r.ing_pos, I(c.head_dim), I(kvw), I(c.head_dim),
                         theta_scale);
             // rows go to ring index position % ring (at most two contiguous pieces)
-            const u32 start = p0 % r.ring, first = std::min(m, r.ring - start);
-            hip::copyAsync(sc.kc[l] + start * kvw * 4, r.ing_k, first * kvw * 4, stream);
-            hip::copyAsync(sc.vc[l] + start * kvw * 4, r.ing_v, first * kvw * 4, stream);
-            if (m > first) {
-                hip::copyAsync(sc.kc[l], r.ing_k + first * kvw * 4, (m - first) * kvw * 4, stream);
-                hip::copyAsync(sc.vc[l], r.ing_v + first * kvw * 4, (m - first) * kvw * 4, stream);
+            const ::whirl::dflash::RingPieces rp = ::whirl::dflash::ringPieces(p0, m, r.ring);
+            hip::copyAsync(sc.kc[l] + rp.start * kvw * 4, r.ing_k, rp.first * kvw * 4, stream);
+            hip::copyAsync(sc.vc[l] + rp.start * kvw * 4, r.ing_v, rp.first * kvw * 4, stream);
+            if (rp.second > 0) {
+                hip::copyAsync(sc.kc[l], r.ing_k + rp.first * kvw * 4, rp.second * kvw * 4, stream);
+                hip::copyAsync(sc.vc[l], r.ing_v + rp.first * kvw * 4, rp.second * kvw * 4, stream);
             }
         }
         for (u32 i = 0; i < m; ++i) sc.cpos_h[(p0 + i) % r.ring] = static_cast<i32>(p0 + i);

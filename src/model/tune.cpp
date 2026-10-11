@@ -634,8 +634,7 @@ bool Model::checkPreciseDecode(std::string& log) {
     return all_ok;
 }
 
-// attn_wsplit consistency: the grouped (verify) launch must give every query
-// the same partials, bit for bit, as its own one-query launch.
+// DFlash2 hidden capture: captureLayerInput copies exactly x into each slot.
 bool Model::checkCapture(std::string& log) {
     // capture slots for the embeddings, a middle layer and the last layer output
     const std::vector<u32> keep_ids = dflash ? dflash->cfg.target_layers : std::vector<u32>{};
@@ -662,6 +661,8 @@ bool Model::checkCapture(std::string& log) {
     return ok;
 }
 
+// attn_wsplit consistency: the grouped (verify) launch must give every query
+// the same partials, bit for bit, as its own one-query launch.
 bool Model::checkAttnGroups(std::string& log, u32 p0, u32 n, bool wide) {
     const u32 hd = cfg.head_dim;
     if (k.attn_wsplit1 == nullptr || hd != 256) return true;

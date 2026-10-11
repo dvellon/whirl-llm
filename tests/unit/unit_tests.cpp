@@ -10,6 +10,7 @@
 #include "whirl/numerics.h"
 #include "whirl/spec_sample.h"
 #include "whirl/relax_accept.h"
+#include "whirl/dflash_policy.h"
 #include "whirl/vram_limit.h"
 
 #include "../../kernels/gemm_small_addr.h"
@@ -21,6 +22,7 @@
 #include <optional>
 #include <stdexcept>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -1299,6 +1301,141 @@ void testSpecSample() {
     runOpen(tl, 1.f / 1.5f, 3, N);
     testReplies();
 }
+// ---------------------------------------------------------------------------
+// DFlash2 host policy (whirl/dflash_policy.h): draft-source choice, environment, capture /
+// ring sizing, draft limit, the server slot's context range and ingest plan
+void testDflashPolicy() {
+    namespace d = whirl::dflash;
+    // --draft parsing
+    CHECK(d::parseSource("mtp") == d::Source::mtp);
+    CHECK(d::parseSource("dflash") == d::Source::dflash);
+    CHECK(!d::parseSource("DFlash") && !d::parseSource("") && !d::parseSource("eagle"));
+    CHECK_EQ(std::string(d::sourceName(d::Source::dflash)), std::string("dflash"));
+    // choice: mtp stays mtp (a set WHIRL_DRAFT_MODEL is reported, not loaded)
+    const std::optional<std::string> dm = std::string("D:/m/dflash2-q8_0.gguf"), none;
+    {
+        const d::Choice c = d::choose(d::Source::mtp, none, "", true);
+        CHECK(c.source == d::Source::mtp && c.warning.empty());
+        const d::Choice c2 = d::choose(d::Source::mtp, dm, "", true);
+        CHECK(c2.source == d::Source::mtp && c2.warning.find("not loaded") != std::string::npos);
+    }
+    // dflash: every fallback is mtp with a reason; all conditions met -> dflash, silent
+    CHECK(d::choose(d::Source::dflash, dm, "", true).source == d::Source::dflash);
+    CHECK(d::choose(d::Source::dflash, dm, "", true).warning.empty());
+    {
+        const d::Choice c = d::choose(d::Source::dflash, none, "", true);
+        CHECK(c.source == d::Source::mtp && c.warning.find("WHIRL_DRAFT_MODEL") != std::string::npos);
+        const d::Choice c2 = d::choose(d::Source::dflash, dm, "hidden size 2048 != target 5120", true);
+        CHECK(c2.source == d::Source::mtp && c2.warning.find("hidden size 2048") != std::string::npos &&
+              c2.warning.find("dflash2-q8_0.gguf") != std::string::npos);
+        const d::Choice c3 = d::choose(d::Source::dflash, dm, "", false);
+        CHECK(c3.source == d::Source::mtp && c3.warning.find("dflash_") != std::string::npos);
+        // an incompatible drafter is reported before missing kernels
+        CHECK(d::choose(d::Source::dflash, dm, "x", false).warning.find("does not fit") != std::string::npos);
+    }
+    // relaxacc: MTP drafts only (DFlash2 keeps exact acceptance in fast mode)
+    CHECK(d::relaxApplies(d::Source::mtp, true) && !d::relaxApplies(d::Source::mtp, false));
+    CHECK(!d::relaxApplies(d::Source::dflash, true) && !d::relaxApplies(d::Source::dflash, false));
+    // environment
+    {
+        std::map<std::string, std::string> envm;
+        auto env = [&](const char* n) -> std::optional<std::string> {
+            auto it = envm.find(n);
+            if (it == envm.end()) return std::nullopt;
+            return it->second;
+        };
+        std::vector<std::string> w;
+        d::Params p = d::parseParams(env, w);
+        CHECK(w.empty() && p.p_min == 0.0f && p.n_min == 0 && p.warm == 64 && !p.capture_rows);
+        envm = {{"DFLASH_PMIN", "0.25"}, {"DFLASH_NMIN", "2"}, {"DFLASH_WARM", "0"}, {"DFLASH_CAPTURE_ROWS", "512"}};
+        p = d::parseParams(env, w);
+        CHECK(w.empty() && std::fabs(p.p_min - 0.25f) < 1e-7f && p.n_min == 2 && p.warm == 0 && p.capture_rows && *p.capture_rows == 512);
+        envm = {{"DFLASH_PMIN", "1.5"}, {"DFLASH_NMIN", "-1"}, {"DFLASH_WARM", "6x"}, {"DFLASH_CAPTURE_ROWS", "0"}};
+        p = d::parseParams(env, w);
+        CHECK_EQ(w.size(), std::size_t{4});
+        CHECK(p.p_min == 0.0f && p.n_min == 0 && p.warm == 64 && !p.capture_rows);
+        w.clear();
+        envm = {{"DFLASH_PMIN", "1"}, {"DFLASH_NMIN", "99999999999"}, {"DFLASH_PMIN_X", "z"}};
+        p = d::parseParams(env, w);
+        CHECK(p.p_min == 1.0f && w.size() == 1 && w[0].find("DFLASH_NMIN") != std::string::npos);
+        w.clear();
+        envm = {{"DFLASH_PMIN", ".5"}};
+        CHECK(d::parseParams(env, w).p_min == 0.5f && w.empty());
+        envm = {{"DFLASH_PMIN", "."}};
+        CHECK(d::parseParams(env, w).p_min == 0.0f && w.size() == 1);
+        w.clear();
+        envm = {{"DFLASH_PMIN", "0.1.2"}};
+        CHECK(d::parseParams(env, w).p_min == 0.0f && w.size() == 1);
+    }
+    // capture rows / ring: the window (2048 without one), the batch caps the capture
+    {
+        d::Params p;
+        CHECK_EQ(d::captureRows(p, 2048, 4096), 2048u);
+        CHECK_EQ(d::captureRows(p, 0, 4096), 2048u);
+        CHECK_EQ(d::captureRows(p, 4096, 1024), 1024u);
+        p.capture_rows = 300;
+        CHECK_EQ(d::captureRows(p, 2048, 4096), 300u);
+        CHECK_EQ(d::ringRows(0), 2048u);
+        CHECK_EQ(d::ringRows(4096), 4096u);
+    }
+    // ring pieces: wrap at the end, never more than the ring
+    {
+        d::RingPieces r = d::ringPieces(10, 5, 2048);
+        CHECK(r.start == 10 && r.first == 5 && r.second == 0);
+        r = d::ringPieces(2046, 5, 2048);
+        CHECK(r.start == 2046 && r.first == 2 && r.second == 3);
+        r = d::ringPieces(4096, 7, 2048);
+        CHECK(r.start == 0 && r.first == 7 && r.second == 0);
+        r = d::ringPieces(5, 3000, 2048);
+        CHECK(r.start == 5 && r.first == 2043 && r.second == 5 && r.first + r.second == 2048);
+        r = d::ringPieces(5, 0, 2048);
+        CHECK(r.first == 0 && r.second == 0);
+    }
+    // draft limit: block 8 -> 7 drafts solo; shared verify rows / snapshots per slot; unfused 1
+    {
+        CHECK_EQ(d::draftLimit(8, 15, 15, 16, 1, true), 7u);
+        CHECK_EQ(d::draftLimit(16, 15, 15, 16, 1, true), 15u);
+        CHECK_EQ(d::draftLimit(8, 15, 15, 16, 2, true), 7u);
+        CHECK_EQ(d::draftLimit(8, 15, 15, 16, 4, true), 3u);   // 16 rows / 4 slots - own row
+        CHECK_EQ(d::draftLimit(8, 15, 15, 32, 4, true), 3u);   // snapshots 15 / 4
+        CHECK_EQ(d::draftLimit(8, 15, 32, 32, 4, true), 7u);   // replay: snap_cap = vrows
+        CHECK_EQ(d::draftLimit(8, 15, 15, 16, 1, false), 1u);
+        CHECK_EQ(d::draftLimit(1, 15, 15, 16, 1, true), 0u);   // no drafter
+        CHECK_EQ(d::draftLimit(8, 15, 15, 16, 0, true), 0u);
+        CHECK_EQ(d::draftLimit(8, 15, 15, 16, 17, true), 0u);
+    }
+    // slot range + ingest plan (Engine::dflIngest / dflReady)
+    {
+        d::Range r;
+        // prefill 0..99 in one forward, all captured
+        d::Ingest g = d::planIngest(r, 100, 100, 0, 100, 0);
+        CHECK(g.any && g.cap_row == 0 && g.n == 100 && g.pos == 0 && g.gap == 0 && r.lo == 0 && r.hi == 100);
+        CHECK(d::ready(r, 100, 64) && !d::ready(r, 101, 64));
+        // verify of 8 rows (slot rows 0..7), kept 3: positions 100..102
+        g = d::planIngest(r, 8, 8, 0, 3, 100);
+        CHECK(g.any && g.cap_row == 0 && g.n == 3 && g.pos == 100 && r.hi == 103 && r.lo == 0);
+        // batched verify: this slot is rows 8..15 of 24, the capture holds the last 16 rows (8..23)
+        g = d::planIngest(r, 16, 24, 8, 2, 103);
+        CHECK(g.any && g.cap_row == 0 && g.n == 2 && g.pos == 103 && r.hi == 105);
+        // capture of only the last 4 rows of a 2048-row chunk: a gap, the run restarts
+        g = d::planIngest(r, 4, 2048, 0, 2048, 105);
+        CHECK(g.any && g.cap_row == 0 && g.n == 4 && g.pos == 105 + 2044 && g.gap == 2044 && r.lo == 2149 && r.hi == 2153);
+        CHECK(!d::ready(r, 2153, 64) && d::ready(r, 2153, 4) && d::ready(r, 2153, 0));
+        // rows entirely outside the capture: gap counted, range untouched
+        const d::Range before = r;
+        g = d::planIngest(r, 4, 16, 0, 8, 2153);
+        CHECK(!g.any && g.gap == 8 && r.lo == before.lo && r.hi == before.hi);
+        // restore point (dflReset at 500): ready after warm rows
+        r = d::Range{500, 500};
+        CHECK(!d::ready(r, 500, 64));
+        g = d::planIngest(r, 64, 64, 0, 64, 500);
+        CHECK(d::ready(r, 564, 64) && r.lo == 500);
+        d::Range r0{0, 10};
+        CHECK(d::ready(r0, 10, 64));  // short prompt: min(pos, warm)
+        CHECK_EQ(d::planIngest(r0, 8, 8, 0, 0, 10).n, 0u);
+    }
+}
+
 }  // namespace specsample_test
 
 int main() {
@@ -1315,6 +1452,7 @@ int main() {
     testKvChoice();
     testKernelFetchBounds();
     specsample_test::testSpecSample();
+    testDflashPolicy();
     std::printf("unit tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

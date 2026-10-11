@@ -45,7 +45,6 @@
 #include "gemv_h.hip"              // precise decode / verify matmul (f16 activations)
 #include "moe_mxfp4.hip"           // MXFP4 routed experts (decode, fp8 grouped GEMM)
 #include "moe_f.hip"               // precise MoE decode experts (f32 activations)
-#include "dflash.hip"              // DFlash2 drafter: dynamic conv, top-k, selector lattice / walk
 #endif
 
 #if defined(__gfx1151__)
@@ -53,3 +52,5 @@
 #endif
 
 #include "spec_sample.hip"           // speculative sampling of MTP drafts (both kernel sets)
+#include "dflash.hip"                // DFlash2 drafter: dynamic conv, top-k, selector lattice / walk, attention
+                                     // (both kernel sets: plain f32 code, h2f from either common.hip)

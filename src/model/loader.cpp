@@ -565,7 +565,9 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
             m.ssm_state[il] = m.allocZero(static_cast<u64>(cfg.n_v_heads) * cfg.d_state * cfg.headV() * 4);
         }
     }
-    if (!opt.no_mtp && cfg.n_nextn > 0 && f.tensor(Loader::bn(cfg.n_layer, "nextn.eh_proj.weight")) != nullptr) {
+    // --draft dflash: no MTP block, unless the drafter could not run (no dflash_* kernels)
+    m.mtp_skipped = opt.no_mtp && m.dflashMissingKernel().empty();
+    if (!m.mtp_skipped && cfg.n_nextn > 0 && f.tensor(Loader::bn(cfg.n_layer, "nextn.eh_proj.weight")) != nullptr) {
         const u32 il = cfg.n_layer;
         auto n = [&](const char* s) { return Loader::bn(il, s); };
         MtpW w;
