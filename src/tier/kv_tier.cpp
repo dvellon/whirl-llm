@@ -318,6 +318,12 @@ void Tier::start(const Config& cfg_in, const Layout& lay_in, std::uint64_t finge
                 if (log_fn) log_fn("kv tier: the SSD directory is in use by another WHIRL server; SSD tier off for this one");
                 return;
             }
+            // any other failure (access denied, bad path, ...): without the lock a second server
+            // could share the directory and evict this one's files, so the SSD tier stays off
+            // (the RAM tier is unaffected)
+            if (log_fn)
+                log_fn(fmt("kv tier: cannot lock the SSD directory (Windows error %lu); SSD tier off", static_cast<unsigned long>(GetLastError())));
+            return;
         } else {
             const std::string pid = std::to_string(GetCurrentProcessId());
             DWORD w = 0;

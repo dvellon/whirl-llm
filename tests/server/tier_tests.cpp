@@ -1341,6 +1341,34 @@ static void testRestoreCopyThrows(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+// TIER-LOCK-FAILOPEN: when the directory lock cannot be taken for a reason other than another
+// server holding it (here: whirl.lock is a directory -> access denied), the SSD tier stays off
+// instead of running unlocked.
+static void testLockFailClosed(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / L"whirl.lock", ec);
+    CHECK(!ec);
+    SsdEnv env{dir};
+    std::vector<std::string> logs;
+    {
+        auto t = Tier::create(ops, 32ull << 20, 5, 0);
+        t->log_fn = [&](std::string_view s) { logs.emplace_back(s); };
+        t->start(env.cfg(1ull << 30), kLay, 5);
+        CHECK(!t->hasSsd());
+        CHECK(!t->ssdDirBusy());  // not "another server": a different failure
+        CHECK(!logs.empty() && logs.back().find("cannot lock") != std::string::npos);
+        // the RAM tier still works
+        DevSlot src(ops, 1, 2);
+        src.fill(5);
+        Entry* e = spill(*t, src, makeTokens(300, 3));
+        CHECK(e != nullptr);
+        CHECK(tickIdle(*t));
+        CHECK(countFiles(dir) == 0);
+    }
+    fs::remove_all(dir, ec);
+}
+
 static void testSupersedeTrim(MockDeviceOps& ops, const fs::path& dir) {
     std::error_code ec;
     fs::remove_all(dir, ec);
@@ -1581,6 +1609,8 @@ int main(int argc, char** argv) {
     testSsdTruncated(ops, dir);
     std::printf("-- %s\n", "testRestoreCopyThrows");
     testRestoreCopyThrows(ops, dir);
+    std::printf("-- %s\n", "testLockFailClosed");
+    testLockFailClosed(ops, dir);
     std::printf("-- %s\n", "testSupersedeTrim");
     testSupersedeTrim(ops, dir);
     std::printf("-- %s\n", "testWorkflows");
