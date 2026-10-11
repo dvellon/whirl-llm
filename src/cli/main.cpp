@@ -36,6 +36,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
@@ -920,8 +921,7 @@ bool wantDFlash(const Args& a, const gguf::File& f) {
     std::string why;
     if (*src == whirl::dflash::Source::dflash && dm) why = q::dflashIncompatible(f, gguf::File::open(*dm));
     const whirl::dflash::Choice c = whirl::dflash::choose(*src, dm, why, true);
-    if (!c.warning.empty()) std::fprintf(stderr, "warning: %s
-", c.warning.c_str());
+    if (!c.warning.empty()) std::fprintf(stderr, "warning: %s\n", c.warning.c_str());
     return c.source == whirl::dflash::Source::dflash;
 }
 
@@ -931,16 +931,14 @@ bool wantDFlash(const Args& a, const gguf::File& f) {
 bool loadDraftModelEnv(q::Model& m) {
     if (!m.mtp_skipped) {
         const whirl::dflash::Choice c = whirl::dflash::choose(whirl::dflash::Source::dflash, envGet("DRAFT_MODEL"), "", false);
-        std::fprintf(stderr, "warning: %s (missing: %s)
-", c.warning.c_str(), m.dflashMissingKernel().c_str());
+        std::fprintf(stderr, "warning: %s (missing: %s)\n", c.warning.c_str(), m.dflashMissingKernel().c_str());
         return false;
     }
     const auto dm = envGet("DRAFT_MODEL");
     if (!dm || m.dflash) return m.dflash != nullptr;
     std::vector<std::string> warn;
     const whirl::dflash::Params dp = whirl::dflash::parseParams([](const char* n) { return envGet(n); }, warn);
-    for (const std::string& w : warn) std::fprintf(stderr, "warning: %s
-", w.c_str());
+    for (const std::string& w : warn) std::fprintf(stderr, "warning: %s\n", w.c_str());
     const hip::MemInfo d0 = hip::memInfo();
     const gguf::File df = gguf::File::open(*dm);
     q::LoadStats ds;
@@ -949,8 +947,7 @@ bool loadDraftModelEnv(q::Model& m) {
     m.enableCapture(whirl::dflash::captureRows(dp, dc.window, m.max_batch));
     m.dflashSetup(1, m.cap_rows);
     const hip::MemInfo d1 = hip::memInfo();
-    std::fprintf(stderr, "draft model %s: DFlash2, %u layers, block %u, weights %.2f GiB, capture %u rows, VRAM +%.2f GiB (MTP block not loaded)
-",
+    std::fprintf(stderr, "draft model %s: DFlash2, %u layers, block %u, weights %.2f GiB, capture %u rows, VRAM +%.2f GiB (MTP block not loaded)\n",
                  dm->c_str(), dc.n_layer, dc.block, static_cast<double>(wb) / (1024.0 * 1024.0 * 1024.0), m.cap_rows,
                  static_cast<double>(d0.free > d1.free ? d0.free - d1.free : 0) / (1024.0 * 1024.0 * 1024.0));
     return true;
@@ -1083,6 +1080,43 @@ ChatOpts mtpOpts(const q::Model& model, ChatOpts base, u32* drafts_out) {
     return base;
 }
 
+// WHIRL_DFLASH_DUMP=DIR (whirl chat --draft dflash, GPU phase reference check): the target features
+// the capture holds after the prompt (its last chunk: use --no-think so the prompt is not split
+// before its last token) as DIR/feats.npy [n_ctx][n_target_layers * n_embd] f32 (the input layout of
+// whirl-cloud tools/dflash_ref/ref_drafter.py) and DIR/dump_meta.txt (n_ctx, ctx_pos0, anchor,
+// anchor_pos: its --ctx-pos0 / --anchor / --anchor-pos). export_check.py then writes the REFDIR of
+// whirl dflash-check.
+void dflashDumpFeatures(q::Model& m, const std::string& dir, u32 anchor, u32 anchor_pos) {
+    if (!m.cap_buf || !m.dflash || m.cap_n == 0) {
+        std::fprintf(stderr, "warning: WHIRL_DFLASH_DUMP: no captured rows\n");
+        return;
+    }
+    const u64 E = m.cfg.n_embd, L = m.dflash->cfg.target_layers.size(), n = m.cap_n;
+    std::vector<float> lm(static_cast<std::size_t>(L * n * E));
+    hip::streamSync(m.stream);
+    for (u64 j = 0; j < L; ++j)
+        hip::download(lm.data() + j * n * E, m.cap_buf + j * m.cap_rows * E * 4, static_cast<std::size_t>(n * E * 4));
+    std::vector<float> pm(lm.size());  // position-major: row r = concat over layers
+    for (u64 r = 0; r < n; ++r)
+        for (u64 j = 0; j < L; ++j) std::memcpy(&pm[(r * L + j) * E], &lm[(j * n + r) * E], static_cast<std::size_t>(E * 4));
+    std::filesystem::create_directories(std::filesystem::path(widen(dir)));
+    std::string hdr = "{'descr': '<f4', 'fortran_order': False, 'shape': (" + std::to_string(n) + ", " + std::to_string(L * E) + "), }";
+    while ((10 + hdr.size() + 1) % 64 != 0) hdr += ' ';
+    hdr += '\n';
+    std::string npy = "\x93NUMPY";
+    npy += static_cast<char>(1);
+    npy += static_cast<char>(0);
+    npy += static_cast<char>(hdr.size() & 0xff);
+    npy += static_cast<char>((hdr.size() >> 8) & 0xff);
+    npy += hdr;
+    npy.append(reinterpret_cast<const char*>(pm.data()), pm.size() * 4);
+    writeFile(dir + "/feats.npy", npy);
+    writeFile(dir + "/dump_meta.txt", "n_ctx " + std::to_string(n) + "\nctx_pos0 " + std::to_string(anchor_pos - n) + "\nanchor " +
+                                          std::to_string(anchor) + "\nanchor_pos " + std::to_string(anchor_pos) + "\n");
+    std::fprintf(stderr, "WHIRL_DFLASH_DUMP: %llu rows x %llu target layers -> %s (anchor %u at %u)\n", static_cast<unsigned long long>(n),
+                 static_cast<unsigned long long>(L), dir.c_str(), anchor, anchor_pos);
+}
+
 // --draft dflash: the walk cutoffs (whirl/dflash_policy.h) and the n-gram settings, with the same
 // per-model defaults and environment as the MTP path (mtpOpts)
 ChatOpts dflashOpts(const q::Model& model, ChatOpts base) {
@@ -1090,8 +1124,7 @@ ChatOpts dflashOpts(const q::Model& model, ChatOpts base) {
     base = mtpOpts(model, base, &unused);
     std::vector<std::string> warn;
     const whirl::dflash::Params dp = whirl::dflash::parseParams([](const char* n) { return envGet(n); }, warn);
-    for (const std::string& w : warn) std::fprintf(stderr, "warning: %s
-", w.c_str());
+    for (const std::string& w : warn) std::fprintf(stderr, "warning: %s\n", w.c_str());
     base.dfl_p_min = dp.p_min;
     base.dfl_n_min = dp.n_min;
     return base;
@@ -1344,6 +1377,7 @@ int cmdChat(const Args& a) {
             printProfile("prefill", prof, ids.size());
             prof.reset();
         }
+        if (auto dir = envGet("DFLASH_DUMP")) dflashDumpFeatures(model, *dir, next, static_cast<u32>(ids.size()));
         const ChatOpts dopt = dflashOpts(model, opt);
         const DecodeResult r = dflashDecode(model, tok, next, static_cast<u32>(ids.size()), dopt, ids);
         printSpecSummary(r, ids.size(), prefill_ms, dopt, "DFlash2 spec");

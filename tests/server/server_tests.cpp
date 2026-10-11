@@ -1043,6 +1043,26 @@ void testDFlashGreedy() {
     }
 }
 
+// fast mode's relaxacc relaxes MTP drafts only: DFlash2 drafts keep exact acceptance even with the
+// item on in the engine (whirl-server also turns it off for --draft dflash), so the output is the
+// greedy reference whatever the drafter proposes
+void testDFlashRelaxExact() {
+    ServerSetup su = dflashSetup(false);
+    su.mc.dfl_miss = 0.3;
+    su.eo.relax.on = true;
+    TestServer srv(su);
+    for (std::uint32_t n : {7u, 600u}) {
+        const auto p = makePrompt(n, 90 + n);
+        const auto ref = srv.model().greedyReference(p, 100, true);
+        auto r = srv.post("/v1/completions", completionBody(p, 100, false));
+        CHECK_EQ(r.status, 200);
+        CHECK_EQ(completionText(r), decode(ref));
+    }
+    const Engine::Stats st = srv.engine().stats();
+    CHECK(st.dfl_cycles > 0 && st.dfl_accepted > 0 && st.dfl_accepted < st.dfl_drafted);
+    CHECK_EQ(srv.model().dflBad(), 0u);
+}
+
 // n-gram and DFlash2 drafts in the same requests (a repetitive toy model: the output cycles, so
 // n-gram matches appear and the cost model switches between the two); several slots at once
 void testDFlashNgram() {
@@ -1939,6 +1959,7 @@ int main(int argc, char** argv) {
         {"concurrency16", [] { testConcurrency(16, 24, true); }},
         {"concurrency_nomtp", [] { testConcurrency(4, 8, false); }},
         {"dflash_greedy", testDFlashGreedy},
+        {"dflash_relax_exact", testDFlashRelaxExact},
         {"dflash_ngram", testDFlashNgram},
         {"dflash_rollback", testDFlashRollback},
         {"dflash_tier", testDFlashTier},
