@@ -100,7 +100,7 @@ const char* k_help_chat =
     "  --tokens ID,ID,...         token ids instead of a prompt (no template)\n"
     "  --out FILE                 write the last prompt position's logits (f32) to FILE (no MTP)\n"
     "  --draft mtp|dflash         draft source (default mtp). dflash: the DFlash2 drafter GGUF in\n"
-    "                             WHIRL_DRAFT_MODEL drafts up to block - 1 tokens per cycle (n-gram drafts\n"
+    "                             --draft-model FILE (or WHIRL_DRAFT_MODEL) drafts up to block - 1 tokens per cycle (n-gram drafts\n"
     "                             stay on); the MTP block is not loaded. Without a matching drafter: mtp\n"
     "  --mmproj MMPROJ.gguf       vision encoder (Qwen3-VL style mmproj, F16 / BF16) for --image\n"
     "  --image IMAGE              an image placed before the prompt text (repeatable; needs --mmproj)\n"
@@ -121,7 +121,7 @@ const char* k_help_bench =
     "  --prompt TEXT | @FILE      prompt of the decode runs (default: a zh/en coding question)\n"
     "  --modes M,M,...            decode modes: mtp-ngram (MTP + n-gram drafts), mtp, plain; with\n"
     "                             --draft dflash: dflash-ngram, dflash, plain (default: all three)\n"
-    "  --draft mtp|dflash         draft source (default mtp; dflash: WHIRL_DRAFT_MODEL, see whirl chat)\n"
+    "  --draft mtp|dflash         draft source (default mtp; dflash: --draft-model, see whirl chat)\n"
     "  --no-think / --think       thinking off / on for the decode prompt (default on)\n"
     "  --device SPEC              GPU: r9700 (default), 8060s, an index, or a name / gfx substring\n"
     WHIRL_HELP_MODES
@@ -232,7 +232,7 @@ struct Args {
 
 bool takesValue(const std::string& o) {
     static const char* v[] = {"--max-tokens", "--ctx", "--tokens", "--out", "--device", "--prefill", "--decode", "--prompt", "--modes", "--mmproj", "--suite",
-                              "--draft"};
+                              "--draft", "--draft-model"};
     for (const char* s : v)
         if (o == s) return true;
     return false;
@@ -913,11 +913,16 @@ void printProfile(const char* label, q::Profile& p, std::size_t n_tok) {
 // Runtime A/B switches shared by chat and bench (WHIRL_FLOAT_GEMV, ...).
 // --draft dflash: true when WHIRL_DRAFT_MODEL holds a DFlash2 drafter that fits this model
 // (headers only, before loading); otherwise a warning and the MTP drafts (whirl/dflash_policy.h).
+std::optional<std::string> draftModelOpt(const Args& a) {
+    std::optional<std::string> cli;
+    if (a.get("--draft-model")) cli = *a.get("--draft-model");
+    return whirl::dflash::resolveDraftModel(cli, envGet("DRAFT_MODEL"));
+}
 bool wantDFlash(const Args& a, const gguf::File& f) {
     const std::string mode = a.get("--draft") ? *a.get("--draft") : std::string("mtp");
     const auto src = whirl::dflash::parseSource(mode);
     if (!src) throw std::runtime_error("--draft must be mtp or dflash");
-    const auto dm = envGet("DRAFT_MODEL");
+    const auto dm = draftModelOpt(a);
     std::string why;
     if (*src == whirl::dflash::Source::dflash && dm) why = q::dflashIncompatible(f, gguf::File::open(*dm));
     const whirl::dflash::Choice c = whirl::dflash::choose(*src, dm, why, true);
@@ -928,13 +933,14 @@ bool wantDFlash(const Args& a, const gguf::File& f) {
 // WHIRL_DRAFT_MODEL (--draft dflash): DFlash2 drafter GGUF, the hidden capture of its target layers
 // and the drafter context of one sequence. false: the code object has no DFlash2 kernels, so
 // Model::load kept the MTP block (warning printed; the caller drafts with MTP).
-bool loadDraftModelEnv(q::Model& m) {
+bool loadDraftModelEnv(q::Model& m, const Args& a) {
+    const auto dm0 = draftModelOpt(a);
     if (!m.mtp_skipped) {
-        const whirl::dflash::Choice c = whirl::dflash::choose(whirl::dflash::Source::dflash, envGet("DRAFT_MODEL"), "", false);
+        const whirl::dflash::Choice c = whirl::dflash::choose(whirl::dflash::Source::dflash, dm0, "", false);
         std::fprintf(stderr, "warning: %s (missing: %s)\n", c.warning.c_str(), m.dflashMissingKernel().c_str());
         return false;
     }
-    const auto dm = envGet("DRAFT_MODEL");
+    const auto dm = draftModelOpt(a);
     if (!dm || m.dflash) return m.dflash != nullptr;
     std::vector<std::string> warn;
     const whirl::dflash::Params dp = whirl::dflash::parseParams([](const char* n) { return envGet(n); }, warn);
@@ -1290,7 +1296,7 @@ int cmdChat(const Args& a) {
     const bool profiling = envGet("PROFILE").has_value();
     if (profiling) model.prof = &prof;
     applyRuntimeEnv(model);
-    if (use_dflash) use_dflash = loadDraftModelEnv(model);
+    if (use_dflash) use_dflash = loadDraftModelEnv(model, a);
 
     // MTP speculative decode is exact greedy: on whenever the checkpoint has a nextn
     // layer; WHIRL_MTP=0 turns it off.
@@ -1491,7 +1497,7 @@ int cmdBench(const Args& a) {
     loadLog(model, L.stats);
     applyRuntimeEnv(model);
     if (use_dflash) {
-        use_dflash = loadDraftModelEnv(model);
+        use_dflash = loadDraftModelEnv(model, a);
         if (!use_dflash && !a.get("--modes")) modes = {"mtp-ngram", "mtp", "plain"};
     }
     const bool has_mtp = model.mtp.has_value() && envFlag("MTP", true);

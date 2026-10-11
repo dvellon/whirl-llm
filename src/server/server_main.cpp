@@ -130,10 +130,12 @@ const char* kHelpBody =
     "                           WHIRL_MODE\n"
     "  --mtp-drafts N           MTP drafts per cycle, 1..10 (fixed count; default: per model type)\n"
     "  --draft mtp|dflash       draft source of the speculative decode (default mtp). dflash: the DFlash2\n"
-    "                           drafter GGUF in WHIRL_DRAFT_MODEL (block 8: up to 7 drafts per cycle);\n"
-    "                           the MTP block is then not loaded and the KV pool grows by its share.\n"
+    "                           drafter GGUF from --draft-model FILE (block 8: up to 7 drafts per cycle);\n"
+    "                           the MTP block is then not loaded; the drafter's weights and context rings\n"
+    "                           come out of the KV pool (about 2 GiB net of the MTP block).\n"
     "                           A model without a matching drafter (e.g. a MoE model) keeps mtp.\n"
     "                           n-gram drafts stay on in both modes; outputs equal plain greedy decoding\n"
+    "  --draft-model FILE       DFlash2 drafter GGUF for --draft dflash (env WHIRL_DRAFT_MODEL overrides)\n"
     "  --decode-min-tps N       while other requests prefill, keep every streaming (decoding) request\n"
     "                           at >= N tok/s by limiting prefill forwards (default 20; 0 = off:\n"
     "                           prefill forwards are not limited)\n"
@@ -173,6 +175,7 @@ struct Options {
     std::optional<std::uint32_t> ctx_per_slot;
     std::optional<std::uint32_t> mtp_drafts;
     std::string draft = "mtp";
+    std::string draft_model;  // --draft-model FILE (WHIRL_DRAFT_MODEL overrides)
     std::optional<std::uint32_t> decode_min_tps;
     std::optional<std::string> log_file;
     std::optional<std::string> alias;
@@ -369,6 +372,7 @@ int serveMain(int argc, char** argv, const char* program) {
         else if (auto v4b = argValue(args, i, "-np")) { opt.parallel = parseNum<std::uint32_t>(*v4b, "--parallel"); opt.parallel_given = true; }
         else if (auto v5 = argValue(args, i, "--mtp-drafts"))
             opt.mtp_drafts = std::clamp(parseNum<std::uint32_t>(*v5, "--mtp-drafts"), 1u, qwen35::max_drafts);
+        else if (auto v5d = argValue(args, i, "--draft-model")) opt.draft_model = *v5d;
         else if (auto v5c = argValue(args, i, "--draft")) {
             if (*v5c != "mtp" && *v5c != "dflash") die("invalid --draft " + *v5c + " (mtp or dflash)");
             opt.draft = *v5c;
@@ -587,9 +591,10 @@ int serveMain(int argc, char** argv, const char* program) {
         // --draft dflash: check the drafter against the target before loading (headers only); a
         // model without a matching drafter keeps the MTP drafts (whirl/dflash_policy.h)
         bool use_dflash = false;
+        std::optional<std::string> dm_resolved;
         std::optional<gguf::File> dfile;
         {
-            const auto dm = env("DRAFT_MODEL");
+            const auto dm = dm_resolved = whirl::dflash::resolveDraftModel(opt.draft_model.empty() ? std::nullopt : std::optional<std::string>(opt.draft_model), env("DRAFT_MODEL"));
             const auto src = *whirl::dflash::parseSource(opt.draft);
             std::string why;
             if (src == whirl::dflash::Source::dflash && dm) {
@@ -636,7 +641,7 @@ int serveMain(int argc, char** argv, const char* program) {
         // layers (WHIRL_DFLASH_CAPTURE_ROWS rows, default the drafter's window or 2048)
         if (use_dflash && !model.mtp_skipped) {
             // the code object has no DFlash2 kernels: Model::load kept the MTP block
-            logW("{} (missing: {})", whirl::dflash::choose(whirl::dflash::Source::dflash, env("DRAFT_MODEL"), "", false).warning,
+            logW("{} (missing: {})", whirl::dflash::choose(whirl::dflash::Source::dflash, dm_resolved, "", false).warning,
                  model.dflashMissingKernel());
             use_dflash = false;
             dfile.reset();
@@ -646,7 +651,7 @@ int serveMain(int argc, char** argv, const char* program) {
         if (use_dflash)
             for (const std::string& w : dfl_warn) logW("{}", w);
         if (use_dflash) {
-            const std::string dm = *env("DRAFT_MODEL");
+            const std::string dm = *dm_resolved;
             const hip::MemInfo d0 = hip::memInfo();
             const gguf::File& df = *dfile;
             qwen35::LoadStats ds;

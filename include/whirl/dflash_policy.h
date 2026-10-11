@@ -37,24 +37,32 @@ inline std::optional<Source> parseSource(std::string_view s) {
 
 inline const char* sourceName(Source s) { return s == Source::dflash ? "dflash" : "mtp"; }
 
+// The drafter GGUF: the WHIRL_DRAFT_MODEL environment variable (a debug override) wins over
+// --draft-model; an empty value counts as not set.
+inline std::optional<std::string> resolveDraftModel(const std::optional<std::string>& cli, const std::optional<std::string>& env) {
+    if (env && !env->empty()) return env;
+    if (cli && !cli->empty()) return cli;
+    return std::nullopt;
+}
+
 // The draft source actually used, and the warning to print when a dflash request falls back.
 struct Choice {
     Source source = Source::mtp;
     std::string warning;  // empty: nothing to report
 };
 
-// requested: --draft; draft_model: WHIRL_DRAFT_MODEL; incompatible: dflashIncompatible() of the
+// requested: --draft; draft_model: resolveDraftModel(); incompatible: dflashIncompatible() of the
 // two headers ("" = fits; ignored without a draft model); kernels_ok: the code object has every
 // dflash_* kernel (false only for an old / foreign WHIRL_CODE_OBJECT once both kernel sets carry
 // them; pass true before the module is loaded and check again after).
 inline Choice choose(Source requested, const std::optional<std::string>& draft_model, std::string_view incompatible, bool kernels_ok) {
     Choice c;
     if (requested == Source::mtp) {
-        if (draft_model) c.warning = "WHIRL_DRAFT_MODEL is set but --draft is mtp: the DFlash2 drafter is not loaded";
+        if (draft_model) c.warning = "a DFlash2 drafter is set (--draft-model / WHIRL_DRAFT_MODEL) but --draft is mtp: the DFlash2 drafter is not loaded";
         return c;
     }
     if (!draft_model) {
-        c.warning = "--draft dflash needs the DFlash2 drafter GGUF in WHIRL_DRAFT_MODEL: using MTP drafts";
+        c.warning = "--draft dflash needs the DFlash2 drafter GGUF (--draft-model FILE or WHIRL_DRAFT_MODEL): using MTP drafts";
         return c;
     }
     if (!incompatible.empty()) {

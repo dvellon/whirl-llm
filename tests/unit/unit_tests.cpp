@@ -1069,6 +1069,15 @@ void testDflashPolicy() {
         // an incompatible drafter is reported before missing kernels
         CHECK(d::choose(d::Source::dflash, dm, "x", false).warning.find("does not fit") != std::string::npos);
     }
+    // --draft-model FILE vs the WHIRL_DRAFT_MODEL debug override: the environment wins, empty = not set
+    {
+        const std::optional<std::string> cli = std::string("a.gguf"), env = std::string("b.gguf"), empty = std::string();
+        CHECK(*d::resolveDraftModel(cli, none) == "a.gguf");
+        CHECK(*d::resolveDraftModel(none, env) == "b.gguf");
+        CHECK(*d::resolveDraftModel(cli, env) == "b.gguf");
+        CHECK(*d::resolveDraftModel(cli, empty) == "a.gguf");
+        CHECK(!d::resolveDraftModel(none, none) && !d::resolveDraftModel(empty, empty) && !d::resolveDraftModel(none, empty));
+    }
     // relaxacc: MTP drafts only (DFlash2 keeps exact acceptance in fast mode)
     CHECK(d::relaxApplies(d::Source::mtp, true) && !d::relaxApplies(d::Source::mtp, false));
     CHECK(!d::relaxApplies(d::Source::dflash, true) && !d::relaxApplies(d::Source::dflash, false));
