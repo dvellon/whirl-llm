@@ -125,6 +125,40 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
   −1.4%, 256k −1.4% (same output hash); Swift-1.5 27B q8h 256k 1,129 tok/s (f16 KV at 256k does
   not fit 32 GB next to its weights). Prefills within the scratch are unchanged.
 
+### Fixes from the external review (FIX-REVIEW2)
+
+Error-path, guard and dispatch-condition fixes; outputs are bit-identical (golden gfx1201 12/12 and
+selftest in every mode unchanged).
+
+- MTP draft attention window (`Model::attn_win`) is restored on every exit path; a throwing draft
+  step no longer leaves the window on for the next request's trunk attention (long contexts only,
+  OVH-C1).
+- `planFit` never shrinks the prefill batch below 1280 rows (one 1024 chunk + the 256-row merged
+  tail); 1024 / 512 started the server and then failed long prompts with `BatchTooLarge` (VRAM-01).
+- SSD tier: a file shorter than its extent is deleted at start-up, and a read job that gets EOF or
+  a short read fails (cold prefill) instead of restoring stale bytes as valid KV (MAIN-001). A
+  failed directory lock now leaves the SSD tier off instead of running unlocked (any error other
+  than another server holding it). Block dedup can no longer create an A <-> B reference cycle
+  between two entries (rewriting a parent to a fork's content), and a cycle already on disk no
+  longer recurses until the stack overflows (CACHE1-002).
+- An exception while copying a restore (`pumpRestore` / `pumpTail`) marks the restore failed
+  instead of treating it as done and valid (RESTORE-EXC).
+- Models with DeltaNet layers must have `ssm.conv_kernel` 4, `ssm.state_size` 128 and a value head
+  size that is a multiple of 32, otherwise `UnsupportedConfig` before any GPU work (the kernels
+  do not implement other shapes, GDN-CFG).
+- The pre-load VRAM estimate counts the 256 attention splits of q4 KV, `dq_st_ml`, the dq page
+  table and `moe_tiles64`; `Model::load` notes when the estimate is below its buffer allocations
+  (KV-FIT-ESTIMATE).
+- f32 / f16 weight matrices keep the bitwise-equal-to-n=1 GEMV family in a 17..32-row wide verify
+  and without the multi-token GEMV instances (RC-R1 / PREFILL-R2; none of the shipped models has
+  such matrices).
+- n-gram draft timing: a single measured point no longer extrapolates to a zero or negative time
+  (policy only, MTP-01).
+- Golden gate: empty model / mode / suite lists, runs without `G` lines, empty references, an
+  unrecorded model file and a suite `ngram` that never drafts are errors; every `WHIRL_*`
+  variable is cleared for the runs; new suite `ngram` (gfx1201). `fast_stream` of the server gate
+  now requires MTP on and `cached_tokens > 0` for the repeats (FS-001).
+
 ## 0.1.4 — 2026-10-06
 
 Routine bug-fix release: no new features, no speed changes. The changes harden input handling (GGUF
