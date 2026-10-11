@@ -103,10 +103,54 @@ void benchGemvh(Ctx& c) {
         {QType::q4_k, 5120, 5120, "attn proj 5120x5120"}, {QType::q4_k, 17408, 5120, "ffn gate/up 17408x5120"},
         {QType::q6_k, 5120, 17408, "ffn down 5120x17408"}, {QType::q6_k, 5120, 5120, "5120x5120"},
         {QType::q8_0, 5120, 5120, "5120x5120"},            {QType::q5_k, 5120, 5120, "5120x5120"},
-        {QType::q6_k, 248320, 5120, "lm head 248320x5120"},
+        {QType::q6_k, 248320, 5120, "lm head 248320x5120"}, {QType::mxfp4, 5120, 5120, "5120x5120"},
+        {QType::iq4_xs, 5120, 5120, "5120x5120"},
     };
     std::printf("   (peak reference %.0f GB/s)\n", peak);
+    // kernel development: WHIRL_KT_GEMVH_HSACO=<code object> WHIRL_KT_GEMVH_VARS=<prefix>:<rows per block>:<threads>[,..]
+    // times <prefix>_<type> from that code object next to the built-in kernels (and checks it bitwise against gemvh2);
+    // WHIRL_KT_GEMVH_LITE=1 skips gemms_c1..c7, WHIRL_KT_GEMVH_TYPES=q4_k,q8_0 filters the types,
+    // WHIRL_KT_GEMVH_NS=1,16 the token counts.
+    struct XVar {
+        std::string prefix;
+        int bm, nth;
+    };
+    std::vector<XVar> xvars;
+    std::vector<char> ximage;
+    hip::Module xmod;
+    if (const char* e = std::getenv("WHIRL_KT_GEMVH_HSACO")) {
+        if (std::FILE* fp = std::fopen(e, "rb")) {
+            std::fseek(fp, 0, SEEK_END);
+            ximage.resize(static_cast<std::size_t>(std::ftell(fp)));
+            std::fseek(fp, 0, SEEK_SET);
+            if (std::fread(ximage.data(), 1, ximage.size(), fp) != ximage.size()) ximage.clear();
+            std::fclose(fp);
+        }
+        if (!ximage.empty()) xmod = hip::Module::loadData(ximage.data(), c.mod.arch());
+        const std::string vs = std::getenv("WHIRL_KT_GEMVH_VARS") ? std::getenv("WHIRL_KT_GEMVH_VARS") : "";
+        for (std::size_t a = 0; a < vs.size();) {
+            std::size_t b = vs.find(',', a);
+            if (b == std::string::npos) b = vs.size();
+            const std::string it = vs.substr(a, b - a);
+            const std::size_t p1 = it.find(':'), p2 = it.find(':', p1 + 1);
+            if (p1 != std::string::npos && p2 != std::string::npos)
+                xvars.push_back({it.substr(0, p1), std::atoi(it.substr(p1 + 1, p2 - p1 - 1).c_str()), std::atoi(it.substr(p2 + 1).c_str())});
+            a = b + 1;
+        }
+    }
+    const bool lite = std::getenv("WHIRL_KT_GEMVH_LITE") != nullptr;
+    const std::string tfilter = std::getenv("WHIRL_KT_GEMVH_TYPES") ? std::string(",") + std::getenv("WHIRL_KT_GEMVH_TYPES") + "," : "";
+    std::vector<int> nlist = {1, 16, 32};
+    if (const char* e = std::getenv("WHIRL_KT_GEMVH_NS")) {
+        nlist.clear();
+        for (const char* q = e; *q;) {
+            nlist.push_back(std::atoi(q));
+            while (*q && *q != ',') ++q;
+            if (*q == ',') ++q;
+        }
+    }
     for (const Shape& sh : shapes) {
+        if (!tfilter.empty() && tfilter.find(std::string(",") + wk::typeSuffix(sh.t) + ",") == std::string::npos) continue;
         const int ti = static_cast<int>(sh.t);
         if (!c.k.gemvh[ti]) continue;
         const HostMat m = randomMat(c, sh.t, sh.nrows, sh.ncols);
@@ -115,7 +159,7 @@ void benchGemvh(Ctx& c) {
         std::vector<Buf> ws;
         for (int i = 0; i < copies; ++i) ws.emplace_back(m.data);
         Buf x16 = makeX16(c, 32, sh.ncols);
-        for (int nt : {1, 16, 32}) {
+        for (int nt : nlist) {
             Buf y(static_cast<std::size_t>(nt) * sh.nrows * 4);
             struct V {
                 std::string name;
@@ -127,8 +171,33 @@ void benchGemvh(Ctx& c) {
             if (nt <= 16 && c.k.gemvh[ti]) vs.push_back({"gemvh", c.k.gemvh[ti], 16, 1 << 20, 32, false});
             if (c.k.gemvh2[ti]) vs.push_back({"gemvh2", c.k.gemvh2[ti], 16, 1 << 20, 32, false});
             for (int si = 0; si < static_cast<int>(wk::kGemmsCfgs.size()); ++si) {
+                if (lite && si > 0) break;
                 const auto& cf = c.k.gemms_geom[static_cast<std::size_t>(si)];
                 if (c.k.gemms[si][ti]) vs.push_back({"gemms_c" + std::to_string(si), c.k.gemms[si][ti], cf.bm, cf.bn, cf.nth, true});
+            }
+            for (const XVar& xv : xvars) {
+                if (!ximage.empty() && nt <= 32) {
+                    const hip::Function f = xmod.getFunctionOpt((xv.prefix + "_" + wk::typeSuffix(sh.t)).c_str());
+                    if (f) vs.push_back({xv.prefix, f, xv.bm, 1 << 20, xv.nth, false});
+                }
+            }
+            // bitwise check of the development variants against the built-in gemvh2 (any n <= 32)
+            if (!xvars.empty() && c.k.gemvh2[ti]) {
+                auto runv = [&](hip::Function f, int bm, int nth) {
+                    Buf yy(static_cast<std::size_t>(nt) * sh.nrows * 4);
+                    hip::launch(f, {cdiv(sh.nrows, bm), 1, 1}, {static_cast<unsigned>(nth), 1, 1}, 0, c.s, ws[0].p(), m.row_bytes, x16.p(), yy.p(),
+                                sh.ncols, sh.nrows, nt, 0);
+                    c.sync();
+                    return yy.down<float>(static_cast<std::size_t>(nt) * sh.nrows);
+                };
+                const auto ref = runv(c.k.gemvh2[ti], 16, 32);
+                for (const V& v : vs) {
+                    if (v.tok_x || v.name.rfind("gemvh", 0) == 0 && (v.name == "gemvh" || v.name == "gemvh2")) continue;
+                    const auto yv = runv(v.f, v.bm, v.nth);
+                    std::size_t bad = 0;
+                    for (std::size_t i = 0; i < yv.size(); ++i) bad += std::memcmp(&yv[i], &ref[i], 4) != 0;
+                    std::printf("   check %s n %d %s: %zu mismatches\n", v.name.c_str(), nt, sh.what, bad);
+                }
             }
             for (const V& v : vs) {
                 auto launch = [&](int i) {
@@ -139,15 +208,24 @@ void benchGemvh(Ctx& c) {
                 };
                 for (int i = 0; i < copies; ++i) launch(i);
                 c.sync();
-                const int iters = std::max(copies * 2, 20);
-                hip::Event e0 = hip::eventCreate(true), e1 = hip::eventCreate(true);
-                hip::eventRecord(e0, c.s);
-                for (int i = 0; i < iters; ++i) launch(i);
-                hip::eventRecord(e1, c.s);
-                hip::eventSync(e1);
-                const double us = 1000.0 * hip::eventElapsedMs(e0, e1) / iters;
-                hip::eventDestroy(e0);
-                hip::eventDestroy(e1);
+                // timed in ~150 ms windows after a ~100 ms warm-up (short windows read the GPU clock ramp-up, not the kernel)
+                auto timed = [&](int iters) {
+                    hip::Event e0 = hip::eventCreate(true), e1 = hip::eventCreate(true);
+                    hip::eventRecord(e0, c.s);
+                    for (int i = 0; i < iters; ++i) launch(i);
+                    hip::eventRecord(e1, c.s);
+                    hip::eventSync(e1);
+                    const double us1 = 1000.0 * hip::eventElapsedMs(e0, e1) / iters;
+                    hip::eventDestroy(e0);
+                    hip::eventDestroy(e1);
+                    return us1;
+                };
+                const int base_iters = std::max(copies * 2, 20);
+                double us = timed(base_iters);
+                const int win = static_cast<int>(std::min(20000.0, std::max<double>(base_iters, 150000.0 / us)));
+                timed(win * 2 / 3);
+                us = 1e30;
+                for (int rep = 0; rep < 3; ++rep) us = std::min(us, timed(win));
                 const double gbs = static_cast<double>(m.data.size()) / (us * 1e3);
                 std::printf("   %-6s %-24s n %2d %-9s %9.1f us %7.1f GB/s %5.1f%% of %.0f\n", wk::typeSuffix(sh.t), sh.what, nt, v.name.c_str(),
                             us, gbs, 100.0 * gbs / peak, peak);
