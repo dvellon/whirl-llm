@@ -1,0 +1,282 @@
+// whirl-kernel-test families "gemvh" (bitwise, part of the default run) and "gemvhbench"
+// (timing only, --only gemvhbench): the precise-decode f16-activation matmul gemvh / gemvh2.
+// SPDX-License-Identifier: Apache-2.0
+// gemvh: for every exported type, ncols (even stage count, odd stage count, 5120), nrows (not a
+// multiple of 16 included), n_tok in {1,2,5,16,17,32} and accumulate 0/1, gemvh (n <= 16) and
+// gemvh2 (n <= 32) must equal the existing gemms_c* kernels and gemm_c0 bit for bit (accumulate
+// starts from the same random prefill).
+// gemvhbench: us per call, GB/s of weight bytes and % of the memory-bandwidth peak for gemvh vs
+// gemms (the path precise decode used before), real Qwen3.8-27B shapes.
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <string>
+#include <vector>
+
+#include "kt.h"
+
+namespace kt {
+
+namespace {
+
+Buf makeX16(Ctx& c, int nmax, int ncols) {
+    const std::vector<float> x = c.randn(static_cast<std::size_t>(nmax) * ncols);
+    Buf dx(x);
+    Buf x16(static_cast<std::size_t>(nmax) * ncols * 2);
+    hip::launch(c.k.f32_to_f16, {cdiv(static_cast<std::uint64_t>(nmax) * ncols / 4, 256), 1, 1}, {256, 1, 1}, 0, c.s, dx.p(), x16.p(),
+                nmax * ncols);
+    c.sync();
+    return x16;
+}
+
+}  // namespace
+
+void testGemvh(Ctx& c) {
+    c.rep.family = "gemvh";
+    const std::vector<int> ncolsL = c.quick ? std::vector<int>{512, 768} : std::vector<int>{256, 512, 768, 1280, 5120};
+    const std::vector<int> nrowsL = c.quick ? std::vector<int>{7, 37, 100} : std::vector<int>{1, 7, 16, 17, 37, 100, 1003, 4099};
+    const int ns[] = {1, 2, 5, 16, 17, 32};
+    for (QType t : wk::kAllTypes) {
+        const int ti = static_cast<int>(t);
+        if (t == QType::f32 || (!c.k.gemvh[ti] && !c.k.gemvh2[ti])) continue;
+        std::size_t checked = 0, bad = 0;
+        std::string first_bad;
+        for (int ncols : ncolsL) {
+            if (ncols % 256 != 0) continue;
+            for (int nrows : nrowsL) {
+                const HostMat m = randomMat(c, t, nrows, ncols);
+                Buf w(m.data);
+                Buf x16 = makeX16(c, 32, ncols);
+                for (int nt : ns) {
+                    for (int acc = 0; acc < 2; ++acc) {
+                        const std::vector<float> init = c.randn(static_cast<std::size_t>(nt) * nrows, 3.0f);
+                        auto run = [&](hip::Function f, int bm, int bn, int nth, bool tok_x) {
+                            Buf y(init);
+                            const hip::Dim3 grid = tok_x ? hip::Dim3{cdiv(nt, bn), cdiv(nrows, bm), 1} : hip::Dim3{cdiv(nrows, bm), cdiv(nt, bn), 1};
+                            hip::launch(f, grid, {static_cast<unsigned>(nth), 1, 1}, 0, c.s, w.p(), m.row_bytes, x16.p(), y.p(), ncols, nrows, nt,
+                                        acc);
+                            c.sync();
+                            return y.down<float>(static_cast<std::size_t>(nt) * nrows);
+                        };
+                        const auto& c0 = wk::kGemmCfgs[0];
+                        const std::vector<float> ref = run(c.k.gemmc[0][ti], c0.bm, c0.bn, c0.nth, true);
+                        auto chk = [&](const std::vector<float>& y, const std::string& label) {
+                            ++checked;
+                            if (std::memcmp(y.data(), ref.data(), ref.size() * 4) != 0) {
+                                ++bad;
+                                if (first_bad.empty())
+                                    first_bad = label + " ncols " + std::to_string(ncols) + " nrows " + std::to_string(nrows) + " n " +
+                                                std::to_string(nt) + " acc " + std::to_string(acc);
+                            }
+                        };
+                        for (int si = 0; si < static_cast<int>(wk::kGemmsCfgs.size()); ++si) {
+                            const auto& cf = c.k.gemms_geom[static_cast<std::size_t>(si)];
+                            if (c.k.gemms[si][ti]) chk(run(c.k.gemms[si][ti], cf.bm, cf.bn, cf.nth, true), "gemms_c" + std::to_string(si));
+                        }
+                        if (nt <= 16 && c.k.gemvh[ti]) chk(run(c.k.gemvh[ti], 16, 1 << 20, 32, false), "gemvh");
+                        if (c.k.gemvh2[ti]) chk(run(c.k.gemvh2[ti], 16, 1 << 20, 32, false), "gemvh2");
+                        // gfx1151: the blocks loop over row tiles, so a grid of 1/2 / 1/3 of the tiles (and one block) must give the same bits
+                        if (c.mod.arch() == hip::Arch::gfx1151) {
+                            for (int div : {2, 3, 1 << 20}) {
+                                const int bm = 16 * div > 16 ? 16 * div : 16;  // rows per launched block (div tiles each) for run()'s grid
+                                if (nt <= 16 && c.k.gemvh[ti]) chk(run(c.k.gemvh[ti], bm, 1 << 20, 32, false), "gemvh/" + std::to_string(div));
+                                if (c.k.gemvh2[ti]) chk(run(c.k.gemvh2[ti], bm, 1 << 20, 32, false), "gemvh2/" + std::to_string(div));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Result r;
+        r.name = std::string("gemvh/gemvh2 == gemm_c0 and gemms_c*, ncols x nrows x n x acc sweep (") + std::to_string(checked) + " runs) " +
+                 wk::typeSuffix(t);
+        r.kind = Kind::invariant;
+        r.n = checked;
+        r.mismatches = bad;
+        r.pass = bad == 0 && checked > 0;
+        if (!first_bad.empty()) r.note = "first " + first_bad;
+        c.rep.add(r);
+    }
+}
+
+// WHIRL_KT_PEAK_GBS (default 238): the bandwidth the % column refers to.
+void benchGemvh(Ctx& c) {
+    double peak = 238.0;
+    if (const char* e = std::getenv("WHIRL_KT_PEAK_GBS")) peak = std::atof(e);
+    struct Shape {
+        QType t;
+        int nrows, ncols;
+        const char* what;
+    };
+    std::vector<Shape> shapes = {
+        {QType::q4_k, 5120, 5120, "5120x5120"},      {QType::q4_k, 17408, 5120, "17408x5120 ffn up"}, {QType::q4_k, 5120, 17408, "5120x17408 ffn down"},
+        {QType::q5_k, 5120, 5120, "5120x5120"},      {QType::q5_k, 17408, 5120, "17408x5120 ffn up"}, {QType::q5_k, 5120, 17408, "5120x17408 ffn down"},
+        {QType::q5_k, 10240, 5120, "10240x5120 qkv"},
+        {QType::q6_k, 5120, 5120, "5120x5120"},      {QType::q6_k, 17408, 5120, "17408x5120 ffn up"}, {QType::q6_k, 5120, 17408, "5120x17408 ffn down"},
+        {QType::q6_k, 248320, 5120, "lm head 248320x5120"},
+        {QType::q8_0, 5120, 5120, "5120x5120"},      {QType::mxfp4, 5120, 5120, "5120x5120"},
+        {QType::iq4_xs, 5120, 5120, "5120x5120"},    {QType::iq4_xs, 17408, 5120, "17408x5120 ffn up"}, {QType::iq4_xs, 5120, 17408, "5120x17408 ffn down"},
+        {QType::iq4_nl, 17408, 5120, "17408x5120 ffn up"}, {QType::iq4_nl, 5120, 17408, "5120x17408 ffn down"},
+        {QType::q3_k, 17408, 5120, "17408x5120 ffn up"}, {QType::q3_k, 5120, 17408, "5120x17408 ffn down"},
+        {QType::iq3_s, 17408, 5120, "17408x5120 ffn up"}, {QType::iq3_s, 5120, 17408, "5120x17408 ffn down"},
+    };
+    // WHIRL_KT_GEMVH_SHAPES=<type>:<nrows>:<ncols>[,..] replaces the list (development)
+    if (const char* e = std::getenv("WHIRL_KT_GEMVH_SHAPES")) {
+        shapes.clear();
+        static std::vector<std::string> names;
+        names.reserve(64);
+        const std::string vs = e;
+        for (std::size_t a = 0; a < vs.size();) {
+            std::size_t b = vs.find(',', a);
+            if (b == std::string::npos) b = vs.size();
+            const std::string it = vs.substr(a, b - a);
+            const std::size_t p1 = it.find(':'), p2 = it.find(':', p1 + 1);
+            if (p1 != std::string::npos && p2 != std::string::npos) {
+                QType t = QType::q4_k;
+                for (QType cand : wk::kAllTypes)
+                    if (it.substr(0, p1) == wk::typeSuffix(cand)) t = cand;
+                names.push_back(it.substr(p1 + 1));
+                shapes.push_back({t, std::atoi(it.substr(p1 + 1, p2 - p1 - 1).c_str()), std::atoi(it.substr(p2 + 1).c_str()), names.back().c_str()});
+            }
+            a = b + 1;
+        }
+    }
+    std::printf("   (peak reference %.0f GB/s)\n", peak);
+    // kernel development: WHIRL_KT_GEMVH_HSACO=<code object> WHIRL_KT_GEMVH_VARS=<prefix>:<rows per block>:<threads>[,..]
+    // times <prefix>_<type> from that code object next to the built-in kernels (and checks it bitwise against gemvh2);
+    // WHIRL_KT_GEMVH_LITE=1 skips gemms_c1..c7, WHIRL_KT_GEMVH_TYPES=q4_k,q8_0 filters the types,
+    // WHIRL_KT_GEMVH_NS=1,16 the token counts.
+    struct XVar {
+        std::string prefix;
+        int bm, nth;
+    };
+    std::vector<XVar> xvars;
+    std::vector<char> ximage;
+    hip::Module xmod;
+    if (const char* e = std::getenv("WHIRL_KT_GEMVH_HSACO")) {
+        if (std::FILE* fp = std::fopen(e, "rb")) {
+            std::fseek(fp, 0, SEEK_END);
+            ximage.resize(static_cast<std::size_t>(std::ftell(fp)));
+            std::fseek(fp, 0, SEEK_SET);
+            if (std::fread(ximage.data(), 1, ximage.size(), fp) != ximage.size()) ximage.clear();
+            std::fclose(fp);
+        }
+        if (!ximage.empty()) xmod = hip::Module::loadData(ximage.data(), c.mod.arch());
+        const std::string vs = std::getenv("WHIRL_KT_GEMVH_VARS") ? std::getenv("WHIRL_KT_GEMVH_VARS") : "";
+        for (std::size_t a = 0; a < vs.size();) {
+            std::size_t b = vs.find(',', a);
+            if (b == std::string::npos) b = vs.size();
+            const std::string it = vs.substr(a, b - a);
+            const std::size_t p1 = it.find(':'), p2 = it.find(':', p1 + 1);
+            if (p1 != std::string::npos && p2 != std::string::npos)
+                xvars.push_back({it.substr(0, p1), std::atoi(it.substr(p1 + 1, p2 - p1 - 1).c_str()), std::atoi(it.substr(p2 + 1).c_str())});
+            a = b + 1;
+        }
+    }
+    const bool lite = std::getenv("WHIRL_KT_GEMVH_LITE") != nullptr;
+    const bool onlyx = std::getenv("WHIRL_KT_GEMVH_ONLYX") != nullptr;  // time only the development variants
+    const std::string tfilter = std::getenv("WHIRL_KT_GEMVH_TYPES") ? std::string(",") + std::getenv("WHIRL_KT_GEMVH_TYPES") + "," : "";
+    std::vector<int> nlist = {1, 16, 32};
+    if (const char* e = std::getenv("WHIRL_KT_GEMVH_NS")) {
+        nlist.clear();
+        for (const char* q = e; *q;) {
+            nlist.push_back(std::atoi(q));
+            while (*q && *q != ',') ++q;
+            if (*q == ',') ++q;
+        }
+    }
+    for (const Shape& sh : shapes) {
+        if (!tfilter.empty() && tfilter.find(std::string(",") + wk::typeSuffix(sh.t) + ",") == std::string::npos) continue;
+        const int ti = static_cast<int>(sh.t);
+        if (!c.k.gemvh[ti]) continue;
+        const HostMat m = randomMat(c, sh.t, sh.nrows, sh.ncols);
+        // enough copies that the weights never stay in the 32 MB MALL between calls
+        const int copies = std::max<int>(1, std::min<int>(48, static_cast<int>((640u << 20) / m.data.size())));
+        std::vector<Buf> ws;
+        for (int i = 0; i < copies; ++i) ws.emplace_back(m.data);
+        Buf x16 = makeX16(c, 32, sh.ncols);
+        for (int nt : nlist) {
+            Buf y(static_cast<std::size_t>(nt) * sh.nrows * 4);
+            struct V {
+                std::string name;
+                hip::Function f;
+                int bm, bn, nth;
+                bool tok_x;
+            };
+            std::vector<V> vs;
+            if (!onlyx && nt <= 16 && c.k.gemvh[ti]) vs.push_back({"gemvh", c.k.gemvh[ti], 16, 1 << 20, 32, false});
+            if (!onlyx && c.k.gemvh2[ti]) vs.push_back({"gemvh2", c.k.gemvh2[ti], 16, 1 << 20, 32, false});
+            for (int si = 0; si < static_cast<int>(wk::kGemmsCfgs.size()); ++si) {
+                if (onlyx || (lite && si > 0)) break;
+                const auto& cf = c.k.gemms_geom[static_cast<std::size_t>(si)];
+                if (c.k.gemms[si][ti]) vs.push_back({"gemms_c" + std::to_string(si), c.k.gemms[si][ti], cf.bm, cf.bn, cf.nth, true});
+            }
+            for (const XVar& xv : xvars) {
+                if (!ximage.empty() && nt <= 32) {
+                    const hip::Function f = xmod.getFunctionOpt((xv.prefix + "_" + wk::typeSuffix(sh.t)).c_str());
+                    if (f) vs.push_back({xv.prefix, f, xv.bm, 1 << 20, xv.nth, false});
+                }
+            }
+            // bitwise check of the development variants against the built-in gemvh2 (any n <= 32)
+            if (!xvars.empty() && c.k.gemvh2[ti]) {
+                auto runv = [&](hip::Function f, int bm, int nth) {
+                    Buf yy(static_cast<std::size_t>(nt) * sh.nrows * 4);
+                    hip::launch(f, {cdiv(sh.nrows, bm), 1, 1}, {static_cast<unsigned>(nth), 1, 1}, 0, c.s, ws[0].p(), m.row_bytes, x16.p(), yy.p(),
+                                sh.ncols, sh.nrows, nt, 0);
+                    c.sync();
+                    return yy.down<float>(static_cast<std::size_t>(nt) * sh.nrows);
+                };
+                const auto ref = runv(c.k.gemvh2[ti], 16, 32);
+                for (const V& v : vs) {
+                    if (v.tok_x || v.name.rfind("gemvh", 0) == 0 && (v.name == "gemvh" || v.name == "gemvh2")) continue;
+                    const auto yv = runv(v.f, v.bm, v.nth);
+                    std::size_t bad = 0;
+                    for (std::size_t i = 0; i < yv.size(); ++i) bad += std::memcmp(&yv[i], &ref[i], 4) != 0;
+                    std::printf("   check %s n %d %s: %zu mismatches\n", v.name.c_str(), nt, sh.what, bad);
+                }
+            }
+            for (const V& v : vs) {
+                auto launch = [&](int i) {
+                    // WHIRL_KT_GEMVH_GRIDDIV=<d>: development variants (persistent tile loop) get 1/d of the blocks
+                    const int gdiv = (!v.tok_x && v.name != "gemvh" && v.name != "gemvh2" && std::getenv("WHIRL_KT_GEMVH_GRIDDIV"))
+                                         ? std::max(1, std::atoi(std::getenv("WHIRL_KT_GEMVH_GRIDDIV"))) : 1;
+                    const bool shipped = (v.name == "gemvh" || v.name == "gemvh2") && c.mod.arch() == hip::Arch::gfx1151;
+                    const hip::Dim3 grid = v.tok_x ? hip::Dim3{cdiv(nt, v.bn), cdiv(sh.nrows, v.bm), 1}
+                                                   : hip::Dim3{shipped ? wk::gemvhGrid(static_cast<unsigned>(sh.nrows)) : cdiv(cdiv(sh.nrows, v.bm), gdiv),
+                                                               cdiv(nt, v.bn), 1};
+                    hip::launch(v.f, grid, {static_cast<unsigned>(v.nth), 1, 1}, 0, c.s, ws[static_cast<std::size_t>(i % copies)].p(), m.row_bytes,
+                                x16.p(), y.p(), sh.ncols, sh.nrows, nt, 0);
+                };
+                for (int i = 0; i < copies; ++i) launch(i);
+                c.sync();
+                // timed in ~150 ms windows after a ~100 ms warm-up (short windows read the GPU clock ramp-up, not the kernel)
+                auto timed = [&](int iters) {
+                    hip::Event e0 = hip::eventCreate(true), e1 = hip::eventCreate(true);
+                    hip::eventRecord(e0, c.s);
+                    for (int i = 0; i < iters; ++i) launch(i);
+                    hip::eventRecord(e1, c.s);
+                    hip::eventSync(e1);
+                    const double us1 = 1000.0 * hip::eventElapsedMs(e0, e1) / iters;
+                    hip::eventDestroy(e0);
+                    hip::eventDestroy(e1);
+                    return us1;
+                };
+                const int base_iters = std::max(copies * 2, 20);
+                double us = timed(base_iters);
+                const int win = static_cast<int>(std::min(20000.0, std::max<double>(base_iters, 150000.0 / us)));
+                timed(win * 2 / 3);
+                us = 1e30;
+                for (int rep = 0; rep < 3; ++rep) us = std::min(us, timed(win));
+                const double gbs = static_cast<double>(m.data.size()) / (us * 1e3);
+                std::printf("   %-6s %-24s n %2d %-9s %9.1f us %7.1f GB/s %5.1f%% of %.0f\n", wk::typeSuffix(sh.t), sh.what, nt, v.name.c_str(),
+                            us, gbs, 100.0 * gbs / peak, peak);
+                std::fflush(stdout);
+            }
+        }
+    }
+}
+
+}  // namespace kt
