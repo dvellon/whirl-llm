@@ -300,6 +300,9 @@ struct EngineOptions {
     std::uint32_t mtp_adapt = 0;
     bool mtp_auto = false;
     std::array<std::uint32_t, gdn_max_seg + 1> batch_drafts{};
+    // without DeltaNet replay: snapshot sets the n-gram / DFlash2 drafts may use (0 = all; CONC-8S
+    // keeps them at the budget they had before the MTP caps under load were raised)
+    std::uint32_t ng_snap_sets = 0;
     bool no_prefix_cache = false;
     bool verify_cache = false;
     bool seg_prefill = true;

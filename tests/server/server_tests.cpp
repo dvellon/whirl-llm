@@ -8,6 +8,7 @@
 
 #include "http_client.h"
 #include "mock_backend.h"
+#include "server/draft_caps.h"
 #include "server/engine.h"
 #include "server/http.h"
 #include "server/log.h"
@@ -326,6 +327,38 @@ std::string streamText(const HttpResult& r, bool chat, std::string* finish = nul
 
 // ---------------------------------------------------------------------------
 // unit tests
+
+// CONC-8S: MTP draft caps under load with DeltaNet snapshot sets (gfx1151, no replay) equal the
+// replay path's {8, 7, 4, 3}; the literal (n-gram) drafts keep the old budget (8 sets)
+void testDraftCaps() {
+    const std::array<std::uint32_t, qwen35::gdn_max_seg + 1> def = {0, 8, 7, 4, 3, 2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+    const SnapDraftCaps a = snapshotDraftCaps(def, 8, 4, false, std::nullopt);
+    CHECK_EQ(a.caps[1], 8u);
+    CHECK_EQ(a.caps[2], 7u);
+    CHECK_EQ(a.caps[3], 4u);
+    CHECK_EQ(a.caps[4], 3u);  // was 8 / 4 = 2: concurrent fast output != solo
+    CHECK_EQ(a.caps[5], 2u);
+    CHECK_EQ(a.sets, 14u);    // 2 slots x 7 drafts
+    CHECK_EQ(a.lit_sets, 8u);  // what the old caps allocated (n-gram budget unchanged)
+    for (std::uint32_t k = 1; k <= 4; ++k) CHECK(k * a.caps[k] <= qwen35::gdn_max_snap);
+    // fixed 3 drafts: 3 per cycle at every load (old: 2 with 3-4 slots)
+    const SnapDraftCaps b = snapshotDraftCaps(def, 3, 4, false, std::nullopt);
+    CHECK_EQ(std::min(b.caps[4], 3u), 3u);
+    CHECK_EQ(std::min(b.caps[3], 3u), 3u);
+    CHECK_EQ(b.sets, 12u);
+    CHECK_EQ(b.lit_sets, 8u);
+    // one slot: nothing changes
+    const SnapDraftCaps c = snapshotDraftCaps(def, 8, 1, false, std::nullopt);
+    CHECK_EQ(c.sets, 8u);
+    CHECK_EQ(c.lit_sets, 8u);
+    // WHIRL_MTP_BATCH_DRAFTS: used as given, literal drafts may use all sets; WHIRL_SNAP_SETS raises both
+    const SnapDraftCaps d = snapshotDraftCaps(def, 8, 4, true, std::nullopt);
+    CHECK_EQ(d.caps[4], 3u);
+    CHECK_EQ(d.lit_sets, 0u);
+    const SnapDraftCaps e = snapshotDraftCaps(def, 8, 1, false, 12u);
+    CHECK_EQ(e.sets, 12u);
+    CHECK_EQ(e.lit_sets, 12u);
+}
 
 void testProtocol() {
     CHECK_EQ(partialHold("abc<to", "<tool_call>"), std::size_t(3));
@@ -1944,6 +1977,7 @@ int main(int argc, char** argv) {
     };
     const std::vector<T> tests = {
         {"vision", testVision},
+        {"draft_caps", testDraftCaps},
         {"protocol", testProtocol},
         {"sampler", testSampler},
         {"chat_tokens", testChatTokens},
