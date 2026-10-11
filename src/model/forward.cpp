@@ -266,7 +266,8 @@ void Model::gemmF16(const Mat& w, DevPtr x16in, DevPtr y, u32 n, i32 acc) {
         }();
         const hip::Function hv = n <= 16 ? k.gemvh[t] : k.gemvh2[t];
         if (gemvh_on && hv != nullptr) {
-            hip::launch(hv, D((w.nrows + 15) / 16), D(32), 0, stream, w.ptr, w.row_bytes, x16in, y, ncols, nrows, I(n), acc);
+            hip::launch(hv, D(arch == hip::Arch::gfx1151 ? kernels::gemvhGrid(w.nrows) : (w.nrows + 15) / 16), D(32), 0, stream, w.ptr, w.row_bytes, x16in, y, ncols, nrows, I(n),
+                        acc);
             return;
         }
     }

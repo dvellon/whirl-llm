@@ -78,6 +78,14 @@ void testGemvh(Ctx& c) {
                         }
                         if (nt <= 16 && c.k.gemvh[ti]) chk(run(c.k.gemvh[ti], 16, 1 << 20, 32, false), "gemvh");
                         if (c.k.gemvh2[ti]) chk(run(c.k.gemvh2[ti], 16, 1 << 20, 32, false), "gemvh2");
+                        // gfx1151: the blocks loop over row tiles, so a grid of 1/2 / 1/3 of the tiles (and one block) must give the same bits
+                        if (c.mod.arch() == hip::Arch::gfx1151) {
+                            for (int div : {2, 3, 1 << 20}) {
+                                const int bm = 16 * div > 16 ? 16 * div : 16;  // rows per launched block (div tiles each) for run()'s grid
+                                if (nt <= 16 && c.k.gemvh[ti]) chk(run(c.k.gemvh[ti], bm, 1 << 20, 32, false), "gemvh/" + std::to_string(div));
+                                if (c.k.gemvh2[ti]) chk(run(c.k.gemvh2[ti], bm, 1 << 20, 32, false), "gemvh2/" + std::to_string(div));
+                            }
+                        }
                     }
                 }
             }
@@ -106,11 +114,14 @@ void benchGemvh(Ctx& c) {
     std::vector<Shape> shapes = {
         {QType::q4_k, 5120, 5120, "5120x5120"},      {QType::q4_k, 17408, 5120, "17408x5120 ffn up"}, {QType::q4_k, 5120, 17408, "5120x17408 ffn down"},
         {QType::q5_k, 5120, 5120, "5120x5120"},      {QType::q5_k, 17408, 5120, "17408x5120 ffn up"}, {QType::q5_k, 5120, 17408, "5120x17408 ffn down"},
+        {QType::q5_k, 10240, 5120, "10240x5120 qkv"},
         {QType::q6_k, 5120, 5120, "5120x5120"},      {QType::q6_k, 17408, 5120, "17408x5120 ffn up"}, {QType::q6_k, 5120, 17408, "5120x17408 ffn down"},
         {QType::q6_k, 248320, 5120, "lm head 248320x5120"},
-        {QType::q8_0, 5120, 5120, "5120x5120"},      {QType::mxfp4, 5120, 5120, "5120x5120"},        {QType::iq4_xs, 5120, 5120, "5120x5120"},
-        {QType::iq4_xs, 17408, 5120, "17408x5120 ffn up"}, {QType::iq4_xs, 5120, 17408, "5120x17408 ffn down"},
-        {QType::q5_k, 10240, 5120, "10240x5120 qkv"}, {QType::q5_k, 5120, 6144, "5120x6144 ssm out"},
+        {QType::q8_0, 5120, 5120, "5120x5120"},      {QType::mxfp4, 5120, 5120, "5120x5120"},
+        {QType::iq4_xs, 5120, 5120, "5120x5120"},    {QType::iq4_xs, 17408, 5120, "17408x5120 ffn up"}, {QType::iq4_xs, 5120, 17408, "5120x17408 ffn down"},
+        {QType::iq4_nl, 17408, 5120, "17408x5120 ffn up"}, {QType::iq4_nl, 5120, 17408, "5120x17408 ffn down"},
+        {QType::q3_k, 17408, 5120, "17408x5120 ffn up"}, {QType::q3_k, 5120, 17408, "5120x17408 ffn down"},
+        {QType::iq3_s, 17408, 5120, "17408x5120 ffn up"}, {QType::iq3_s, 5120, 17408, "5120x17408 ffn down"},
     };
     // WHIRL_KT_GEMVH_SHAPES=<type>:<nrows>:<ncols>[,..] replaces the list (development)
     if (const char* e = std::getenv("WHIRL_KT_GEMVH_SHAPES")) {
@@ -166,6 +177,7 @@ void benchGemvh(Ctx& c) {
         }
     }
     const bool lite = std::getenv("WHIRL_KT_GEMVH_LITE") != nullptr;
+    const bool onlyx = std::getenv("WHIRL_KT_GEMVH_ONLYX") != nullptr;  // time only the development variants
     const std::string tfilter = std::getenv("WHIRL_KT_GEMVH_TYPES") ? std::string(",") + std::getenv("WHIRL_KT_GEMVH_TYPES") + "," : "";
     std::vector<int> nlist = {1, 16, 32};
     if (const char* e = std::getenv("WHIRL_KT_GEMVH_NS")) {
@@ -195,10 +207,10 @@ void benchGemvh(Ctx& c) {
                 bool tok_x;
             };
             std::vector<V> vs;
-            if (nt <= 16 && c.k.gemvh[ti]) vs.push_back({"gemvh", c.k.gemvh[ti], 16, 1 << 20, 32, false});
-            if (c.k.gemvh2[ti]) vs.push_back({"gemvh2", c.k.gemvh2[ti], 16, 1 << 20, 32, false});
+            if (!onlyx && nt <= 16 && c.k.gemvh[ti]) vs.push_back({"gemvh", c.k.gemvh[ti], 16, 1 << 20, 32, false});
+            if (!onlyx && c.k.gemvh2[ti]) vs.push_back({"gemvh2", c.k.gemvh2[ti], 16, 1 << 20, 32, false});
             for (int si = 0; si < static_cast<int>(wk::kGemmsCfgs.size()); ++si) {
-                if (lite && si > 0) break;
+                if (onlyx || (lite && si > 0)) break;
                 const auto& cf = c.k.gemms_geom[static_cast<std::size_t>(si)];
                 if (c.k.gemms[si][ti]) vs.push_back({"gemms_c" + std::to_string(si), c.k.gemms[si][ti], cf.bm, cf.bn, cf.nth, true});
             }
@@ -231,8 +243,10 @@ void benchGemvh(Ctx& c) {
                     // WHIRL_KT_GEMVH_GRIDDIV=<d>: development variants (persistent tile loop) get 1/d of the blocks
                     const int gdiv = (!v.tok_x && v.name != "gemvh" && v.name != "gemvh2" && std::getenv("WHIRL_KT_GEMVH_GRIDDIV"))
                                          ? std::max(1, std::atoi(std::getenv("WHIRL_KT_GEMVH_GRIDDIV"))) : 1;
+                    const bool shipped = (v.name == "gemvh" || v.name == "gemvh2") && c.mod.arch() == hip::Arch::gfx1151;
                     const hip::Dim3 grid = v.tok_x ? hip::Dim3{cdiv(nt, v.bn), cdiv(sh.nrows, v.bm), 1}
-                                                   : hip::Dim3{cdiv(cdiv(sh.nrows, v.bm), gdiv), cdiv(nt, v.bn), 1};
+                                                   : hip::Dim3{shipped ? wk::gemvhGrid(static_cast<unsigned>(sh.nrows)) : cdiv(cdiv(sh.nrows, v.bm), gdiv),
+                                                               cdiv(nt, v.bn), 1};
                     hip::launch(v.f, grid, {static_cast<unsigned>(v.nth), 1, 1}, 0, c.s, ws[static_cast<std::size_t>(i % copies)].p(), m.row_bytes,
                                 x16.p(), y.p(), sh.ncols, sh.nrows, nt, 0);
                 };

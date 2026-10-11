@@ -170,6 +170,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
@@ -515,4 +516,19 @@ std::string gemvwName(QType t, int nt, int v, bool grouped);
 std::string gemmcName(QType t, int cfg);
 std::string gemmsName(QType t, int cfg, bool f16_out);
 
+
+// gemvh / gemvh2 on gfx1151 (one wave per 16 weight rows; the blocks loop over row tiles): launching every
+// tile as its own block leaves a partial last round and a long single-wave tail once the matrix has more
+// tiles than the GPU holds waves (17408 rows = 1088 tiles). The grid is cut to ceil(tiles / k) blocks with
+// k = ceil(tiles / kGemvhWaves), so each block gets k or k - 1 tiles. WHIRL_GEMVH_WAVES=<n> overrides (tests).
+inline unsigned gemvhGrid(unsigned nrows) {
+    static const unsigned cap = [] {
+        const char* e = std::getenv("WHIRL_GEMVH_WAVES");
+        const int v = e != nullptr ? std::atoi(e) : 640;
+        return static_cast<unsigned>(v > 0 ? v : 640);
+    }();
+    const unsigned tiles = (nrows + 15) / 16;
+    const unsigned k = (tiles + cap - 1) / cap;
+    return k > 1 ? (tiles + k - 1) / k : tiles;
+}
 }  // namespace whirl::kernels
