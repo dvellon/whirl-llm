@@ -15,8 +15,8 @@
 # empty reference file, or a suite ngram run that never drafted from the n-gram table (ng_cycles=0)
 # is an error (exit 2). The runner clears every WHIRL_* environment variable (a stray WHIRL_HIP_DEVICE
 # or WHIRL_MODE would change what is measured; --device selects the GPU) and restores them on exit.
-# Suites: single, pair; ngram (forced n-gram MTP drafts on a copy-the-text prompt) is part of the
-# default for gfx1201 only until the gfx1151 references are recorded.
+# Suites: single, pair, ngram (forced n-gram MTP drafts on a copy-the-text prompt); all three are the
+# default for both architectures.
 param(
     [Parameter(Mandatory = $true, Position = 0)][ValidateSet("check", "record")][string]$Action,
     [ValidateSet("gfx1201", "gfx1151")][string]$Arch = "gfx1201",
@@ -35,7 +35,7 @@ $Models = @($Models | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 $Modes = @($Modes | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 $Suites = @($Suites | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 if ($Suites.Count -eq 0 -and -not $PSBoundParameters.ContainsKey("Suites")) {
-    $Suites = if ($Arch -eq "gfx1201") { @("single", "pair", "ngram") } else { @("single", "pair") }
+    $Suites = @("single", "pair", "ngram")
 }
 if ($Models.Count -eq 0 -or $Modes.Count -eq 0 -or $Suites.Count -eq 0) {
     Write-Host "golden: empty model / mode / suite list (models=$($Models.Count) modes=$($Modes.Count) suites=$($Suites.Count)): nothing would be checked"

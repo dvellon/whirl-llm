@@ -594,8 +594,8 @@ __device__ __forceinline__ void gemvh11_impl(uint8_t *__restrict__ Ws, const uin
             if (WCH % WARP == 0 || idx < WCH) {                                                              \
                 const size_t st = (size_t)min(m0 + idx / CH, nrows - 1) * row_bytes + (size_t)(js_) * SB;                                             \
                 const size_t a = (st & ~(size_t)15) + (idx % CH) * 16;                                       \
-                /* no 16-byte chunk wholly past the stage (the matrix may end there) */                      \
-                if (a < st + SB) rw[e] = *(const gs_u32x4 *)(W + a);                                         \
+                /* no 16-byte chunk wholly past the stage (the matrix may end there): zero-fill, never stale bytes */ \
+                rw[e] = a < st + SB ? *(const gs_u32x4 *)(W + a) : (gs_u32x4){0, 0, 0, 0};            \
             }                                                                                                \
         }                                                                                                    \
     } while (0)

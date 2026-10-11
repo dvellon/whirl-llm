@@ -74,8 +74,8 @@ __device__ __forceinline__ void gemms11_impl(const uint8_t *__restrict__ W, uint
                 const int row = min(m0 + r, nrows - 1);                                             \
                 const size_t st = (size_t)row * row_bytes + (size_t)(js_) * SB;                     \
                 const size_t a = (st & ~(size_t)15) + c * 16;                                       \
-                /* no 16-byte chunk wholly past the stage (the matrix may end there) */             \
-                if (a < st + SB) rw[e] = *(const gs_u32x4 *)(W + a);                                \
+                /* no 16-byte chunk wholly past the stage (the matrix may end there): zero-fill it, never stale/undefined LDS bytes */ \
+                rw[e] = a < st + SB ? *(const gs_u32x4 *)(W + a) : (gs_u32x4){0, 0, 0, 0};   \
             }                                                                                       \
         }                                                                                           \
     } while (0)

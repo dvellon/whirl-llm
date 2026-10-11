@@ -54,8 +54,8 @@ size and a hash of its size plus first and last 4 MiB, kept in `tests/golden/mod
 `WHIRL_HIP_DEVICE` or `WHIRL_MODE` would change what is measured; `--device` picks the GPU) and restores
 them afterwards. Suites: `single`, `pair`, and `ngram` (the forced n-gram MTP drafts on a copy-the-text
 prompt; the runner fails the case when `ng_cycles` is 0, because the n-gram case of `single` never drafts on
-its prompt). `ngram` needs a model with an MTP head and is in the default list for gfx1201 only, until its
-gfx1151 references are recorded on the Radeon 8060S (`golden.ps1 record -Arch gfx1151 -Suites ngram`).
+its prompt). `ngram` needs a model with an MTP head and is in the default list for both architectures
+(gfx1151 references recorded on the Radeon 8060S with `golden.ps1 record -Arch gfx1151 -Suites ngram`).
 
 Reference files are kept per architecture, at `tests/golden/<arch>/<model>/<mode>_<suite>.txt`.
 gfx1201 and gfx1151 use different kernels and tuning tables, so their outputs differ.
