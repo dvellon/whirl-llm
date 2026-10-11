@@ -591,11 +591,11 @@ void testVramLimit() {
     CHECK_EQ(vram::fixedNeed(fi, 4096, 4, 2), fi.weights + fi.fixed + fi.buf_fixed + fi.buf_per_row * 4096 + 6 * fi.ckpt_bytes);
     const vram::FitPlan p = vram::planFit(fi);
     CHECK(p.reduced && p.fits);
-    CHECK_EQ(p.batch, 1024u);
+    CHECK_EQ(p.batch, 1280u);  // VRAM-01: never below one 1024 chunk + the 256-row merged tail
     CHECK_EQ(p.n_ck, 2u);
     CHECK_EQ(p.n_spe, 1u);
     CHECK(p.pool_tokens >= 16384);
-    CHECK(p.note == "prefill batch 4096 -> 1024, checkpoints per slot 4 -> 2, shared checkpoints 2 -> 1");
+    CHECK(p.note == "prefill batch 4096 -> 1280, checkpoints per slot 4 -> 2, shared checkpoints 2 -> 1");
     // the same model on 32 GB: nothing changes
     vram::FitInput roomy = fi;
     roomy.avail = 29 * GiB;
@@ -621,13 +621,25 @@ void testVramLimit() {
     vram::FitInput hopeless = fi;
     hopeless.avail = 10 * GiB;
     const vram::FitPlan ph = vram::planFit(hopeless);
-    CHECK(ph.reduced && !ph.fits && ph.batch == 512 && ph.n_ck == 1 && ph.n_spe == 0 && ph.pool_tokens == 0);
+    CHECK(ph.reduced && !ph.fits && ph.batch == 1280 && ph.n_ck == 1 && ph.n_spe == 0 && ph.pool_tokens == 0);
     // prefix cache off (0 checkpoints): checkpoint steps change nothing
     vram::FitInput nopc = fi;
     nopc.n_ck = 0;
     nopc.n_spe = 0;
     const vram::FitPlan pn = vram::planFit(nopc);
     CHECK(pn.n_ck == 0 && pn.n_spe == 0 && pn.batch <= 2048);
+    // VRAM-01 sweep: whatever the budget, the planned batch is never below the scheduler's largest
+    // forward (1024-row chunk + 256-row tail), so a long prompt cannot hit BatchTooLarge
+    for (std::uint32_t req : {4096u, 2048u, 1536u, 1280u}) {
+        for (std::uint64_t av = 8 * GiB; av <= 30 * GiB; av += 256 * MiB) {
+            vram::FitInput sw = fi;
+            sw.batch = req;
+            sw.avail = av;
+            const vram::FitPlan ps = vram::planFit(sw);
+            CHECK(ps.batch >= 1280u && ps.batch <= req);
+        }
+    }
+    CHECK_EQ(vram::min_prefill_batch, 1280u);
 }
 
 // server defaults by card size (vram::cardDefaults)

@@ -43,6 +43,9 @@
 
 namespace whirl::server {
 
+// planFit's smallest batch must hold the largest forward the scheduler builds (VRAM-01)
+static_assert(vram::min_prefill_batch >= prefill_chunk + prefill_merge);
+
 namespace {
 
 // Graceful shutdown: Ctrl+C / Ctrl+Break / closing the console window (and logoff /

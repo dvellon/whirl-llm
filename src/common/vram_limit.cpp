@@ -112,9 +112,8 @@ FitPlan planFit(const FitInput& in) {
     const Step steps[] = {
         {2048, 0xffffffffu, 0xffffffffu},  // batch 2048
         {0, 2, 1},                         // checkpoints: 2 per slot, 1 shared
-        {1024, 0xffffffffu, 0xffffffffu},  // batch 1024
+        {min_prefill_batch, 0xffffffffu, 0xffffffffu},  // batch 1280 (one 1024 chunk + 256 merged tail), never lower
         {0, 1, 0},                         // checkpoints: 1 per slot, no shared
-        {512, 0xffffffffu, 0xffffffffu},   // batch 512
     };
     const std::uint32_t b0 = p.batch, c0 = p.n_ck, s0 = p.n_spe;
     for (const Step& s : steps) {

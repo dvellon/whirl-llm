@@ -69,8 +69,14 @@ std::uint64_t processCap(std::uint64_t free_at_first, std::uint64_t total, std::
 // The server picks the prefill batch and the number of prefix checkpoints
 // before the weights are loaded; when the estimate says the KV pool left
 // afterwards would be below `pool_min_tokens`, it lowers them step by step
-// (batch 4096 -> 2048, checkpoints, batch -> 1024, ...) until the pool fits.
+// (batch 4096 -> 2048, checkpoints, batch -> min_prefill_batch, ...) until the pool fits.
 // Nothing changes when the pool already fits with the requested values.
+// Smallest prefill batch the planner may pick: the scheduler builds chunks of 1024 rows and merges a
+// tail of up to 256 more (engine.h prefill_chunk + prefill_merge), and Model::forward throws
+// BatchTooLarge for more rows than the batch. A smaller batch would start the server and then fail
+// every long prompt, so the planner refuses to shrink below it (it reduces the checkpoints, or the
+// server stops with the VRAM message).
+inline constexpr std::uint32_t min_prefill_batch = 1280;
 struct FitInput {
     std::uint64_t avail = 0;          // VRAM the model may use from now on (free' minus reserve, WDDM room)
     std::uint64_t weights = 0;        // weight bytes uploaded to VRAM
