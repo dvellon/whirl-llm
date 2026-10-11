@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <set>
 #include <vector>
@@ -76,6 +77,14 @@ struct MockConfig {
     // simulated device time (busy wait; 0 = none): per prefill row, per verify cycle
     double prefill_us_per_row = 0;
     double cycle_us = 0;
+    // > 0: the next token depends on the last token only, drawn from the first `markov` words
+    // (greedy output cycles: n-gram drafts hit)
+    std::uint32_t markov = 0;
+    // DFlash2 drafter (--draft dflash): block size, capture rows, probability that a draft is wrong
+    bool dflash = false;
+    std::uint32_t dfl_block = 8;
+    std::uint32_t dfl_cap_rows = 2048;
+    double dfl_miss = 0.3;
 };
 
 class MockModel final : public server::ServerModel {
@@ -127,6 +136,19 @@ public:
     void topkRows(std::uint32_t row0, std::uint32_t rows, std::uint32_t k, float inv_t, server::DevPtr ids,
                   server::DevPtr vals, server::DevPtr stats) override;
 
+    bool hasDFlash() const override { return mc_.dflash; }
+    std::uint32_t dflashMaxDrafts() const override { return mc_.dflash ? mc_.dfl_block - 1 : 0; }
+    std::uint32_t captureN() const override;
+    void dflashIngest(std::uint32_t s, std::uint32_t row0, std::uint32_t n, std::uint32_t pos0) override;
+    std::vector<std::uint32_t> dflashDraft(std::uint32_t s, std::uint32_t anchor, std::uint32_t pos, float p_min,
+                                           std::uint32_t n_min) override;
+    void dflashTrim(std::uint32_t s, std::uint32_t keep) override;
+    // DFlash2: ingested rows that did not match the capture (wrong row / sequence / position),
+    // context rows from another lineage seen by a draft, draft blocks run
+    std::uint64_t dflBad() const { return dfl_bad_; }
+    std::uint64_t dflStale() const { return dfl_stale_; }
+    std::uint64_t dflBlocks() const { return dfl_blocks_; }
+
     // Reference: greedy continuation of `prompt` computed from scratch
     // (independent of the engine), stopping at <|im_end|> / <|endoftext|>
     // unless ignore_eos, or after max_tokens.
@@ -175,6 +197,15 @@ private:
     void prefillOne(std::uint32_t s, std::span<const std::uint32_t> toks, std::uint32_t pos0, std::uint32_t r0,
                     std::uint32_t logits_row, std::optional<server::DevPtr> prev_hidden, bool mtp);
     std::uint32_t corruptDraft(std::uint32_t truth, std::uint64_t key) const;
+    std::uint64_t stepH(std::uint64_t h, std::uint32_t tok, std::uint32_t pos) const;
+    struct CapRow {
+        std::uint32_t seq, tok;
+        State st;
+    };
+    void capRow(std::uint32_t seq, std::uint32_t tok, const State& st);
+    std::vector<CapRow> cap_;
+    std::vector<std::map<std::uint32_t, State>> dfl_ctx_;
+    std::uint64_t dfl_bad_ = 0, dfl_stale_ = 0, dfl_blocks_ = 0;
 
     tier::DeviceOps& ops_;
     const Tokenizer& tok_;

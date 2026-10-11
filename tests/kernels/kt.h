@@ -203,6 +203,7 @@ void testMoeMx(Ctx& c);
 // 8060S grouped expert GEMMs (test_moe_gu.cpp), called by testMoe / testMoeMx
 void moeGuChecks(Ctx& c, const HostMat& gate, const HostMat& up, const HostMat& down, int R, int K);
 void testMisc(Ctx& c);
+void testDflash(Ctx& c);
 
 inline unsigned cdiv(std::uint64_t a, std::uint64_t b) { return static_cast<unsigned>((a + b - 1) / b); }
 

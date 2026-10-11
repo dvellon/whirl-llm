@@ -6,6 +6,7 @@
 
 #include "cache/tier_adapter.h"
 #include "log.h"
+#include "whirl/dflash_policy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -298,6 +299,11 @@ Engine::Stats Engine::stats() const {
     s.ssd_used = stat_ssd_used_.load(std::memory_order_relaxed);
     s.ssd_entries = stat_ssd_entries_.load(std::memory_order_relaxed);
     s.superseded = stat_superseded_.load(std::memory_order_relaxed);
+    s.dfl_cycles = stat_dfl_cycles_;
+    s.dfl_drafted = stat_dfl_drafted_;
+    s.dfl_accepted = stat_dfl_accepted_;
+    s.dfl_cold = stat_dfl_cold_;
+    s.dfl_gap = stat_dfl_gap_;
     return s;
 }
 
@@ -351,6 +357,43 @@ void Engine::loadCkpt(const Ckpt& c) {
 void Engine::dropCache(Slot& sl) {
     for (Ckpt& c : sl.ckpts) c.valid = false;
     sl.cache_tokens.clear();
+    dflReset(sl, 0);
+}
+
+// ---------------------------------------------------------------------------
+// DFlash2 drafter context (--draft dflash). Its rows come from the target features captured by
+// each forward / verify; a slot's context is valid for the slot's own lineage only (same tokens at
+// the same positions). Restores from a shared checkpoint or a host tier bring KV and state but no
+// features: the context starts empty at the restore point and the slot drafts with DFlash2 again
+// once dfl_warm rows were ingested after it (re-running the target over earlier positions would
+// rewrite KV rows the restored state already holds).
+
+std::uint32_t Engine::draftRoom() const {
+    if (opt_.use_mtp) return opt_.n_draft;
+    if (opt_.use_dflash) return m_.dflashMaxDrafts();
+    return 0;
+}
+
+void Engine::dflReset(Slot& sl, std::uint32_t at) {
+    if (!opt_.use_dflash) return;
+    m_.dflashTrim(sl.id, 0);
+    sl.dfl_lo = sl.dfl_hi = at;
+}
+
+// Rows r0 .. r0 + n - 1 of the latest forward / verify of run_rows rows are positions pos0 .. of
+// slot sl: ingest those whose features were captured.
+void Engine::dflIngest(Slot& sl, std::uint32_t run_rows, std::uint32_t r0, std::uint32_t n, std::uint32_t pos0) {
+    if (!opt_.use_dflash || n == 0) return;
+    ::whirl::dflash::Range rg{sl.dfl_lo, sl.dfl_hi};
+    const ::whirl::dflash::Ingest g = ::whirl::dflash::planIngest(rg, m_.captureN(), run_rows, r0, n, pos0);
+    stat_dfl_gap_ += g.gap;
+    if (g.any) m_.dflashIngest(sl.id, g.cap_row, g.n, g.pos);
+    sl.dfl_lo = rg.lo;
+    sl.dfl_hi = rg.hi;
+}
+
+bool Engine::dflReady(const Slot& sl) const {
+    return opt_.use_dflash && ::whirl::dflash::ready(::whirl::dflash::Range{sl.dfl_lo, sl.dfl_hi}, sl.pos, opt_.dfl_warm);
 }
 
 void Engine::freePages(Slot& sl) {
@@ -729,6 +772,8 @@ void Engine::attachSpe(Slot& sl, Spe& s) {
     copyPage(*np, s.pages[last]);
     m_.mapPages(sl.id, 0, sl.pages);
     sl.cache_tokens.insert(sl.cache_tokens.end(), s.tokens.begin(), s.tokens.end());
+    // another lineage's KV: no drafter context for it
+    dflReset(sl, s.n);
     s.last_used = pc_->touch();
     s.uses += 1;
     stat_spe_hits_ += 1;
@@ -1112,7 +1157,7 @@ bool Engine::startJob(Slot& sl, Job& job) {
     const Params& p = job.params;
     const std::span<const std::uint32_t> toks = job.tokens;
     const std::uint32_t N = static_cast<std::uint32_t>(toks.size());
-    const std::uint32_t nd_max = opt_.use_mtp ? opt_.n_draft : 0;
+    const std::uint32_t nd_max = draftRoom();
     const auto& cfg = m_.cfg();
     sl.job = &job;
     sl.last_used = pc_->touch();
@@ -1187,6 +1232,17 @@ bool Engine::startJob(Slot& sl, Job& job) {
     for (Ckpt& c : sl.ckpts)
         if (c.valid && c.pos > mt.reuse) c.valid = false;
     sl.cache_tokens.resize(std::min<std::size_t>(sl.cache_tokens.size(), mt.reuse));
+    if (opt_.use_dflash) {
+        // the slot's own prefix keeps its drafter rows below reuse (attachSpe reset them for a
+        // shared checkpoint); positions >= reuse are rewritten
+        if (mt.reuse == 0) {
+            dflReset(sl, 0);
+        } else {
+            m_.dflashTrim(sl.id, mt.reuse);
+            sl.dfl_hi = std::min(sl.dfl_hi, mt.reuse);
+            sl.dfl_lo = std::min(sl.dfl_lo, sl.dfl_hi);
+        }
+    }
     {
         const std::size_t need_p =
             static_cast<std::size_t>((static_cast<std::uint64_t>(N) + nd_max + 2 + kv_page - 1) / kv_page);
@@ -1276,9 +1332,12 @@ bool Engine::startJob(Slot& sl, Job& job) {
     sl.ng.reset();
     sl.ng.ng.norm = crlf_norm_;
     sl.ng_cycles = 0;
+    sl.dfl_acc = qwen35::DraftAccept{};
+    sl.dfl_nd = static_cast<float>(m_.dflashMaxDrafts());
+    sl.dfl_cycles = 0;
     // relaxacc: a solo request starts from the same draft-policy state every time (the kept
     // tokens depend on the drafts), so its output depends only on prompt, seed and settings
-    if ((opt_.timing_reset || opt_.relax.on) && opt_.use_mtp) {
+    if ((opt_.timing_reset || opt_.relax.on) && (opt_.use_mtp || opt_.use_dflash)) {
         bool others = false;
         for (Slot& o : slots_) others = others || (&o != &sl && o.phase == Phase::decode);
         if (!others) {
@@ -1286,6 +1345,7 @@ bool Engine::startJob(Slot& sl, Job& job) {
             for (auto& c : ccost_) c.reset();
             ccost_primed_.fill(false);
             dpool_ = qwen35::DraftAccept{};
+            for (auto& t : dtiming_) t = qwen35::DraftTiming{};
             prev_nd_ = 0;
             policy_cycles_ = 0;
         }
@@ -1344,6 +1404,7 @@ void Engine::prefillStep(Slot& sl) {
     } else {
         m_.forward(toks.subspan(sl.pf_off, n), sl.reuse + static_cast<std::uint32_t>(sl.pf_off));
     }
+    dflIngest(sl, static_cast<std::uint32_t>(n), 0, static_cast<std::uint32_t>(n), sl.reuse + static_cast<std::uint32_t>(sl.pf_off));
     sl.pf_off += n;
     stat_prefill_tok_ += n;
     maybeSplitCkpt(sl, m_.hn() + static_cast<std::uint64_t>(n - 1) * m_.cfg().n_embd * 4);
@@ -1434,6 +1495,8 @@ std::size_t Engine::prefillGroup(Slot& first, std::size_t row_budget) {
     std::uint64_t r0 = 0;
     for (std::size_t k = 0; k < grp.size(); ++k) {
         Slot& sl = *grp[k];
+        dflIngest(sl, static_cast<std::uint32_t>(total), static_cast<std::uint32_t>(r0), static_cast<std::uint32_t>(segs[k].n),
+                  sl.reuse + static_cast<std::uint32_t>(sl.pf_off));
         sl.pf_off += segs[k].n;
         r0 += segs[k].n;
         try {
@@ -1644,7 +1707,7 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
     const TimePoint t_cycle0 = Clock::now();
     // slots out of context room end here
     std::vector<Slot*> act;
-    const std::uint32_t nd_room = opt_.use_mtp ? opt_.n_draft : 0;
+    const std::uint32_t nd_room = draftRoom();
     for (Slot* sl : act_in) {
         const bool room_ok = sl->pos + nd_room + 1 < ctx_ && ensurePages(*sl, sl->pos + nd_room + 2);
         if (!room_ok) {
@@ -1661,18 +1724,34 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
     const std::size_t A = act.size();
     if (A == 0) return;
     // n-gram drafts per slot (history = cache_tokens + next) when they promise
-    // more tokens per ms than MTP drafts
+    // more tokens per ms than MTP / DFlash2 drafts. Literal drafts (n-gram, DFlash2) go to the
+    // verify from the host: ng_n / ng_d, with dsrc telling which drafter made them.
     std::array<std::uint32_t, gdn_max_seg> ng_n{}, ng_ml{};
     std::array<std::array<std::uint32_t, qwen35::max_ng_drafts>, gdn_max_seg> ng_d{};
+    std::array<std::uint8_t, gdn_max_seg> dsrc{};  // 0 MTP / none, 1 n-gram, 2 DFlash2
     std::size_t n_ng = 0;
     // replay keeps no snapshot sets: the verify row budget is the only shared limit
     const std::uint32_t snap_cap = m_.gdnReplay() ? vrows_ : std::min(qwen35::gdn_max_snap, m_.snapSets());
-    if (opt_.ngram && opt_.use_mtp) {
-        const std::uint32_t Au = static_cast<std::uint32_t>(A);
+    const std::uint32_t Au = static_cast<std::uint32_t>(A);
+    // the verify writes KV rows pos .. pos + drafts: stay inside the pages mapped
+    // for the slot and the context
+    auto room = [&](const Slot& sl, std::uint32_t lim) {
+        const std::uint64_t mapped = static_cast<std::uint64_t>(sl.pages.size()) * kv_page;
+        const std::uint64_t a1 = mapped > static_cast<std::uint64_t>(sl.pos) + 1 ? mapped - (sl.pos + 1ull) : 0;
+        const std::uint64_t a2 = ctx_ > sl.pos + 2ull ? ctx_ - (sl.pos + 2ull) : 0;
+        return static_cast<std::uint32_t>(std::min({static_cast<std::uint64_t>(lim), a1, a2}));
+    };
+    // DFlash2: drafts per slot within the shared verify rows / snapshot sets
+    std::uint32_t dfl_lim = 0;
+    if (opt_.use_dflash) {
+        dfl_lim = ::whirl::dflash::draftLimit(m_.dflashMaxDrafts() + 1, qwen35::max_ng_drafts, snap_cap, vrows_, Au, m_.fusedDecode());
+    }
+    const qwen35::DraftTiming& dtm = dtiming_[std::min<std::size_t>(A, gdn_max_seg)];
+    if (opt_.ngram && (opt_.use_mtp || opt_.use_dflash)) {
         std::uint32_t lim = std::min({qwen35::max_ng_drafts, snap_cap / Au, vrows_ / Au > 0 ? vrows_ / Au - 1 : 0u});
         if (opt_.ngram_max > 0) lim = std::min(lim, opt_.ngram_max);
         if (!m_.fusedDecode()) lim = std::min(lim, 1u);
-        const qwen35::DraftTiming& tm = timing_[std::min<std::size_t>(A, gdn_max_seg)];
+        const qwen35::DraftTiming& tm = opt_.use_dflash ? dtm : timing_[std::min<std::size_t>(A, gdn_max_seg)];
         const std::uint32_t nd0 = std::max(1u, std::min(prev_nd_ > 0 ? prev_nd_ : 3u, draftCap(Au)));
         for (std::size_t k = 0; k < A; ++k) {
             if (lim == 0) break;
@@ -1682,26 +1761,53 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
                 std::vector<std::uint32_t>& v;
                 ~Pop() { v.pop_back(); }
             } pop{sl.cache_tokens};
-            // the verify writes KV rows pos .. pos + drafts: stay inside the
-            // pages mapped for this slot and the context
-            const std::uint64_t mapped = static_cast<std::uint64_t>(sl.pages.size()) * kv_page;
-            const std::uint64_t a1 = mapped > static_cast<std::uint64_t>(sl.pos) + 1 ? mapped - (sl.pos + 1ull) : 0;
-            const std::uint64_t a2 = ctx_ > sl.pos + 2ull ? ctx_ - (sl.pos + 2ull) : 0;
-            const std::uint32_t lim_k = static_cast<std::uint32_t>(std::min({static_cast<std::uint64_t>(lim), a1, a2}));
+            const std::uint32_t lim_k = room(sl, lim);
             if (lim_k == 0) continue;
             const auto mt = sl.ng.propose(sl.cache_tokens, opt_.ngram_min, std::span<std::uint32_t>(ng_d[k].data(), lim_k));
             if (mt.n == 0) continue;
-            float mtp_score = 0;
-            if (opt_.slot_drafts == 2 && A >= 2) {
+            // the alternative's tokens per ms: MTP with nd0 drafts, or DFlash2 with its usual draft
+            // count (a slot whose drafter context is not ready verifies one row)
+            float alt_score = 0;
+            if (opt_.use_dflash) {
+                const std::uint32_t dn = dflReady(sl) ? room(sl, std::min(dfl_lim, static_cast<std::uint32_t>(std::lround(sl.dfl_nd)))) : 0;
+                if (auto t = dtm.estimate(dn)) alt_score = sl.dfl_acc.expected(dn) / *t;
+            } else if (opt_.slot_drafts == 2 && A >= 2) {
                 // against this slot's own last MTP allocation and its effective acceptance (one slot: as before)
                 const std::uint32_t d = sl.d_prev > 0 ? sl.d_prev : nd0;
-                if (auto t = tm.estimate(d)) mtp_score = sl.sacc.effective(dpool_).expected(d) / *t;
+                if (auto t = tm.estimate(d)) alt_score = sl.sacc.effective(dpool_).expected(d) / *t;
             } else if (auto t = tm.estimate(nd0)) {
-                mtp_score = sl.dacc.expected(nd0) / *t;
+                alt_score = sl.dacc.expected(nd0) / *t;
             }
             ng_ml[k] = mt.mlen;
-            ng_n[k] = opt_.ngram_force ? static_cast<std::uint32_t>(mt.n) : sl.ng.choose(mt.n, mt.mlen, mtp_score, tm);
-            if (ng_n[k] > 0) n_ng += 1;
+            ng_n[k] = opt_.ngram_force ? static_cast<std::uint32_t>(mt.n) : sl.ng.choose(mt.n, mt.mlen, alt_score, tm);
+            if (ng_n[k] > 0) {
+                n_ng += 1;
+                dsrc[k] = 1;
+            }
+        }
+    }
+    // DFlash2 drafts for the slots without n-gram drafts (their time counts in the DFlash2 cycle time)
+    const TimePoint td0 = Clock::now();
+    std::size_t n_dfl = 0;
+    std::uint32_t dfl_max_n = 0;
+    if (opt_.use_dflash && dfl_lim > 0) {
+        for (std::size_t k = 0; k < A; ++k) {
+            if (dsrc[k] != 0) continue;
+            Slot& sl = *act[k];
+            if (!dflReady(sl)) {
+                stat_dfl_cold_ += 1;
+                continue;
+            }
+            const std::uint32_t lim_k = room(sl, dfl_lim);
+            if (lim_k == 0) continue;
+            const std::vector<std::uint32_t> d = m_.dflashDraft(sl.id, sl.next, sl.pos, opt_.dfl_p_min, opt_.dfl_n_min);
+            sl.dfl_nd = 0.8f * sl.dfl_nd + 0.2f * static_cast<float>(d.size());
+            const std::uint32_t n = std::min(lim_k, static_cast<std::uint32_t>(d.size()));
+            std::copy(d.begin(), d.begin() + n, ng_d[k].begin());
+            ng_n[k] = n;
+            dsrc[k] = 2;
+            n_dfl += 1;
+            dfl_max_n = std::max(dfl_max_n, n);
         }
     }
     // MTP drafts for the other slots
@@ -1919,6 +2025,10 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
         const float ms = opt_.relax.on ? cycle_ms : static_cast<float>(msSince(tc0));
         for (Slot* sl : act) sl->ng.timing.update(ng_max_n, ms);
     }
+    if (opt_.use_dflash && n_ng == 0) {
+        // DFlash2 cycle times (drafting included; 0 drafts: a plain verify)
+        dtiming_[std::min<std::size_t>(A, gdn_max_seg)].update(dfl_max_n, static_cast<float>(msSince(td0)));
+    }
     if (p) {
         if (p->events) m_.profileFlush(pa);
         p->cycles[pa] += 1;
@@ -1928,7 +2038,7 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
         p->host_ms[pa] += msSince(t_cycle0) - msSince(tc0);
         if (p->last_end) p->gap_ms[pa] += std::chrono::duration<double, std::milli>(t_cycle0 - *p->last_end).count();
     }
-    if (opt_.trace_nd) logI("trace | cycle {} | slots {} | nd {} | {:.2f} ms", n_cycles_, A, nd, msSince(tc0));
+    if (opt_.trace_nd) logI("trace | cycle {} | slots {} | nd {} | n-gram {} | dflash {} | {:.2f} ms", n_cycles_, A, nd, n_ng, n_dfl, msSince(tc0));
     n_cycles_ += 1;
     policy_cycles_ += 1;
     stat_cycles_ += 1;
@@ -1941,14 +2051,14 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
         const std::int32_t* ctl = ctl_host_.data() + static_cast<std::size_t>(sl.id) * qwen35::ctl_words;
         const std::uint32_t row0 = row_of[k];
         const std::uint32_t nd_k = nd_of[k];
-        const bool is_ng = ng_n[k] > 0;
+        const bool is_ng = ng_n[k] > 0;  // literal drafts (n-gram or DFlash2)
         // MTP: drafts (and the device p-min cutoff) from the control area; n-gram: literal
         const std::uint32_t nd_dev =
             is_ng ? nd_k : (nd_k > 0 ? std::min(nd_k, static_cast<std::uint32_t>(std::max(0, ctl[qwen35::ctl_nd]))) : 0);
         std::array<std::uint32_t, qwen35::max_ng_drafts> dr{};
         for (std::uint32_t r = 0; r < nd_k; ++r)
             dr[r] = is_ng ? ng_d[k][r] : static_cast<std::uint32_t>(ctl[qwen35::ctl_drafts + r]);
-        if (is_ng) sl.ng_cycles += 1;
+        if (dsrc[k] == 1) sl.ng_cycles += 1;
         sl.cycles += 1;
         sl.drafted += nd_dev;
         std::uint32_t acc = 0;
@@ -2010,7 +2120,7 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
             }
         }
         sl.accepted += acc;
-        if (!is_ng) {
+        if (dsrc[k] == 0 && opt_.use_mtp) {
             // n-gram cycles stay out of the MTP acceptance models
             sl.acc_ema = 0.7f * sl.acc_ema + 0.3f * static_cast<float>(acc);
             sl.dacc.update(nd_dev, acc);
@@ -2018,6 +2128,12 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
                 sl.sacc.observe(nd_dev, acc);
                 dpool_.update(nd_dev, acc);
             }
+        } else if (dsrc[k] == 2) {
+            sl.dfl_acc.update(nd_dev, acc);
+            sl.dfl_cycles += 1;
+            stat_dfl_cycles_ += 1;
+            stat_dfl_drafted_ += nd_dev;
+            stat_dfl_accepted_ += acc;
         }
         // an accepted end-of-turn draft ends the reply: the trunk keeps only the
         // rows before it and the stop token becomes `chosen`
@@ -2041,6 +2157,8 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
         // the verify ran nd + 1 rows of this slot: keep acc + 1 of them
         if (m_.gdnReplay()) m_.setPending(sl.id, acc + 1);
         else if (acc < nd_k) m_.restoreSeqSnapshot(sl.id, snap_of[k] + acc);
+        // DFlash2 context: the kept rows' features (whatever drafted them; rejected rows never enter)
+        dflIngest(sl, rows, row0, acc + 1, sl.pos);
         // trunk now holds next, dr[0..acc) at pos .. pos + acc
         sl.cache_tokens.push_back(sl.next);
         sl.cache_tokens.insert(sl.cache_tokens.end(), dr.begin(), dr.begin() + acc);
@@ -2064,7 +2182,7 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
         flushOut(sl);
         if (sl.n_gen >= sl.last_log_n + 100 || msSince(sl.last_log_t) >= 5000) {
             const double el = msSince(sl.td0);
-            if (opt_.use_mtp) {
+            if (opt_.use_mtp || opt_.use_dflash) {
                 logI("req {} | slot {} | gen: n_gen {}, tg {:.2f} t/s, draft acceptance {:.1f}% ({:.2f} tok/cycle)",
                      sl.reqId(), sl.id, sl.n_gen, static_cast<double>(sl.n_gen) * 1000.0 / el,
                      sl.drafted > 0 ? 100.0 * sl.accepted / sl.drafted : 0.0,
@@ -2467,7 +2585,7 @@ bool Engine::tryRestore(Slot& sl, Job& job) {
     if (!t) return false;
     if (!job.params.cache_prompt || opt_.no_prefix_cache) return false;
     const std::span<const std::uint32_t> toks = job.tokens;
-    const std::uint32_t nd_max = opt_.use_mtp ? opt_.n_draft : 0;
+    const std::uint32_t nd_max = draftRoom();
     if (toks.size() + nd_max + 2 >= ctx_ || toks.size() + nd_max + 2 >= static_cast<std::uint64_t>(pool_pages_) * kv_page)
         return false;
     const auto mt = t->lookup(toks);
@@ -2665,6 +2783,8 @@ void Engine::pollRestores() {
         } else {
             tier::Entry& en = *x;
             sl.cache_tokens.assign(en.tokens.begin(), en.tokens.begin() + en.n_tok);
+            // the tier holds KV and state, not drafter features
+            dflReset(sl, en.n_tok);
             for (Ckpt& c : sl.ckpts) c.valid = false;
             std::uint64_t max_seq = 0;
             for (std::size_t k = 0; k < en.nck; ++k) {

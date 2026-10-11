@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <map>
 #include <fstream>
+#include <functional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -36,6 +37,7 @@ void check(bool ok, const char* what) {
         std::printf("FAIL: %s\n", what);
     }
 }
+void check(bool ok, const std::string& what) { check(ok, what.c_str()); }
 
 // Minimal GGUF v3 image builder.
 struct GgufImage {
@@ -64,13 +66,42 @@ struct GgufImage {
         u32(kv, val);
         ++n_kv;
     }
+    void kvF32(const std::string& k, float val) {
+        str(kv, k);
+        u32(kv, 6);
+        std::uint32_t bits;
+        std::memcpy(&bits, &val, 4);
+        u32(kv, bits);
+        ++n_kv;
+    }
+    void kvI32Array(const std::string& k, const std::vector<std::int32_t>& vals) {
+        str(kv, k);
+        u32(kv, 9);  // array
+        u32(kv, 5);  // of i32
+        u64(kv, vals.size());
+        for (std::int32_t v : vals) u32(kv, static_cast<std::uint32_t>(v));
+        ++n_kv;
+    }
+    // tensor infos only (an unknown type: no payload needed, shapes still readable)
+    std::uint64_t n_t = 0;
+    std::vector<std::uint8_t> ti;
+    void tensor(const std::string& name, std::uint64_t ne0, std::uint64_t ne1) {
+        str(ti, name);
+        u32(ti, 2);
+        u64(ti, ne0);
+        u64(ti, ne1);
+        u32(ti, 1000);  // unknown type
+        u64(ti, 0);
+        ++n_t;
+    }
     std::vector<std::uint8_t> build() {
         std::vector<std::uint8_t> out;
         u32(out, 0x46554747);  // "GGUF"
         u32(out, 3);
-        u64(out, 0);  // tensors
+        u64(out, n_t);  // tensors
         u64(out, n_kv);
         out.insert(out.end(), kv.begin(), kv.end());
+        out.insert(out.end(), ti.begin(), ti.end());
         while (out.size() % 32) out.push_back(0);
         return out;
     }
@@ -558,6 +589,150 @@ void testDraftWindowArg() {
           "draft window: fields clamped");
 }
 
+// DFlash2 drafter metadata (arch "dflash"): parsing and the checks against the target
+GgufImage dflashImage(std::uint32_t embd, std::uint32_t vocab, bool mask = true, const char* arch = "dflash") {
+    GgufImage g;
+    const std::string a = arch;
+    g.kvString("general.architecture", a);
+    g.kvU32(a + ".block_count", 5);
+    g.kvU32(a + ".embedding_length", embd);
+    g.kvU32(a + ".feed_forward_length", 96);
+    g.kvU32(a + ".attention.head_count", 4);
+    g.kvU32(a + ".attention.head_count_kv", 2);
+    g.kvU32(a + ".attention.key_length", 16);
+    g.kvF32(a + ".attention.layer_norm_rms_epsilon", 1e-6f);
+    g.kvF32(a + ".rope.freq_base", 1e7f);
+    g.kvU32(a + ".block_size", 8);
+    g.kvU32(a + ".conv_kernel_size", 2);
+    g.kvU32(a + ".conv_group_size", 16);
+    g.kvU32(a + ".selector_rank", 8);
+    g.kvU32(a + ".selector_top_k", 4);
+    g.kvU32(a + ".attention.sliding_window", 2048);
+    g.kvI32Array(a + ".target_layers", {2, 4, 6});
+    if (mask) g.kvU32("tokenizer.ggml.mask_token_id", 95);
+    g.tensor("fc.weight", 3ull * embd, embd);
+    g.tensor("selector_predecessor.weight", 8, vocab);
+    g.tensor("selector_successor.weight", 8, vocab);
+    return g;
+}
+
+void testDFlashConfig() {
+    q::Config t;
+    t.n_embd = 64;
+    t.n_layer = 8;
+    t.n_vocab = 100;
+    const auto img = dflashImage(64, 100).build();
+    const gguf::File f = gguf::File::parse(img);
+    const q::DFlashConfig c = q::DFlashConfig::fromGguf(f);
+    check(c.n_layer == 5 && c.n_embd == 64 && c.n_head == 4 && c.n_head_kv == 2 && c.head_dim == 16 && c.n_ff == 96 && c.block == 8 &&
+              c.conv_k == 2 && c.conv_group == 16 && c.sel_rank == 8 && c.sel_topk == 4 && c.window == 2048 && c.mask_id == 95 &&
+              c.target_layers == std::vector<std::uint32_t>{2, 4, 6} && std::fabs(c.rope_base - 1e7f) < 1.0f,
+          "DFlash2 config: metadata");
+    bool ok = true;
+    try {
+        c.validate(t, f);
+    } catch (const q::ModelError&) {
+        ok = false;
+    }
+    check(ok, "DFlash2 config: fits the target");
+    auto code = [](const std::function<void()>& fn) {
+        try {
+            fn();
+        } catch (const q::ModelError& e) {
+            return e.code();
+        }
+        return std::string();
+    };
+    q::Config t2 = t;
+    t2.n_embd = 128;
+    check(code([&] { c.validate(t2, f); }) == "DraftModelMismatch", "DFlash2 config: hidden size mismatch rejected");
+    q::Config t3 = t;
+    t3.n_layer = 4;
+    check(code([&] { c.validate(t3, f); }) == "DraftModelMismatch", "DFlash2 config: target layer beyond the target rejected");
+    q::Config t4 = t;
+    t4.n_vocab = 200;
+    check(code([&] { c.validate(t4, f); }) == "DraftModelMismatch", "DFlash2 config: vocabulary mismatch rejected");
+    const auto img_arch = dflashImage(64, 100, true, "qwen35").build();
+    check(code([&] { (void)q::DFlashConfig::fromGguf(gguf::File::parse(img_arch)); }) == "UnsupportedArch", "DFlash2 config: arch whitelist");
+    const auto img_mask = dflashImage(64, 100, false).build();
+    check(code([&] { (void)q::DFlashConfig::fromGguf(gguf::File::parse(img_mask)); }) == "MissingKey", "DFlash2 config: mask token required");
+    // kernel limits (C-52): attention keys = window (2048 without one) + block, head_dim, selector top-k
+    auto limited = [&](auto edit) {
+        q::DFlashConfig c2 = c;
+        edit(c2);
+        return code([&] { c2.validate(t, f); });
+    };
+    check(limited([](q::DFlashConfig& x) { x.window = 4096, x.block = 16; }).empty(), "DFlash2 config: Ornith's window 4096 + block 16 accepted");
+    check(limited([](q::DFlashConfig& x) { x.window = 0; }).empty(), "DFlash2 config: no window (ring 2048) accepted");
+    check(limited([](q::DFlashConfig& x) { x.window = whirl::kernels::kDFlashMaxKeys - 8; }).empty(),
+          "DFlash2 config: window + block == the attention limit accepted");
+    check(limited([](q::DFlashConfig& x) { x.window = whirl::kernels::kDFlashMaxKeys - 7; }) == "DraftModelMismatch",
+          "DFlash2 config: window + block past the attention limit rejected");
+    check(limited([](q::DFlashConfig& x) { x.head_dim = 512; }) == "DraftModelMismatch", "DFlash2 config: head_dim > 256 rejected");
+    check(limited([](q::DFlashConfig& x) { x.sel_topk = 32; }) == "DraftModelMismatch", "DFlash2 config: selector top-k > 16 rejected");
+    bool msg = false;
+    try {
+        q::DFlashConfig c2 = c;
+        c2.window = 70000;
+        c2.validate(t, f);
+    } catch (const q::ModelError& e) {
+        const std::string w = e.what();
+        msg = w.find("70008") != std::string::npos && w.find(std::to_string(whirl::kernels::kDFlashMaxKeys)) != std::string::npos;
+    }
+    check(msg, "DFlash2 config: the refusal names the keys needed and the limit");
+}
+
+// a target header (qwen35 / qwen35moe) for dflashIncompatible: metadata + token_embd only
+GgufImage targetImage(const char* arch, std::uint32_t embd, std::uint32_t vocab, std::uint32_t layers) {
+    GgufImage g;
+    const std::string a = arch;
+    const bool moe = a == "qwen35moe";
+    g.kvString("general.architecture", a);
+    g.kvU32(a + ".block_count", layers + 1);
+    g.kvU32(a + ".nextn_predict_layers", 1);
+    g.kvU32(a + ".embedding_length", embd);
+    if (moe) {
+        g.kvU32(a + ".expert_feed_forward_length", 256);  // kg3 load hardening: 256..65536
+        g.kvU32(a + ".expert_count", 8);
+        g.kvU32(a + ".expert_used_count", 2);
+    } else {
+        g.kvU32(a + ".feed_forward_length", 128);
+    }
+    g.kvU32(a + ".attention.head_count", 4);
+    g.kvU32(a + ".attention.head_count_kv", 2);
+    g.kvU32(a + ".attention.key_length", 32);  // kg3 load hardening: 32..256
+    g.kvU32(a + ".rope.dimension_count", 32);
+    g.kvF32(a + ".rope.freq_base", 1e7f);
+    g.kvF32(a + ".attention.layer_norm_rms_epsilon", 1e-6f);
+    g.kvU32(a + ".ssm.conv_kernel", 4);
+    g.kvU32(a + ".ssm.state_size", 16);
+    g.kvU32(a + ".ssm.group_count", 2);
+    g.kvU32(a + ".ssm.time_step_rank", 4);
+    g.kvU32(a + ".ssm.inner_size", 64);
+    g.tensor("token_embd.weight", embd, vocab);
+    return g;
+}
+
+// --draft dflash: the header-only fit check before loading (a MoE target without a drafter of
+// its size keeps MTP)
+void testDFlashCompat() {
+    // kg3 Config::fromGguf accepts embedding_length 256..65536 only (load hardening)
+    const auto draft = dflashImage(256, 100).build();
+    const gguf::File df = gguf::File::parse(draft);
+    const auto dense = targetImage("qwen35", 256, 100, 8).build();
+    const std::string why_dense = q::dflashIncompatible(gguf::File::parse(dense), df);
+    check(why_dense.empty(), "dflashIncompatible: matching dense target (" + why_dense + ")");
+    const auto moe = targetImage("qwen35moe", 512, 100, 8).build();
+    const std::string why = q::dflashIncompatible(gguf::File::parse(moe), df);
+    check(why.find("DraftModelMismatch") != std::string::npos, "dflashIncompatible: MoE target of another size rejected (" + why + ")");
+    const auto shallow = targetImage("qwen35", 256, 100, 4).build();
+    const std::string why_sh = q::dflashIncompatible(gguf::File::parse(shallow), df);
+    check(why_sh.find("target layer id") != std::string::npos, "dflashIncompatible: target layers beyond the target rejected (" + why_sh + ")");
+    const auto not_draft = dflashImage(256, 100, true, "qwen35").build();
+    check(q::dflashIncompatible(gguf::File::parse(dense), gguf::File::parse(not_draft)).find("UnsupportedArch") != std::string::npos,
+          "dflashIncompatible: a non-dflash draft file rejected");
+}
+
 void testNgram() {
     q::Ngram ng;
     // history: "1 2 3 4 5 6 7 8 9" then "... 1 2 3" -> drafts 4 5 6 ...
@@ -974,6 +1149,8 @@ int main() {
     testNgram();
     testDraftVocab();
     testDraftWindowArg();
+    testDFlashConfig();
+    testDFlashCompat();
     testCycleCost();
     testSlotAccept();
     testAllocDrafts();

@@ -339,4 +339,74 @@ MtpDefaults mtpDefaults(bool moe, hip::Arch arch) {
     return {8, 0.0f, 0, true};
 }
 
+DFlashConfig DFlashConfig::fromGguf(const gguf::File& f) {
+    const std::string arch(f.getStringOr("general.architecture", ""));
+    if (arch != "dflash") throw ModelError("UnsupportedArch", "draft model general.architecture = '" + arch + "' (expected dflash)");
+    auto K = [&](const char* s) { return arch + "." + s; };
+    auto u32 = [&](const char* s) { return static_cast<std::uint32_t>(f.getUint(K(s))); };
+    auto u32or = [&](const char* s, std::uint64_t d) { return static_cast<std::uint32_t>(f.getUintOr(K(s), d)); };
+    DFlashConfig c;
+    c.n_layer = u32("block_count");
+    c.n_embd = u32("embedding_length");
+    c.n_head = u32("attention.head_count");
+    c.n_head_kv = u32or("attention.head_count_kv", c.n_head);
+    c.head_dim = u32or("attention.key_length", c.n_head ? c.n_embd / c.n_head : 0);
+    c.n_ff = u32("feed_forward_length");
+    c.block = u32or("block_size", 16);
+    c.conv_k = u32or("conv_kernel_size", 0);
+    c.conv_group = u32or("conv_group_size", 0);
+    c.sel_rank = u32or("selector_rank", 0);
+    c.sel_topk = u32or("selector_top_k", 0);
+    c.window = u32or("attention.sliding_window", 0);
+    c.rope_base = static_cast<float>(f.has(K("rope.freq_base")) ? f.getFloat(K("rope.freq_base")) : 10000.0);
+    c.eps = static_cast<float>(f.getFloat(K("attention.layer_norm_rms_epsilon")));
+    if (!f.has("tokenizer.ggml.mask_token_id")) throw ModelError("MissingKey", "tokenizer.ggml.mask_token_id");
+    c.mask_id = static_cast<std::uint32_t>(f.getUint("tokenizer.ggml.mask_token_id"));
+    if (!f.has(K("target_layers"))) throw ModelError("MissingKey", K("target_layers"));
+    for (const std::int64_t v : f.intArray(K("target_layers"))) {
+        if (v < 0) throw ModelError("BadKey", K("target_layers"));
+        c.target_layers.push_back(static_cast<std::uint32_t>(v));
+    }
+    return c;
+}
+
+void DFlashConfig::validate(const Config& t, const gguf::File& f) const {
+    auto bad = [](const std::string& what) { throw ModelError("DraftModelMismatch", what); };
+    if (n_embd != t.n_embd) bad("hidden size " + std::to_string(n_embd) + " != target " + std::to_string(t.n_embd));
+    if (target_layers.empty()) bad("no target layers");
+    for (const std::uint32_t l : target_layers)
+        if (l == 0 || l > t.n_layer) bad("target layer id " + std::to_string(l) + " outside 1.." + std::to_string(t.n_layer));
+    if (sel_topk == 0 || sel_rank == 0) bad("not a DFlash2 drafter (no candidate selector)");
+    if (block < 2 || block > 16) bad("block size " + std::to_string(block) + " (2..16 supported)");
+    if (conv_k == 0 || conv_group == 0 || n_embd % conv_group != 0) bad("dynamic convolution parameters");
+    if (n_head == 0 || n_head_kv == 0 || n_head % n_head_kv != 0 || head_dim == 0) bad("attention heads");
+    if (mask_id >= t.n_vocab) bad("mask token " + std::to_string(mask_id) + " >= vocabulary " + std::to_string(t.n_vocab));
+    // kernel limits (kernels/dflash.hip): attention keys = context ring (the sliding window, 2048 without
+    // one) + block, one thread per head dimension, the selector lattice has 32 x top-k threads per block
+    const std::uint64_t keys = static_cast<std::uint64_t>(window > 0 ? window : 2048) + block;
+    if (keys > static_cast<std::uint64_t>(kernels::kDFlashMaxKeys))
+        bad("attention window " + std::to_string(window) + " + block " + std::to_string(block) + " = " + std::to_string(keys) +
+            " keys > the drafter attention limit " + std::to_string(kernels::kDFlashMaxKeys));
+    if (head_dim > 256) bad("head_dim " + std::to_string(head_dim) + " > 256 (one thread per dimension)");
+    if (sel_topk > 16) bad("selector top-k " + std::to_string(sel_topk) + " > 16 (dflash_lattice: 32 x top-k threads <= 512)");
+    const gguf::TensorInfo* fc = f.tensor("fc.weight");
+    if (!fc || fc->ne[0] != static_cast<std::uint64_t>(target_layers.size()) * n_embd || fc->ne[1] != n_embd)
+        bad("fc.weight is not [" + std::to_string(target_layers.size() * n_embd) + ", " + std::to_string(n_embd) + "]");
+    for (const char* name : {"selector_predecessor.weight", "selector_successor.weight"}) {
+        const gguf::TensorInfo* sel = f.tensor(name);
+        if (!sel || sel->ne[0] != sel_rank || sel->ne[1] != t.n_vocab)
+            bad(std::string(name) + " is not [rank, target vocabulary " + std::to_string(t.n_vocab) + "]");
+    }
+}
+
+std::string dflashIncompatible(const gguf::File& target, const gguf::File& draft) {
+    try {
+        const Config t = Config::fromGguf(target);
+        DFlashConfig::fromGguf(draft).validate(t, draft);
+    } catch (const std::exception& ex) {
+        return ex.what();
+    }
+    return {};
+}
+
 }  // namespace whirl::qwen35

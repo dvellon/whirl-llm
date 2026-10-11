@@ -279,6 +279,59 @@ enum class KvMode { automatic, f16, q8, q8h, q8v, q4 };
 // automatic, like the prototype's process-wide KV setting.
 std::optional<KvMode> kvModeFromEnv();
 
+// ---- DFlash2 block-diffusion drafter (arch "dflash"; z-lab DFlash2, llama.cpp names):
+// loaded next to the target (WHIRL_DRAFT_MODEL), drafts with `--draft dflash`.
+struct DFlashConfig {
+    std::uint32_t n_layer = 0, n_embd = 0, n_head = 0, n_head_kv = 0, head_dim = 0, n_ff = 0;
+    std::uint32_t block = 0, conv_k = 0, conv_group = 0, sel_rank = 0, sel_topk = 0, window = 0;
+    std::uint32_t mask_id = 0;
+    float rope_base = 0, eps = 0;
+    // target layer ids, llama.cpp convention: id il = the input of target layer il
+    // (= the output of layer il - 1; HF layers 5/19/33/47/61 -> 6/20/34/48/62)
+    std::vector<std::uint32_t> target_layers;
+    static DFlashConfig fromGguf(const gguf::File& f);
+    // Throws ModelError unless it fits the target (hidden size, layer ids, vocabulary, tensors).
+    void validate(const Config& target, const gguf::File& f) const;
+};
+
+// Before loading anything: empty when the DFlash2 drafter `draft` fits the target model `target`
+// (both GGUF headers only), else the reason (e.g. a MoE target such as Ornith has no drafter).
+std::string dflashIncompatible(const gguf::File& target, const gguf::File& draft);
+
+struct DFlashLayerW {
+    DevPtr attn_norm = 0, ffn_norm = 0, q_norm = 0, k_norm = 0;
+    Mat q, k, v, o, gate, up, down;
+    Mat attn_conv_proj, ffn_conv_proj;  // dynamic-convolution kernel projections
+    DevPtr attn_conv_base = 0, ffn_conv_base = 0;  // [2][K][n_embd] f32 static kernels
+};
+
+struct DFlashW {
+    DFlashConfig cfg;
+    Mat fc;                     // [n_embd, n_target_layers * n_embd]
+    DevPtr enc_norm = 0;        // enc.output_norm (after fc)
+    DevPtr out_norm = 0;        // output_norm (decoder)
+    Mat sel_prev, sel_next;     // selector codebooks [n_vocab, rank]
+    Mat sel_hidden;             // [rank, n_embd]
+    std::vector<DFlashLayerW> layers;
+    std::uint64_t bytes = 0;    // weights in VRAM
+};
+
+// DFlash2 drafter run state (dflashSetup): per-slot context ring and the scratch of one draft block.
+struct DFlashSlotCtx {
+    std::vector<DevPtr> kc, vc;        // per drafter layer: [ring][n_head_kv][head_dim] f32 (RoPE'd K, V)
+    DevPtr cpos = 0;                   // [ring] i32: position of each ring row, -1 = empty
+    std::vector<std::int32_t> cpos_h;  // host mirror of cpos
+};
+
+struct DFlashRun {
+    std::uint32_t ring = 0, block = 0, ingest_rows = 0;
+    DevPtr ids = 0, pos = 0, x = 0, h = 0, h2 = 0, dyn = 0, q = 0, kb = 0, vb = 0, att = 0, o = 0, g = 0, u = 0, e = 0;
+    DevPtr logits = 0, cand = 0, unary = 0, gate = 0, lat = 0, out = 0;
+    DevPtr ing_g = 0, ing_k = 0, ing_v = 0, ing_pos = 0;
+    DevPtr dbg = 0;  // when set: [n_layer][block][n_embd] hidden after each drafter layer (dflash-check)
+    std::vector<DFlashSlotCtx> slots;
+};
+
 struct LoadOptions {
     // Prefill batch (rows per forward) the buffers are sized for.
     std::uint32_t max_batch = max_batch_default;
@@ -294,6 +347,10 @@ struct LoadOptions {
     std::uint32_t min_ctx = 0;
     // Optional external code object file (development: WHIRL_CODE_OBJECT).
     std::string code_object;
+    // Skip the MTP (nextn) block: no weights, no KV layer (--draft dflash drafts with DFlash2).
+    // Ignored when the code object lacks the DFlash2 kernels (Model::mtp_skipped stays false):
+    // the caller then falls back to the MTP drafts.
+    bool no_mtp = false;
 };
 
 // VRAM Model::load will take, estimated from the GGUF header before any
@@ -597,6 +654,46 @@ public:
     std::uint32_t draft_rows = 0;
     std::optional<DevPtr> draft_map;
     std::int32_t attn_win = 0;  // KvArgs::win of the current attnBlock (set around the MTP calls only)
+    // DFlash2 drafter (loadDrafter) and the target hidden capture it needs. Capture slot j of
+    // cap_buf holds x at the input of layer dflash->cfg.target_layers[j] for the last cap_n rows
+    // of the latest run() (layer-major: [slot][cap_rows][n_embd] f32). Off unless enabled.
+    std::unique_ptr<DFlashW> dflash;
+    std::vector<std::int32_t> cap_slot;  // per layer input 0..n_layer: capture slot or -1
+    DevPtr cap_buf = 0;
+    std::uint32_t cap_rows = 0;
+    std::uint32_t cap_n = 0;
+    // Loads a DFlash2 GGUF (weights only), checks it against this target, returns the VRAM bytes.
+    std::uint64_t loadDrafter(const gguf::File& f, LoadStats& stats);
+    // Turns the capture on for the drafter's target layers, keeping up to `rows` rows per run().
+    void enableCapture(std::uint32_t rows);
+    // Capture for explicit layer-input ids (0 = embeddings, n_layer = last layer output); off: empty.
+    void enableCaptureLayers(std::span<const std::uint32_t> ids, std::uint32_t rows);
+    void disableCapture();
+    // run(): copy x (the input of layer li) for the last min(n, cap_rows) rows into its slot.
+    void captureLayerInput(std::size_t li, std::uint32_t n);
+    // selftest: the capture copies exactly x for each slot (random x, no forward needed).
+    bool checkCapture(std::string& log);
+
+    // ---- DFlash2 drafter forward (src/model/dflash.cpp); needs loadDrafter and the dflash_* kernels
+    std::unique_ptr<DFlashRun> dfr;
+    // First kernel the drafter forward needs that the code object lacks ("" = all present). Both
+    // kernel sets carry kernels/dflash.hip; an old WHIRL_CODE_OBJECT may not.
+    std::string dflashMissingKernel() const;
+    // Model::load with LoadOptions::no_mtp skipped the MTP block (false: kernels missing, MTP loaded)
+    bool mtp_skipped = false;
+    // Buffers for `slots` contexts (ring = the drafter's window, else 2048) and ingest batches of
+    // up to `ingest_rows` rows; `debug` keeps every layer's block hidden for dflash-check.
+    void dflashSetup(std::uint32_t slots, std::uint32_t ingest_rows, bool debug = false);
+    // Context rows for positions pos0 .. pos0 + n - 1 from target features in layer-major layout
+    // (feature of row r, target layer j at feats + (j * stride + r) * n_embd floats): fc + norm,
+    // then each layer's K (k_norm, RoPE) and V into the slot's ring.
+    void dflashIngest(std::uint32_t slot, DevPtr feats, std::uint32_t stride, std::uint32_t row0, std::uint32_t n, std::uint32_t pos0);
+    // One draft block [anchor, MASK x (block - 1)] at positions pos .. pos + block - 1 against the
+    // slot's context (< pos): up to block - 1 draft tokens (greedy lattice walk; p-min / n-min).
+    std::vector<std::uint32_t> dflashDraft(std::uint32_t slot, std::uint32_t anchor, std::uint32_t pos, float p_min = 0,
+                                           std::uint32_t n_min = 0);
+    // Forget context rows at positions >= keep (rejected drafts, rollback).
+    void dflashTrim(std::uint32_t slot, std::uint32_t keep);
     std::uint32_t moe_bn_force = 0;
     std::vector<std::int32_t>* moe_dump = nullptr;
     std::uint32_t ff_scratch = 0;
@@ -1004,6 +1101,22 @@ struct AllocResult {
 // or acceptances so close that u is already optimal.
 AllocResult allocDrafts(std::span<const AllocSlot> slots, const CycleCost& cost, AllocBudget budget, std::uint32_t uniform,
                         std::span<const std::uint32_t> prev, float x = 0.03f);
+
+class Model;
+// The DFlash2 drafter's interface for the speculative loop (`--draft dflash`): features come from
+// the target's hidden capture (Model::enableCapture), one draft block per call.
+class DFlashDrafter {
+public:
+    DFlashDrafter(Model& m, std::uint32_t slots);
+    // after a target forward: rows row0 .. row0 + n - 1 of its capture are positions pos0 ..
+    void ingest(std::uint32_t slot, std::uint32_t row0, std::uint32_t n, std::uint32_t pos0);
+    std::vector<std::uint32_t> draft(std::uint32_t slot, std::uint32_t anchor, std::uint32_t pos, float p_min = 0,
+                                     std::uint32_t n_min = 0);
+    void trim(std::uint32_t slot, std::uint32_t keep);
+
+private:
+    Model& m_;
+};
 
 class Ngram {
 public:

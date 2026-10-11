@@ -116,6 +116,11 @@ std::uint64_t MockModel::mix(std::uint64_t h, std::uint64_t a, std::uint64_t b) 
 
 std::uint64_t MockModel::kvRow(std::uint32_t tok, std::uint32_t pos, std::uint64_t h) { return mix(h, tok, pos); }
 
+std::uint64_t MockModel::stepH(std::uint64_t h, std::uint32_t tok, std::uint32_t pos) const {
+    // markov: the state is the last token only (greedy output cycles, n-gram drafts hit)
+    return mc_.markov > 0 ? mix(0x5EEDull, tok, 0) : mix(h, tok, pos);
+}
+
 MockModel::MockModel(tier::DeviceOps& ops, const Tokenizer& tok, const MockConfig& mc) : ops_(ops), tok_(tok), mc_(mc) {
     cfg_.n_layer = mc.n_layer;
     cfg_.n_embd = mc.n_embd;
@@ -153,6 +158,7 @@ MockModel::MockModel(tier::DeviceOps& ops, const Tokenizer& tok, const MockConfi
     hn_ = ops_.malloc(static_cast<std::uint64_t>(mc.max_batch + qwen35::max_small_batch) * cfg_.n_embd * 4);
     seq_pages_ = (mc.slot_ctx + kPage - 1) / kPage;
     seqs_.resize(mc.parallel);
+    dfl_ctx_.resize(mc.parallel);
     for (Seq& s : seqs_) {
         s.conv.assign(cfg_.n_layer, 0);
         s.ssm.assign(cfg_.n_layer, 0);
@@ -289,7 +295,8 @@ std::uint64_t MockModel::kvPrefix(const Seq& s, std::uint32_t pos) const {
 }
 
 std::uint32_t MockModel::nextToken(std::uint64_t h, std::uint64_t kv) const {
-    const std::uint64_t seed = mix(h, kv, 77);
+    const std::uint64_t seed = mc_.markov > 0 ? mix(h, 0, 77) : mix(h, kv, 77);
+    if (mc_.markov > 0) return text_ids_[(seed >> 7) % std::min<std::size_t>(mc_.markov, text_ids_.size())];
     if (mc_.eos_rate > 0) {
         const double u = static_cast<double>(seed >> 11) * (1.0 / 9007199254740992.0);
         if (u < mc_.eos_rate) return im_end_;
@@ -329,11 +336,12 @@ MockModel::State MockModel::runRows(Seq& s, std::span<const std::uint32_t> toks,
     const std::uint64_t E = cfg_.n_embd;
     for (std::size_t i = 0; i < toks.size(); ++i) {
         const std::uint32_t p = pos0 + static_cast<std::uint32_t>(i);
-        st.h = mix(st.h, toks[i], p);
+        st.h = stepH(st.h, toks[i], p);
         writeKv(s, p, toks[i], st.h);
         st.kv = mix(st.kv, kvRow(toks[i], p, st.h), p);
         st.pos = p;
         writeHidden(hn_ + (r0 + i) * E * 4, st);
+        capRow(static_cast<std::uint32_t>(&s - seqs_.data()), toks[i], st);
         rows_run_ += 1;
     }
     if (commit) writeH(s, st.h);
@@ -360,7 +368,7 @@ void MockModel::commitSeq(std::uint32_t si) {
     Seq& s = seqs_[si];
     if (s.npend == 0) return;
     std::uint64_t h = readH(s);
-    for (std::uint32_t i = 0; i < s.npend && i < s.pend.size(); ++i) h = mix(h, s.pend[i].tok, s.pend[i].pos);
+    for (std::uint32_t i = 0; i < s.npend && i < s.pend.size(); ++i) h = stepH(h, s.pend[i].tok, s.pend[i].pos);
     writeH(s, h);
     s.npend = 0;
 }
@@ -383,16 +391,19 @@ void MockModel::reset() {
 }
 
 void MockModel::forward(std::span<const std::uint32_t> tokens, std::uint32_t pos0) {
+    cap_.clear();
     prefillOne(cur_, tokens, pos0, 0, 0, std::nullopt, false);
 }
 
 void MockModel::prefillMtpChunk(std::span<const std::uint32_t> tokens, std::uint32_t pos0, std::size_t off, std::size_t n,
                                 std::optional<server::DevPtr> prev_hidden) {
+    cap_.clear();
     prefillOne(cur_, tokens.subspan(off, n), pos0 + static_cast<std::uint32_t>(off), 0, 0,
                off == 0 ? prev_hidden : std::nullopt, true);
 }
 
 void MockModel::prefillSegs(std::span<const server::PSeg> segs, bool with_mtp) {
+    cap_.clear();
     std::uint32_t r0 = 0;
     for (std::size_t k = 0; k < segs.size(); ++k) {
         const server::PSeg& sg = segs[k];
@@ -433,7 +444,7 @@ void MockModel::mtpBatchStepEx(std::span<const server::MSeg> segs, std::uint32_t
             }
             const State last = readHidden(s.hid + (sg.pend.size() - 1) * E * 4);
             const std::uint32_t p = sg.pend_pos + static_cast<std::uint32_t>(sg.pend.size()) - 1;
-            State ch{mix(last.h, sg.pend.back(), p), 0, p};
+            State ch{stepH(last.h, sg.pend.back(), p), 0, p};
             ch.kv = mix(last.kv, kvRow(sg.pend.back(), p, ch.h), p);
             s.chain = ch;
             s.chain_pos = p;
@@ -445,7 +456,7 @@ void MockModel::mtpBatchStepEx(std::span<const server::MSeg> segs, std::uint32_t
         s.ctl[qwen35::ctl_drafts + r] = static_cast<std::int32_t>(d);
         s.ctl[qwen35::ctl_nd] = static_cast<std::int32_t>(r + 1);
         const std::uint32_t p = s.chain_pos + 1;
-        s.chain.h = mix(s.chain.h, d, p);
+        s.chain.h = stepH(s.chain.h, d, p);
         s.chain.kv = mix(s.chain.kv, kvRow(d, p, s.chain.h), p);
         s.chain_pos = p;
     }
@@ -453,6 +464,7 @@ void MockModel::mtpBatchStepEx(std::span<const server::MSeg> segs, std::uint32_t
 
 std::uint32_t MockModel::verifyBatchEnqueue(std::span<const server::VSeg> segs) {
     std::uint32_t row = 0;
+    cap_.clear();
     spinUs(mc_.cycle_us);
     for (const server::VSeg& sg : segs) {
         Seq& s = seqs_[sg.seq];
@@ -469,12 +481,13 @@ std::uint32_t MockModel::verifyBatchEnqueue(std::span<const server::VSeg> segs) 
         s.pend.clear();
         for (std::size_t i = 0; i < toks.size(); ++i) {
             const std::uint32_t p = sg.pos + static_cast<std::uint32_t>(i);
-            st.h = mix(st.h, toks[i], p);
+            st.h = stepH(st.h, toks[i], p);
             writeKv(s, p, toks[i], st.h);
             st.kv = mix(st.kv, kvRow(toks[i], p, st.h), p);
             st.pos = p;
             writeHidden(hn_ + (row + i) * E * 4, st);
             writeLogits(row + static_cast<std::uint32_t>(i), st.h, st.kv);
+            capRow(sg.seq, toks[i], st);
             s.ctl[qwen35::ctl_rows + i] = static_cast<std::int32_t>(nextToken(st.h, st.kv));
             s.pend.push_back({toks[i], p});
             rows_run_ += 1;
@@ -517,12 +530,85 @@ void MockModel::topkRows(std::uint32_t row0, std::uint32_t rows, std::uint32_t k
     }
 }
 
+// DFlash2 mock: the capture keeps (sequence, token, state) of the last dfl_cap_rows rows of the
+// latest forward / verify; a draft block continues the true chain from the context row at pos - 1,
+// so drafts are right only with that row present and from the sequence's own lineage.
+void MockModel::capRow(std::uint32_t seq, std::uint32_t tok, const State& st) {
+    if (!mc_.dflash) return;
+    cap_.push_back({seq, tok, st});
+    if (cap_.size() > 2 * static_cast<std::size_t>(mc_.dfl_cap_rows))
+        cap_.erase(cap_.begin(), cap_.end() - mc_.dfl_cap_rows);
+}
+
+std::uint32_t MockModel::captureN() const {
+    return static_cast<std::uint32_t>(std::min<std::size_t>(cap_.size(), mc_.dfl_cap_rows));
+}
+
+void MockModel::dflashIngest(std::uint32_t s, std::uint32_t row0, std::uint32_t n, std::uint32_t pos0) {
+    const std::size_t base = cap_.size() - captureN();
+    for (std::uint32_t i = 0; i < n; ++i) {
+        if (row0 + i >= captureN()) {
+            dfl_bad_ += 1;
+            continue;
+        }
+        const CapRow& c = cap_[base + row0 + i];
+        if (c.seq != s || c.st.pos != pos0 + i) dfl_bad_ += 1;
+        dfl_ctx_[s][pos0 + i] = c.st;
+    }
+}
+
+void MockModel::dflashTrim(std::uint32_t s, std::uint32_t keep) {
+    auto& m = dfl_ctx_[s];
+    m.erase(m.lower_bound(keep), m.end());
+}
+
+std::vector<std::uint32_t> MockModel::dflashDraft(std::uint32_t s, std::uint32_t anchor, std::uint32_t pos, float, std::uint32_t) {
+    dfl_blocks_ += 1;
+    std::vector<std::uint32_t> out;
+    const auto& m = dfl_ctx_[s];
+    auto it = pos > 0 ? m.find(pos - 1) : m.end();
+    if (it == m.end()) {
+        // no context row before the anchor: guesses
+        for (std::uint32_t r = 0; r + 1 < mc_.dfl_block; ++r) out.push_back(text_ids_[mix(anchor, pos, r) % text_ids_.size()]);
+        return out;
+    }
+    // every context row must be this sequence's own (its KV rows hold the same state)
+    const Seq& q = seqs_[s];
+    for (auto jt = m.begin(); jt != m.end(); ++jt) {
+        const std::uint32_t p = jt->first;
+        if (p >= pos) break;
+        const std::uint32_t pg = p / kPage;
+        if (pg >= q.ptab.size() || q.ptab[pg] < 0) {
+            dfl_stale_ += 1;
+            continue;
+        }
+        const std::uint64_t row = static_cast<std::uint64_t>(q.ptab[pg]) * kPage + p % kPage;
+        std::uint64_t h = 0;
+        std::memcpy(&h, at<const std::uint8_t>(kc_[0]) + row * kKRow + 8, 8);
+        if (h != jt->second.h) dfl_stale_ += 1;
+    }
+    State ch = it->second;
+    ch.h = stepH(ch.h, anchor, pos);
+    ch.kv = mix(ch.kv, kvRow(anchor, pos, ch.h), pos);
+    std::uint32_t p = pos;
+    for (std::uint32_t r = 0; r + 1 < mc_.dfl_block; ++r) {
+        const std::uint32_t truth = nextToken(ch.h, ch.kv);
+        const double u = static_cast<double>(mix(ch.h, 0xDF, p) >> 11) * (1.0 / 9007199254740992.0);
+        const std::uint32_t d = u < mc_.dfl_miss ? text_ids_[mix(ch.h, 0xD2, p) % text_ids_.size()] : truth;
+        out.push_back(d);
+        p += 1;
+        ch.h = stepH(ch.h, d, p);
+        ch.kv = mix(ch.kv, kvRow(d, p, ch.h), p);
+    }
+    return out;
+}
+
 std::vector<std::uint32_t> MockModel::greedyReference(std::span<const std::uint32_t> prompt, std::uint32_t max_tokens,
                                                       bool ignore_eos) const {
     std::uint64_t h = kH0, kv = 0;
     std::uint32_t p = 0;
     for (std::uint32_t t : prompt) {
-        h = mix(h, t, p);
+        h = stepH(h, t, p);
         kv = mix(kv, kvRow(t, p, h), p);
         ++p;
     }
@@ -531,7 +617,7 @@ std::vector<std::uint32_t> MockModel::greedyReference(std::span<const std::uint3
         const std::uint32_t t = nextToken(h, kv);
         if (!ignore_eos && (t == im_end_ || t == eot_)) break;
         out.push_back(t);
-        h = mix(h, t, p);
+        h = stepH(h, t, p);
         kv = mix(kv, kvRow(t, p, h), p);
         ++p;
     }
