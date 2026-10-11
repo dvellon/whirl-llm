@@ -1440,8 +1440,9 @@ bool Tier::tick() {
             i += 1;
             continue;
         }
-        jobs_[i] = jobs_.back();  // swapRemove
-        jobs_.pop_back();
+        // ordered erase (not swapRemove): finished jobs are reaped, and logged, in submission order, which is the
+        // order the IO thread ran them in (the graceful flush's MRU-first order stays observable)
+        jobs_.erase(jobs_.begin() + static_cast<std::ptrdiff_t>(i));
         bool failed = j->failed.load(std::memory_order_acquire);
         if (j->kind == JobKind::read) {
             if (Entry* e = find(j->entry_id)) {
