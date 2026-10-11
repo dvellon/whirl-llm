@@ -311,7 +311,10 @@ struct LoadEstimate {
 };
 LoadEstimate estimateLoad(const gguf::File& f, const Config& cfg, bool embd_on_host);
 // Prefill / decode buffers of Model::load for prefill batch B.
-std::uint64_t bufferBytes(const Config& cfg, std::uint32_t B, std::uint64_t ffs, std::uint64_t max_elems);
+// fd_splits: attention split-K partials (resolveFdSplits: 64, 256 with q4 KV, WHIRL_FD_SPLITS).
+std::uint64_t bufferBytes(const Config& cfg, std::uint32_t B, std::uint64_t ffs, std::uint64_t max_elems, std::uint32_t fd_splits = 64);
+// The attention split count Model::load uses for the KV format (and WHIRL_FD_SPLITS).
+std::uint32_t resolveFdSplits(bool kv_q4);
 // KV bytes per token (Model::kvBytesPerTokenFmt) from the config alone.
 std::uint64_t kvBytesPerTokenCfg(const Config& cfg, bool has_mtp, bool q8, bool kf16, bool q4 = false);
 
@@ -433,6 +436,7 @@ public:
     DevPtr output_norm = 0;
     std::vector<Layer> layers;
     std::vector<DevPtr> allocations;
+    std::uint64_t alloc_total = 0;  // bytes requested through alloc() so far (sizing self-check in load)
     std::array<std::uint64_t, n_types> type_bytes{};
     Profile* prof = nullptr;
     hip::Stream stream = nullptr;

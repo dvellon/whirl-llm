@@ -245,6 +245,7 @@ Model::~Model() {
 DevPtr Model::alloc(u64 bytes) {
     const DevPtr p = hip::malloc(static_cast<std::size_t>(bytes));
     allocations.push_back(p);
+    alloc_total += bytes;
     return p;
 }
 
@@ -314,7 +315,16 @@ std::optional<KvMode> kvModeFromEnv() {
     throw std::invalid_argument("WHIRL_KV must be auto, f16, q8, q8h, q8v or q4 (got '" + *v + "')");
 }
 
-u64 bufferBytes(const Config& cfg, u32 Bq, u64 ffs, u64 max_elems) {
+u32 resolveFdSplits(bool kv_q4) {
+    u32 splits = kv_q4 ? 256 : 64;
+    if (const auto v = envGet("FD_SPLITS")) {
+        const unsigned long s = std::strtoul(v->c_str(), nullptr, 10);
+        if (s >= 64 && s <= 256 && s % 64 == 0) splits = static_cast<u32>(s);
+    }
+    return splits;
+}
+
+u64 bufferBytes(const Config& cfg, u32 Bq, u64 ffs, u64 max_elems, u32 fd_splits) {
     // mirrors the buffer allocations of Model::load below (keep in step)
     const u64 f4 = 4;
     const u64 B = Bq;
@@ -335,9 +345,11 @@ u64 bufferBytes(const Config& cfg, u32 Bq, u64 ffs, u64 max_elems) {
     n += static_cast<u64>(max_small_batch) * cfg.n_embd * f4;  // mtp_h
     n += B * 4 * 3;                                       // mtp_ids, ids, pos_buf
     n += ctl_words * 4;                                   // out_tok
-    const u64 n_split = 64;
+    const u64 n_split = fd_splits;
     n += max_verify_rows * n_split * cfg.n_head * 2 * f4;  // part_ml
     n += max_verify_rows * n_split * cfg.n_head * cfg.head_dim * f4;  // part_acc
+    n += B * cfg.n_head * 2 * f4;                         // dq_st_ml (q8 / q4 / KG-3 prefill attention softmax state)
+    n += (static_cast<u64>(Model::kDqMaxKeys) / 256 + 1) * 4;  // dq_ptab (identity pages for up to kDqMaxKeys keys)
     n += max_elems * 2;                                   // w16
     {
         const u64 n_chunks = (B + 63) / 64;
@@ -362,6 +374,8 @@ u64 bufferBytes(const Config& cfg, u32 Bq, u64 ffs, u64 max_elems) {
         n += B * Kx * 4 * 2;                              // moe_perm, moe_inv
         n += (B * Kx / 32 + cfg.n_expert + 1) * 16;       // moe_tiles
         n += 16;                                          // moe_ntiles
+        n += (B * Kx / 64 + cfg.n_expert + 1) * 16;       // moe_tiles64
+        n += 16;                                          // moe_ntiles64
         n += B * Kx * std::max(E, F) * 2;                 // moe_x16
         n += B * Kx * F * f4 * 2;                         // moe_yg, moe_yu
         n += B * Kx * E * f4;                             // moe_yd
@@ -499,7 +513,7 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
     // (not on the UMA iGPU, gfx1151, unless a limit is set: its free VRAM does not bound what it can allocate)
     if (m.arch != hip::Arch::gfx1151 || vram::limitBytes() != 0) {
         const LoadEstimate est = estimateLoad(f, cfg, opt.embd_on_host);
-        const u64 buf = bufferBytes(cfg, m.max_batch, est.ffs, est.max_elems);
+        const u64 buf = bufferBytes(cfg, m.max_batch, est.ffs, est.max_elems, resolveFdSplits(m.kv_q4));
         const u64 need = est.weights + est.state + buf;
         const hip::MemInfo mi = hip::memInfo();
         if (need > mi.free) {
@@ -592,6 +606,8 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
 
     const u64 f4 = 4;
     const u64 B = m.max_batch;
+    const u64 buffers_from = m.alloc_total;
+    u64 max_elems = 0;
     m.x = m.alloc(B * cfg.n_embd * f4);
     m.h = m.alloc(B * cfg.n_embd * f4);
     m.qf = m.alloc(B * cfg.n_head * cfg.head_dim * 2 * f4);
@@ -621,11 +637,7 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
     m.host_ids.assign(static_cast<std::size_t>(2 * B), 0);
     m.pos_buf = m.alloc(B * 4);
     m.out_tok = m.allocZero(ctl_words * 4);
-    m.fd_splits = m.kv_q4 ? 256 : 64;
-    if (const auto v = envGet("FD_SPLITS")) {
-        const unsigned long s = std::strtoul(v->c_str(), nullptr, 10);
-        if (s >= 64 && s <= 256 && s % 64 == 0) m.fd_splits = static_cast<u32>(s);
-    }
+    m.fd_splits = resolveFdSplits(m.kv_q4);
     const u64 n_split = m.fd_splits;
     m.part_ml = m.alloc(max_verify_rows * n_split * cfg.n_head * 2 * f4);
     m.part_acc = m.alloc(max_verify_rows * n_split * cfg.n_head * cfg.head_dim * f4);
@@ -642,7 +654,6 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
     // KG-3: attn_prefill_wmma_s softmax state (also f16 KV, for WHIRL_ATTN_SEG key ranges)
     if (m.dq_st_ml == 0 && m.k.attn_pws != nullptr) m.dq_st_ml = m.alloc(B * cfg.n_head * 2 * f4);
     {
-        u64 max_elems = 0;
         for (const Layer& L : m.layers)
             for (const Mat& w : m.layerMats(L).slice()) max_elems = std::max(max_elems, static_cast<u64>(w.ncols) * w.nrows);
         m.w16 = m.alloc(max_elems * 2);
@@ -692,6 +703,11 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
         m.moe_yd = m.alloc(B * Kx * E * f4);
         m.moe_sx = m.alloc(B * Kx * f4);
     }
+    // sizing self-check: the pre-load estimate (bufferBytes, the server's auto-shrink) must cover what was just
+    // allocated; a shortfall means an allocation was added without updating the estimate
+    if (const u64 used = m.alloc_total - buffers_from, est = bufferBytes(cfg, m.max_batch, ffs, max_elems, m.fd_splits); used > est)
+        m.load_note += "warning: the VRAM estimate for the prefill buffers (" + std::to_string(est >> 20) + " MiB) is below what was allocated (" +
+                       std::to_string(used >> 20) + " MiB); please report\n";
     // KV pool for max_ctx tokens, one sequence with an identity page table (the
     // server loads with max_ctx 0 and allocates its shared pool later). The format chosen above
     // must fit next to what the CLI still allocates (MTP snapshot sets for 8 drafts, the 2-bit

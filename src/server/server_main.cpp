@@ -516,13 +516,6 @@ int serveMain(int argc, char** argv, const char* program) {
             // ~4% more that WDDM sees for this process than the sum of its allocations
             fi.fixed = est.state + opt.parallel * (st1 + pend1) + (est.has_mtp ? 65536ull * cfg.n_embd * 5 / 16 : 0) + (256ull << 20);
             fi.fixed += (est.weights + fi.fixed) / 25;
-            const std::uint64_t b2 = qwen35::bufferBytes(cfg, 2048, est.ffs, est.max_elems);
-            const std::uint64_t b4 = qwen35::bufferBytes(cfg, 4096, est.ffs, est.max_elems);
-            fi.buf_per_row = (b4 - b2) / 2048;
-            fi.buf_fixed = b2 - fi.buf_per_row * 2048;
-            // (WHIRL_CKPT_HOST=1: checkpoints in pinned host memory, no VRAM)
-            fi.ckpt_bytes = envOn("CKPT_HOST", false) ? 0 : st1 + static_cast<std::uint64_t>(cfg.n_embd) * 4 + static_cast<std::uint64_t>(cfg.n_vocab) * 4;
-            fi.parallel = opt.parallel;
             // the mode's KV format (numerics::chooseKv; the code object is not loaded yet: only dGPUs
             // reach here, and the R9700 code object has q4 KV kernels since FC-1c)
             const auto kv_env = env("KV");
@@ -530,6 +523,15 @@ int serveMain(int argc, char** argv, const char* program) {
                 numerics::chooseKv(nreq, cfg.moe, numerics::KvCaps{true, true, true},
                                    kv_env && *kv_env != "auto" ? numerics::kvKindFromName(*kv_env) : std::nullopt)
                     .kv;
+            // (q4 KV uses 256 attention splits: more split-K partial buffers)
+            const std::uint32_t fd_splits_est = qwen35::resolveFdSplits(kv_est == numerics::KvKind::q4);
+            const std::uint64_t b2 = qwen35::bufferBytes(cfg, 2048, est.ffs, est.max_elems, fd_splits_est);
+            const std::uint64_t b4 = qwen35::bufferBytes(cfg, 4096, est.ffs, est.max_elems, fd_splits_est);
+            fi.buf_per_row = (b4 - b2) / 2048;
+            fi.buf_fixed = b2 - fi.buf_per_row * 2048;
+            // (WHIRL_CKPT_HOST=1: checkpoints in pinned host memory, no VRAM)
+            fi.ckpt_bytes = envOn("CKPT_HOST", false) ? 0 : st1 + static_cast<std::uint64_t>(cfg.n_embd) * 4 + static_cast<std::uint64_t>(cfg.n_vocab) * 4;
+            fi.parallel = opt.parallel;
             fi.kv_per_token = kv_est == numerics::KvKind::f16   ? est.kv_f16
                               : kv_est == numerics::KvKind::q8v ? est.kv_q8v
                               : kv_est == numerics::KvKind::q4  ? est.kv_q4

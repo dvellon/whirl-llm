@@ -914,6 +914,20 @@ void testLoadEstimate() {
         check(b(4096) - b(2048) == 2 * (b(2048) - b(1024)) && b(1024) - b(512) == b(576) - b(64) && b(64) > 0,
               ("bufferBytes linear in the batch" + tag).c_str());
         check(b(4096) > b(2048) && b(2048) > b(1024), ("bufferBytes grows with the batch" + tag).c_str());
+        // KV-FIT-ESTIMATE: q4 KV allocates 256 attention splits (part_ml + part_acc for max_verify_rows
+        // rows), 192 more than the 64 the estimate used to assume
+        {
+            const std::uint64_t d = q::bufferBytes(cfg, 1024, ev.ffs, ev.max_elems, 256) - q::bufferBytes(cfg, 1024, ev.ffs, ev.max_elems, 64);
+            const std::uint64_t want = static_cast<std::uint64_t>(q::max_verify_rows) * (256 - 64) * cfg.n_head * (2 + cfg.head_dim) * 4;
+            check(d == want, ("bufferBytes: q4 KV attention splits counted" + tag).c_str());
+            check(q::resolveFdSplits(true) >= 64 && q::resolveFdSplits(false) >= 64 && q::resolveFdSplits(true) % 64 == 0,
+                  ("resolveFdSplits multiples of 64" + tag).c_str());
+            // the default parameter is the f16 / q8 KV split count
+            check(q::bufferBytes(cfg, 1024, ev.ffs, ev.max_elems) == q::bufferBytes(cfg, 1024, ev.ffs, ev.max_elems, 64),
+                  ("bufferBytes default splits" + tag).c_str());
+            // dq_st_ml (n_head x 2 f32 per row) and the identity page table are part of the estimate
+            check(b(2048) - b(1024) >= 1024ull * cfg.n_head * 2 * 4, ("bufferBytes counts dq_st_ml" + tag).c_str());
+        }
         // part of the per-row cost that is easy to see: x, h, hn (3 x E f32), mtp_cat (2 x E f32), ffn_g / ffn_u (2 x ffs f32)
         check((b(2048) - b(1024)) / 1024 >= (5ull * cfg.n_embd + 2ull * ev.ffs) * 4, ("bufferBytes per-row lower bound" + tag).c_str());
     }
