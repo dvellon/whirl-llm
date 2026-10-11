@@ -98,7 +98,9 @@ std::optional<float> DraftTiming::estimate(u32 nd) const {
     const float xf = static_cast<float>(nd);
     if (pts == 1) {
         const float t0 = t[only];
-        return t0 * (1 + prior_slope * (xf - static_cast<float>(only)));
+        // (floored: far below the measured point the linear prior would reach zero or go negative, e.g. only = 15,
+        // nd = 1, slope 0.12 -> factor -0.68, and a short n-gram would be rejected on a negative time estimate)
+        return t0 * std::max(0.25f, 1 + prior_slope * (xf - static_cast<float>(only)));
     }
     const float den = sw * sxx - sx * sx;
     float b = den > 0 ? (sw * sxy - sx * sy) / den : 0;

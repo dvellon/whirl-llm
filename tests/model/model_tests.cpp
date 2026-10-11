@@ -471,6 +471,16 @@ void testDraftModel() {
     check(!tm.estimate(3).has_value(), "DraftTiming empty");
     tm.update(2, 10.0f);
     check(std::fabs(*tm.estimate(4) - 10.0f * (1 + 0.12f * 2)) < 1e-4f, "DraftTiming one-point prior");
+    {
+        // MTP-01: a single measured point far from the asked draft count never extrapolates to <= 0
+        q::DraftTiming far;
+        far.update(15, 20.0f);
+        const std::optional<float> e1 = far.estimate(1);
+        check(e1.has_value() && *e1 >= 0.25f * 20.0f - 1e-4f && *e1 > 0, "DraftTiming one-point extrapolation floored");
+        check(std::fabs(*far.estimate(14) - 20.0f * (1 - 0.12f)) < 1e-4f, "DraftTiming near point unchanged");
+        check(std::fabs(*far.estimate(15) - 20.0f) < 1e-6f, "DraftTiming measured point exact");
+        for (std::uint32_t nd = 0; nd <= q::max_ng_drafts; ++nd) check(*far.estimate(nd) > 0, "DraftTiming estimate positive for every draft count");
+    }
     tm.update(6, 14.0f);
     const float e4 = *tm.estimate(4);
     check(e4 > 11.5f && e4 < 12.5f, "DraftTiming linear fit");
