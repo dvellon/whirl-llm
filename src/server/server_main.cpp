@@ -65,7 +65,7 @@ BOOL WINAPI onConsoleCtrl(DWORD type) {
     logI("shutdown requested ({}): no new requests; finishing running ones and flushing the prefix-cache tiers", what);
     e->stop();
     const bool interactive = type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT;
-    const DWORD wait_ms = interactive ? static_cast<DWORD>(Engine::shutdown_flush_ms + 60000) : 4500;
+    const DWORD wait_ms = interactive ? static_cast<DWORD>(Engine::shutdown_flush_long_ms + 60000) : 4500;
     if (g_stopped != nullptr && WaitForSingleObject(g_stopped, wait_ms) == WAIT_OBJECT_0) {
         // main returns from serveMain and the process exits normally; for close /
         // logoff / shutdown events the OS ends the process when the handler returns
@@ -176,6 +176,7 @@ struct Options {
     std::optional<std::string> kv_ssd_dir;
     std::optional<std::uint64_t> kv_ssd_gb;
     std::optional<std::string> kv_ssd_mode;
+    std::optional<std::uint64_t> kv_ssd_delay;  // seconds (--kv-ssd-delay)
     std::string device;
     // vision: encoder, idle release seconds, weight mode, embedding cache MiB
     std::optional<std::string> mmproj;
@@ -373,6 +374,7 @@ int serveMain(int argc, char** argv, const char* program) {
         else if (auto v9 = argValue(args, i, "--kv-ram-mb")) opt.kv_ram_mb = parseNum<std::uint64_t>(*v9, "--kv-ram-mb");
         else if (auto v10 = argValue(args, i, "--kv-ssd-dir")) opt.kv_ssd_dir = *v10;
         else if (auto v11 = argValue(args, i, "--kv-ssd-gb")) opt.kv_ssd_gb = parseNum<std::uint64_t>(*v11, "--kv-ssd-gb");
+        else if (auto vd = argValue(args, i, "--kv-ssd-delay")) opt.kv_ssd_delay = parseNum<std::uint64_t>(*vd, "--kv-ssd-delay");
         else if (auto vm = argValue(args, i, "--kv-ssd-mode")) {
             if (*vm != "always" && *vm != "shutdown" && *vm != "off")
                 throw std::runtime_error("--kv-ssd-mode: expected always, shutdown or off");
@@ -1021,8 +1023,8 @@ int serveMain(int argc, char** argv, const char* program) {
             for (const KvArr& a : backend->kvArrays()) page_row += a.row;
             if (tier_pre && page_row == per_tok) {
                 std::optional<std::string> ssd_dir;
-                std::string ssd_mode = opt.kv_ssd_mode.value_or(env("KV_SSD_MODE").value_or("always"));
-                if (ssd_mode != "shutdown" && ssd_mode != "off") ssd_mode = "always";
+                std::string ssd_mode = opt.kv_ssd_mode.value_or(env("KV_SSD_MODE").value_or("shutdown"));
+                if (ssd_mode != "always" && ssd_mode != "off") ssd_mode = "shutdown";
                 if (ssd_gb > 0 && ssd_mode != "off") {
                     if (opt.kv_ssd_dir) ssd_dir = opt.kv_ssd_dir;
                     else if (auto v = env("KV_SSD_DIR")) ssd_dir = *v;
@@ -1040,7 +1042,9 @@ int serveMain(int argc, char** argv, const char* program) {
                 tc.ssd_dir = ssd_dir;
                 tc.ssd_cap = ssd_gb << 30;
                 tc.min_tokens = envU32("KV_TIER_MIN", 2048);
-                tc.ssd_delay_ms = envU32("KV_SSD_DELAY_MS", 2000);
+                if (opt.kv_ssd_delay) tc.ssd_delay_ms = *opt.kv_ssd_delay * 1000;
+                else tc.ssd_delay_ms = envU32("KV_SSD_DELAY_MS", 300000);
+                tc.expire_s = envU32("KV_SSD_EXPIRE_S", 7 * 24 * 3600);  // test override only
                 tc.ssd_shutdown_only = ssd_mode == "shutdown";
                 tc.dedup = envU32("KV_SSD_DEDUP", 1) != 0;
                 // the wake hook must be in place before the IO thread starts

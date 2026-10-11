@@ -406,9 +406,13 @@ then KV page j at `nck × ck_stride + j × page_bytes` (13.0 MiB per page for q8
 
 - One file per entry (4 KiB header, token ids, data region). An I/O thread writes only dirty blocks
   with unbuffered positional writes: header marked invalid → data → flush → valid header. An entry
-  is written after it has been unchanged for 2 s.
+  is written (`--kv-ssd-mode always` only; the default `shutdown` writes at a graceful stop) after it has been
+  unchanged for `--kv-ssd-delay` seconds (default 300), and only if it was reused or resumed at least once (a
+  one-shot prompt is never written); a graceful stop writes the most recently used entries first.
 - At startup the directory is scanned and indexed; magic, fingerprint and token checksum are
-  checked and bad files deleted. Over the size cap (default 64 GiB) the LRU file is deleted.
+  checked and bad files deleted (half-written, corrupt, not ours); files of other models are counted and
+  deleted first when space is needed; files unused for 7 days are deleted (start-up and hourly). The
+  directory never holds more than the size cap (default 64 GiB) on disk; over it the LRU file goes.
 - **Fingerprint:** executable (size + modification time), model file name + tensor count + bytes,
   KV format, MTP on/off, layout, prefill batch, and every engine setting that changes numerics
   (scheduling/logging/tier settings excluded). An entry written by a different build or numerical

@@ -348,7 +348,10 @@ public:
     // tier writes are flushed (bounded, shutdown_flush_ms), then it returns.
     void runLoop();
     void stop();
+    // flush bound: --kv-ssd-mode always (a few entries are pending); shutdown (everything in RAM is
+    // written at stop, so it may be gigabytes)
     static constexpr std::uint64_t shutdown_flush_ms = 10000;
+    static constexpr std::uint64_t shutdown_flush_long_ms = 60000;
 
     // Connection threads
     std::uint64_t nextJobId() { return next_id_.fetch_add(1); }

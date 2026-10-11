@@ -332,6 +332,21 @@ void Tier::start(const Config& cfg_in, const Layout& lay_in, std::uint64_t finge
         }
         ssd_dir_w_ = std::move(dw);
         index();
+        {
+            expireSweep();
+            enforceCap();
+            cleanup_.files = foreign_.size() + ssdEntries();
+            cleanup_.bytes = ssd_bytes;
+            if (log_fn)
+                log_fn(fmt("kv tier: SSD cache %s: %llu files, %.2f GiB on disk (cap %.0f GiB; %llu files for other models / builds); removed at startup: %llu expired (>%llu days unused, %.2f GiB), %llu corrupt / half-written (%.2f GiB), %llu other model / over the cap (%.2f GiB)",
+                           cfg.ssd_dir->c_str(), static_cast<unsigned long long>(cleanup_.files), static_cast<double>(cleanup_.bytes) / 1073741824.0,
+                           static_cast<double>(cfg.ssd_cap) / 1073741824.0, static_cast<unsigned long long>(foreign_.size()),
+                           static_cast<unsigned long long>(cleanup_.expired_files), static_cast<unsigned long long>(cfg.expire_s / 86400),
+                           static_cast<double>(cleanup_.expired_bytes) / 1073741824.0, static_cast<unsigned long long>(cleanup_.bad_files),
+                           static_cast<double>(cleanup_.bad_bytes) / 1073741824.0, static_cast<unsigned long long>(cleanup_.cap_files),
+                           static_cast<double>(cleanup_.cap_bytes) / 1073741824.0));
+            next_expiry_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg.expire_check_ms);
+        }
         io_thread_ = std::thread([this] { ioThread(); });
     }
 }
@@ -365,6 +380,38 @@ std::size_t Tier::countRam() const {
     std::size_t n = 0;
     for (const Entry* e : entries) n += e->in_ram ? 1 : 0;
     return n;
+}
+
+std::int64_t Tier::nowUnix() const { return cfg.clock_fn ? cfg.clock_fn() : unixNow(); }
+
+// e (and the owners of the blocks it borrows) was used now.
+void Tier::markUsed(Entry* e) {
+    const std::int64_t t = nowUnix();
+    e->used = t;
+    if (!e->ssd) return;
+    std::uint64_t last = 0;
+    for (const BlkRef& r : e->ssd->tbl) {
+        if (r.owner == 0 || r.owner == last) continue;
+        last = r.owner;
+        if (Entry* o = find(r.owner)) o->used = std::max(o->used, t);
+    }
+}
+
+// Persist "used now" in the file's last-write time (metadata only; no data is written).
+void Tier::stampFile(std::uint64_t id, std::int64_t unix_s) {
+    if (!ssd_dir_w_) return;
+    try {
+        const std::wstring p = filePath(id);
+        HANDLE h = CreateFileW(p.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return;
+        ULARGE_INTEGER u;
+        u.QuadPart = (static_cast<std::uint64_t>(unix_s) + 11644473600ull) * 10000000ull;
+        FILETIME ft{u.LowPart, u.HighPart};
+        SetFileTime(h, nullptr, nullptr, &ft);
+        CloseHandle(h);
+    } catch (...) {
+    }
 }
 
 void Tier::touch(Entry* e) {
@@ -403,6 +450,7 @@ Entry* Tier::newEntry(std::uint32_t nck) {
     e->id = rng_() | 1;
     e->nck = nck;
     e->in_ram = true;
+    e->used = nowUnix();
     e->ev = newEvent();
     entries.push_back(e.get());
     Entry* p = e.release();
@@ -462,15 +510,49 @@ bool Tier::evictable(Entry* e, Entry* keep) {
     return e != keep && e->in_ram && e->pin == 0 && !e->io_busy && gpuIdle(e);
 }
 
-// Free RAM until `blocks` arena blocks are free (LRU). false: not possible.
+// RAM pressure on an entry whose SSD write is not due yet: it is written now (asynchronously;
+// its RAM blocks are freed by a later pass) if it is worth a disk write (>= min_tokens, SSD tier
+// in `always` mode); else it is dropped (older consistent SSD copy, or gone: a cold prefill later).
+bool Tier::evictWanted(const Entry* v) const {
+    if (!ssd_dir_w_ || cfg.ssd_shutdown_only || v->n_tok < cfg.min_tokens || v->n_tok == 0 || !seenOk(v)) return false;
+    return !v->ssd || v->hasDirty();  // clean: nothing to write
+}
+
+bool Tier::evictWrite(Entry* v) {
+    if (!evictWanted(v)) return false;
+    try {
+        startWrite(v);
+    } catch (...) {
+    }
+    return v->io_busy;
+}
+
+// Free RAM until `blocks` arena blocks are free (LRU). false: not possible (now).
 bool Tier::makeRoom(std::size_t blocks, Entry* keep) {
+    room_pending_ = false;
     while (free_blocks_.size() < blocks) {
+        // blocks that running writes of idle RAM entries will make evictable
+        std::size_t incoming = 0;
+        for (const Entry* e : entries)
+            if (e != keep && e->in_ram && e->io_busy && !e->loading)
+                for (auto b : e->blocks) incoming += b != no_block ? 1 : 0;
         Entry* victim = nullptr;
         for (Entry* e : entries) {
             if (!evictable(e, keep)) continue;
             if (victim == nullptr || e->lru < victim->lru) victim = e;
         }
-        if (victim == nullptr) return false;
+        if (victim == nullptr) {
+            room_pending_ = incoming > 0;
+            return false;
+        }
+        if (evictWanted(victim) && incoming > 0 && free_blocks_.size() + incoming >= blocks) {
+            room_pending_ = true;  // running writes will free enough
+            return false;
+        }
+        if (evictWrite(victim)) {
+            room_pending_ = true;
+            continue;
+        }
         dropRam(victim);
     }
     return true;
@@ -580,6 +662,20 @@ Restore* Tier::beginRestore(Entry* e, std::span<const Span> spans, std::size_t n
     auto r = std::make_unique<Restore>();
     r->entry_id = e->id;
     r->t0 = std::chrono::steady_clock::now();
+    // in use: the "unchanged for" clock of its SSD write restarts
+    e->t_mod = r->t0;
+    e->reused = true;
+    markUsed(e);
+    if (e->ssd && (!e->in_ram || e->prefetching)) {
+        // SSD use: the file's last-write time is the persisted "last used" (expiry, LRU after a restart)
+        stampFile(e->id, e->used);
+        std::uint64_t last = 0;
+        for (const BlkRef& rf : e->ssd->tbl) {
+            if (rf.owner == 0 || rf.owner == last) continue;
+            last = rf.owner;
+            stampFile(rf.owner, e->used);
+        }
+    }
     r->from_ssd = !e->in_ram || e->prefetching;
     bool job_new = false;
     if (e->prefetching) {
@@ -1196,7 +1292,7 @@ void Tier::makeHeader(const Entry* e, bool valid, std::uint8_t* buf) const {
     h.data_off = lay.dataOff();
     h.ck_stride = lay.ckStride();
     h.page_bytes = lay.page_bytes;
-    h.last_used = unixNow();
+    h.last_used = nowUnix();
     h.tok_sum = tokSum(e->tokens.data(), e->n_tok);
     for (std::size_t k = 0; k < max_ck; ++k) h.ck[k] = e->ck[k];
     h.tbl_off = header_bytes + lay.tokRegion();
@@ -1333,6 +1429,8 @@ void Tier::startWrite(Entry* e) {
 
 bool Tier::tick() {
     bool busy = false;
+    bool delay_wait = false;  // busy only because some entry waits for its write delay
+    next_due_.reset();
     // finished jobs
     std::size_t i = 0;
     while (i < jobs_.size()) {
@@ -1422,6 +1520,7 @@ bool Tier::tick() {
                     stats.ssd_writes += 1;
                     stats.ssd_dedup_bytes += j->dedup;
                     touchOwners(e);
+                    markUsed(e);
                     if (log_fn && !j->meta_only) {
                         log_fn(fmt("kv tier: entry %016llx (%u tok) written to SSD: %.0f MiB in %.0f ms (file %.0f MiB, %.0f MiB "
                                    "shared with other entries; SSD written in all %.2f GiB)",
@@ -1435,11 +1534,21 @@ bool Tier::tick() {
         }
         freeJob(j);
     }
+    if (ssd_dir_w_ && cfg.expire_s > 0 && std::chrono::steady_clock::now() >= next_expiry_) {
+        next_expiry_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg.expire_check_ms);
+        expireSweep();
+    }
     if (ssd_dir_w_) {
         const auto now = std::chrono::steady_clock::now();
         // startWrite may evict SSD-only entries (ssdRoom): iterate over a copy
         // and skip entries removed meanwhile
-        const std::vector<Entry*> snapshot = entries;
+        std::vector<Entry*> snapshot = entries;
+        // graceful shutdown: most recently used first, so when the time bound runs out the oldest
+        // sessions are the ones not written
+        if (flushing)
+            std::stable_sort(snapshot.begin(), snapshot.end(), [](const Entry* a, const Entry* b) {
+                return a->t_mod != b->t_mod ? a->t_mod > b->t_mod : a->lru > b->lru;
+            });
         const bool writes_on = !cfg.ssd_shutdown_only || flushing;
         for (Entry* e : snapshot) {
             if (!contains(e)) continue;
@@ -1459,10 +1568,13 @@ bool Tier::tick() {
                 continue;
             }
             if (!e->hasDirty() && e->ssd) continue;
+            if (!seenOk(e)) continue;  // one-shot prompt, never reused: not worth a disk write
             const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - e->t_mod).count();
             const std::uint64_t age_ms = age > 0 ? static_cast<std::uint64_t>(age) : 0;
             if (age_ms < cfg.ssd_delay_ms) {
-                busy = true;
+                delay_wait = true;
+                const auto due = e->t_mod + std::chrono::milliseconds(cfg.ssd_delay_ms);
+                if (!next_due_ || due < *next_due_) next_due_ = due;
                 continue;
             }
             try {
@@ -1477,36 +1589,71 @@ bool Tier::tick() {
         }
     }
     if (gc_due_) gcOwners();
-    return busy;
+    wait_only_ = delay_wait && !busy;
+    return busy || delay_wait;
 }
 
 // ---- startup index ----------------------------------------------------------------
 
 void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<IndexItem>& order) {
     const std::uint64_t logical_size = size;  // the directory entry's size (sparse files: includes the holes)
-    bool del = false;
+    bool del = false, expired = false;
+    std::uint64_t alloc_sz = size;  // bytes on disk (sparse files: without the holes)
     ScopeExit del_guard{[&] {
-        if (del) DeleteFileW(pw.c_str());
+        if (del) {
+            DeleteFileW(pw.c_str());
+            (expired ? cleanup_.expired_files : cleanup_.bad_files) += 1;
+            (expired ? cleanup_.expired_bytes : cleanup_.bad_bytes) += alloc_sz;
+        }
     }};
+    {
+        DWORD hi = 0;
+        const DWORD lo = GetCompressedFileSizeW(pw.c_str(), &hi);
+        if (lo != INVALID_FILE_SIZE || GetLastError() == NO_ERROR) alloc_sz = std::min(size, (static_cast<std::uint64_t>(hi) << 32) | lo);
+    }
     HANDLE fh = CreateFileW(pw.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (fh == INVALID_HANDLE_VALUE) return;
+    if (fh == INVALID_HANDLE_VALUE) {
+        // cannot be read: still counted against the cap (and evicted first)
+        foreign_.push_back(Foreign{pw, alloc_sz, 0});
+        ssd_bytes += alloc_sz;
+        return;
+    }
     ScopeExit close_guard{[&] { CloseHandle(fh); }};
+    std::int64_t mtime = 0;
+    {
+        FILETIME ft;
+        if (GetFileTime(fh, nullptr, nullptr, &ft)) {
+            const std::uint64_t t100 = (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+            mtime = static_cast<std::int64_t>(t100 / 10000000ull) - 11644473600ll;
+        }
+    }
     try {
         alignas(16) std::uint8_t hdr_buf[header_bytes];
-        if (!readAt(fh, hdr_buf, header_bytes, 0)) return;
+        // a *.wkv file that is not a WHIRL cache file (short, wrong magic) or is half-written is deleted
+        if (!readAt(fh, hdr_buf, header_bytes, 0)) {
+            del = true;
+            return;
+        }
         Header hd;
         std::memcpy(&hd, hdr_buf, sizeof hd);
-        if (std::memcmp(hd.magic, file_magic, sizeof hd.magic) != 0) return;
+        if (std::memcmp(hd.magic, file_magic, sizeof hd.magic) != 0) {
+            del = true;
+            return;
+        }
         // allocated bytes (sparse files: shared blocks are holes)
-        {
-            DWORD hi = 0;
-            const DWORD lo = GetCompressedFileSizeW(pw.c_str(), &hi);
-            if (lo != INVALID_FILE_SIZE || GetLastError() == NO_ERROR)
-                size = std::min(size, (static_cast<std::uint64_t>(hi) << 32) | lo);
+        size = alloc_sz;
+        const std::int64_t used = std::max<std::int64_t>(hd.last_used, mtime);
+        if (hd.valid == 0) {  // a write was interrupted (header invalidated first)
+            del = true;
+            return;
         }
         if (hd.version != file_version || hd.fingerprint != fingerprint_) {
-            // another build / format: counted against the cap, dropped first
-            foreign_.push_back(Foreign{pw, size, hd.last_used});
+            // another model / build / format: counted against the cap, dropped first (or expired)
+            if (cfg.expire_s > 0 && used < nowUnix() - static_cast<std::int64_t>(cfg.expire_s)) {
+                del = expired = true;
+                return;
+            }
+            foreign_.push_back(Foreign{pw, size, used});
             ssd_bytes += size;
             return;
         }
@@ -1524,8 +1671,10 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
             return;
         }
         std::vector<std::uint32_t> toks(hd.n_tok);
-        if (!readAt(fh, reinterpret_cast<std::uint8_t*>(toks.data()), static_cast<std::uint64_t>(hd.n_tok) * 4, hd.tok_off))
+        if (!readAt(fh, reinterpret_cast<std::uint8_t*>(toks.data()), static_cast<std::uint64_t>(hd.n_tok) * 4, hd.tok_off)) {
+            del = true;
             return;
+        }
         if (tokSum(toks.data(), toks.size()) != hd.tok_sum) {
             del = true;
             return;
@@ -1538,7 +1687,10 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
             return;
         }
         std::vector<BlkRef> tbl(n_blk);
-        if (n_blk > 0 && !readAt(fh, reinterpret_cast<std::uint8_t*>(tbl.data()), n_blk * sizeof(BlkRef), hd.tbl_off)) return;
+        if (n_blk > 0 && !readAt(fh, reinterpret_cast<std::uint8_t*>(tbl.data()), n_blk * sizeof(BlkRef), hd.tbl_off)) {
+            del = true;
+            return;
+        }
         auto e = std::make_unique<Entry>();
         e->id = hd.id;
         e->nck = hd.nck;
@@ -1546,6 +1698,7 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
         e->pages = hd.pages;
         for (std::size_t k = 0; k < max_ck; ++k) e->ck[k] = hd.ck[k];
         e->in_ram = false;
+        e->used = std::max<std::int64_t>(hd.last_used, mtime);
         e->tokens = toks;
         try {
             e->ev = newEvent();
@@ -1565,7 +1718,7 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
         entries.push_back(e.get());
         Entry* ep = e.release();
         try {
-            order.push_back(IndexItem{ep, hd.last_used});
+            order.push_back(IndexItem{ep, ep->used});
         } catch (...) {
         }
         ssd_bytes += size;
@@ -1592,7 +1745,52 @@ void Tier::index() {
     order.erase(std::remove_if(order.begin(), order.end(), [&](const IndexItem& o) { return !contains(o.e); }), order.end());
     // LRU order of the indexed entries = their last write time
     std::stable_sort(order.begin(), order.end(), [](const IndexItem& a, const IndexItem& b) { return a.t < b.t; });
+    // an owner is at least as recently used as the files borrowing its blocks
+    for (const IndexItem& o : order) {
+        if (!contains(o.e) || !o.e->ssd) continue;
+        for (const BlkRef& r : o.e->ssd->tbl)
+            if (r.owner != 0)
+                if (Entry* ow = find(r.owner)) ow->used = std::max(ow->used, o.e->used);
+    }
     for (const IndexItem& o : order) touch(o.e);
+}
+
+// Delete SSD files not used for cfg.expire_s (SSD-only entries and files of other models; the SSD copy
+// of an entry that is also in RAM is left: the RAM copy is live and would just be written again).
+void Tier::expireSweep() {
+    if (!ssd_dir_w_ || cfg.expire_s == 0) return;
+    const std::int64_t cutoff = nowUnix() - static_cast<std::int64_t>(cfg.expire_s);
+    for (std::size_t i = 0; i < foreign_.size();) {
+        if (foreign_[i].last_used < cutoff) {
+            DeleteFileW(foreign_[i].path.c_str());
+            ssd_bytes = satSub(ssd_bytes, foreign_[i].size);
+            cleanup_.expired_files += 1;
+            cleanup_.expired_bytes += foreign_[i].size;
+            foreign_.erase(foreign_.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            i += 1;
+        }
+    }
+    const std::vector<Entry*> snapshot = entries;
+    for (Entry* e : snapshot) {
+        if (!contains(e) || !e->ssd || e->in_ram || e->used >= cutoff || !ssdDroppable(e)) continue;
+        const std::uint64_t b = e->ssd->alloc_bytes;
+        // files borrowing its blocks go with it (they are at least as old: owners are marked used with them)
+        const std::size_t before = ssdEntries();
+        dropSsdCopy(e);
+        cleanup_.expired_files += before - ssdEntries();
+        cleanup_.expired_bytes += b;
+    }
+    if (log_fn && cleanup_.expired_files > 0) log_fn(fmt("kv tier: SSD cache expiry: %llu files / %.2f GiB removed so far (not used for %llu days)", static_cast<unsigned long long>(cleanup_.expired_files), static_cast<double>(cleanup_.expired_bytes) / 1073741824.0, static_cast<unsigned long long>(cfg.expire_s / 86400)));
+}
+
+// More on disk than the cap (a smaller --kv-ssd-gb than before, foreign files): evict, foreign first, then LRU.
+void Tier::enforceCap() {
+    const std::uint64_t before = ssd_bytes;
+    const std::size_t nf = foreign_.size() + ssdEntries();
+    ssdRoom(0, nullptr);
+    cleanup_.cap_bytes += satSub(before, ssd_bytes);
+    cleanup_.cap_files += satSub(nf, foreign_.size() + ssdEntries());
 }
 
 // Startup: a file referencing a block that is not (or no longer) in its

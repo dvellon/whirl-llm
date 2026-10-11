@@ -11,6 +11,13 @@
 #include "cache/prefix_cache.h"
 
 #include <malloc.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 #include <algorithm>
 #include <atomic>
@@ -252,7 +259,8 @@ static bool runRestore(Tier& t, Restore* r, int timeout_ms = 20000) {
 
 static bool tickIdle(Tier& t, int timeout_ms = 20000) {
     const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (t.tick()) {
+    // waiting only for write delays to expire is idle (the engine sleeps then)
+    while (t.tick() && !t.waitOnly()) {
         if (std::chrono::steady_clock::now() > dl) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -482,6 +490,7 @@ struct SsdEnv {
         c.ssd_dir = std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
         c.ssd_cap = cap;
         c.ssd_delay_ms = 0;
+        c.ssd_seen_filter = false;  // the seen-once filter has its own test (testSeenOnce)
         return c;
     }
 };
@@ -921,6 +930,7 @@ static bool spillSess(Tier& t, Sess& s, std::size_t changed_from) {
     t.fence(x, nullptr);
     x->owner = 0;
     x->t_mod = std::chrono::steady_clock::now();
+    if (!fresh) x->reused = true;  // Engine::spillSlot: an in-place update is a resumed session
     s.e = x;
     s.id = x->id;
     return fresh;
@@ -1638,6 +1648,716 @@ static void testWorkflows(MockDeviceOps& ops, const fs::path& dir) {
     }
 }
 
+
+// ---- SSD-QUIET: write delay, eviction writes, cap, expiry, startup cleanup ----------------
+
+// bytes the .wkv files of dir really occupy (sparse files: without the holes)
+static std::uint64_t diskBytes(const fs::path& dir) {
+    std::uint64_t n = 0;
+    std::error_code ec;
+    for (const auto& de : fs::directory_iterator(dir, ec)) {
+        if (de.path().extension() != ".wkv") continue;
+        DWORD hi = 0;
+        const DWORD lo = GetCompressedFileSizeW(de.path().c_str(), &hi);
+        n += (static_cast<std::uint64_t>(hi) << 32) | lo;
+    }
+    return n;
+}
+
+static void sleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+
+static void testQuietDefaults() {
+    Config c;
+    CHECK(c.ssd_delay_ms == 300000);
+    CHECK(c.expire_s == 7ull * 24 * 3600 && c.expire_check_ms == 3600ull * 1000);
+    CHECK(c.ssd_seen_filter);
+    CHECK(!c.ssd_shutdown_only);  // the server's default mode (shutdown) is set by server_main
+}
+
+// An entry is written once unchanged for ssd_delay_ms; every change (or use) restarts the clock; while
+// it only waits, tick() reports wait-only work and the due time.
+static void testWriteDelay(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 3100;
+    auto t = Tier::create(ops, 128ull << 20, 31, 0);
+    Config c = env.cfg(4ull << 30);
+    c.ssd_delay_ms = 600;
+    t->start(c, kLay, 3);
+    Sess a(ops, 24);
+    a.toks = freshToks(3000, seed);
+    spillSess(*t, a, 0);
+    t->tick();
+    CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);
+    CHECK(t->waitOnly() && t->nextDue().has_value());
+    sleepMs(300);
+    // a new request continues the conversation: the entry changes, the clock restarts
+    a.toks.push_back(77);
+    spillSess(*t, a, a.toks.size() - 1);
+    sleepMs(400);  // 700 ms after the first spill, 400 ms after the change
+    t->tick();
+    CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);
+    CHECK(t->waitOnly());
+    sleepMs(300);
+    CHECK(tickIdle(*t));
+    CHECK(t->stats.ssd_writes == 1 && countFiles(dir) == 1);
+    CHECK(!t->nextDue().has_value());
+    // a dirty entry that is served from RAM (restored) restarts its clock
+    a.toks.push_back(78);
+    spillSess(*t, a, a.toks.size() - 1);
+    CHECK(t->find(a.id)->hasDirty());
+    sleepMs(450);
+    CHECK(restoreMatches(*t, ops, t->find(a.id), a));
+    sleepMs(300);  // 750 ms after the spill, 300 ms after the restore
+    t->tick();
+    CHECK(t->stats.ssd_writes == 1);
+    sleepMs(400);
+    CHECK(tickIdle(*t));
+    CHECK(t->stats.ssd_writes == 2);
+    t.reset();
+    fs::remove_all(dir, ec);
+}
+
+// RAM pressure before the delay: the evicted entry is written when it has >= min_tokens, else dropped.
+static void testEvictionWrite(MockDeviceOps& ops, const fs::path& dir) {
+    for (int mode = 0; mode < 3; ++mode) {  // 0: written, 1: below min_tokens (dropped), 2: shutdown mode (dropped)
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        SsdEnv env{dir};
+        std::uint64_t seed = 3200 + mode;
+        auto t = Tier::create(ops, 64ull << 20, 32, 0);  // 32 blocks; a 3000-token entry takes 13
+        Config c = env.cfg(4ull << 30);
+        c.ssd_delay_ms = 600000;
+        c.min_tokens = mode == 1 ? 5000 : 2048;
+        c.ssd_shutdown_only = mode == 2;
+        t->start(c, kLay, 4);
+        Sess a(ops, 24), b(ops, 24), d(ops, 24);
+        a.toks = freshToks(3000, seed);
+        b.toks = freshToks(3000, seed);
+        d.toks = freshToks(3000, seed);
+        spillSess(*t, a, 0);
+        const std::uint64_t id_a = a.id;
+        sleepMs(5);
+        spillSess(*t, b, 0);
+        t->tick();
+        CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);  // not due
+        // the third needs room: the LRU entry a goes
+        bool kept = spillSess(*t, d, 0) && d.id != 0;
+        if (mode == 0) {
+            // a is written first (async); its blocks are free after that and the spill is retried
+            CHECK(!kept && t->roomPending());
+            CHECK(tickIdle(*t, 20000));
+            kept = spillSess(*t, d, 0) && d.id != 0;
+            CHECK(kept);
+            CHECK(t->stats.ssd_writes >= 1);
+            Entry* ea = t->find(id_a);
+            CHECK(ea != nullptr && ea->ssd.has_value() && !ea->in_ram);  // evicted to its SSD copy
+            CHECK(t->stats.dropped == 0);
+            CHECK(countFiles(dir) == 1);
+            // room for the restore (RAM is full of dirty entries, which would need writes first)
+            if (Entry* eb = t->find(b.id)) t->removeEntry(eb);
+            if (ea) CHECK(restoreMatches(*t, ops, ea, a));
+            CHECK(tickIdle(*t));
+        } else {
+            CHECK(kept);
+            CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);
+            CHECK(t->find(id_a) == nullptr && t->stats.dropped == 1);
+        }
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+}
+
+// Shutdown mode: no write while running even with delay 0, a flush writes everything; always mode: the
+// flush (delay forced to 0 like Engine::flushTierOnStop) does not wait for the delay either.
+static void testShutdownFlush(MockDeviceOps& ops, const fs::path& dir) {
+    for (int mode = 0; mode < 2; ++mode) {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        SsdEnv env{dir};
+        std::uint64_t seed = 3300 + mode;
+        auto t = Tier::create(ops, 128ull << 20, 33, 0);
+        Config c = env.cfg(4ull << 30);
+        c.ssd_delay_ms = mode == 0 ? 0 : 600000;
+        c.ssd_shutdown_only = mode == 0;
+        t->start(c, kLay, 5);
+        Sess a(ops, 24), b(ops, 24);
+        a.toks = freshToks(3000, seed);
+        b.toks = freshToks(3000, seed);
+        spillSess(*t, a, 0);
+        spillSess(*t, b, 0);
+        t->tick();
+        sleepMs(50);
+        t->tick();
+        CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);
+        t->flushing = true;
+        const std::uint64_t saved = t->cfg.ssd_delay_ms;
+        t->cfg.ssd_delay_ms = 0;
+        CHECK(tickIdle(*t));
+        t->cfg.ssd_delay_ms = saved;
+        CHECK(t->stats.ssd_writes == 2 && countFiles(dir) == 2);
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+}
+
+
+// Graceful flush order: most recently used first (a restore counts as use), so when the time bound runs
+// out the oldest sessions are the ones not written. Writes run in submission order on the IO thread.
+static void testFlushOrder(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 3600;
+    auto t = Tier::create(ops, 256ull << 20, 36, 0);
+    Config c = env.cfg(4ull << 30);
+    c.ssd_delay_ms = 600000;
+    c.ssd_shutdown_only = true;
+    std::vector<std::string> logs;
+    t->log_fn = [&](std::string_view s) { logs.emplace_back(s); };
+    t->start(c, kLay, 6);
+    Sess s0(ops, 24), s1(ops, 24), s2(ops, 24), s3(ops, 24);
+    Sess* all[4] = {&s0, &s1, &s2, &s3};
+    for (Sess* s : all) {
+        s->toks = freshToks(3000, seed);
+        spillSess(*t, *s, 0);
+        sleepMs(5);
+    }
+    // creation order s0 s1 s2 s3; s1 is used last (restored), then s0 is updated in place
+    CHECK(restoreMatches(*t, ops, t->find(s1.id), s1));
+    sleepMs(5);
+    s0.toks.push_back(99);
+    spillSess(*t, s0, s0.toks.size() - 1);
+    t->tick();
+    CHECK(t->stats.ssd_writes == 0);
+    t->flushing = true;
+    t->cfg.ssd_delay_ms = 0;
+    CHECK(tickIdle(*t));
+    CHECK(t->stats.ssd_writes == 4);
+    // order of the "written to SSD" lines
+    std::vector<std::uint64_t> order;
+    for (const std::string& l : logs) {
+        const auto p = l.find("entry ");
+        if (l.find("written to SSD") == std::string::npos || p == std::string::npos) continue;
+        order.push_back(std::strtoull(l.c_str() + p + 6, nullptr, 16));
+    }
+    const std::uint64_t want[4] = {s0.id, s1.id, s3.id, s2.id};
+    CHECK(order.size() == 4);
+    for (std::size_t i = 0; i < order.size() && i < 4; ++i) CHECK(order[i] == want[i]);
+    t.reset();
+    fs::remove_all(dir, ec);
+}
+
+// `always` mode seen-once filter: only entries whose prefix was reused (restored) or that were resumed
+// (updated in place) are written; a stream of distinct one-shot prompts writes nothing. Shutdown mode writes
+// everything on the flush.
+static void testSeenOnce(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 3700;
+    auto mk = [&](std::uint64_t ram, std::uint64_t delay_ms, bool shutdown_only) {
+        auto t = Tier::create(ops, ram, 37, 0);
+        Config c = env.cfg(4ull << 30);
+        c.ssd_seen_filter = true;
+        c.ssd_delay_ms = delay_ms;
+        c.ssd_shutdown_only = shutdown_only;
+        t->start(c, kLay, 7);
+        return t;
+    };
+    // 1. delay expiry: distinct prompts -> nothing; reused prefix and resumed session -> written
+    {
+        auto t = mk(256ull << 20, 200, false);
+        std::vector<std::unique_ptr<Sess>> st;
+        for (int i = 0; i < 6; ++i) {
+            st.push_back(std::make_unique<Sess>(ops, 24));
+            st.back()->toks = freshToks(3000, seed);
+            spillSess(*t, *st.back(), 0);
+        }
+        sleepMs(300);
+        CHECK(!t->tick());  // nothing to wait for or write
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);
+        CHECK(!t->waitOnly() && !t->nextDue().has_value());
+        // one prefix is reused (restored), one session resumed (grew by appending)
+        CHECK(restoreMatches(*t, ops, t->find(st[2]->id), *st[2]));
+        st[4]->toks.push_back(55);
+        spillSess(*t, *st[4], st[4]->toks.size() - 1);
+        sleepMs(300);
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 2 && countFiles(dir) == 2);
+        // restore path unchanged: evict the written one from RAM, restore from the SSD copy
+        const std::uint64_t id2 = st[2]->id;
+        t->removeEntry(t->find(st[0]->id));
+        CHECK(t->find(id2)->ssd.has_value());
+        // graceful flush in `always` mode keeps the filter
+        t->flushing = true;
+        t->cfg.ssd_delay_ms = 0;
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 2 && countFiles(dir) == 2);
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+    // 2. RAM pressure before the delay: a one-shot entry is dropped, a reused one is written then restored
+    for (int mode = 0; mode < 2; ++mode) {  // 0: LRU victim never reused (dropped), 1: reused (written)
+        auto t = mk(64ull << 20, 600000, false);  // 32 blocks; a 3000-token entry takes 13
+        Sess a(ops, 24), b(ops, 24), d(ops, 24);
+        a.toks = freshToks(3000, seed);
+        b.toks = freshToks(3000, seed);
+        d.toks = freshToks(3000, seed);
+        spillSess(*t, a, 0);
+        const std::uint64_t id_a = a.id;
+        if (mode == 1) CHECK(restoreMatches(*t, ops, t->find(a.id), a));
+        sleepMs(5);
+        spillSess(*t, b, 0);
+        bool kept = spillSess(*t, d, 0) && d.id != 0;
+        if (mode == 0) {
+            CHECK(kept);
+            CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);
+            CHECK(t->find(id_a) == nullptr && t->stats.dropped == 1);
+        } else {
+            // the reused LRU entry a is written (async); the unseen b is dropped for room
+            CHECK(kept && t->stats.dropped == 1 && t->find(b.id) == nullptr);
+            CHECK(tickIdle(*t, 20000));
+            CHECK(t->stats.ssd_writes == 1 && countFiles(dir) == 1);
+            Entry* ea = t->find(id_a);
+            CHECK(ea != nullptr && ea->ssd.has_value());
+            if (ea) CHECK(restoreMatches(*t, ops, ea, a));
+            CHECK(tickIdle(*t));
+        }
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+    // 3. shutdown mode: the flush writes everything in RAM, seen or not
+    {
+        auto t = mk(256ull << 20, 600000, true);
+        Sess a(ops, 24), b(ops, 24);
+        a.toks = freshToks(3000, seed);
+        b.toks = freshToks(3000, seed);
+        spillSess(*t, a, 0);
+        spillSess(*t, b, 0);
+        t->tick();
+        CHECK(t->stats.ssd_writes == 0);
+        t->flushing = true;
+        t->cfg.ssd_delay_ms = 0;
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 2 && countFiles(dir) == 2);
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+}
+
+static void writeJunk(const fs::path& p, std::size_t n, std::uint64_t seed) {
+    std::vector<std::uint8_t> v(n);
+    if (n > 0) fillBytes(v.data(), n, seed);
+    FILE* f = _wfopen(p.c_str(), L"wb");
+    if (f) {
+        if (n > 0) std::fwrite(v.data(), 1, n, f);
+        std::fclose(f);
+    }
+}
+
+// Startup: every kind of file in the directory is accounted for: corrupt / half-written files are deleted,
+// valid files of another model count against the cap and go first, the directory never holds more than
+// the cap (real bytes) and the log has one summary line.
+static void testStartupCleanupCap(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 3400;
+    const std::uint64_t fp_a = 41, fp_b = 42;
+    std::uint64_t one_file = 0;
+    std::uint64_t id_ours = 0;
+    {
+        // two entries of another model (fp_a)
+        auto t = Tier::create(ops, 256ull << 20, 34, 0);
+        t->start(env.cfg(4ull << 30), kLay, fp_a);
+        Sess a(ops, 24), b(ops, 24);
+        a.toks = freshToks(3000, seed);
+        b.toks = freshToks(3000, seed);
+        spillSess(*t, a, 0);
+        spillSess(*t, b, 0);
+        CHECK(tickIdle(*t));
+        one_file = t->ssd_bytes / 2;
+    }
+    {
+        auto t = Tier::create(ops, 256ull << 20, 35, 0);
+        t->start(env.cfg(4ull << 30), kLay, fp_b);
+        CHECK(t->ssdEntries() == 0);  // the files of the other model are foreign: counted, not indexed
+        Sess c(ops, 24);
+        c.toks = freshToks(3000, seed);
+        spillSess(*t, c, 0);
+        CHECK(tickIdle(*t));
+        id_ours = c.id;
+    }
+    const fs::path ours = entryFile(dir, fp_b, id_ours);
+    CHECK(fs::exists(ours));
+    // junk: not a cache file, zero length, a short file, a half-written one (valid = 0), a cut-short one
+    writeJunk(dir / L"junk1.wkv", 100000, 1);
+    writeJunk(dir / L"junk2.wkv", 0, 2);
+    writeJunk(dir / L"junk3.wkv", 100, 3);
+    const fs::path half = dir / L"000000000000002a-00000000000000aa.wkv";
+    const fs::path cut = dir / L"000000000000002a-00000000000000bb.wkv";
+    fs::copy_file(ours, half, fs::copy_options::overwrite_existing, ec);
+    {
+        FILE* fh = _wfopen(half.c_str(), L"r+b");
+        CHECK(fh != nullptr);
+        if (fh) {
+            std::uint32_t zero = 0;
+            std::fseek(fh, 12, SEEK_SET);  // Header::valid
+            std::fwrite(&zero, 4, 1, fh);
+            std::fclose(fh);
+        }
+    }
+    fs::copy_file(ours, cut, fs::copy_options::overwrite_existing, ec);
+    fs::resize_file(cut, fs::file_size(ours) / 3, ec);
+    CHECK(countFiles(dir) == 8);  // 2 foreign + ours + 5 bad
+    std::vector<std::string> logs;
+    {
+        // cap = 1.5 files: the bad files go, the other model's files go first, ours stays
+        auto t = Tier::create(ops, 256ull << 20, 36, 0);
+        t->log_fn = [&](std::string_view s) { logs.emplace_back(s); };
+        Config c = env.cfg(one_file + one_file / 2);
+        t->start(c, kLay, fp_b);
+        CHECK(t->hasSsd());
+        const Tier::Cleanup& cl = t->cleanup();
+        CHECK(cl.bad_files == 5);
+        CHECK(t->ssdEntries() == 1);
+        CHECK(cl.cap_files == 2);
+        CHECK(t->ssd_bytes <= c.ssd_cap);
+        CHECK(diskBytes(dir) <= c.ssd_cap);
+        CHECK(countFiles(dir) == 1 && fs::exists(ours));
+        bool line = false;
+        for (const auto& l : logs)
+            if (l.find("SSD cache") != std::string::npos && l.find("removed at startup") != std::string::npos) line = true;
+        CHECK(line);
+    }
+    {
+        // a cap lower than what is there (--kv-ssd-gb lowered): evicted at start, not at the next write
+        auto t = Tier::create(ops, 256ull << 20, 37, 0);
+        Config c = env.cfg(one_file / 2);
+        t->start(c, kLay, fp_b);
+        CHECK(t->ssd_bytes <= c.ssd_cap && diskBytes(dir) <= c.ssd_cap && countFiles(dir) == 0);
+    }
+    fs::remove_all(dir, ec);
+}
+
+// The cap holds on every write and the LRU victim takes the files borrowing its blocks with it.
+static void testCapLruDedup(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 3500;
+    const std::uint64_t fp = 51;
+    const auto sys = freshToks(2560, seed);
+    Sess c(ops, 24), a(ops, 24), b(ops, 24);
+    c.toks = freshToks(3000, seed);
+    a.toks = sys;
+    {
+        auto x = freshToks(1000, seed);
+        a.toks.insert(a.toks.end(), x.begin(), x.end());
+    }
+    b.toks = sys;
+    {
+        auto x = freshToks(700, seed);
+        b.toks.insert(b.toks.end(), x.begin(), x.end());
+    }
+    std::uint64_t used = 0;
+    {
+        auto t = Tier::create(ops, 256ull << 20, 38, 0);
+        t->start(env.cfg(4ull << 30), kLay, fp);
+        spillSess(*t, c, 0);
+        CHECK(tickIdle(*t));
+        sleepMs(1100);  // distinct last-write seconds: the LRU order survives the restart
+        spillSess(*t, a, 0);
+        CHECK(tickIdle(*t));
+        sleepMs(1100);
+        spillSess(*t, b, 0);
+        CHECK(tickIdle(*t));
+        CHECK(t->dependentsOf(a.e).size() == 1);
+        used = t->ssd_bytes;
+        CHECK(diskBytes(dir) <= used);
+    }
+    const std::uint64_t cap = used + (3ull << 20);
+    auto t = Tier::create(ops, 256ull << 20, 39, 0);
+    Config cf = env.cfg(cap);
+    t->start(cf, kLay, fp);
+    CHECK(t->ssdEntries() == 3);
+    Sess d(ops, 24), e2(ops, 24);
+    d.toks = freshToks(3000, seed);
+    e2.toks = freshToks(3000, seed);
+    spillSess(*t, d, 0);
+    CHECK(tickIdle(*t));
+    CHECK(t->ssd_bytes <= cap && diskBytes(dir) <= cap);
+    CHECK(t->find(c.id) == nullptr);  // the oldest went
+    CHECK(t->find(a.id) != nullptr && t->find(b.id) != nullptr);
+    spillSess(*t, e2, 0);
+    CHECK(tickIdle(*t));
+    CHECK(t->ssd_bytes <= cap && diskBytes(dir) <= cap);
+    // a is evicted together with b (which borrows its blocks), never alone
+    const bool a_gone = t->find(a.id) == nullptr, b_gone = t->find(b.id) == nullptr;
+    CHECK(!(a_gone && !b_gone));
+    const std::uint64_t cnt = countFiles(dir);
+    t.reset();
+    auto t2 = Tier::create(ops, 256ull << 20, 40, 0);
+    t2->start(cf, kLay, fp);
+    CHECK(t2->ssdEntries() == cnt);  // every file on disk is valid (no dangling reference)
+    CHECK(t2->ssd_bytes <= cap && diskBytes(dir) <= cap);
+    CHECK(t2->cleanup().bad_files == 0);
+    t2.reset();
+    fs::remove_all(dir, ec);
+}
+
+// Files unused for the expiry time are deleted (start-up and periodic); use refreshes them (also the
+// owners of borrowed blocks).
+static void testExpiry(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 3600;
+    const std::uint64_t fp = 61;
+    const std::int64_t day = 86400;
+    std::int64_t offset = 0;
+    auto cfg = [&](std::uint64_t cap) {
+        Config c = env.cfg(cap);
+        c.expire_check_ms = 0;
+        c.clock_fn = [&] { return static_cast<std::int64_t>(std::time(nullptr)) + offset; };
+        return c;
+    };
+    const auto sys = freshToks(2560, seed);
+    Sess a(ops, 24), b(ops, 24), z(ops, 24);
+    a.toks = sys;
+    {
+        auto x = freshToks(1000, seed);
+        a.toks.insert(a.toks.end(), x.begin(), x.end());
+    }
+    b.toks = sys;
+    {
+        auto x = freshToks(700, seed);
+        b.toks.insert(b.toks.end(), x.begin(), x.end());
+    }
+    z.toks = freshToks(3000, seed);
+    std::uint64_t id_a = 0, id_b = 0, id_z = 0;
+    {
+        auto t = Tier::create(ops, 256ull << 20, 41, 0);
+        t->start(cfg(4ull << 30), kLay, fp);
+        spillSess(*t, a, 0);
+        CHECK(tickIdle(*t));
+        spillSess(*t, b, 0);
+        CHECK(tickIdle(*t));
+        spillSess(*t, z, 0);
+        CHECK(tickIdle(*t));
+        id_a = a.id;
+        id_b = b.id;
+        id_z = z.id;
+        CHECK(t->dependentsOf(a.e).size() == 1);
+    }
+    {
+        // 6 days later: all kept; b is used (restored): b and its owner a are fresh at day 6
+        offset = 6 * day;
+        auto t = Tier::create(ops, 256ull << 20, 42, 0);
+        t->start(cfg(4ull << 30), kLay, fp);
+        CHECK(t->ssdEntries() == 3 && t->cleanup().expired_files == 0);
+        Entry* eb = t->find(id_b);
+        CHECK(eb != nullptr);
+        if (eb) CHECK(restoreMatches(*t, ops, eb, b));
+        CHECK(tickIdle(*t));
+    }
+    {
+        // day 8: z (unused for 8 days) expires at start; a and b were used at day 6
+        offset = 8 * day;
+        std::vector<std::string> logs;
+        auto t = Tier::create(ops, 256ull << 20, 43, 0);
+        t->log_fn = [&](std::string_view s) { logs.emplace_back(s); };
+        t->start(cfg(4ull << 30), kLay, fp);
+        CHECK(t->find(id_z) == nullptr);
+        CHECK(t->find(id_a) != nullptr && t->find(id_b) != nullptr);
+        CHECK(t->cleanup().expired_files == 1);
+        CHECK(countFiles(dir) == 2);
+        bool line = false;
+        for (const auto& l : logs)
+            if (l.find("1 expired") != std::string::npos) line = true;
+        CHECK(line);
+        // periodic: day 14 -> both expire on a tick
+        offset = 14 * day;
+        t->tick();
+        CHECK(t->ssdEntries() == 0 && countFiles(dir) == 0 && t->ssd_bytes == 0);
+    }
+    {
+        // files of another model expire too; expire_s = 0 turns expiry off
+        fs::remove_all(dir, ec);
+        offset = 0;
+        {
+            auto t = Tier::create(ops, 256ull << 20, 44, 0);
+            t->start(cfg(4ull << 30), kLay, fp);
+            Sess q(ops, 24);
+            q.toks = freshToks(3000, seed);
+            spillSess(*t, q, 0);
+            CHECK(tickIdle(*t));
+        }
+        offset = 9 * day;
+        {
+            Config c = cfg(4ull << 30);
+            c.expire_s = 0;
+            auto t = Tier::create(ops, 256ull << 20, 45, 0);
+            t->start(c, kLay, fp + 1);
+            CHECK(countFiles(dir) == 1 && t->ssd_bytes > 0 && t->cleanup().expired_files == 0);
+        }
+        auto t = Tier::create(ops, 256ull << 20, 46, 0);
+        t->start(cfg(4ull << 30), kLay, fp + 1);
+        CHECK(countFiles(dir) == 0 && t->cleanup().expired_files == 1);
+    }
+    fs::remove_all(dir, ec);
+}
+
+
+// ---- SSD-QUIET: write amplification of a benchmark-like request stream -------------------
+// Ornith-35B-A3B layout from the server log ("entry: 51.2 MiB per checkpoint, 9.0 MiB per 256-token
+// page", f16 KV), scaled by 1/amp_div so the default run stays small (WHIRL_TIER_AMP=full: real sizes).
+
+namespace amp {
+struct Sim {
+    MockDeviceOps& ops;
+    Layout lay;
+    std::uint32_t nck = 4;
+    DevPtr ck_dev = 0, kv_dev = 0;
+    std::uint32_t max_pages = 0;
+    Sim(MockDeviceOps& o, int div, std::uint32_t max_tokens) : ops(o) {
+        lay.ck_bytes = static_cast<std::uint64_t>(51.2 * 1048576.0) / div;
+        lay.page_bytes = (9ull << 20) / div;
+        lay.page_tokens = 256;
+        lay.tok_cap = max_tokens;
+        max_pages = (max_tokens + 255) / 256;
+        ck_dev = o.malloc(lay.ck_bytes);
+        kv_dev = o.malloc(static_cast<std::uint64_t>(max_pages) * lay.page_bytes);
+        fillBytes(reinterpret_cast<void*>(ck_dev), lay.ck_bytes, 5);
+        fillBytes(reinterpret_cast<void*>(kv_dev), static_cast<std::uint64_t>(max_pages) * lay.page_bytes, 6);
+    }
+    ~Sim() {
+        ops.free(ck_dev);
+        ops.free(kv_dev);
+    }
+    std::uint64_t logical(std::uint32_t n_tok, std::uint32_t valid_ck) const {
+        return valid_ck * lay.ck_bytes + static_cast<std::uint64_t>((n_tok + 255) / 256) * lay.page_bytes;
+    }
+    // new entry: all `valid_ck` checkpoints and all pages are new
+    Entry* spillNew(Tier& t, const std::vector<std::uint32_t>& toks, std::uint32_t valid_ck) {
+        Entry* e = t.newEntry(nck);
+        e->tokens = toks;
+        e->n_tok = static_cast<std::uint32_t>(toks.size());
+        e->pages = (e->n_tok + 255) / 256;
+        std::vector<Span> sp;
+        for (std::uint32_t k = 0; k < valid_ck; ++k) {
+            e->ck[k] = CkMeta{static_cast<std::uint32_t>((k + 1) * toks.size() / valid_ck), 1, static_cast<std::uint8_t>(k + 1 == valid_ck), 0, 0, k + 1};
+            sp.push_back(Span{ck_dev, static_cast<std::uint64_t>(k) * lay.ckStride(), lay.ck_bytes, static_cast<std::uint8_t>(k)});
+        }
+        sp.push_back(Span{kv_dev, e->kvOff(lay), static_cast<std::uint64_t>(e->pages) * lay.page_bytes, 0xff});
+        for (const Span& s : sp) {
+            const auto r = Tier::lbRange(s.off, s.len);
+            if (!t.ensureBlocks(e, r[0], r[1])) {
+                t.removeEntry(e);
+                return nullptr;
+            }
+        }
+        t.copyOut(e, sp);
+        t.fence(e, nullptr);
+        e->t_mod = std::chrono::steady_clock::now();
+        return e;
+    }
+    // a conversation turn: `add` tokens appended; pages from the old last (partial) page are new, the
+    // oldest checkpoint slot is replaced by one at the new end (what a request that resumed from the
+    // newest checkpoint produces)
+    void growTurn(Tier& t, Entry* e, std::size_t add, std::uint64_t seed, std::uint32_t slot) {
+        const std::uint32_t old_pages = e->pages;
+        auto more = makeTokens(add, seed);
+        e->tokens.insert(e->tokens.end(), more.begin(), more.end());
+        e->n_tok = static_cast<std::uint32_t>(e->tokens.size());
+        e->pages = (e->n_tok + 255) / 256;
+        const std::uint32_t vp = old_pages > 0 ? old_pages - 1 : 0;  // the partial last page changes
+        std::vector<Span> sp;
+        sp.push_back(Span{ck_dev, static_cast<std::uint64_t>(slot) * lay.ckStride(), lay.ck_bytes, static_cast<std::uint8_t>(slot)});
+        sp.push_back(Span{kv_dev + static_cast<std::uint64_t>(vp) * lay.page_bytes, e->kvOff(lay) + static_cast<std::uint64_t>(vp) * lay.page_bytes,
+                          static_cast<std::uint64_t>(e->pages - vp) * lay.page_bytes, 0xff});
+        for (const Span& s : sp) {
+            const auto r = Tier::lbRange(s.off, s.len);
+            CHECK(t.ensureBlocks(e, r[0], r[1]));
+        }
+        e->ck[slot] = CkMeta{e->n_tok, 1, 1, 0, 0, 100 + static_cast<std::uint64_t>(e->n_tok)};
+        t.copyOut(e, sp);
+        t.fence(e, nullptr);
+        e->t_mod = std::chrono::steady_clock::now();
+    }
+};
+}  // namespace amp
+
+static void testWriteAmplification(MockDeviceOps& ops, const fs::path& dir) {
+    const char* full = std::getenv("WHIRL_TIER_AMP");
+    const int div = full != nullptr && std::strcmp(full, "full") == 0 ? 1 : 8;
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    amp::Sim sim(ops, div, 36000);
+    // A: distinct prompts of 2k..32k tokens, one request each (4 checkpoints), written at once (delay 0)
+    {
+        auto t = Tier::create(ops, 1ull << 30, 71, 0);
+        t->start(env.cfg(64ull << 30), sim.lay, 9);
+        const std::uint32_t lens[] = {2048, 4096, 8192, 16384, 32768};
+        std::uint64_t seed = 7100;
+        std::printf("amp A: distinct prompts (scale 1/%d): tokens, logical MiB, written MiB, ratio\n", div);
+        std::uint64_t req_no = 0;
+        for (std::uint32_t n : lens) {
+            const std::uint64_t w0 = t->stats.ssd_write_bytes;
+            Entry* e = sim.spillNew(*t, freshToks(n, seed), 4);
+            CHECK(e != nullptr);
+            if (!e) continue;
+            CHECK(tickIdle(*t, 120000));
+            const std::uint64_t w = t->stats.ssd_write_bytes - w0;
+            const std::uint64_t lg = sim.logical(n, 4);
+            const std::uint64_t fb = e->ssd ? e->ssd->file_bytes : 0;
+            std::printf("  %6u tok  logical %8.1f  file %8.1f  written %8.1f  ratio %.3f (to file %.3f)\n", n, lg / 1048576.0, fb / 1048576.0,
+                        w / 1048576.0, static_cast<double>(w) / static_cast<double>(lg), static_cast<double>(w) / static_cast<double>(fb ? fb : 1));
+            // the file is the logical size rounded up to whole 2 MiB strides; the writes add only headers
+            CHECK(fb > 0 && static_cast<double>(w) <= 1.001 * static_cast<double>(fb));
+            CHECK(t->stats.ssd_writes == ++req_no);  // one write per request, never again
+        }
+        // the same prompts again are RAM hits: nothing to write
+        const std::uint64_t w_all = t->stats.ssd_write_bytes;
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_write_bytes == w_all);
+    }
+    fs::remove_all(dir, ec);
+    // B: one conversation, 16 turns of +700 tokens from 8k, a checkpoint replaced per turn: the old
+    // 2 s behaviour writes after every turn, a long delay once at the end
+    std::uint64_t per_turn = 0, coalesced = 0, final_logical = 0;
+    for (int variant = 0; variant < 2; ++variant) {
+        auto t = Tier::create(ops, 1ull << 30, 72, 0);
+        Config c = env.cfg(64ull << 30);
+        c.ssd_delay_ms = variant == 0 ? 0 : 3600000;
+        t->start(c, sim.lay, 9);
+        std::uint64_t seed = 7200;
+        Entry* e = sim.spillNew(*t, freshToks(8192, seed), 3);
+        CHECK(e != nullptr);
+        if (!e) return;
+        for (int turn = 0; turn < 16; ++turn) {
+            if (variant == 0) CHECK(tickIdle(*t, 120000));
+            sim.growTurn(*t, e, 700, seed + turn, static_cast<std::uint32_t>(turn % 3));
+        }
+        // the delay passes / graceful stop
+        t->flushing = true;
+        t->cfg.ssd_delay_ms = 0;
+        CHECK(tickIdle(*t, 120000));
+        (variant == 0 ? per_turn : coalesced) = t->stats.ssd_write_bytes;
+        final_logical = sim.logical(e->n_tok, 3);
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+    std::printf("amp B: 16-turn conversation (final entry %.1f MiB): written per turn %.1f MiB (x%.2f), coalesced %.1f MiB (x%.2f)\n",
+                final_logical / 1048576.0, per_turn / 1048576.0, static_cast<double>(per_turn) / static_cast<double>(final_logical),
+                coalesced / 1048576.0, static_cast<double>(coalesced) / static_cast<double>(final_logical));
+    CHECK(coalesced <= final_logical + final_logical / 10);  // stride padding only
+    CHECK(per_turn > 2 * coalesced);
+}
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // default: WHIRL_TEST_TMP, else %TEMP%\whirl-tests; this test uses <base>\tier_test_tmp
@@ -1679,6 +2399,26 @@ int main(int argc, char** argv) {
     testSupersedeTrim(ops, dir);
     std::printf("-- %s\n", "testWorkflows");
     testWorkflows(ops, dir);
+    std::printf("-- %s\n", "testQuietDefaults");
+    testQuietDefaults();
+    std::printf("-- %s\n", "testWriteDelay");
+    testWriteDelay(ops, dir);
+    std::printf("-- %s\n", "testEvictionWrite");
+    testEvictionWrite(ops, dir);
+    std::printf("-- %s\n", "testShutdownFlush");
+    testShutdownFlush(ops, dir);
+    std::printf("-- %s\n", "testFlushOrder");
+    testFlushOrder(ops, dir);
+    std::printf("-- %s\n", "testSeenOnce");
+    testSeenOnce(ops, dir);
+    std::printf("-- %s\n", "testStartupCleanupCap");
+    testStartupCleanupCap(ops, dir);
+    std::printf("-- %s\n", "testCapLruDedup");
+    testCapLruDedup(ops, dir);
+    std::printf("-- %s\n", "testExpiry");
+    testExpiry(ops, dir);
+    std::printf("-- %s\n", "testWriteAmplification");
+    testWriteAmplification(ops, dir);
     std::printf("tier tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
