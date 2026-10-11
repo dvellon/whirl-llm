@@ -2028,6 +2028,8 @@ int cmdGolden(const Args& a) {
     if (suite == "single") return goldenSingle(a, f, tok, n_dec);
     if (suite == "pair") return goldenPair(a, f, tok, n_dec);
     throw std::runtime_error("golden: --suite must be single or pair");
+}
+
 // whirl dflash-check MODEL DRAFT REFDIR: drafter forward vs reference values
 std::string readBinFile(const std::string& path) {
     std::FILE* fp = std::fopen(path.c_str(), "rb");

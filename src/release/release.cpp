@@ -350,6 +350,7 @@ constexpr EnvDoc k_env[] = {
     {"Speculative decoding (output always equals plain greedy)", "DRAFT_MODEL=FILE, DFLASH_CAPTURE_ROWS=N", "DFlash2 drafter GGUF for --draft dflash (checked against the model before loading; the MTP block is then not loaded) and its target-layer hidden capture rows", C | B | S},
     {"Speculative decoding (output always equals plain greedy)", "DFLASH_PMIN=P, DFLASH_NMIN=N", "--draft dflash: end a draft block's walk at a token with probability below P (after N drafts)", C | B | S},
     {"Speculative decoding (output always equals plain greedy)", "DFLASH_WARM=N", "server, --draft dflash: after a restore without drafter rows, draft with DFlash2 again once N rows followed it (default 64)", S},
+    {"Speculative decoding (output always equals plain greedy)", "DFLASH_DUMP=DIR", "whirl chat --draft dflash (developers): write the captured target features after the prompt to DIR (feats.npy, dump_meta.txt) for the DFlash2 reference check (whirl dflash-check)", C},
     {"Speculative decoding (output always equals plain greedy)", "NGRAM=0", "no n-gram (prompt-lookup) drafts", C | B | S},
     {"Speculative decoding (output always equals plain greedy)", "NGRAM_MIN=N", "minimum matched suffix for an n-gram draft (default 3)", C | B | S},
     {"Speculative decoding (output always equals plain greedy)", "NGRAM_SLOPE=X", "prior cost of one more n-gram verify row, relative to a 1-draft cycle (default 0.015; Radeon 8060S 0.12)", C | B | S},

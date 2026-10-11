@@ -186,11 +186,11 @@ std::vector<u32> Model::dflashDraft(u32 slot, u32 anchor, u32 pos, float p_min, 
                     side, I(ds));
     };
     // block tokens and positions; the mask token's embedding is the target's row mask_id
-    std::vector<i32> ids(B, static_cast<i32>(c.mask_id)), ph(B);
-    ids[0] = static_cast<i32>(anchor);
+    std::vector<i32> blk(B, static_cast<i32>(c.mask_id)), ph(B);
+    blk[0] = static_cast<i32>(anchor);
     for (u32 t = 0; t < B; ++t) ph[t] = static_cast<i32>(pos + t);
     hip::streamSync(stream);
-    hip::upload(r.ids, ids.data(), ids.size() * 4);
+    hip::upload(r.ids, blk.data(), blk.size() * 4);
     hip::upload(r.pos, ph.data(), ph.size() * 4);
     hip::launch(k.get_rows[static_cast<std::size_t>(tok_embd.ty) % n_types], D(8, B), D(128), 0, stream, tok_embd.ptr, tok_embd.row_bytes,
                 r.ids, r.x, I(E));

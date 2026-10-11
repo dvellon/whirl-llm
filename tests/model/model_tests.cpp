@@ -37,6 +37,7 @@ void check(bool ok, const char* what) {
         std::printf("FAIL: %s\n", what);
     }
 }
+void check(bool ok, const std::string& what) { check(ok, what.c_str()); }
 
 // Minimal GGUF v3 image builder.
 struct GgufImage {
@@ -654,7 +655,7 @@ GgufImage targetImage(const char* arch, std::uint32_t embd, std::uint32_t vocab,
     g.kvU32(a + ".nextn_predict_layers", 1);
     g.kvU32(a + ".embedding_length", embd);
     if (moe) {
-        g.kvU32(a + ".expert_feed_forward_length", 32);
+        g.kvU32(a + ".expert_feed_forward_length", 256);  // kg3 load hardening: 256..65536
         g.kvU32(a + ".expert_count", 8);
         g.kvU32(a + ".expert_used_count", 2);
     } else {
@@ -662,8 +663,8 @@ GgufImage targetImage(const char* arch, std::uint32_t embd, std::uint32_t vocab,
     }
     g.kvU32(a + ".attention.head_count", 4);
     g.kvU32(a + ".attention.head_count_kv", 2);
-    g.kvU32(a + ".attention.key_length", 16);
-    g.kvU32(a + ".rope.dimension_count", 16);
+    g.kvU32(a + ".attention.key_length", 32);  // kg3 load hardening: 32..256
+    g.kvU32(a + ".rope.dimension_count", 32);
     g.kvF32(a + ".rope.freq_base", 1e7f);
     g.kvF32(a + ".attention.layer_norm_rms_epsilon", 1e-6f);
     g.kvU32(a + ".ssm.conv_kernel", 4);
@@ -678,16 +679,19 @@ GgufImage targetImage(const char* arch, std::uint32_t embd, std::uint32_t vocab,
 // --draft dflash: the header-only fit check before loading (a MoE target without a drafter of
 // its size keeps MTP)
 void testDFlashCompat() {
-    const auto draft = dflashImage(64, 100).build();
+    // kg3 Config::fromGguf accepts embedding_length 256..65536 only (load hardening)
+    const auto draft = dflashImage(256, 100).build();
     const gguf::File df = gguf::File::parse(draft);
-    const auto dense = targetImage("qwen35", 64, 100, 8).build();
-    check(q::dflashIncompatible(gguf::File::parse(dense), df).empty(), "dflashIncompatible: matching dense target");
-    const auto moe = targetImage("qwen35moe", 32, 100, 8).build();
+    const auto dense = targetImage("qwen35", 256, 100, 8).build();
+    const std::string why_dense = q::dflashIncompatible(gguf::File::parse(dense), df);
+    check(why_dense.empty(), "dflashIncompatible: matching dense target (" + why_dense + ")");
+    const auto moe = targetImage("qwen35moe", 512, 100, 8).build();
     const std::string why = q::dflashIncompatible(gguf::File::parse(moe), df);
-    check(why.find("DraftModelMismatch") != std::string::npos, "dflashIncompatible: MoE target of another size rejected");
-    const auto shallow = targetImage("qwen35", 64, 100, 4).build();
-    check(!q::dflashIncompatible(gguf::File::parse(shallow), df).empty(), "dflashIncompatible: target layers beyond the target rejected");
-    const auto not_draft = dflashImage(64, 100, true, "qwen35").build();
+    check(why.find("DraftModelMismatch") != std::string::npos, "dflashIncompatible: MoE target of another size rejected (" + why + ")");
+    const auto shallow = targetImage("qwen35", 256, 100, 4).build();
+    const std::string why_sh = q::dflashIncompatible(gguf::File::parse(shallow), df);
+    check(why_sh.find("target layer id") != std::string::npos, "dflashIncompatible: target layers beyond the target rejected (" + why_sh + ")");
+    const auto not_draft = dflashImage(256, 100, true, "qwen35").build();
     check(q::dflashIncompatible(gguf::File::parse(dense), gguf::File::parse(not_draft)).find("UnsupportedArch") != std::string::npos,
           "dflashIncompatible: a non-dflash draft file rejected");
 }

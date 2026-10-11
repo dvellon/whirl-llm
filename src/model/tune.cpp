@@ -639,16 +639,16 @@ bool Model::checkCapture(std::string& log) {
     // capture slots for the embeddings, a middle layer and the last layer output
     const std::vector<u32> keep_ids = dflash ? dflash->cfg.target_layers : std::vector<u32>{};
     const u32 keep_rows = cap_rows;
-    const std::vector<u32> ids = {0, cfg.n_layer / 2, cfg.n_layer};
+    const std::vector<u32> layer_ids = {0, cfg.n_layer / 2, cfg.n_layer};
     const u32 rows = std::min<u32>(256, max_batch), n = std::min<u32>(300, max_batch);
-    enableCaptureLayers(ids, rows);
+    enableCaptureLayers(layer_ids, rows);
     const u32 c = std::min(n, rows);
     const u64 E = cfg.n_embd;
     bool ok = true;
-    for (std::size_t j = 0; j < ids.size(); ++j) {
+    for (std::size_t j = 0; j < layer_ids.size(); ++j) {
         const std::vector<float> xs = randomNormal(static_cast<std::size_t>(n) * E, 31 + static_cast<u32>(j));
         hip::upload(x, xs.data(), xs.size() * 4);
-        captureLayerInput(ids[j], n);
+        captureLayerInput(layer_ids[j], n);
         hip::streamSync(stream);
         std::vector<float> got(static_cast<std::size_t>(c) * E);
         hip::download(got.data(), cap_buf + static_cast<u64>(j) * cap_rows * E * 4, got.size() * 4);

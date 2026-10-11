@@ -933,14 +933,14 @@ void Model::enableCapture(u32 rows) {
     if (dflash) enableCaptureLayers(dflash->cfg.target_layers, rows);
 }
 
-void Model::enableCaptureLayers(std::span<const u32> ids, u32 rows) {
+void Model::enableCaptureLayers(std::span<const u32> layer_ids, u32 rows) {
     disableCapture();
-    if (ids.empty() || rows == 0) return;
+    if (layer_ids.empty() || rows == 0) return;
     cap_slot.assign(cfg.n_layer + 1, -1);
-    for (std::size_t j = 0; j < ids.size(); ++j)
-        if (ids[j] <= cfg.n_layer) cap_slot[ids[j]] = static_cast<i32>(j);
+    for (std::size_t j = 0; j < layer_ids.size(); ++j)
+        if (layer_ids[j] <= cfg.n_layer) cap_slot[layer_ids[j]] = static_cast<i32>(j);
     cap_rows = std::min(rows, max_batch);
-    cap_buf = allocZero(static_cast<u64>(ids.size()) * cap_rows * cfg.n_embd * 4);
+    cap_buf = allocZero(static_cast<u64>(layer_ids.size()) * cap_rows * cfg.n_embd * 4);
 }
 
 void Model::disableCapture() {

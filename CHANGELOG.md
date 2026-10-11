@@ -131,6 +131,19 @@ Routine bug-fix release: no new features, no speed changes. The changes harden i
 files, HTTP requests, tokenizer vocabularies); inference code paths are unchanged, so outputs are
 bit-identical to 0.1.3.
 
+### DFlash2 speculative decoding (`--draft dflash`, in development)
+
+- `--draft mtp|dflash` for `whirl chat` / `whirl bench` / `whirl-server`: with
+  `WHIRL_DRAFT_MODEL` = a DFlash2 drafter GGUF that fits the model (incoai/Qwen3.8-27B-DFlash2,
+  Apache-2.0), the block-diffusion drafter proposes up to block - 1 (7) tokens per cycle from the
+  target's hidden states at its target layers; the MTP block is then not loaded and the KV pool is
+  sized after the drafter. n-gram drafts stay on. DFlash2 drafts are verified like n-gram drafts
+  with exact acceptance in every mode (relaxacc in `--fast` relaxes MTP drafts only), so the output
+  equals plain greedy decoding of the same mode. Without a fitting drafter or without the
+  `dflash_*` kernels in the code object: a warning and the MTP drafts. The kernels are in both
+  kernel sets (gfx1201, gfx1151). Ported from the r97-rc DFlash2 series onto 0.2.0 (DFLASH-1a);
+  **not yet run on a GPU**: correctness and speed checks are the next step.
+
 ### Fixes
 
 - Server (HTTP): a streaming client that stops reading no longer stalls the other slots. While a
