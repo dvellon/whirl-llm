@@ -705,10 +705,10 @@ GgufImage targetImage(const char* arch, std::uint32_t embd, std::uint32_t vocab,
     g.kvF32(a + ".rope.freq_base", 1e7f);
     g.kvF32(a + ".attention.layer_norm_rms_epsilon", 1e-6f);
     g.kvU32(a + ".ssm.conv_kernel", 4);
-    g.kvU32(a + ".ssm.state_size", 16);
+    g.kvU32(a + ".ssm.state_size", 128);  // fix-review2 GDN-CFG: state 128 and headV (inner/rank) a multiple of 32
     g.kvU32(a + ".ssm.group_count", 2);
     g.kvU32(a + ".ssm.time_step_rank", 4);
-    g.kvU32(a + ".ssm.inner_size", 64);
+    g.kvU32(a + ".ssm.inner_size", 512);
     g.tensor("token_embd.weight", embd, vocab);
     return g;
 }
