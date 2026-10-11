@@ -310,6 +310,9 @@ public:
     // Enqueue the pieces whose blocks are in RAM; true once the request's
     // part (pieces [0, n_main)) is done on the GPU (or the restore failed).
     bool pumpRestore(Restore* r);
+    // The same, but an exception from the device layer marks the restore failed (a half-copied
+    // checkpoint must never be taken for a valid one) and counts as done.
+    bool pumpRestoreNoThrow(Restore* r);
 
     struct Verify {
         std::uint64_t bytes = 0;
@@ -322,6 +325,7 @@ public:
     Event cutTail(Restore* r);
     // true once everything (tail pieces, the SSD read) is done.
     bool pumpTail(Restore* r);
+    bool pumpTailNoThrow(Restore* r);  // exception -> r->failed, done
     // Finish (or abandon) a restore: unpin, free its resources.
     void endRestore(Restore* r);
     // Main-thread housekeeping: finished SSD jobs, due SSD writes. true while

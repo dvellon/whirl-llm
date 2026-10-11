@@ -47,8 +47,11 @@ class MockDeviceOps final : public DeviceOps {
 public:
     std::atomic<long> live_events{0}, live_host{0}, live_streams{0};
     std::atomic<std::uint64_t> copies{0};
+    // fault injection: copyAsync call number `throw_at` (counted from `copy_calls`) throws
+    std::atomic<std::uint64_t> copy_calls{0}, throw_at{0};
 
     void copyAsync(DevPtr dst, DevPtr src, std::uint64_t bytes, Stream) override {
+        if (const std::uint64_t n = ++copy_calls; n == throw_at.load()) throw std::runtime_error("injected copyAsync failure");
         std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), bytes);
         copies += 1;
     }
@@ -1274,6 +1277,70 @@ static void testSsdTruncated(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+// RESTORE-EXC: a throwing device copy during a restore marks it failed (cold prefill), it is never
+// reported as done-and-valid; the tier stays consistent and the entry restores later.
+static void testRestoreCopyThrows(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    const std::uint64_t fp = hashStr(0xcbf29ce484222325ull, "model-throw");
+    const std::uint32_t nck = 2, pages = 7;
+    DevSlot src(ops, nck, pages);
+    src.fill(88);
+    const auto toks = makeTokens(1700, 31);
+    std::uint64_t id = 0;
+    {
+        auto t = Tier::create(ops, 32ull << 20, 5, 0);
+        t->start(env.cfg(1ull << 30), kLay, fp);
+        Entry* e = spill(*t, src, toks);
+        CHECK(e != nullptr);
+        if (!e) return;
+        id = e->id;
+        CHECK(tickIdle(*t));
+    }
+    auto t = Tier::create(ops, 32ull << 20, 6, 0);
+    t->start(env.cfg(1ull << 30), kLay, fp);
+    Entry* e = t->find(id);
+    CHECK(e != nullptr);
+    if (!e) return;
+    {
+        DevSlot dst(ops, nck, pages);
+        std::size_t nm = 0;
+        const auto sp = dst.spans(e, 1, &nm);
+        ops.closeGate();  // the SSD read waits: no copy happens inside beginRestore
+        Restore* r = t->beginRestore(e, sp, nm);
+        CHECK(r != nullptr);
+        if (!r) {
+            ops.openGate();
+            return;
+        }
+        // the 2nd copy of this restore throws
+        ops.throw_at = ops.copy_calls.load() + 2;
+        ops.openGate();
+        const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (!t->pumpRestoreNoThrow(r) && std::chrono::steady_clock::now() < dl)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ops.throw_at = 0;
+        CHECK(r->failed);
+        t->endRestore(r);
+        tickIdle(*t);
+        // the tier is intact: the same entry restores byte-identical afterwards
+        e = t->find(id);
+        CHECK(e != nullptr);
+        if (!e) return;
+        DevSlot ok(ops, nck, pages);
+        const auto sp2 = ok.spans(e, 1, &nm);
+        Restore* r2 = t->beginRestore(e, sp2, nm);
+        CHECK(r2 != nullptr);
+        if (r2) {
+            CHECK(runRestore(*t, r2));
+            t->endRestore(r2);
+            CHECK(ok.ckEq(src, 0) && ok.ckEq(src, 1) && ok.kvEq(src));
+        }
+    }
+    fs::remove_all(dir, ec);
+}
+
 static void testSupersedeTrim(MockDeviceOps& ops, const fs::path& dir) {
     std::error_code ec;
     fs::remove_all(dir, ec);
@@ -1512,6 +1579,8 @@ int main(int argc, char** argv) {
     testModesLock(ops, dir);
     std::printf("-- %s\n", "testSsdTruncated");
     testSsdTruncated(ops, dir);
+    std::printf("-- %s\n", "testRestoreCopyThrows");
+    testRestoreCopyThrows(ops, dir);
     std::printf("-- %s\n", "testSupersedeTrim");
     testSupersedeTrim(ops, dir);
     std::printf("-- %s\n", "testWorkflows");

@@ -2549,12 +2549,8 @@ void Engine::finishTail(Slot& sl, bool wait) {
     tier::Restore* r = sl.restore;
     if (!r) return;
     for (;;) {
-        bool done = true;
-        try {
-            done = t->pumpTail(r);
-        } catch (const std::exception&) {
-            done = true;
-        }
+        // (an exception marks the restore failed: the tail checkpoints stay invalid)
+        const bool done = t->pumpTailNoThrow(r);
         if (done) break;
         if (!wait) return;
         std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -2609,10 +2605,7 @@ void Engine::cutTail(Slot& sl) {
     tier::Restore* r = sl.restore;
     if (!r) return;
     tier::Tier* t = tier_;
-    try {
-        t->pumpRestore(r);
-    } catch (const std::exception&) {
-    }
+    t->pumpRestoreNoThrow(r);  // (a throw marks the restore failed: the tail checkpoints stay invalid)
     for (std::size_t i = r->cursor; i < r->pieces.size(); ++i)
         if (r->pieces[i].ck != kNoTag) sl.rs_tail[r->pieces[i].ck] = false;
     tier::Event ev = nullptr;
@@ -2639,12 +2632,8 @@ void Engine::pollRestores() {
             finishTail(sl, false);
             continue;
         }
-        bool done = true;
-        try {
-            done = t->pumpRestore(r);
-        } catch (const std::exception&) {
-            done = true;
-        }
+        // an exception from the copies marks the restore failed (cold prefill), never a valid one
+        const bool done = t->pumpRestoreNoThrow(r);
         if (!done) continue;
         Job& job = *sl.job;
         tier::Entry* x = t->find(r->entry_id);

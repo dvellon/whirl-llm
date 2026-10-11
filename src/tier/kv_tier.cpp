@@ -743,6 +743,24 @@ bool Tier::pumpRestore(Restore* r) {
     return ops_.eventDone(r->ev_main);
 }
 
+bool Tier::pumpRestoreNoThrow(Restore* r) {
+    try {
+        return pumpRestore(r);
+    } catch (const std::exception&) {
+        r->failed = true;
+        return true;
+    }
+}
+
+bool Tier::pumpTailNoThrow(Restore* r) {
+    try {
+        return pumpTail(r);
+    } catch (const std::exception&) {
+        r->failed = true;
+        return true;
+    }
+}
+
 Tier::Verify Tier::verifyPieces(std::span<const Piece> pieces) {
     std::vector<std::uint8_t> scratch(max_piece);
     Verify v;
