@@ -143,11 +143,18 @@ struct Config {
     std::uint64_t ssd_cap = 0;
     // entries shorter than this are not kept (re-prefill is cheap)
     std::uint32_t min_tokens = 2048;
-    // an entry is written to SSD once unchanged for this long
-    std::uint64_t ssd_delay_ms = 2000;
+    // an entry is written to SSD once unchanged for this long (the clock restarts whenever the
+    // entry changes or is restored from RAM; 5 min: a conversation that continues within it is
+    // served from RAM and never costs a disk write)
+    std::uint64_t ssd_delay_ms = 300000;
     // --kv-ssd-mode shutdown: entries stay in RAM and are written only while
     // `flushing` is set (graceful shutdown)
     bool ssd_shutdown_only = false;
+    // SSD files not used for this long are deleted (startup, then every expire_check_ms); 0: never
+    std::uint64_t expire_s = 7ull * 24 * 3600;
+    std::uint64_t expire_check_ms = 3600ull * 1000;
+    // unix seconds "now" (nullptr: the system clock); a test hook
+    std::function<std::int64_t()> clock_fn;
     // share identical KV blocks between SSD files (WHIRL_KV_SSD_DEDUP=0: off)
     bool dedup = true;
 };
@@ -186,6 +193,7 @@ struct Entry {
     // slot whose VRAM content extends this entry (in-place updates)
     std::optional<std::uint32_t> owner;
     std::uint64_t lru = 0;
+    std::int64_t used = 0;  // unix seconds of the last use (spill, restore; SSD files: persisted)
     std::chrono::steady_clock::time_point t_mod{};
     bool removed = false;
     // read jobs of other entries reading blocks this entry owns
@@ -334,8 +342,22 @@ public:
     // Main-thread housekeeping: finished SSD jobs, due SSD writes. true while
     // there is background work.
     bool tick();
+    // the only background work tick() reported is waiting for write delays to expire
+    bool waitOnly() const { return wait_only_; }
+    // earliest time an entry becomes due for its SSD write (nullopt: none waiting)
+    std::optional<std::chrono::steady_clock::time_point> nextDue() const { return next_due_; }
+    // RAM evictions started SSD writes that will free blocks when they finish (retry the spill then)
+    bool roomPending() const { return room_pending_; }
 
     bool hasSsd() const { return ssd_dir_w_.has_value(); }
+    // What the SSD cache cleanup removed (startup and periodic expiry) and what it holds now.
+    struct Cleanup {
+        std::uint64_t files = 0, bytes = 0;  // on disk now (after the startup cleanup)
+        std::uint64_t expired_files = 0, expired_bytes = 0;
+        std::uint64_t bad_files = 0, bad_bytes = 0;          // corrupt, half-written, old format, unreadable
+        std::uint64_t cap_files = 0, cap_bytes = 0;          // evicted (LRU) to fit the cap
+    };
+    const Cleanup& cleanup() const { return cleanup_; }
     // the SSD directory is used by another process (SSD tier disabled)
     bool ssdDirBusy() const { return dir_busy_; }
 
@@ -423,6 +445,19 @@ private:
     void* dir_lock_ = nullptr;  // HANDLE of <ssd dir>\whirl.lock (delete on close)
     bool dir_busy_ = false;
     bool gc_due_ = false;
+    Cleanup cleanup_;
+    bool wait_only_ = false;
+    bool room_pending_ = false;
+    std::optional<std::chrono::steady_clock::time_point> next_due_;
+    std::int64_t nowUnix() const;
+    void markUsed(Entry* e);
+    void stampFile(std::uint64_t id, std::int64_t unix_s);
+    void expireSweep();
+    void enforceCap();
+    std::uint64_t foreignFiles_() const { return foreign_.size(); }
+    std::chrono::steady_clock::time_point next_expiry_{};
+    bool evictWanted(const Entry* v) const;
+    bool evictWrite(Entry* v);
 };
 
 // Write %LOCALAPPDATA%\whirl\pinned\<pid>.txt = the pinned host bytes this

@@ -58,8 +58,8 @@ Base URL 為 `http://127.0.0.1:8080/v1`；接受任何 API key。模型只載入
 （[windows-hip.md](windows-hip.md#wddm-demote)）。
 
 **停止。** Ctrl+C、Ctrl+Break 或關閉主控台視窗會讓 server 正常結束：排隊中的請求回 503，執行中的跑完，
-完成的 session 寫出到 RAM 層，所有還沒寫進 SSD 層的 RAM 層項目（平常在最後一次變更 2 秒後才寫）立刻寫入，
-最多等 10 秒（log 會有 `shutdown: tier writes done …`），下次啟動就能從 SSD 還原最後幾輪對話。
+完成的 session 寫出到 RAM 層，所有還沒寫進 SSD 層的 RAM 層項目（預設執行中完全不寫，即 `--kv-ssd-mode shutdown`；`always` 模式為最後一次變更 5 分鐘後才寫）立刻寫入，
+最多等 60 秒（`always` 模式 10 秒；log 會有 `shutdown: tier writes done …`），下次啟動就能從 SSD 還原最後幾輪對話。
 再按一次 Ctrl+C 會立即結束；關閉主控台時 Windows 約 5 秒後一定結束行程。直接殺行程（工作管理員、
 `taskkill /F`）則以上都不會發生。
 

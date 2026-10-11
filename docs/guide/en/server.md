@@ -61,8 +61,9 @@ second instance waits ([windows-hip.md](windows-hip.md#wddm-demote)).
 
 **Stopping.** Ctrl+C, Ctrl+Break or closing the console window stops the server gracefully: queued
 requests get 503, running ones finish, finished sessions spill to the RAM tier and every RAM-tier
-entry not yet on the SSD tier (normally written 2 s after its last change) is written now, for at
-most 10 s (`shutdown: tier writes done …` in the log), so the next start restores the last turns
+entry not yet on the SSD tier (by default none is written while running: `--kv-ssd-mode shutdown`; in
+`always` mode 5 minutes after its last change) is written now, for at most 60 s (10 s in `always` mode;
+`shutdown: tier writes done …` in the log), so the next start restores the last turns
 from the SSD. A second Ctrl+C exits at once; for a console close Windows ends the process after
 about 5 s whatever is left. Killing the process (Task Manager, `taskkill /F`) skips all of this.
 

@@ -2319,6 +2319,13 @@ void Engine::spillSlot(Slot& sl) {
                                            static_cast<std::uint64_t>(npages - vp) * lay.page_bytes);
         if (!t->ensureBlocks(x, r[0], r[1])) ok = false;
     }
+    if (!ok && fresh && t->roomPending()) {
+        // RAM pressure: older entries are being written to the SSD tier first; their blocks free up when
+        // those writes finish (the slot keeps its state meanwhile): retry then
+        t->removeEntry(x);
+        sl.spill_wanted = true;
+        return;
+    }
     if (!ok) {
         logW("slot {} | kv tier: no room for {} tokens in the RAM tier ({} MiB); not kept", sl.id, P, t->cfg.ram_bytes >> 20);
         if (fresh) t->removeEntry(x);
@@ -2730,6 +2737,8 @@ bool Engine::tierTick() {
     tier::Tier* t = tier_;
     if (!t) return false;
     bool busy = t->tick();
+    // only waiting for write delays (minutes): not polled every few ms; the idle loop sleeps until due
+    if (t->waitOnly()) busy = false;
     stat_ssd_written_.store(t->stats.ssd_write_bytes, std::memory_order_relaxed);
     stat_ssd_dedup_.store(t->stats.ssd_dedup_bytes, std::memory_order_relaxed);
     stat_ssd_used_.store(t->ssd_bytes, std::memory_order_relaxed);
@@ -2777,18 +2786,19 @@ void Engine::flushTierOnStop() {
     const std::uint64_t saved_delay = t->cfg.ssd_delay_ms;
     t->cfg.ssd_delay_ms = 0;
     t->flushing = true;
+    const std::uint64_t flush_ms = t->cfg.ssd_shutdown_only ? shutdown_flush_long_ms : shutdown_flush_ms;
     const auto t0 = Clock::now();
     const std::uint64_t w0 = t->stats.ssd_writes;
     bool busy = tierTick();
-    if (busy) logI("shutdown: writing pending prefix-cache entries to the tiers (up to {} s)", shutdown_flush_ms / 1000);
-    while (busy && msSince(t0) < static_cast<double>(shutdown_flush_ms)) {
+    if (busy) logI("shutdown: writing pending prefix-cache entries to the tiers (up to {} s)", flush_ms / 1000);
+    while (busy && msSince(t0) < static_cast<double>(flush_ms)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         busy = tierTick();
     }
     t->cfg.ssd_delay_ms = saved_delay;
     t->flushing = false;
     if (busy)
-        logW("shutdown: tier writes still pending after {} s; exiting without them", shutdown_flush_ms / 1000);
+        logW("shutdown: tier writes still pending after {} s; exiting without them", flush_ms / 1000);
     else if (t->stats.ssd_writes != w0 || msSince(t0) > 1.0)
         logI("shutdown: tier writes done in {:.0f} ms ({} SSD writes)", msSince(t0), t->stats.ssd_writes - w0);
     logTier();
@@ -2985,6 +2995,7 @@ void Engine::runLoop() {
                     const std::uint64_t seq = wake_seq_;
                     lk.unlock();
                     const bool busy = tierTick();
+                    if (busy) logged = false;
                     if (!busy && !logged) {
                         logTier();
                         logged = true;
@@ -3012,7 +3023,13 @@ void Engine::runLoop() {
                     continue;
                 }
                 tier_wake_ = false;
-                q_cond_.wait(lk, [&] { return !queue_.empty() || tier_wake_ || stop_; });
+                if (tier_ != nullptr && tier_->nextDue()) {
+                    // an SSD write is due at a known time: wake then (re-checked every minute)
+                    const auto due = std::min(*tier_->nextDue() + std::chrono::milliseconds(2), std::chrono::steady_clock::now() + std::chrono::seconds(60));
+                    q_cond_.wait_until(lk, due, [&] { return !queue_.empty() || tier_wake_ || stop_; });
+                } else {
+                    q_cond_.wait(lk, [&] { return !queue_.empty() || tier_wake_ || stop_; });
+                }
             }
             stat_t0_ = Clock::now();
         }

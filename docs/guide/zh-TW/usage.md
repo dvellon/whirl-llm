@@ -182,7 +182,8 @@ whirl serve  MODEL.gguf [選項]      （同一支程式）
 | `--kv-ram-mb N` | 前綴快取的主記憶體層，單位 MiB 的 pinned 記憶體（預設：實體記憶體的 1/4，至少 8 GiB 或一個完整長度 session（若更大；27B 模型約 9 GiB），最多 32 GiB，且不超過啟動時可用記憶體的一半；64 GB 的電腦為 16 GiB；整合式 GPU 預設關閉）。啟動日誌會印出選定的大小與原因。閒置 session 會複製到這裡，下次直接還原而不必重新 prefill。`0` 會關閉兩個 host 層。**Radeon 8060S**（內顯）：預設 `0` —— KV pool 本來就在系統記憶體；給定大小才會開啟 RAM 與 SSD 層 |
 | `--kv-ssd-dir PATH` | SSD 層目錄（預設 `%LOCALAPPDATA%\whirl\kvcache`） |
 | `--kv-ssd-gb N` | SSD 層容量上限，GiB（預設 64；`0` = 不用 SSD 層） |
-| `--kv-ssd-mode M` | SSD 層何時寫入：`always`（預設；閒置約 2 秒後）、`shutdown`（留在主記憶體，正常關閉時才寫）、`off`（不寫 SSD 檔案）。見[SSD 層如何儲存 session](#ssd-tier) |
+| `--kv-ssd-mode M` | SSD 層何時寫入：`shutdown`（預設；留在主記憶體，執行中完全不寫 SSD，正常關閉時才寫）、`always`（閒置超過 `--kv-ssd-delay` 後寫入）、`off`（不寫 SSD 檔案）。見[SSD 層如何儲存 session](#ssd-tier) |
+| `--kv-ssd-delay SEC` | `--kv-ssd-mode always`：session 連續 SEC 秒沒有變動才寫入 SSD（預設 300）。在這之前又被使用的 session 直接從主記憶體服務，不會寫入 |
 | `--mmproj FILE` | 視覺編碼器（Qwen3-VL 形式的 mmproj GGUF，F16 / BF16）。`image_url` 內容（base64 PNG / JPEG 等的 `data:` URL）會變成圖片 token。權重放在 pinned 主記憶體，收到圖片之前不占 VRAM |
 | `--vis-idle-s N` | N 秒沒有圖片就釋放視覺編碼器（預設 60） |
 | `--vis-mode M` | `auto`（預設）、`resident`（編碼器權重常駐 VRAM）、`stream`（逐層串流） |
@@ -255,9 +256,15 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -Conten
 
 ### <a id="ssd-tier"></a>SSD 層如何儲存 session
 
-- **何時寫入。** `--kv-ssd-mode always`（預設）：閒置 session 的主記憶體層項目在最後一次變動約 2 秒後寫入 SSD。
-  `shutdown`：項目留在主記憶體，只在正常關閉（Ctrl+C）時寫入——SSD 寫入量最少，但當機或主記憶體層擠掉時會遺失。
-  `off`：完全不寫 SSD 檔案（主記憶體層照常運作）。`--kv-ssd-gb` 限制容量，最久沒用的項目先刪。
+- **何時寫入。** `--kv-ssd-mode shutdown`（預設）：執行中完全不寫 SSD。session 留在主記憶體層，正常關閉（Ctrl+C，最多 60 秒）時寫入，
+  下次啟動即可使用；當機或被主記憶體層擠掉就會遺失。`always`：項目連續 `--kv-ssd-delay` 秒（預設 300，即 5 分鐘）沒有變動後才寫入。
+  對話在這段時間內又來了下一個請求，就直接從主記憶體服務，不產生任何磁碟寫入；主記憶體吃緊時，還沒到時間的項目若有至少 2048 token
+  就先寫入，否則直接丟棄。`off`：完全不寫 SSD 檔案（主記憶體層照常運作）。原因：benchmark 或 agent 連續送出大量不同的長 prompt 時，
+  每個請求會寫數 GB，幾分鐘就是數百 GB，會損耗 SSD。
+- **容量上限與過期。** 資料夾實際佔用的磁碟空間（以真正配置的位元組計，稀疏檔中共用的區塊是洞，不重複計算）不會超過
+  `--kv-ssd-gb`（預設 64 GiB）。滿了就刪最久沒用的 session（連同借用其區塊的檔案）；其他模型、版本或 KV 格式的檔案最先刪。
+  超過 7 天沒被使用的檔案會自動刪除（啟動時與每小時一次）；無法使用的檔案（當機寫一半、損毀、不是 WHIRL 快取檔）在啟動時刪除。
+  啟動 log 有一行：檔案數、佔用 GiB、容量上限，以及刪了什麼、為什麼。
 - **只寫有變動的部分。** 續接的對話只寫新的 KV page 與變動的 checkpoint，不會整段重寫。SSD 上其他檔案已存有、
   且 token 前綴相同的 KV 區塊（共用的系統提示與工具定義、retry 或 compact 之前的部分）不再重寫：新檔案只記錄引用
   （稀疏檔，該區塊從另一個檔案讀取）。只有 token 前綴相同且 128-bit 內容雜湊相同的區塊才會共用。
@@ -272,6 +279,7 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -Conten
   請給每個 server 各自的 `--kv-ssd-dir`。
 - **寫入量。** log 的 `kv tier |` 行與 `GET /props`（`kv_ssd.bytes_written`、`bytes_shared`、`bytes_used`、`entries`、
   `superseded`）會顯示啟動以來寫入 SSD 的位元組，以及以共用取代寫入的位元組。
+- **手動刪除。** 先關閉 server，刪掉資料夾中的 `*.wkv` 檔（或整個資料夾）即可，下次從空的開始。這裡不存放其他東西。
 - **隱私。** 這些檔案以 token id 形式保存你的 prompt（能讀檔的人就能還原文字）與其 KV 資料，放在你的使用者設定檔目錄、
   沿用其權限。要刪除：先關閉 server 再刪掉該資料夾；`--kv-ssd-mode off` 則從不寫入。
 
@@ -395,8 +403,9 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 | `WHIRL_KV_SSD_DIR=PATH` | SSD 層目錄（= `--kv-ssd-dir`） |
 | `WHIRL_KV_SSD_GB=N` | SSD 層容量上限，GiB（= `--kv-ssd-gb`） |
 | `WHIRL_KV_TIER_MIN=N` | 複製到 host 層的最小 session，單位 token（預設 2048） |
-| `WHIRL_KV_SSD_DELAY_MS=MS` | 主記憶體層項目延後多久再寫入 SSD（預設 2000） |
-| `WHIRL_KV_SSD_MODE=always\|shutdown\|off` | = `--kv-ssd-mode` |
+| `WHIRL_KV_SSD_DELAY_MS=MS` | `always` 模式下主記憶體層項目延後多久再寫入 SSD（預設 300000；`--kv-ssd-delay` 優先） |
+| `WHIRL_KV_SSD_MODE=always\|shutdown\|off` | = `--kv-ssd-mode`（預設 shutdown） |
+| `WHIRL_KV_SSD_EXPIRE_S=S` | 超過 S 秒沒用的 SSD 快取檔刪除（預設 604800 = 7 天；測試用） |
 | `WHIRL_KV_SSD_DEDUP=0` | 即使其他 SSD 檔案已有相同區塊也照寫（預設：共用） |
 | `WHIRL_KV_SUPERSEDE=0` | 保留被 agent compact／刪減取代的 session（預設：截到共用部分） |
 | `WHIRL_MMPROJ=FILE` | 視覺編碼器（= `--mmproj`） |
