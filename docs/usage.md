@@ -292,7 +292,10 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -Conten
   session's entry is written once it has been unchanged for `--kv-ssd-delay` seconds (default 300,
   5 minutes). A conversation whose next request comes within that time is served from RAM and
   costs no disk write; under RAM pressure an entry that is not due yet is written (if it has at
-  least 2048 tokens) or dropped instead of being kept. `off`: no SSD files at all (the RAM tier
+  least 2048 tokens) or dropped instead of being kept. `always` writes only sessions worth keeping: one whose
+  prefix was reused (restored) at least once, or that was resumed by a follow-up turn; a one-shot prompt nobody
+  came back to is never written (a benchmark stream of distinct prompts writes about nothing). A graceful stop
+  writes the most recently used sessions first. `off`: no SSD files at all (the RAM tier
   still works). Why: a benchmark or an agent that sends many different long prompts would
   otherwise write several GB per request (hundreds of GB in minutes), which wears the SSD.
 - **Size cap, expiry.** The directory never holds more than `--kv-ssd-gb` (default 64 GiB) on

@@ -490,6 +490,7 @@ struct SsdEnv {
         c.ssd_dir = std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
         c.ssd_cap = cap;
         c.ssd_delay_ms = 0;
+        c.ssd_seen_filter = false;  // the seen-once filter has its own test (testSeenOnce)
         return c;
     }
 };
@@ -929,6 +930,7 @@ static bool spillSess(Tier& t, Sess& s, std::size_t changed_from) {
     t.fence(x, nullptr);
     x->owner = 0;
     x->t_mod = std::chrono::steady_clock::now();
+    if (!fresh) x->reused = true;  // Engine::spillSlot: an in-place update is a resumed session
     s.e = x;
     s.id = x->id;
     return fresh;
@@ -1668,6 +1670,7 @@ static void testQuietDefaults() {
     Config c;
     CHECK(c.ssd_delay_ms == 300000);
     CHECK(c.expire_s == 7ull * 24 * 3600 && c.expire_check_ms == 3600ull * 1000);
+    CHECK(c.ssd_seen_filter);
     CHECK(!c.ssd_shutdown_only);  // the server's default mode (shutdown) is set by server_main
 }
 
@@ -1793,6 +1796,152 @@ static void testShutdownFlush(MockDeviceOps& ops, const fs::path& dir) {
         t->cfg.ssd_delay_ms = 0;
         CHECK(tickIdle(*t));
         t->cfg.ssd_delay_ms = saved;
+        CHECK(t->stats.ssd_writes == 2 && countFiles(dir) == 2);
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+}
+
+
+// Graceful flush order: most recently used first (a restore counts as use), so when the time bound runs
+// out the oldest sessions are the ones not written. Writes run in submission order on the IO thread.
+static void testFlushOrder(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 3600;
+    auto t = Tier::create(ops, 256ull << 20, 36, 0);
+    Config c = env.cfg(4ull << 30);
+    c.ssd_delay_ms = 600000;
+    c.ssd_shutdown_only = true;
+    std::vector<std::string> logs;
+    t->log_fn = [&](std::string_view s) { logs.emplace_back(s); };
+    t->start(c, kLay, 6);
+    Sess s0(ops, 24), s1(ops, 24), s2(ops, 24), s3(ops, 24);
+    Sess* all[4] = {&s0, &s1, &s2, &s3};
+    for (Sess* s : all) {
+        s->toks = freshToks(3000, seed);
+        spillSess(*t, *s, 0);
+        sleepMs(5);
+    }
+    // creation order s0 s1 s2 s3; s1 is used last (restored), then s0 is updated in place
+    CHECK(restoreMatches(*t, ops, t->find(s1.id), s1));
+    sleepMs(5);
+    s0.toks.push_back(99);
+    spillSess(*t, s0, s0.toks.size() - 1);
+    t->tick();
+    CHECK(t->stats.ssd_writes == 0);
+    t->flushing = true;
+    t->cfg.ssd_delay_ms = 0;
+    CHECK(tickIdle(*t));
+    CHECK(t->stats.ssd_writes == 4);
+    // order of the "written to SSD" lines
+    std::vector<std::uint64_t> order;
+    for (const std::string& l : logs) {
+        const auto p = l.find("entry ");
+        if (l.find("written to SSD") == std::string::npos || p == std::string::npos) continue;
+        order.push_back(std::strtoull(l.c_str() + p + 6, nullptr, 16));
+    }
+    const std::uint64_t want[4] = {s0.id, s1.id, s3.id, s2.id};
+    CHECK(order.size() == 4);
+    for (std::size_t i = 0; i < order.size() && i < 4; ++i) CHECK(order[i] == want[i]);
+    t.reset();
+    fs::remove_all(dir, ec);
+}
+
+// `always` mode seen-once filter: only entries whose prefix was reused (restored) or that were resumed
+// (updated in place) are written; a stream of distinct one-shot prompts writes nothing. Shutdown mode writes
+// everything on the flush.
+static void testSeenOnce(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 3700;
+    auto mk = [&](std::uint64_t ram, std::uint64_t delay_ms, bool shutdown_only) {
+        auto t = Tier::create(ops, ram, 37, 0);
+        Config c = env.cfg(4ull << 30);
+        c.ssd_seen_filter = true;
+        c.ssd_delay_ms = delay_ms;
+        c.ssd_shutdown_only = shutdown_only;
+        t->start(c, kLay, 7);
+        return t;
+    };
+    // 1. delay expiry: distinct prompts -> nothing; reused prefix and resumed session -> written
+    {
+        auto t = mk(256ull << 20, 200, false);
+        std::vector<std::unique_ptr<Sess>> st;
+        for (int i = 0; i < 6; ++i) {
+            st.push_back(std::make_unique<Sess>(ops, 24));
+            st.back()->toks = freshToks(3000, seed);
+            spillSess(*t, *st.back(), 0);
+        }
+        sleepMs(300);
+        CHECK(!t->tick());  // nothing to wait for or write
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);
+        CHECK(!t->waitOnly() && !t->nextDue().has_value());
+        // one prefix is reused (restored), one session resumed (grew by appending)
+        CHECK(restoreMatches(*t, ops, t->find(st[2]->id), *st[2]));
+        st[4]->toks.push_back(55);
+        spillSess(*t, *st[4], st[4]->toks.size() - 1);
+        sleepMs(300);
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 2 && countFiles(dir) == 2);
+        // restore path unchanged: evict the written one from RAM, restore from the SSD copy
+        const std::uint64_t id2 = st[2]->id;
+        t->removeEntry(t->find(st[0]->id));
+        CHECK(t->find(id2)->ssd.has_value());
+        // graceful flush in `always` mode keeps the filter
+        t->flushing = true;
+        t->cfg.ssd_delay_ms = 0;
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 2 && countFiles(dir) == 2);
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+    // 2. RAM pressure before the delay: a one-shot entry is dropped, a reused one is written then restored
+    for (int mode = 0; mode < 2; ++mode) {  // 0: LRU victim never reused (dropped), 1: reused (written)
+        auto t = mk(64ull << 20, 600000, false);  // 32 blocks; a 3000-token entry takes 13
+        Sess a(ops, 24), b(ops, 24), d(ops, 24);
+        a.toks = freshToks(3000, seed);
+        b.toks = freshToks(3000, seed);
+        d.toks = freshToks(3000, seed);
+        spillSess(*t, a, 0);
+        const std::uint64_t id_a = a.id;
+        if (mode == 1) CHECK(restoreMatches(*t, ops, t->find(a.id), a));
+        sleepMs(5);
+        spillSess(*t, b, 0);
+        bool kept = spillSess(*t, d, 0) && d.id != 0;
+        if (mode == 0) {
+            CHECK(kept);
+            CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);
+            CHECK(t->find(id_a) == nullptr && t->stats.dropped == 1);
+        } else {
+            // the reused LRU entry a is written (async); the unseen b is dropped for room
+            CHECK(kept && t->stats.dropped == 1 && t->find(b.id) == nullptr);
+            CHECK(tickIdle(*t, 20000));
+            CHECK(t->stats.ssd_writes == 1 && countFiles(dir) == 1);
+            Entry* ea = t->find(id_a);
+            CHECK(ea != nullptr && ea->ssd.has_value());
+            if (ea) CHECK(restoreMatches(*t, ops, ea, a));
+            CHECK(tickIdle(*t));
+        }
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+    // 3. shutdown mode: the flush writes everything in RAM, seen or not
+    {
+        auto t = mk(256ull << 20, 600000, true);
+        Sess a(ops, 24), b(ops, 24);
+        a.toks = freshToks(3000, seed);
+        b.toks = freshToks(3000, seed);
+        spillSess(*t, a, 0);
+        spillSess(*t, b, 0);
+        t->tick();
+        CHECK(t->stats.ssd_writes == 0);
+        t->flushing = true;
+        t->cfg.ssd_delay_ms = 0;
+        CHECK(tickIdle(*t));
         CHECK(t->stats.ssd_writes == 2 && countFiles(dir) == 2);
         t.reset();
         fs::remove_all(dir, ec);
@@ -2258,6 +2407,10 @@ int main(int argc, char** argv) {
     testEvictionWrite(ops, dir);
     std::printf("-- %s\n", "testShutdownFlush");
     testShutdownFlush(ops, dir);
+    std::printf("-- %s\n", "testFlushOrder");
+    testFlushOrder(ops, dir);
+    std::printf("-- %s\n", "testSeenOnce");
+    testSeenOnce(ops, dir);
     std::printf("-- %s\n", "testStartupCleanupCap");
     testStartupCleanupCap(ops, dir);
     std::printf("-- %s\n", "testCapLruDedup");

@@ -1402,9 +1402,10 @@ void testTiers() {
         CHECK(cachedTokens(r3) >= pa.size());
         CHECK(srv.tierp()->stats.restores_ram >= 1);
         CHECK(g_log.count("kv tier: restored") >= 1);
-        // let the SSD writes finish (delay 0)
-        for (int i = 0; i < 400 && srv.tierp()->ssdEntries() < 2; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        CHECK(srv.tierp()->ssdEntries() >= 2);
+        // let the SSD writes finish (delay 0). A was reused (restored) and is written; B is a one-shot
+        // prompt and, with the seen-once filter, is not
+        for (int i = 0; i < 400 && srv.tierp()->ssdEntries() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(srv.tierp()->ssdEntries() >= 1);
         CHECK_EQ(srv.model().poison(), 0u);
         CHECK_EQ(srv.model().hidMismatch(), 0u);
     }
@@ -1412,7 +1413,7 @@ void testTiers() {
         // restart: the SSD index brings the entries back; A's turn restores from SSD
         TestServer srv(su);
         g_log.clear();
-        CHECK(srv.tierp()->ssdEntries() >= 2);
+        CHECK(srv.tierp()->ssdEntries() >= 1);
         auto r = srv.post("/v1/completions", completionBody(pa2, 40));
         CHECK_EQ(completionText(r), decode(srv.model().greedyReference(pa2, 40, true)));
         CHECK(srv.tierp()->stats.restores_ssd >= 1);

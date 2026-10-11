@@ -150,6 +150,10 @@ struct Config {
     // --kv-ssd-mode shutdown: entries stay in RAM and are written only while
     // `flushing` is set (graceful shutdown)
     bool ssd_shutdown_only = false;
+    // `always` mode: an entry is written (delay expired, RAM pressure, flush) only if it was reused
+    // (its prefix was restored at least once) or is a session that was resumed (grew by appending);
+    // a one-shot prompt nobody came back to costs no disk write. Not applied in shutdown-only mode.
+    bool ssd_seen_filter = true;
     // SSD files not used for this long are deleted (startup, then every expire_check_ms); 0: never
     std::uint64_t expire_s = 7ull * 24 * 3600;
     std::uint64_t expire_check_ms = 3600ull * 1000;
@@ -202,6 +206,8 @@ struct Entry {
     bool meta_dirty = false;
     // an owner of a block it references was dropped while its write ran
     bool ssd_stale = false;
+    // restored at least once, or resumed in place (a multi-turn session); see Config::ssd_seen_filter
+    bool reused = false;
 
     std::uint64_t kvOff(const Layout& l) const;
     std::uint64_t extent(const Layout& l) const;
@@ -456,6 +462,7 @@ private:
     void enforceCap();
     std::uint64_t foreignFiles_() const { return foreign_.size(); }
     std::chrono::steady_clock::time_point next_expiry_{};
+    bool seenOk(const Entry* e) const { return cfg.ssd_shutdown_only || !cfg.ssd_seen_filter || e->reused; }
     bool evictWanted(const Entry* v) const;
     bool evictWrite(Entry* v);
 };

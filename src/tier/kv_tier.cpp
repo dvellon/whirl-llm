@@ -514,7 +514,7 @@ bool Tier::evictable(Entry* e, Entry* keep) {
 // its RAM blocks are freed by a later pass) if it is worth a disk write (>= min_tokens, SSD tier
 // in `always` mode); else it is dropped (older consistent SSD copy, or gone: a cold prefill later).
 bool Tier::evictWanted(const Entry* v) const {
-    if (!ssd_dir_w_ || cfg.ssd_shutdown_only || v->n_tok < cfg.min_tokens || v->n_tok == 0) return false;
+    if (!ssd_dir_w_ || cfg.ssd_shutdown_only || v->n_tok < cfg.min_tokens || v->n_tok == 0 || !seenOk(v)) return false;
     return !v->ssd || v->hasDirty();  // clean: nothing to write
 }
 
@@ -664,6 +664,7 @@ Restore* Tier::beginRestore(Entry* e, std::span<const Span> spans, std::size_t n
     r->t0 = std::chrono::steady_clock::now();
     // in use: the "unchanged for" clock of its SSD write restarts
     e->t_mod = r->t0;
+    e->reused = true;
     markUsed(e);
     if (e->ssd && (!e->in_ram || e->prefetching)) {
         // SSD use: the file's last-write time is the persisted "last used" (expiry, LRU after a restart)
@@ -1541,7 +1542,13 @@ bool Tier::tick() {
         const auto now = std::chrono::steady_clock::now();
         // startWrite may evict SSD-only entries (ssdRoom): iterate over a copy
         // and skip entries removed meanwhile
-        const std::vector<Entry*> snapshot = entries;
+        std::vector<Entry*> snapshot = entries;
+        // graceful shutdown: most recently used first, so when the time bound runs out the oldest
+        // sessions are the ones not written
+        if (flushing)
+            std::stable_sort(snapshot.begin(), snapshot.end(), [](const Entry* a, const Entry* b) {
+                return a->t_mod != b->t_mod ? a->t_mod > b->t_mod : a->lru > b->lru;
+            });
         const bool writes_on = !cfg.ssd_shutdown_only || flushing;
         for (Entry* e : snapshot) {
             if (!contains(e)) continue;
@@ -1561,6 +1568,7 @@ bool Tier::tick() {
                 continue;
             }
             if (!e->hasDirty() && e->ssd) continue;
+            if (!seenOk(e)) continue;  // one-shot prompt, never reused: not worth a disk write
             const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - e->t_mod).count();
             const std::uint64_t age_ms = age > 0 ? static_cast<std::uint64_t>(age) : 0;
             if (age_ms < cfg.ssd_delay_ms) {

@@ -2298,11 +2298,17 @@ void Engine::spillSlot(Slot& sl) {
                 }
                 x = old;
                 fresh = false;
+                x->reused = true;  // the session grew by appending (resumed): worth an SSD write
                 vp = std::min(sl.tier_pages, old->n_tok / kv_page);
             }
         }
     }
-    if (fresh) x = t->newEntry(static_cast<std::uint32_t>(sl.ckpts.size()));
+    if (fresh) {
+        x = t->newEntry(static_cast<std::uint32_t>(sl.ckpts.size()));
+        // a session restored from the tier earlier is a multi-turn one: its successor entry is worth keeping
+        if (sl.tier_id != 0)
+            if (const tier::Entry* prev = t->find(sl.tier_id)) x->reused = prev->reused;
+    }
     const tier::Layout lay = t->lay;
     const std::uint64_t stride = lay.ckStride();
     const std::uint64_t kv_off = x->kvOff(lay);

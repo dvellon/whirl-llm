@@ -27,6 +27,10 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 - **Files not used for 7 days are deleted** (start-up, then hourly; a restore from the SSD refreshes the
   file's last-write time and the owners of its shared blocks). Fixed default; `WHIRL_KV_SSD_EXPIRE_S`
   exists for tests. One start-up log line reports files, GiB on disk, the cap and what was removed and why.
+- **`always` mode skips one-shot prompts; the graceful stop flushes most recently used first** (SSD-QUIET-2): an
+  entry is written (delay expired, RAM pressure) only if its prefix was restored at least once or the session
+  was resumed by a later turn, so a stream of distinct prompts writes about nothing; `shutdown` mode still
+  writes everything in RAM, and when the 60 s bound runs out the oldest sessions are the ones left out.
 - Write amplification was measured with the mock tier (Ornith-35B layout, 2k to 16k-token distinct
   prompts): a new entry writes 1.004 to 1.012 times its file size, once; a continued conversation writes
   only new pages and the changed checkpoint. The volume is real data (about 0.3 to 1.5 GiB per prompt,
