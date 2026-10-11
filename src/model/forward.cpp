@@ -1229,9 +1229,12 @@ void Model::mtpEnqueue(DevPtr hidden, std::span<const u32> tokens, DevPtr dev_to
         rmsnormQ8(x, mw.attn_norm, h, n);
     else
         rmsnorm(x, mw.attn_norm, h, E, n, E, E);
-    attn_win = draftWindowArg(draft_window, draft_window_min);  // drafts only: sink + last W positions
-    attnBlock(mw.attn, mtpKv(), n);
-    attn_win = 0;
+    {
+        // drafts only: sink + last W positions; restored on every exit, also when attnBlock throws
+        // (the engine keeps serving after a failed step, the trunk must not inherit the window)
+        ValueScope<std::int32_t> draft_win(attn_win, draftWindowArg(draft_window, draft_window_min));
+        attnBlock(mw.attn, mtpKv(), n);
+    }
     if (mw.moe)
         moeBlock(mw.post_norm, mw.ffn_gate, mw.ffn_up, mw.ffn_down, *mw.moe, n);
     else
@@ -1468,9 +1471,12 @@ void Model::mtpBatchStepEx(std::span<const MSeg> segs, u32 r, bool draft) {
     rmsnorm(hidden, mw.hnorm, mtp_cat + E * 4, static_cast<u32>(E), n, static_cast<u32>(E), static_cast<u32>(2 * E));
     matmul(mw.eh_proj, mtp_cat, x, n, false);
     rmsnormQ8(x, mw.attn_norm, h, n);
-    attn_win = draftWindowArg(draft_window, draft_window_min);  // drafts only: sink + last W positions
-    attnBlock(mw.attn, mtpKv(), n);
-    attn_win = 0;
+    {
+        // drafts only: sink + last W positions; restored on every exit, also when attnBlock throws
+        // (the engine keeps serving after a failed step, the trunk must not inherit the window)
+        ValueScope<std::int32_t> draft_win(attn_win, draftWindowArg(draft_window, draft_window_min));
+        attnBlock(mw.attn, mtpKv(), n);
+    }
     if (mw.moe)
         moeBlock(mw.post_norm, mw.ffn_gate, mw.ffn_up, mw.ffn_down, *mw.moe, n);
     else

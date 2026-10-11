@@ -11,6 +11,7 @@
 #include "whirl/spec_sample.h"
 #include "whirl/relax_accept.h"
 #include "whirl/vram_limit.h"
+#include "whirl/value_scope.h"
 
 #include "../../kernels/gemm_small_addr.h"
 
@@ -1301,6 +1302,32 @@ void testSpecSample() {
 }
 }  // namespace specsample_test
 
+// OVH-C1: the MTP draft window (Model::attn_win) must be restored when the draft attention throws,
+// otherwise the next request's trunk attention would inherit the window and drop keys.
+void testValueScope() {
+    std::int32_t win = 0;
+    {
+        whirl::ValueScope<std::int32_t> s(win, 0x4005);
+        CHECK_EQ(win, 0x4005);
+    }
+    CHECK_EQ(win, 0);
+    bool threw = false;
+    try {
+        whirl::ValueScope<std::int32_t> s(win, 0x4005);
+        throw std::runtime_error("attnBlock failed");
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK_EQ(win, 0);  // restored by the destructor during unwinding
+    win = 7;           // a nested scope restores the previous value, not blindly 0
+    {
+        whirl::ValueScope<std::int32_t> s(win, 9);
+        CHECK_EQ(win, 9);
+    }
+    CHECK_EQ(win, 7);
+}
+
 int main() {
     testRelaxAccept();
     testJson();
@@ -1314,6 +1341,7 @@ int main() {
     testNumerics();
     testKvChoice();
     testKernelFetchBounds();
+    testValueScope();
     specsample_test::testSpecSample();
     std::printf("unit tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

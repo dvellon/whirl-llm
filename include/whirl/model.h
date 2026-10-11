@@ -30,6 +30,7 @@
 #include "whirl/kernels_abi.h"
 #include "whirl/numerics.h"
 #include "whirl/relax_accept.h"
+#include "whirl/value_scope.h"
 #include "whirl/spec_sample.h"
 #include "whirl/vismap.h"
 
