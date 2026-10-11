@@ -124,10 +124,10 @@ struct TinyModel {
         {"rope.dimension_count", 16},
         {"full_attention_interval", 2},
         {"ssm.conv_kernel", 4},
-        {"ssm.state_size", 32},
+        {"ssm.state_size", 128},  // the only state width the DeltaNet kernels implement
         {"ssm.group_count", 1},
         {"ssm.time_step_rank", 2},
-        {"ssm.inner_size", 64},
+        {"ssm.inner_size", 256},  // headV 128
     };
     std::uint64_t vocab = 16;
     // tensor name -> ne (overrides / removals applied by the tests)
@@ -337,6 +337,33 @@ void testLoadValidation() {
             TinyModel m(moe);
             m.hp["ssm.conv_kernel"] = 0;  // d_conv - 1 would wrap
             expectCode(m, "UnsupportedConfig", "ssm.conv_kernel 0 rejected");
+        }
+        {
+            // MAIN-002: shapes the DeltaNet kernels do not implement are rejected before any GPU work
+            for (std::uint64_t conv : {2, 3, 5, 16}) {
+                TinyModel m(moe);
+                m.hp["ssm.conv_kernel"] = conv;
+                m.makeTensors();
+                expectCode(m, "UnsupportedConfig", ("ssm.conv_kernel " + std::to_string(conv) + " rejected").c_str());
+            }
+            for (std::uint64_t st : {1, 32, 64, 256}) {
+                TinyModel m(moe);
+                m.hp["ssm.state_size"] = st;
+                m.makeTensors();
+                expectCode(m, "UnsupportedConfig", ("ssm.state_size " + std::to_string(st) + " rejected").c_str());
+            }
+            for (std::uint64_t hv : {1, 31, 33, 255}) {
+                TinyModel m(moe);
+                m.hp["ssm.inner_size"] = 2 * hv;  // time_step_rank 2
+                m.makeTensors();
+                expectCode(m, "UnsupportedConfig", ("headV " + std::to_string(hv) + " rejected").c_str());
+            }
+            for (std::uint64_t hv : {32, 64, 128, 256}) {  // multiples of 32 (up to 256) are accepted
+                TinyModel m(moe);
+                m.hp["ssm.inner_size"] = 2 * hv;
+                m.makeTensors();
+                expectCode(m, "", ("headV " + std::to_string(hv) + " accepted").c_str());
+            }
         }
         {
             TinyModel m(moe);

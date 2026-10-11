@@ -164,6 +164,10 @@ Config Config::fromGguf(const gguf::File& f) {
     if (c.n_v_heads % c.n_k_heads != 0) bad("ssm.time_step_rank must be a multiple of ssm.group_count");
     if (c.d_inner % c.n_v_heads != 0) bad("ssm.inner_size must be a multiple of ssm.time_step_rank");
     if (c.headV() > 256) bad("ssm.inner_size / time_step_rank = " + std::to_string(c.headV()) + " (supported up to 256)");
+    // fail closed on shapes the DeltaNet kernels do not implement (only models with DeltaNet layers)
+    if (c.interval > 1 && !c.gdnShapeSupported())
+        bad("DeltaNet layers need ssm.conv_kernel = 4, ssm.state_size = 128 and ssm.inner_size / time_step_rank a multiple of 32; got " +
+            std::to_string(c.d_conv) + ", " + std::to_string(c.d_state) + ", " + std::to_string(c.headV()));
     if (emb->ne[1] < 1 || emb->ne[1] > (1u << 22))
         bad("vocabulary size " + std::to_string(emb->ne[1]) + " (token_embd.weight ne[1]; supported 1..4194304)");
     if (!(c.rope_base > 0.0f) || !(c.eps > 0.0f) || !std::isfinite(c.rope_base) || !std::isfinite(c.eps))

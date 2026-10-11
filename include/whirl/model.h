@@ -184,6 +184,10 @@ struct Config {
     bool isAttn(std::uint32_t il) const { return (il + 1) % interval == 0; }
     std::uint32_t convCh() const { return 2 * n_k_heads * d_state + d_inner; }
     std::uint32_t headV() const { return d_inner / n_v_heads; }
+    // The DeltaNet (GDN) kernels are written for a 4-tap conv, a 128-wide key/state dimension and
+    // value columns in groups of 32 (conv state rows, gdn_seq_128's compile-time DK, grid.y =
+    // headV / 32). Anything else would read / write past the state buffers or skip columns.
+    bool gdnShapeSupported() const { return d_conv == 4 && d_state == 128 && headV() >= 32 && headV() % 32 == 0; }
 };
 
 struct Mat {
