@@ -212,13 +212,14 @@ void Model::matmul(const Mat& w, DevPtr xin, DevPtr y, u32 n, bool accumulate) {
         hip::launch(k.gemv1[t], D((w.nrows + rows_per_block - 1) / rows_per_block), D(256), 0, stream, w.ptr, w.row_bytes, xin, y, ncols,
                     nrows, ncols, nrows, acc);
     } else if (!prec_small && floatGemvN(w, n)) {
-        // f32 / f16 weights, n = 2..16: f32 activations through gemv_<T>_8 / _4 / _1, each
-        // token bitwise == the n = 1 gemv_<T>_1 (C-13; the f16 GEMM is not)
+        // f32 / f16 weights, n = 2..gvMax() (16; 17..32 in a wide verify): f32 activations through
+        // gemv_<T>_8 / _4 / _1, each token bitwise == the n = 1 gemv_<T>_1 (C-13; the f16 GEMM is
+        // not). A code object without the _4 / _8 instances runs the _1 kernel per token.
         const u32 rows_per_block = 8;
         const hip::Dim3 grid = D((w.nrows + rows_per_block - 1) / rows_per_block);
         for (u32 t0 = 0; t0 < n;) {
             const u32 left = n - t0;
-            const u32 nt = left >= 8 ? 8 : left >= 4 ? 4 : 1;
+            const u32 nt = left >= 8 && k.gemv8[t] != nullptr ? 8 : left >= 4 && k.gemv4[t] != nullptr ? 4 : 1;
             const hip::Function f = nt == 8 ? k.gemv8[t] : nt == 4 ? k.gemv4[t] : k.gemv1[t];
             hip::launch(f, grid, D(256), 0, stream, w.ptr, w.row_bytes, xin + static_cast<DevPtr>(t0) * w.ncols * 4,
                         y + static_cast<DevPtr>(t0) * w.nrows * 4, ncols, nrows, ncols, nrows, acc);
@@ -422,12 +423,14 @@ bool Model::gdnIn2(const GdnW& g, u32 n) const {
     return pin && *pin == ActIn::fp8 && bin && *bin == ActIn::f16;
 }
 
-// f32 / f16 weights (no int8 GEMV) at n = 2..16 run the f32-activation GEMV
-// instances, bitwise == n = 1 per token (C-13).
+// f32 / f16 weights (no int8 GEMV) at n = 2..gvMax() run the f32-activation GEMV
+// instances, bitwise == n = 1 per token (C-13). gvMax() is what the quantized matrices use for the
+// GEMV family too: 16, or 32 rows in a wide verify (RC-R1: those used to fall to the f16 GEMM,
+// which is not bitwise == n = 1). Only the n = 1 kernel is required (PREFILL-R2): without the
+// multi-token instances the launch loop runs it once per token.
 bool Model::floatGemvN(const Mat& w, u32 n) const {
     const std::size_t t = ti(w.ty);
-    return n >= 2 && n <= max_small_batch && (w.ty == GgmlType::f32 || w.ty == GgmlType::f16) && k.gemvq[t] == nullptr &&
-           k.gemv4[t] != nullptr && k.gemv8[t] != nullptr;
+    return n >= 2 && n <= gvMax() && (w.ty == GgmlType::f32 || w.ty == GgmlType::f16) && k.gemvq[t] == nullptr && k.gemv1[t] != nullptr;
 }
 
 // Precise decode: the f16 GEMM choice for n <= gvMax() rows. Every choice computes the

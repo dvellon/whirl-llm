@@ -89,6 +89,43 @@ void testGemv(Ctx& c) {
             }
         }
 
+        // RC-R1: a wide verify (17..32 rows) runs the same composition of _8 / _4 / _1 tiles that matmul
+        // launches for n = 2..16 (floatGemvN, n <= gvMax()); every token must still equal gemv_<T>_1.
+        // PREFILL-R2: a code object without the _4 / _8 instances runs _1 once per token (same bits).
+        if (m.type == QType::f32 || m.type == QType::f16) {
+            constexpr int kWide = 32;
+            const std::vector<float> xw = c.randn(static_cast<std::size_t>(kWide) * ncols);
+            Buf dxw(xw);
+            std::vector<float> ref1(static_cast<std::size_t>(kWide) * nrows);
+            Buf y1(static_cast<std::size_t>(nrows) * 4);
+            for (int t = 0; t < kWide; ++t) {
+                hip::launch(c.fn("gemv_" + sfx + "_1"), {cdiv(nrows, 8), 1, 1}, {256, 1, 1}, 0, c.s, w.p(), m.row_bytes,
+                            dxw.p() + static_cast<DevPtr>(t) * ncols * 4, y1.p(), ncols, nrows, ncols, nrows, 0);
+                c.sync();
+                const auto r1 = y1.down<float>(static_cast<std::size_t>(nrows));
+                std::copy(r1.begin(), r1.end(), ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows);
+            }
+            for (const bool tiled : {true, false}) {
+                for (int nt : {17, 20, 24, 25, 31, 32}) {
+                    Buf y(static_cast<std::size_t>(nt) * nrows * 4);
+                    for (int t0 = 0; t0 < nt;) {
+                        const int left = nt - t0;
+                        const int tile = tiled ? (left >= 8 ? 8 : left >= 4 ? 4 : 1) : 1;
+                        hip::launch(c.fn("gemv_" + sfx + "_" + std::to_string(tile)), {cdiv(nrows, 8), 1, 1}, {256, 1, 1}, 0, c.s, w.p(),
+                                    m.row_bytes, dxw.p() + static_cast<DevPtr>(t0) * ncols * 4,
+                                    y.p() + static_cast<DevPtr>(t0) * nrows * 4, ncols, nrows, ncols, nrows, 0);
+                        t0 += tile;
+                    }
+                    c.sync();
+                    const auto got = y.down<float>(static_cast<std::size_t>(nt) * nrows);
+                    const std::vector<float> want(ref1.begin(), ref1.begin() + static_cast<std::ptrdiff_t>(nt) * nrows);
+                    c.rep.add(cmpExact(std::string("wide verify n=") + std::to_string(nt) + (tiled ? " 8/4/1 tiles" : " per-token _1") +
+                                           " == gemv_" + sfx + "_1 per token " + m.name,
+                                       got, want, Kind::invariant));
+                }
+            }
+        }
+
         if (c.k.gemvq[ti] == nullptr) continue;
         // int8 activations for all 16 tokens
         Buf xq(static_cast<std::size_t>(kNt) * ncols), xd(static_cast<std::size_t>(kNt) * ncols / 32 * 4);

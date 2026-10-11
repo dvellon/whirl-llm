@@ -308,7 +308,7 @@ bool Model::checkGemvBitwise(std::string& log) {
     } prec_off{prec_dec, prec_dec};
     prec_dec = false;  // the int8 kernels (balance / fast), whatever the mode
     const std::size_t cols_max = ff_scratch;
-    const std::vector<float> xs = randomNormal(max_small_batch * cols_max, 7);
+    const std::vector<float> xs = randomNormal(max_verify_rows * cols_max, 7);
     bool done[n_types] = {};
     bool all_ok = true;
     const GemvR saved = gemv_r;
@@ -330,14 +330,16 @@ bool Model::checkGemvBitwise(std::string& log) {
             if (k.gemvq[t] == nullptr && !flt) continue;
             done[t] = true;
             const std::size_t nr = w.nrows;
-            std::vector<float> ref(max_small_batch * nr), got(max_small_batch * nr);
-            for (u32 tk = 0; tk < max_small_batch; ++tk) {
+            // (f32 / f16 are also checked for the 17..32-row wide verify, RC-R1: ref rows up to max_verify_rows)
+            const u32 n_ref = flt ? max_verify_rows : max_small_batch;
+            std::vector<float> ref(n_ref * nr), got(n_ref * nr);
+            for (u32 tk = 0; tk < n_ref; ++tk) {
                 hip::upload(ffn_g, xs.data() + tk * w.ncols, w.ncols * 4ull);
                 xq_src = 0;
                 matmul(w, ffn_g, ffn_u, 1, false);
                 hip::download(ref.data() + tk * nr, ffn_u, nr * 4);
             }
-            hip::upload(ffn_g, xs.data(), static_cast<std::size_t>(max_small_batch) * w.ncols * 4);
+            hip::upload(ffn_g, xs.data(), static_cast<std::size_t>(n_ref) * w.ncols * 4);
             u32 bad = 0;
             for (u32 nt = 2; nt <= max_small_batch; ++nt) {
                 for (int r : {1, 2, 4, 11, 12, 13, 14, 15, 16, 17, 18}) {
@@ -368,6 +370,25 @@ bool Model::checkGemvBitwise(std::string& log) {
                 }
                 gemv_r = saved;
                 gemv_w = saved_w;
+            }
+            if (flt) {
+                // wide verify (17..32 rows, small_max raised like the verify entry points do): the GEMV family
+                // must still reproduce the n = 1 kernel per token
+                struct SmallMax {
+                    u32& v;
+                    u32 s;
+                    ~SmallMax() { v = s; }
+                } sm_guard{small_max, small_max};
+                small_max = max_verify_rows;
+                for (u32 nt = max_small_batch + 1; nt <= max_verify_rows; ++nt) {
+                    xq_src = 0;
+                    matmul(w, ffn_g, ffn_u, nt, false);
+                    hip::download(got.data(), ffn_u, nt * nr * 4);
+                    if (std::memcmp(got.data(), ref.data(), nt * nr * 4) != 0) {
+                        bad += 1;
+                        if (bad <= 3) log += fmt("    %-7s nt=%u (wide verify): MISMATCH\n", tyName(w.ty).c_str(), nt);
+                    }
+                }
             }
             const char* fw = std::getenv("WHIRL_GEMV_BITWISE_FLOAT");
             const bool warn_only = flt && fw != nullptr && std::strcmp(fw, "warn") == 0;
