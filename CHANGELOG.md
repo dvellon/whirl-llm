@@ -5,6 +5,33 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## Unreleased (0.2.0)
 
+### SSD tier: far fewer disk writes, hard size cap, expiry (SSD-QUIET)
+
+- **Default `--kv-ssd-mode` is now `shutdown`**: no SSD writes while the server runs; sessions stay in
+  the RAM tier and a graceful stop (Ctrl+C) writes them (bounded by the RAM tier and `--kv-ssd-gb`;
+  the stop waits up to 60 s for it instead of 10 s). Reason: a user's benchmark of many different
+  long prompts wrote about 400 GB in 23 minutes with the old default (`always`, 2 s). `always` is
+  still available (`--kv-ssd-mode always`).
+- **`always` mode writes after 5 minutes, not 2 s** (new `--kv-ssd-delay SEC`, default 300; env
+  `WHIRL_KV_SSD_DELAY_MS` still works). A session whose next request comes sooner is served from RAM
+  and never written (the "unchanged for" clock restarts on every change and on every RAM restore).
+  Under RAM pressure an entry that is not due yet is written (>= 2048 tokens) or dropped; it used to be
+  dropped or kept for the delay regardless. While entries only wait for their delay the engine sleeps
+  until the first one is due instead of polling every 5 ms.
+- **The cache directory never exceeds `--kv-ssd-gb` (default 64 GiB) on disk**: startup now enforces the
+  cap (it used to be enforced on writes only), counts files of other models / builds against it and
+  deletes them first, and deletes unusable `*.wkv` files (not a cache file, unreadable header, half
+  written, cut short, corrupt) instead of leaving them uncounted. Dedup (sparse) files are counted by
+  allocated bytes. When full the least recently used session goes, together with the files that borrow
+  its blocks.
+- **Files not used for 7 days are deleted** (start-up, then hourly; a restore from the SSD refreshes the
+  file's last-write time and the owners of its shared blocks). Fixed default; `WHIRL_KV_SSD_EXPIRE_S`
+  exists for tests. One start-up log line reports files, GiB on disk, the cap and what was removed and why.
+- Write amplification was measured with the mock tier (Ornith-35B layout, 2k to 16k-token distinct
+  prompts): a new entry writes 1.004 to 1.012 times its file size, once; a continued conversation writes
+  only new pages and the changed checkpoint. The volume is real data (about 0.3 to 1.5 GiB per prompt,
+  more than a third of it checkpoints), not repeated writes; see audit/SSD-QUIET.md.
+
 ### Numerics modes: balance (default), precise, fast
 
 - New `--precise` / `--balance` / `--fast` (or `--mode M`, env `WHIRL_MODE`) for `whirl` and

@@ -2062,6 +2062,153 @@ static void testExpiry(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+
+// ---- SSD-QUIET: write amplification of a benchmark-like request stream -------------------
+// Ornith-35B-A3B layout from the server log ("entry: 51.2 MiB per checkpoint, 9.0 MiB per 256-token
+// page", f16 KV), scaled by 1/amp_div so the default run stays small (WHIRL_TIER_AMP=full: real sizes).
+
+namespace amp {
+struct Sim {
+    MockDeviceOps& ops;
+    Layout lay;
+    std::uint32_t nck = 4;
+    DevPtr ck_dev = 0, kv_dev = 0;
+    std::uint32_t max_pages = 0;
+    Sim(MockDeviceOps& o, int div, std::uint32_t max_tokens) : ops(o) {
+        lay.ck_bytes = static_cast<std::uint64_t>(51.2 * 1048576.0) / div;
+        lay.page_bytes = (9ull << 20) / div;
+        lay.page_tokens = 256;
+        lay.tok_cap = max_tokens;
+        max_pages = (max_tokens + 255) / 256;
+        ck_dev = o.malloc(lay.ck_bytes);
+        kv_dev = o.malloc(static_cast<std::uint64_t>(max_pages) * lay.page_bytes);
+        fillBytes(reinterpret_cast<void*>(ck_dev), lay.ck_bytes, 5);
+        fillBytes(reinterpret_cast<void*>(kv_dev), static_cast<std::uint64_t>(max_pages) * lay.page_bytes, 6);
+    }
+    ~Sim() {
+        ops.free(ck_dev);
+        ops.free(kv_dev);
+    }
+    std::uint64_t logical(std::uint32_t n_tok, std::uint32_t valid_ck) const {
+        return valid_ck * lay.ck_bytes + static_cast<std::uint64_t>((n_tok + 255) / 256) * lay.page_bytes;
+    }
+    // new entry: all `valid_ck` checkpoints and all pages are new
+    Entry* spillNew(Tier& t, const std::vector<std::uint32_t>& toks, std::uint32_t valid_ck) {
+        Entry* e = t.newEntry(nck);
+        e->tokens = toks;
+        e->n_tok = static_cast<std::uint32_t>(toks.size());
+        e->pages = (e->n_tok + 255) / 256;
+        std::vector<Span> sp;
+        for (std::uint32_t k = 0; k < valid_ck; ++k) {
+            e->ck[k] = CkMeta{static_cast<std::uint32_t>((k + 1) * toks.size() / valid_ck), 1, static_cast<std::uint8_t>(k + 1 == valid_ck), 0, 0, k + 1};
+            sp.push_back(Span{ck_dev, static_cast<std::uint64_t>(k) * lay.ckStride(), lay.ck_bytes, static_cast<std::uint8_t>(k)});
+        }
+        sp.push_back(Span{kv_dev, e->kvOff(lay), static_cast<std::uint64_t>(e->pages) * lay.page_bytes, 0xff});
+        for (const Span& s : sp) {
+            const auto r = Tier::lbRange(s.off, s.len);
+            if (!t.ensureBlocks(e, r[0], r[1])) {
+                t.removeEntry(e);
+                return nullptr;
+            }
+        }
+        t.copyOut(e, sp);
+        t.fence(e, nullptr);
+        e->t_mod = std::chrono::steady_clock::now();
+        return e;
+    }
+    // a conversation turn: `add` tokens appended; pages from the old last (partial) page are new, the
+    // oldest checkpoint slot is replaced by one at the new end (what a request that resumed from the
+    // newest checkpoint produces)
+    void growTurn(Tier& t, Entry* e, std::size_t add, std::uint64_t seed, std::uint32_t slot) {
+        const std::uint32_t old_pages = e->pages;
+        auto more = makeTokens(add, seed);
+        e->tokens.insert(e->tokens.end(), more.begin(), more.end());
+        e->n_tok = static_cast<std::uint32_t>(e->tokens.size());
+        e->pages = (e->n_tok + 255) / 256;
+        const std::uint32_t vp = old_pages > 0 ? old_pages - 1 : 0;  // the partial last page changes
+        std::vector<Span> sp;
+        sp.push_back(Span{ck_dev, static_cast<std::uint64_t>(slot) * lay.ckStride(), lay.ck_bytes, static_cast<std::uint8_t>(slot)});
+        sp.push_back(Span{kv_dev + static_cast<std::uint64_t>(vp) * lay.page_bytes, e->kvOff(lay) + static_cast<std::uint64_t>(vp) * lay.page_bytes,
+                          static_cast<std::uint64_t>(e->pages - vp) * lay.page_bytes, 0xff});
+        for (const Span& s : sp) {
+            const auto r = Tier::lbRange(s.off, s.len);
+            CHECK(t.ensureBlocks(e, r[0], r[1]));
+        }
+        e->ck[slot] = CkMeta{e->n_tok, 1, 1, 0, 0, 100 + static_cast<std::uint64_t>(e->n_tok)};
+        t.copyOut(e, sp);
+        t.fence(e, nullptr);
+        e->t_mod = std::chrono::steady_clock::now();
+    }
+};
+}  // namespace amp
+
+static void testWriteAmplification(MockDeviceOps& ops, const fs::path& dir) {
+    const char* full = std::getenv("WHIRL_TIER_AMP");
+    const int div = full != nullptr && std::strcmp(full, "full") == 0 ? 1 : 8;
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    amp::Sim sim(ops, div, 36000);
+    // A: distinct prompts of 2k..32k tokens, one request each (4 checkpoints), written at once (delay 0)
+    {
+        auto t = Tier::create(ops, 1ull << 30, 71, 0);
+        t->start(env.cfg(64ull << 30), sim.lay, 9);
+        const std::uint32_t lens[] = {2048, 4096, 8192, 16384, 32768};
+        std::uint64_t seed = 7100;
+        std::printf("amp A: distinct prompts (scale 1/%d): tokens, logical MiB, written MiB, ratio\n", div);
+        std::uint64_t req_no = 0;
+        for (std::uint32_t n : lens) {
+            const std::uint64_t w0 = t->stats.ssd_write_bytes;
+            Entry* e = sim.spillNew(*t, freshToks(n, seed), 4);
+            CHECK(e != nullptr);
+            if (!e) continue;
+            CHECK(tickIdle(*t, 120000));
+            const std::uint64_t w = t->stats.ssd_write_bytes - w0;
+            const std::uint64_t lg = sim.logical(n, 4);
+            const std::uint64_t fb = e->ssd ? e->ssd->file_bytes : 0;
+            std::printf("  %6u tok  logical %8.1f  file %8.1f  written %8.1f  ratio %.3f (to file %.3f)\n", n, lg / 1048576.0, fb / 1048576.0,
+                        w / 1048576.0, static_cast<double>(w) / static_cast<double>(lg), static_cast<double>(w) / static_cast<double>(fb ? fb : 1));
+            // the file is the logical size rounded up to whole 2 MiB strides; the writes add only headers
+            CHECK(fb > 0 && static_cast<double>(w) <= 1.001 * static_cast<double>(fb));
+            CHECK(t->stats.ssd_writes == ++req_no);  // one write per request, never again
+        }
+        // the same prompts again are RAM hits: nothing to write
+        const std::uint64_t w_all = t->stats.ssd_write_bytes;
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_write_bytes == w_all);
+    }
+    fs::remove_all(dir, ec);
+    // B: one conversation, 16 turns of +700 tokens from 8k, a checkpoint replaced per turn: the old
+    // 2 s behaviour writes after every turn, a long delay once at the end
+    std::uint64_t per_turn = 0, coalesced = 0, final_logical = 0;
+    for (int variant = 0; variant < 2; ++variant) {
+        auto t = Tier::create(ops, 1ull << 30, 72, 0);
+        Config c = env.cfg(64ull << 30);
+        c.ssd_delay_ms = variant == 0 ? 0 : 3600000;
+        t->start(c, sim.lay, 9);
+        std::uint64_t seed = 7200;
+        Entry* e = sim.spillNew(*t, freshToks(8192, seed), 3);
+        CHECK(e != nullptr);
+        if (!e) return;
+        for (int turn = 0; turn < 16; ++turn) {
+            if (variant == 0) CHECK(tickIdle(*t, 120000));
+            sim.growTurn(*t, e, 700, seed + turn, static_cast<std::uint32_t>(turn % 3));
+        }
+        // the delay passes / graceful stop
+        t->flushing = true;
+        t->cfg.ssd_delay_ms = 0;
+        CHECK(tickIdle(*t, 120000));
+        (variant == 0 ? per_turn : coalesced) = t->stats.ssd_write_bytes;
+        final_logical = sim.logical(e->n_tok, 3);
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+    std::printf("amp B: 16-turn conversation (final entry %.1f MiB): written per turn %.1f MiB (x%.2f), coalesced %.1f MiB (x%.2f)\n",
+                final_logical / 1048576.0, per_turn / 1048576.0, static_cast<double>(per_turn) / static_cast<double>(final_logical),
+                coalesced / 1048576.0, static_cast<double>(coalesced) / static_cast<double>(final_logical));
+    CHECK(coalesced <= final_logical + final_logical / 10);  // stride padding only
+    CHECK(per_turn > 2 * coalesced);
+}
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // default: WHIRL_TEST_TMP, else %TEMP%\whirl-tests; this test uses <base>\tier_test_tmp
@@ -2117,6 +2264,8 @@ int main(int argc, char** argv) {
     testCapLruDedup(ops, dir);
     std::printf("-- %s\n", "testExpiry");
     testExpiry(ops, dir);
+    std::printf("-- %s\n", "testWriteAmplification");
+    testWriteAmplification(ops, dir);
     std::printf("tier tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
