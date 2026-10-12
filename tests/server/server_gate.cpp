@@ -1297,17 +1297,20 @@ void suiteSys() {
         s->waitTierIdle(60);  // pending SSD writes done before the stop
     }
     {
-        // CACHE-1 block dedup: sessions sharing the system prompt store its KV once. FIX-TEST-A: counted in the
-        // sys_tier log after its graceful stop: since SSD-QUIET the default SSD mode writes at shutdown only (the
-        // check used to run while the server ran and saw 0 writes; the always mode skips these one-shot sessions)
-        const std::regex shared(R"(MiB, [1-9]\d* MiB shared with other entries)");
-        std::size_t n = 0;
+        // CACHE-1 block dedup: sessions sharing the system prompt store its KV once. Counted in the sys_tier log
+        // after its graceful stop (the default SSD mode writes at shutdown only; the always mode skips these
+        // one-shot sessions). DEDUP-INV: every session above shares the system prompt, so every SSD write but
+        // the first must reference its blocks (the flush used to write it in full each time: 0 shared).
+        const std::regex shared(R"(MiB, [1-9]\d* MiB shared with other entries)"), written(R"(written to SSD: )");
+        std::size_t n = 0, w = 0;
         std::string line;
         std::istringstream in(readFile(g.work + "\\server_sys_tier.log"));
-        while (std::getline(in, line))
+        while (std::getline(in, line)) {
+            if (std::regex_search(line, written)) ++w;
             if (std::regex_search(line, shared)) ++n;
-        check("sys: SSD entries share the system prompt's KV blocks (dedup, written at shutdown)", n >= 1,
-              std::format("{} SSD writes with shared blocks", n));
+        }
+        check("sys: SSD entries share the system prompt's KV blocks (dedup, written at shutdown)", w >= 2 && n + 1 >= w,
+              std::format("{} of {} SSD writes with shared blocks", n, w));
     }
     {
         auto env = kv;
