@@ -412,6 +412,20 @@ void Tier::stampFile(std::uint64_t id, std::int64_t unix_s) {
         CloseHandle(h);
     } catch (...) {
     }
+    // best effort: not retried (a file that cannot be opened now is not hammered on every tick)
+    if (Entry* x = find(id))
+        if (x->ssd) x->ssd->stamped = std::max(x->ssd->stamped, unix_s);
+}
+
+// Uses the SSD files do not record yet: an entry used from the RAM tier, unchanged, is never rewritten,
+// so its file kept the time of its last write / SSD use and expired at a restart although it was in use.
+// Metadata only (the file's last-write time), at the graceful shutdown flush (and hourly in `always` mode).
+void Tier::persistUse() {
+    if (!ssd_dir_w_) return;
+    for (Entry* e : entries) {
+        if (!e->ssd || e->io_busy || e->used <= e->ssd->stamped) continue;
+        stampFile(e->id, e->used);
+    }
 }
 
 void Tier::touch(Entry* e) {
@@ -1469,6 +1483,7 @@ void Tier::startWrite(Entry* e) {
     sn.ck = e->ck;
     sn.tokens.assign(e->tokens.begin(), e->tokens.begin() + e->n_tok);
     sn.file_bytes = fb;
+    sn.stamped = nowUnix();  // the header's last_used (makeHeader)
     j->snap = std::move(sn);
     e->io_busy = true;
     e->meta_dirty = false;
@@ -1590,8 +1605,10 @@ bool Tier::tick() {
     }
     if (ssd_dir_w_ && cfg.expire_s > 0 && std::chrono::steady_clock::now() >= next_expiry_) {
         next_expiry_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg.expire_check_ms);
+        if (!cfg.ssd_shutdown_only) persistUse();  // shutdown mode: nothing is written while running
         expireSweep();
     }
+    if (ssd_dir_w_ && flushing) persistUse();
     if (ssd_dir_w_) {
         const auto now = std::chrono::steady_clock::now();
         // startWrite may evict SSD-only entries (ssdRoom): iterate over a copy
@@ -1768,6 +1785,7 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
         sn.file_bytes = want_bytes;  // logical size (size below is the allocated part for sparse files)
         sn.alloc_bytes = size;
         sn.tbl = std::move(tbl);
+        sn.stamped = e->used;
         e->ssd = std::move(sn);
         entries.push_back(e.get());
         Entry* ep = e.release();

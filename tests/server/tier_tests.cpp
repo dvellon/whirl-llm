@@ -2360,6 +2360,60 @@ static void testExpiry(MockDeviceOps& ops, const fs::path& dir) {
 }
 
 
+// FIX-RC4-A P2-2: an SSD entry used from the RAM tier, unchanged (a shared system prompt / tool prefix),
+// is never rewritten; its use must still reach the file (graceful shutdown flush) or it expires at a
+// restart although it was used two days before. Both SSD modes.
+static void testRamUsePersisted(MockDeviceOps& ops, const fs::path& dir) {
+    for (int mode = 0; mode < 2; ++mode) {  // 0: always, 1: shutdown
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        SsdEnv env{dir};
+        std::uint64_t seed = 9200 + static_cast<std::uint64_t>(mode) * 10;
+        const std::int64_t day = 86400;
+        std::int64_t offset = 0;
+        auto cfg = [&]() {
+            Config c = env.cfg(4ull << 30);
+            c.ssd_shutdown_only = mode == 1;
+            c.clock_fn = [&] { return static_cast<std::int64_t>(std::time(nullptr)) + offset; };
+            return c;
+        };
+        Sess a(ops, 24);
+        a.toks = freshToks(3000, seed);
+        std::uint64_t id_a = 0;
+        {
+            auto t = Tier::create(ops, 256ull << 20, 92, 0);
+            t->start(cfg(), kLay, 77);
+            spillSess(*t, a, 0);
+            id_a = a.id;
+            t->flushing = true;
+            CHECK(tickIdle(*t));
+            CHECK(countFiles(dir) == 1);
+        }
+        {
+            offset = 6 * day;  // restart; used from SSD at day 6, then from RAM at day 12
+            auto t = Tier::create(ops, 256ull << 20, 93, 0);
+            t->start(cfg(), kLay, 77);
+            CHECK(restoreMatches(*t, ops, t->find(id_a), a));
+            CHECK(tickIdle(*t));
+            offset = 12 * day;
+            Entry* ea = t->find(id_a);
+            CHECK(ea != nullptr && ea->in_ram);
+            CHECK(restoreMatches(*t, ops, ea, a));  // RAM restore at day 12
+            CHECK(tickIdle(*t));
+            t->flushing = true;  // graceful shutdown (Engine::flushTierOnStop)
+            t->cfg.ssd_delay_ms = 0;
+            CHECK(tickIdle(*t));
+        }
+        offset = 14 * day;  // last used 2 days ago
+        auto t = Tier::create(ops, 256ull << 20, 94, 0);
+        t->start(cfg(), kLay, 77);
+        CHECK(t->find(id_a) != nullptr);  // expired before FIX-RC4-A (only the day-6 SSD use was on file)
+        CHECK(t->cleanup().expired_files == 0);
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+}
+
 // ---- SSD-QUIET: write amplification of a benchmark-like request stream -------------------
 // Ornith-35B-A3B layout from the server log ("entry: 51.2 MiB per checkpoint, 9.0 MiB per 256-token
 // page", f16 KV), scaled by 1/amp_div so the default run stays small (WHIRL_TIER_AMP=full: real sizes).
@@ -2624,6 +2678,10 @@ int main(int argc, char** argv) {
     if (want("testExpiry")) {
         std::printf("-- %s\n", "testExpiry");
         testExpiry(ops, dir);
+    }
+    if (want("testRamUsePersisted")) {
+        std::printf("-- %s\n", "testRamUsePersisted");
+        testRamUsePersisted(ops, dir);
     }
     if (want("testWriteAmplification")) {
         std::printf("-- %s\n", "testWriteAmplification");

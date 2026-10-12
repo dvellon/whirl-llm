@@ -172,6 +172,7 @@ struct SsdSnap {
     std::uint64_t file_bytes = 0;   // logical file size
     std::uint64_t alloc_bytes = 0;  // bytes counted against the cap (shared blocks excluded)
     std::vector<BlkRef> tbl;        // one row per KV block
+    std::int64_t stamped = 0;       // last use the file records (header last_used / last-write time), unix s
 };
 
 struct Entry {
@@ -459,6 +460,7 @@ private:
     std::int64_t nowUnix() const;
     void markUsed(Entry* e);
     void stampFile(std::uint64_t id, std::int64_t unix_s);
+    void persistUse();
     void expireSweep();
     void enforceCap();
     std::uint64_t foreignFiles_() const { return foreign_.size(); }
