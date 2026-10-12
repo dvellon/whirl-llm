@@ -255,6 +255,32 @@ selftest in every mode unchanged).
   overwriting the other branch in place. On integrated GPUs the RAM tier is at least one
   max-context entry (or off, with a log line, when that is more than half the available RAM).
 
+### Fixes from the server review (FIX-SRV)
+
+- **Behaviour change:** cross-origin requests are refused. A non-GET request with an Origin that is
+  not allowed (including `null` and `text/plain` "simple" requests) gets 403 before the body is
+  read, and the `Host` header must be `localhost`, `127.0.0.1`, `[::1]`, the `--host` address
+  (any IP literal when bound to `0.0.0.0` / `::`) or a name given with `--allow-host NAME`
+  (repeatable, `*` = any); requests without a Host header are allowed. Clients that reach the
+  server by a host name (for example `mypc.lan`) need `--allow-host`. `--allow-local-images`
+  reads local files only for requests from a localhost page.
+- A tool call cut off by `max_tokens` or a stop string is no longer returned as a complete call
+  (`finish_reason` stays `length`, the text is returned as is).
+- A client that disconnects frees its slot while queued, prefilling or in a non-streaming
+  request. Pressing the KV pool with parallel prefills queues the prompt instead of failing with
+  500; the remaining pool-full case is 503 with `Retry-After`. A decode stopped by a full pool
+  keeps `finish_reason: "length"` and adds `"finish_cause": "kv_pool_exhausted"`.
+- `--draft dflash` on GPUs without DeltaNet replay kernels (Radeon 8060S) allocates snapshot sets
+  so DFlash2 / n-gram drafts are made (before: no drafts); the batch log reports literal drafts
+  per cycle.
+- Smaller fixes: requests during shutdown get 503; an invalid `--kv-ssd-mode` is a usage error;
+  streamed text is always a prefix of the final UTF-8-sanitized text; temperature below 1e-3 is
+  greedy; `/props` reads only atomic counters; at most 16 stop strings of up to 256 bytes;
+  `completion_tokens` no longer counts tokens after a stop string; CRLF n-gram normalization also
+  under `--draft dflash`; bad numeric environment variables fall back to the default with a
+  warning; control characters in logged request lines are escaped; a short follow-up prompt is
+  no longer held behind a long prefill.
+
 ## 0.1.4 — 2026-10-06
 
 Routine bug-fix release: no new features, no speed changes. The changes harden input handling (GGUF
