@@ -30,6 +30,7 @@
 #include "http_client.h"
 #include "whirl/common.h"
 #include "whirl/json.h"
+#include "whirl/numerics.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -406,6 +407,18 @@ bool concSame(const std::vector<ChatResult>& res, const std::vector<ChatResult>&
         d += eq ? "=" : "x";
     }
     return same;
+}
+
+// Do the servers run with relaxed acceptance (fast mode's relaxacc)? From WHIRL_MODE / WHIRL_RELAX as
+// the servers see them (--server-env, else this process's environment).
+bool relaxAccOn(const std::optional<std::string>& mode, const std::optional<std::string>& relax) {
+    if (!mode) return false;
+    try {
+        const numerics::Request r = numerics::parseMode(*mode, "WHIRL_MODE");  // as the server parses it
+        return r.mode == numerics::Mode::fast && r.has(numerics::Item::relaxacc) && !(relax && *relax == "0");
+    } catch (const std::exception&) {
+        return false;  // the server refuses such a mode: no relaxed acceptance to account for
+    }
 }
 
 const json::Value* path(const json::Value& v, std::initializer_list<const char*> keys) {
@@ -818,13 +831,13 @@ void suiteBasic() {
         else
             logLine(std::format("INFO {}: {} ({}; not a gate)", name, same ? "equal" : "differs", d));
     };
-    auto envMode = [] {
-        auto it = g.server_env.find("WHIRL_MODE");
+    auto envOf = [](const char* name) -> std::optional<std::string> {
+        auto it = g.server_env.find(name);
         if (it != g.server_env.end()) return it->second;
-        const char* m = std::getenv("WHIRL_MODE");
-        return std::string(m ? m : "");
+        if (const char* m = std::getenv(name)) return std::string(m);
+        return std::nullopt;
     };
-    if (envMode() == "fast") {
+    if (relaxAccOn(envOf("WHIRL_MODE"), envOf("WHIRL_RELAX"))) {
         concCheck("basic: 4 concurrent requests == each alone (fast, relaxacc on)", false);
         s_opt.reset();
         ServerLease s2("basic_norelax", {}, {{"WHIRL_RELAX", "0"}});
@@ -1691,6 +1704,15 @@ int selfTest() {
     check("selftest: sameText of two failed requests -> false", !sameText(err, err4));
     check("selftest: sameText of a reasoning-only reply with itself -> true", sameText(think, think));
     check("selftest: sameText of different answers -> false", !sameText(ok, ok2));
+    using OS = std::optional<std::string>;
+    check("selftest: WHIRL_MODE=fast -> relaxacc on", relaxAccOn(OS("fast"), std::nullopt));
+    check("selftest: WHIRL_MODE=FAST / ' fast ' -> relaxacc on (the server parses case-insensitively)",
+          relaxAccOn(OS("FAST"), std::nullopt) && relaxAccOn(OS(" fast "), std::nullopt));
+    check("selftest: WHIRL_MODE=fast:relaxacc,kvq8 -> relaxacc on", relaxAccOn(OS("fast:relaxacc,kvq8"), std::nullopt));
+    check("selftest: WHIRL_MODE=fast:kvq8 (no relaxacc) -> off", !relaxAccOn(OS("fast:kvq8"), std::nullopt));
+    check("selftest: WHIRL_MODE=fast + WHIRL_RELAX=0 -> off", !relaxAccOn(OS("fast"), OS("0")));
+    check("selftest: balance / unset / invalid -> off",
+          !relaxAccOn(OS("balance"), std::nullopt) && !relaxAccOn(std::nullopt, std::nullopt) && !relaxAccOn(OS("bogus"), std::nullopt));
     std::printf("== whirl-server-gate --selftest: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
