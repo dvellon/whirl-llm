@@ -101,6 +101,9 @@ struct MockConfig {
     std::uint32_t dfl_block = 8;
     std::uint32_t dfl_cap_rows = 2048;
     double dfl_miss = 0.3;
+    // FR-DFL P2-3: a wrong draft is the target row's runner-up (logit 8.65 vs 10: p / p_max 0.26, inside
+    // relaxacc's greedy top-k / alpha 0.1 window) instead of a random text token
+    bool dfl_miss_runner_up = false;
     // FR-SRV P2-5: false = the DeltaNet verify keeps snapshot sets instead of replaying kept rows
     // (gfx1151 / Radeon 8060S, WHIRL_GDN_REPLAY=0): the state after a verify holds every row, and
     // restoreSeqSnapshot(s, j) rolls it back to snapshot set j. Sets are allocated lazily by a verify
@@ -213,6 +216,7 @@ private:
     std::uint64_t kvPrefix(const Seq& s, std::uint32_t pos) const;
     static std::uint64_t kvRow(std::uint32_t tok, std::uint32_t pos, std::uint64_t h);
     std::uint32_t nextToken(std::uint64_t h, std::uint64_t kv) const;
+    std::uint32_t runnerUp(std::uint64_t h, std::uint64_t kv) const;
     void writeLogits(std::uint32_t row, std::uint64_t h, std::uint64_t kv);
     void writeHidden(server::DevPtr dst, const State& st) const;
     State readHidden(server::DevPtr src) const;

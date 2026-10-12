@@ -1130,6 +1130,10 @@ void testDflashPolicy() {
     // relaxacc: MTP drafts only (DFlash2 keeps exact acceptance in fast mode)
     CHECK(d::relaxApplies(d::Source::mtp, true) && !d::relaxApplies(d::Source::mtp, false));
     CHECK(!d::relaxApplies(d::Source::dflash, true) && !d::relaxApplies(d::Source::dflash, false));
+    // FR-DFL P2-3: the engine's per-slot rule (draft source codes 0 MTP, 1 n-gram, 2 DFlash2)
+    CHECK(d::relaxAppliesTo(d::DraftKind::mtp, true) && !d::relaxAppliesTo(d::DraftKind::mtp, false));
+    CHECK(!d::relaxAppliesTo(d::DraftKind::ngram, true) && !d::relaxAppliesTo(d::DraftKind::dflash, true));
+    CHECK(static_cast<int>(d::DraftKind::mtp) == 0 && static_cast<int>(d::DraftKind::ngram) == 1 && static_cast<int>(d::DraftKind::dflash) == 2);
     // environment
     {
         std::map<std::string, std::string> envm;

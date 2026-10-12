@@ -14,7 +14,8 @@
 //     bitwise verify as plain decoding, and acceptance is EXACT in every numerics mode
 //     (precise / balance / fast). relaxacc (fast) relaxes MTP drafts only (relax_accept.h), so with
 //     --draft dflash the output equals plain greedy decoding of the same numerics mode; for
-//     sampling the reply is a function of (target logits, seed) only. relaxApplies() is the rule.
+//     sampling the reply is a function of (target logits, seed) only. relaxAppliesTo() is the rule
+//     (the server engine calls it per slot; whirl chat's dflashDecode has no relaxed acceptance).
 #pragma once
 
 #include <algorithm>
@@ -86,7 +87,12 @@ inline Choice choose(Source requested, const std::optional<std::string>& draft_m
 }
 
 // relaxacc (fast mode) relaxes MTP drafts only; n-gram and DFlash2 drafts keep exact acceptance.
-inline bool relaxApplies(Source s, bool relax_on) { return relax_on && s == Source::mtp; }
+// The server engine asks relaxAppliesTo() for every slot's drafts (engine.cpp decodeCycle: the top-k
+// launch, greedy relaxed acceptance and typical sampling acceptance), so this is the one rule.
+// DraftKind values are the engine's per-slot draft source codes.
+enum class DraftKind : std::uint8_t { mtp = 0, ngram = 1, dflash = 2 };
+inline bool relaxAppliesTo(DraftKind k, bool relax_on) { return relax_on && k == DraftKind::mtp; }
+inline bool relaxApplies(Source s, bool relax_on) { return relaxAppliesTo(s == Source::dflash ? DraftKind::dflash : DraftKind::mtp, relax_on); }
 
 // Settings from the environment (WHIRL_DFLASH_PMIN / _NMIN / _WARM / _CAPTURE_ROWS).
 struct Params {

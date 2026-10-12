@@ -1302,20 +1302,49 @@ void testDFlashGreedy() {
 // item on in the engine (whirl-server also turns it off for --draft dflash), so the output is the
 // greedy reference whatever the drafter proposes
 void testDFlashRelaxExact() {
-    ServerSetup su = dflashSetup(false);
-    su.mc.dfl_miss = 0.3;
-    su.eo.relax.on = true;
-    TestServer srv(su);
-    for (std::uint32_t n : {7u, 600u}) {
-        const auto p = makePrompt(n, 90 + n);
-        const auto ref = srv.model().greedyReference(p, 100, true);
-        auto r = srv.post("/v1/completions", completionBody(p, 100, false));
-        CHECK_EQ(r.status, 200);
-        CHECK_EQ(completionText(r), decode(ref));
+    // FR-DFL P2-3: the wrong drafts must be ones relaxacc WOULD keep (random tokens never fell inside
+    // its top-k / alpha window, so applying relaxacc to DFlash2 drafts went unnoticed): runner_up makes
+    // every wrong draft the row's second-best token at p / p_max = 0.26 >= alpha 0.1
+    for (bool runner_up : {false, true}) {
+        ServerSetup su = dflashSetup(false);
+        su.mc.dfl_miss = 0.3;
+        su.mc.dfl_miss_runner_up = runner_up;
+        su.eo.relax.on = true;
+        TestServer srv(su);
+        g_log.clear();
+        for (std::uint32_t n : {7u, 600u}) {
+            const auto p = makePrompt(n, 90 + n);
+            const auto ref = srv.model().greedyReference(p, 100, true);
+            auto r = srv.post("/v1/completions", completionBody(p, 100, false));
+            CHECK_EQ(r.status, 200);
+            CHECK_EQ(completionText(r), decode(ref));
+        }
+        const Engine::Stats st = srv.engine().stats();
+        CHECK(st.dfl_cycles > 0 && st.dfl_accepted > 0 && st.dfl_accepted < st.dfl_drafted);
+        CHECK_EQ(srv.model().dflBad(), 0u);
+        // the per-request relaxacc log (written when each request finishes)
+        for (int i = 0; i < 500 && g_log.count("relaxacc: ") < 2; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK_EQ(g_log.count("relaxacc: 0 of"), 2u);  // the per-request log: no draft kept by the relaxed rule
     }
-    const Engine::Stats st = srv.engine().stats();
-    CHECK(st.dfl_cycles > 0 && st.dfl_accepted > 0 && st.dfl_accepted < st.dfl_drafted);
-    CHECK_EQ(srv.model().dflBad(), 0u);
+    // sampling: relaxacc's typical acceptance must not touch DFlash2 drafts either (seeded text ==
+    // plain decoding of the same seed)
+    {
+        ServerSetup su = dflashSetup(false);
+        su.mc.dfl_miss = 0.3;
+        su.mc.dfl_miss_runner_up = true;
+        su.eo.relax.on = true;
+        TestServer a(su);
+        ServerSetup su_plain = baseSetup(false);
+        su_plain.eo.ngram = false;
+        TestServer b(su_plain);
+        const auto p = makePrompt(400, 78);
+        const std::string body = std::format("{{\"prompt\":{},\"max_tokens\":60,\"temperature\":0.8,\"seed\":9,\"ignore_eos\":true}}", idsJson(p));
+        auto ra = a.post("/v1/completions", body);
+        auto rb = b.post("/v1/completions", body);
+        CHECK_EQ(ra.status, 200);
+        CHECK_EQ(completionText(ra), completionText(rb));
+        CHECK(a.engine().stats().dfl_cycles > 0);
+    }
 }
 
 // n-gram and DFlash2 drafts in the same requests (a repetitive toy model: the output cycles, so
