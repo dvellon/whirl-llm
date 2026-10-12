@@ -1734,17 +1734,26 @@ int wmain(int argc, wchar_t** wargv) {
                                                                  {"vis", suiteVis},     {"vis_speed", suiteVisSpeed},
                                                                  {"fast_stream", suiteFastStream}};
     if (!g.exe.empty()) {
+        // a gate that runs nothing must not be green (REVIEW-RC4-C P2-1): no --suite is an error
+        if (g.suites.empty()) {
+            std::fprintf(stderr, "whirl-server-gate: no suites run (pass --suite NAME[,NAME...])\n");
+            return 2;
+        }
         for (const auto& name : g.suites) {
-            auto it = suites.find(name);
-            if (it == suites.end()) {
+            if (!suites.contains(name)) {
                 std::fprintf(stderr, "unknown suite %s\n", name.c_str());
                 return 2;
             }
+        }
+        for (const auto& name : g.suites) {
+            const int before = g_pass + g_fail;
             try {
-                it->second();
+                suites.at(name)();
             } catch (const std::exception& ex) {
                 check("suite " + name + " ran", false, ex.what());
             }
+            // a suite that returned without a single check proves nothing
+            if (g_pass + g_fail == before) check("suite " + name + " ran at least one check", false, "0 checks");
         }
         if (!g.results.empty()) writeFile(g.results, json::dumpPython(json::Value(g_results)));
     } else {
@@ -1767,6 +1776,10 @@ int wmain(int argc, wchar_t** wargv) {
             }
         }
         check(std::format("compare with {}: {} / {} outputs identical", g.compare, same, n), n > 0 && same == n);
+    }
+    if (g_pass + g_fail == 0) {
+        std::printf("== whirl-server-gate: 0 checks ran (no suites run): refusing to report success\n");
+        return 2;
     }
     std::printf("== whirl-server-gate: %d passed, %d failed%s\n", g_pass, g_fail, g_fail ? "" : " (ALL PASS)");
     for (const auto& f : g_failed) std::printf("   FAILED: %s\n", f.c_str());
