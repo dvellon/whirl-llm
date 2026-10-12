@@ -88,14 +88,18 @@ struct GgufImage {
     // tensor infos only (an unknown type: no payload needed, shapes still readable)
     std::uint64_t n_t = 0;
     std::vector<std::uint8_t> ti;
-    void tensor(const std::string& name, std::uint64_t ne0, std::uint64_t ne1) {
+    // a known type needs its payload inside the file: data_bytes zero bytes follow the header
+    // (every tensor at offset 0; only the bounds are checked by File::parse)
+    std::uint64_t data_bytes = 0;
+    void tensor(const std::string& name, std::uint64_t ne0, std::uint64_t ne1, std::uint32_t type = 1000, std::uint64_t nbytes = 0) {
         str(ti, name);
         u32(ti, 2);
         u64(ti, ne0);
         u64(ti, ne1);
-        u32(ti, 1000);  // unknown type
+        u32(ti, type);  // 1000: unknown type
         u64(ti, 0);
         ++n_t;
+        data_bytes = std::max(data_bytes, nbytes);
     }
     std::vector<std::uint8_t> build() {
         std::vector<std::uint8_t> out;
@@ -106,6 +110,7 @@ struct GgufImage {
         out.insert(out.end(), kv.begin(), kv.end());
         out.insert(out.end(), ti.begin(), ti.end());
         while (out.size() % 32) out.push_back(0);
+        out.insert(out.end(), data_bytes, 0);
         return out;
     }
 };
@@ -593,7 +598,20 @@ void testDraftWindowArg() {
 }
 
 // DFlash2 drafter metadata (arch "dflash"): parsing and the checks against the target
-GgufImage dflashImage(std::uint32_t embd, std::uint32_t vocab, bool mask = true, const char* arch = "dflash") {
+// sel_ty: ggml type id of the two selector codebooks (0 f32, 1 f16, 8 Q8_0, 12 Q4_K, ...), sel_ty2 the successor's
+// (-1: same as sel_ty); rank 8 for f32 / f16, 256 otherwise (one block row for every block size up to 256)
+std::uint64_t selRowBytes(std::uint32_t ty, std::uint32_t rank) {
+    switch (ty) {
+        case 0: return rank * 4ull;
+        case 1: return rank * 2ull;
+        case 8: return rank / 32 * 34ull;
+        case 12: return rank / 256 * 144ull;
+        case 14: return rank / 256 * 210ull;
+        default: return 0;
+    }
+}
+GgufImage dflashImage(std::uint32_t embd, std::uint32_t vocab, bool mask = true, const char* arch = "dflash", std::uint32_t sel_ty = 0,
+                      int sel_ty2 = -1) {
     GgufImage g;
     const std::string a = arch;
     g.kvString("general.architecture", a);
@@ -608,14 +626,16 @@ GgufImage dflashImage(std::uint32_t embd, std::uint32_t vocab, bool mask = true,
     g.kvU32(a + ".block_size", 8);
     g.kvU32(a + ".conv_kernel_size", 2);
     g.kvU32(a + ".conv_group_size", 16);
-    g.kvU32(a + ".selector_rank", 8);
+    const std::uint32_t ty2 = sel_ty2 < 0 ? sel_ty : static_cast<std::uint32_t>(sel_ty2);
+    const std::uint32_t rank = (sel_ty <= 1 && ty2 <= 1) ? 8 : 256;
+    g.kvU32(a + ".selector_rank", rank);
     g.kvU32(a + ".selector_top_k", 4);
     g.kvU32(a + ".attention.sliding_window", 2048);
     g.kvI32Array(a + ".target_layers", {2, 4, 6});
     if (mask) g.kvU32("tokenizer.ggml.mask_token_id", 95);
     g.tensor("fc.weight", 3ull * embd, embd);
-    g.tensor("selector_predecessor.weight", 8, vocab);
-    g.tensor("selector_successor.weight", 8, vocab);
+    g.tensor("selector_predecessor.weight", rank, vocab, sel_ty, selRowBytes(sel_ty, rank) * vocab);
+    g.tensor("selector_successor.weight", rank, vocab, ty2, selRowBytes(ty2, rank) * vocab);
     return g;
 }
 
@@ -683,6 +703,32 @@ void testDFlashConfig() {
         msg = w.find("70008") != std::string::npos && w.find(std::to_string(whirl::kernels::kDFlashMaxKeys)) != std::string::npos;
     }
     check(msg, "DFlash2 config: the refusal names the keys needed and the limit");
+    // FIX-K97 (FR-K97 P2-1): dflash_lattice decodes f32 or Q8_0 codebooks with one type flag and one row size
+    auto sel = [&](std::uint32_t ty, int ty2) {
+        const auto im = dflashImage(64, 100, true, "dflash", ty, ty2).build();
+        const gguf::File fs = gguf::File::parse(im);
+        const q::DFlashConfig cs = q::DFlashConfig::fromGguf(fs);
+        std::string what;
+        const std::string cd = code([&] {
+            try {
+                cs.validate(t, fs);
+            } catch (const q::ModelError& e) {
+                what = e.what();
+                throw;
+            }
+        });
+        return std::make_pair(cd, what);
+    };
+    check(sel(0, -1).first.empty(), "DFlash2 config: f32 selector codebooks accepted");
+    check(sel(8, -1).first.empty(), "DFlash2 config: Q8_0 selector codebooks accepted");
+    const auto f16 = sel(1, -1);
+    check(f16.first == "DraftModelMismatch" && f16.second.find("f32 or both Q8_0") != std::string::npos,
+          "DFlash2 config: f16 selector codebooks rejected (" + f16.second + ")");
+    check(sel(12, -1).first == "DraftModelMismatch", "DFlash2 config: Q4_K selector codebooks rejected");
+    check(sel(14, -1).first == "DraftModelMismatch", "DFlash2 config: Q6_K selector codebooks rejected");
+    check(sel(8, 0).first == "DraftModelMismatch", "DFlash2 config: Q8_0 predecessor + f32 successor rejected");
+    check(sel(0, 8).first == "DraftModelMismatch", "DFlash2 config: f32 predecessor + Q8_0 successor rejected");
+    check(sel(0, 1).first == "DraftModelMismatch", "DFlash2 config: f32 predecessor + f16 successor rejected");
 }
 
 // a target header (qwen35 / qwen35moe) for dflashIncompatible: metadata + token_embd only
