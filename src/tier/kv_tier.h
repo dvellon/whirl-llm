@@ -317,6 +317,10 @@ public:
     // Ids of every entry that depends on e directly or through other entries (e itself only if
     // the dependency graph has a cycle through it).
     std::vector<std::uint64_t> dependentClosure(const Entry* e) const;
+    // DEDUP-INV: an entry about to be written whose prefix another entry is writing right now (more
+    // whole blocks shared with that in-flight write than with any file already on the SSD): it waits
+    // for that write, so entries due in the same pass (the shutdown flush) share the prefix too.
+    bool waitForDedupBase(const Entry* e) const;
 
     // Arena blocks for logical blocks [lb0, lb1) of e (allocating what is missing).
     bool ensureBlocks(Entry* e, std::size_t lb0, std::size_t lb1);
