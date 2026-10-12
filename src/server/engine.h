@@ -196,6 +196,7 @@ struct Slot : cache::SlotCache {
     // vision: end of the prompt's last image (after <|vision_end|>), a chunk split
     // where a shared 'prefix' checkpoint is kept (0 = none)
     std::uint32_t img_ck = 0;
+    std::uint32_t tail_ck = 0;  // PREFIX-QA: slot checkpoint at the last schedule point before the prompt end
     bool on_sched = false;
     bool rs_shared = false;
     TimePoint tp0{};

@@ -1029,6 +1029,37 @@ void testPrefixCacheMultiTurn() {
     CHECK_EQ(srv.model().hidMismatch(), 0u);
 }
 
+// PREFIX-QA: same long document, different question, one message each (REL3: the 2nd question
+// re-prefilled the whole 131k document). Every answer equals the cold result; the 2nd question
+// should resume from a checkpoint near the end of the document (llama.cpp does: last user
+// message start / prompt end - n_ubatch), not only the 3rd one (LCP checkpoint on 2nd sighting).
+void testDocQa() {
+  for (std::uint32_t np : {1u, 2u}) {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = np;
+    su.mc.slot_ctx = 32768;
+    su.mc.pool_tokens = 65536;
+    su.eo.n_ck = np == 1 ? 4 : 2;  // server defaults: -np 1 -> 4, -np 2..4 -> 2 (n_ckpt_default*)
+    TestServer srv(su);
+    const auto doc = makePrompt(12000, 91);
+    std::vector<std::uint64_t> cached;
+    for (std::uint64_t q = 0; q < 3; ++q) {
+        const auto p = makePrompt(static_cast<std::uint32_t>(doc.size() + 90 + 10 * q), 500 + q, doc);
+        auto r = srv.post("/v1/completions", completionBody(p, 24));
+        CHECK_EQ(r.status, 200);
+        CHECK_EQ(completionText(r), decode(srv.model().greedyReference(p, 24, true)));
+        cached.push_back(cachedTokens(r));
+    }
+    std::fprintf(stderr, "  (doc_qa np %u n_ck %zu: doc %zu tok, cached q1 %llu, q2 %llu, q3 %llu)\n", np, su.eo.n_ck, doc.size(),
+                 (unsigned long long)cached[0], (unsigned long long)cached[1], (unsigned long long)cached[2]);
+    CHECK_EQ(cached[0], 0u);
+    CHECK(cached[2] + 1280 >= doc.size());  // 3rd question: LCP 'prefix' checkpoint (works today)
+    CHECK(cached[1] + 1280 >= doc.size());  // 2nd question: needs a tail checkpoint (PREFIX-QA fix)
+    CHECK_EQ(srv.model().poison(), 0u);
+    CHECK_EQ(srv.model().hidMismatch(), 0u);
+  }
+}
+
 // --draft dflash: no MTP block, DFlash2 drafts (mock drafter: the true continuation from the
 // context row before the anchor, wrong with probability dfl_miss)
 ServerSetup dflashSetup(bool ngram) {
@@ -2098,6 +2129,7 @@ int main(int argc, char** argv) {
         {"greedy_reference", testGreedyMatchesReference},
         {"stream", testStreamEqualsNonStream},
         {"prefix_cache", testPrefixCacheMultiTurn},
+        {"doc_qa", testDocQa},
         {"concurrency", [] { testConcurrency(4, 12, true); }},
         {"concurrency16", [] { testConcurrency(16, 24, true); }},
         {"concurrency_nomtp", [] { testConcurrency(4, 8, false); }},

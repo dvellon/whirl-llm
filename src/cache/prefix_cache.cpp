@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <string_view>
 
 namespace whirl::cache {
 
@@ -168,6 +169,17 @@ public:
             } else if (cks[slot].valid && c.seq < cks[slot].seq) {
                 slot = i;
             }
+        }
+        // PREFIX-QA prototype: a full set overwrites the oldest checkpoint that is not a
+        // 'prefix' one (the tail checkpoint before the question outlives prompt-end)
+        if (cks[slot].valid && cks[slot].pos != pos && std::string_view(cks[slot].kind) == "prefix") {
+            int alt = -1;
+            for (std::size_t i = 0; i < cks.size(); ++i) {
+                const CkptKey& c = cks[i];
+                if (!c.valid || std::string_view(c.kind) == "prefix") continue;
+                if (alt < 0 || c.seq < cks[static_cast<std::size_t>(alt)].seq) alt = static_cast<int>(i);
+            }
+            if (alt >= 0) slot = static_cast<std::size_t>(alt);
         }
         return slot;
     }

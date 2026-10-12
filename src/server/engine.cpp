@@ -1311,6 +1311,13 @@ bool Engine::startJob(Slot& sl, Job& job) {
                 }
             }
         }
+        // PREFIX-QA: same long document, another question (one message each): keep a slot
+        // checkpoint at the last schedule point before the prompt end (cold-exact, kind 'prefix')
+        sl.tail_ck = 0;
+        if (sl.on_sched && N >= 4096) {
+            const std::uint32_t t = static_cast<std::uint32_t>(schedFloor(toks, N - 1));
+            if (t > mt.reuse && t != sl.sys_split && t != sl.lcp_ck && t != sl.img_ck && t != sl.pf_split) sl.tail_ck = t;
+        }
     }
     sl.phase = Phase::prefill;
     // reset per-request counters
@@ -1368,6 +1375,7 @@ std::size_t Engine::chunkLen(const Slot& sl) const {
             if (&o != &sl && o.phase == Phase::decode) return n;
     while (cur + n < lim) {
         if (sl.lcp_ck > 0 && cur + n == sl.lcp_ck) break;  // a shared-prefix checkpoint is kept there
+        if (sl.tail_ck > 0 && cur + n == sl.tail_ck) break;  // PREFIX-QA tail checkpoint
         const std::size_t nx = prefillChunkLen(lim - cur - n);
         if (n + nx > opt_.prefill_exec + prefill_merge) break;
         n += nx;
@@ -1387,6 +1395,10 @@ void Engine::maybeSplitCkpt(Slot& sl, DevPtr hid_row) {
             logW("req {} | slot {} | shared prefix: checkpoint @{} not kept: {} ({})", sl.reqId(), sl.id, cur, ex.what(),
                  ops_.lastErrorString());
         }
+    }
+    if (sl.tail_ck > 0 && cur == sl.tail_ck) {
+        m_.selectSeq(sl.id);
+        saveCkpt(sl, sl.tail_ck, "prefix", opt_.use_mtp ? std::optional<DevPtr>(hid_row) : std::nullopt, std::nullopt);
     }
     if (sl.pf_split == 0 || cur != sl.pf_split) return;
     m_.selectSeq(sl.id);
