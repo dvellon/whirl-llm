@@ -1269,6 +1269,10 @@ void suiteSys() {
     {
         auto env = kv;
         env["WHIRL_KV_SSD_DIR"] = ssd;
+        // FIX-TEST-A: SSD-QUIET made "shutdown" the default SSD mode with a 5-min write delay, after which the
+        // dedup check below (SSD writes while the server runs) saw 0 writes; this server writes as CACHE-1 did
+        env["WHIRL_KV_SSD_MODE"] = "always";
+        env["WHIRL_KV_SSD_DELAY_MS"] = "0";
         ServerLease s("sys_tier", {"--parallel", "4"}, env, false);
         auto first = sysAsk(byName("S0"));
         B = boundary(*s.s);
