@@ -2763,6 +2763,7 @@ void testFrDFlashNoReplay() {
         su.mc.dfl_miss = 0.3;
         if (ngram) su.mc.markov = 40;
         TestServer srv(su);
+        g_log.clear();
         for (std::uint32_t n : {5u, 300u, 1500u}) {
             const auto p = makePrompt(n, 140 + n);
             const auto ref = srv.model().greedyReference(p, 120, true);
@@ -2775,6 +2776,8 @@ void testFrDFlashNoReplay() {
         CHECK(st.dfl_accepted > 0);
         CHECK(srv.model().snapSets() > 0);
         CHECK_EQ(srv.model().poison(), 0u);
+        CHECK(waitIdle(srv, 5.0));
+        CHECK(g_log.count("literal drafts/cycle (DFlash2 / n-gram)") >= 1);  // the batch log shows them
     }
     {  // MTP without replay still matches the reference (snapshot rollback path of the mock)
         ServerSetup su = baseSetup();

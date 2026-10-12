@@ -2102,6 +2102,7 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
     stat_rows_ += rows;
     stat_slots_ += A;
     stat_drafts_ += nd;
+    for (std::size_t k = 0; k < A; ++k) stat_lit_drafts_ += ng_n[k];
 
     for (std::size_t k = 0; k < A; ++k) {
         Slot& sl = *act[k];
@@ -3141,14 +3142,19 @@ void Engine::logBatchStats(bool force) {
             else if (sl.phase == Phase::prefill || sl.phase == Phase::restore) ++n_pf;
         }
         const double cyc = static_cast<double>(std::max<std::uint64_t>(stat_cycles_, 1));
+        // FR-SRV P2-5: "drafts/cycle" is the MTP draft count; literal drafts (DFlash2 / n-gram) are
+        // reported next to it (with --draft dflash the MTP figure is always 0)
+        const std::string lit = stat_lit_drafts_ > 0
+                                    ? std::format(", {:.2f} literal drafts/cycle (DFlash2 / n-gram)", static_cast<double>(stat_lit_drafts_) / cyc)
+                                    : std::string();
         logI("batch | slots busy {}/{} (decode {}, prefill {}) | {} cycles, {:.2f} slots/cycle, {:.2f} rows/cycle, {:.2f} "
-             "drafts/cycle | aggregate tg {:.1f} tok/s, prefill {:.0f} tok/s over {:.1f} s",
+             "drafts/cycle{} | aggregate tg {:.1f} tok/s, prefill {:.0f} tok/s over {:.1f} s",
              n_dec + n_pf, slots_.size(), n_dec, n_pf, stat_cycles_, static_cast<double>(stat_slots_) / cyc,
-             static_cast<double>(stat_rows_) / cyc, static_cast<double>(stat_drafts_) / cyc,
+             static_cast<double>(stat_rows_) / cyc, static_cast<double>(stat_drafts_) / cyc, lit,
              static_cast<double>(stat_tokens_) * 1000.0 / el, static_cast<double>(stat_prefill_tok_) * 1000.0 / el, el / 1000.0);
     }
     stat_t0_ = Clock::now();
-    stat_tokens_ = stat_cycles_ = stat_rows_ = stat_slots_ = stat_drafts_ = 0;
+    stat_tokens_ = stat_cycles_ = stat_rows_ = stat_slots_ = stat_drafts_ = stat_lit_drafts_ = 0;
     if (stat_seg_batches_ > 0)
         logI("batch | segmented prefill: {} forwards, {} chunks ({:.2f} chunks/forward)", stat_seg_batches_, stat_seg_chunks_,
              static_cast<double>(stat_seg_chunks_) / static_cast<double>(stat_seg_batches_));

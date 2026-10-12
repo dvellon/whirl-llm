@@ -609,6 +609,7 @@ private:
     // batch statistics
     TimePoint stat_t0_{};
     std::uint64_t stat_tokens_ = 0, stat_cycles_ = 0, stat_rows_ = 0, stat_slots_ = 0, stat_drafts_ = 0,
+                  stat_lit_drafts_ = 0,  // FR-SRV P2-5: DFlash2 / n-gram drafts verified (all slots)
                   stat_prefill_tok_ = 0, stat_seg_batches_ = 0, stat_seg_chunks_ = 0;
     std::uint64_t stat_dfl_cycles_ = 0, stat_dfl_drafted_ = 0, stat_dfl_accepted_ = 0, stat_dfl_cold_ = 0, stat_dfl_gap_ = 0;
     std::vector<std::uint32_t> crlf_norm_;
