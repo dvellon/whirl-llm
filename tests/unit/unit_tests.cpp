@@ -1025,8 +1025,9 @@ void testKvChoice() {
 struct FetchBound {
     std::uint64_t max_start = 0, max_end = 0;
 };
-FetchBound replayStageFetch(int sb, std::uint64_t row_bytes, int nrows, int ncols, bool guarded) {
-    const int ch = gemms_stage_chunks(sb), nst = ncols / 256;
+// s: super-block stages per round (gemvh_impl S = 2 when ncols % 512 == 0: SB = 2 * sbb, nst = ncols / 512)
+FetchBound replayStageFetch(int sb, std::uint64_t row_bytes, int nrows, int ncols, bool guarded, int s = 1) {
+    const int ch = gemms_stage_chunks(sb), nst = ncols / (256 * s);
     FetchBound b;
     // rows past nrows are clamped to nrows - 1 by every kernel; the pattern only depends on
     // the row start, so the first rows, the last two and the clamped row cover every case
@@ -1057,28 +1058,33 @@ void testKernelFetchBounds() {
     };
     const T types[] = {{"f16", 8, 16},     {"q8_0", 32, 34},    {"iq4_nl", 32, 18}, {"q3_k", 256, 110}, {"q4_k", 256, 144},
                        {"q5_k", 256, 176}, {"q6_k", 256, 210},  {"iq3_s", 256, 110}, {"iq4_xs", 256, 136}, {"mxfp4", 256, 136}};
-    int old_caught = 0;
-    for (const T& t : types) {
-        const int sb = 256 / t.blk * t.bytes;
-        CHECK(gemms_stage_chunks(sb) * 16 >= sb + 15);  // CH covers the worst misalignment
-        for (int ncols : {256, 2048, 4096, 5120, 8192, 12288, 17408})
-            for (int nrows : {1, 17, 37, 40, 47, 48, 128, 2048, 4097}) {
-                const std::uint64_t rb = static_cast<std::uint64_t>(ncols) / t.blk * t.bytes;
-                const std::uint64_t total = rb * nrows, total16 = (total + 15) & ~15ull;
-                const FetchBound b = replayStageFetch(sb, rb, nrows, ncols, true);
-                const bool ok = b.max_start < total && b.max_end <= total16;
-                if (!ok)
-                    std::printf("FAIL fetch bound %s %dx%d: max start %llu end %llu, matrix %llu bytes\n", t.name, nrows, ncols,
-                                static_cast<unsigned long long>(b.max_start), static_cast<unsigned long long>(b.max_end),
-                                static_cast<unsigned long long>(total));
-                CHECK(ok);
-                // also within the allocation tail pad for any matrix size
-                CHECK(b.max_end <= total + 256);
-                const FetchBound o = replayStageFetch(sb, rb, nrows, ncols, false);
-                if (o.max_end > total16) ++old_caught;
-            }
-    }
-    CHECK(old_caught > 0);  // the check does see the pre-fix over-read (every type reads >= 16 B past)
+    int old_caught = 0, s2_cases = 0, s2_old_caught = 0;
+    for (const T& t : types)
+        for (int st : {1, 2}) {  // FIX-K97 (FR-K97 P3-1): also gemvh_impl's S = 2 stage (2 super-blocks per LDS round)
+            const int sb = st * (256 / t.blk * t.bytes);
+            CHECK(gemms_stage_chunks(sb) * 16 >= sb + 15);  // CH covers the worst misalignment
+            for (int ncols : {256, 512, 1536, 2048, 4096, 5120, 8192, 12288, 17408})
+                for (int nrows : {1, 17, 37, 40, 47, 48, 128, 2048, 4097}) {
+                    if (ncols % (256 * st) != 0) continue;  // S = 2 only when ncols % 512 == 0 (gemvh_<T> / gemvh2_<T>)
+                    const std::uint64_t rb = static_cast<std::uint64_t>(ncols) / t.blk * t.bytes;
+                    const std::uint64_t total = rb * nrows, total16 = (total + 15) & ~15ull;
+                    const FetchBound b = replayStageFetch(sb, rb, nrows, ncols, true, st);
+                    const bool ok = b.max_start < total && b.max_end <= total16;
+                    if (!ok)
+                        std::printf("FAIL fetch bound %s S=%d %dx%d: max start %llu end %llu, matrix %llu bytes\n", t.name, st, nrows, ncols,
+                                    static_cast<unsigned long long>(b.max_start), static_cast<unsigned long long>(b.max_end),
+                                    static_cast<unsigned long long>(total));
+                    CHECK(ok);
+                    // also within the allocation tail pad for any matrix size
+                    CHECK(b.max_end <= total + 256);
+                    const FetchBound o = replayStageFetch(sb, rb, nrows, ncols, false, st);
+                    if (o.max_end > total16) ++(st == 1 ? old_caught : s2_old_caught);
+                    s2_cases += st == 2;
+                }
+        }
+    CHECK(old_caught > 0);     // the check does see the pre-fix over-read (every type reads >= 16 B past)
+    CHECK(s2_cases > 0);       // the S = 2 addressing was replayed
+    CHECK(s2_old_caught > 0);  // and the check bites there too
 }
 
 // ---------------------------------------------------------------------------

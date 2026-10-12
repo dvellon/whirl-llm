@@ -32,8 +32,11 @@ __device__ __forceinline__ unsigned long long spec_splitmix(unsigned long long z
     return z ^ (z >> 31);
 }
 
+// order-preserving key; NaN -> 0, below every number (-inf is 0x007fffff), so a NaN logit is never a
+// candidate ahead of a finite one (FIX-K97 / FR-K97 P3-2; the max below ignores NaN through fmaxf too)
 __device__ __forceinline__ unsigned spec_key(float f) {
     const unsigned u = __float_as_uint(f);
+    if (f != f) return 0u;
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
@@ -66,7 +69,10 @@ extern "C" __global__ void __launch_bounds__(1024)
     m = red[0];
     __syncthreads();
     float sum = 0.f;
-    for (int i = t; i < n; i += blockDim.x) sum += __expf((x[i] - m) * inv_t);
+    for (int i = t; i < n; i += blockDim.x) {
+        const float xi = x[i];
+        if (xi == xi) sum += __expf((xi - m) * inv_t);  // NaN counts as -inf (adds 0)
+    }
     red[t] = sum;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
@@ -116,8 +122,9 @@ extern "C" __global__ void __launch_bounds__(1024)
     __syncthreads();
     const unsigned thr = s_prefix, need = s_remain, base = (unsigned)K - need;
     for (int i = t; i < n; i += blockDim.x) {
-        const float v = x[i];
-        const unsigned k = spec_key(v);
+        const float xv = x[i];
+        const float v = xv == xv ? xv : -INFINITY;  // a NaN only fills a slot past the finite logits, with p = 0
+        const unsigned k = spec_key(xv);
         if (k > thr) {
             const unsigned j = atomicAdd(&s_gt, 1u);
             if (j < base) {
