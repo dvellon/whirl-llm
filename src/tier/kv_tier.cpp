@@ -927,13 +927,14 @@ bool Tier::pumpRestore(Restore* r) {
         r->main_rec = true;
         return false;
     }
-    return ops_.eventDone(r->ev_main);
+    // (an asynchronous copy error throws here: pumpRestoreNoThrow marks the restore failed, cold prefill)
+    return ops_.eventDoneChecked(r->ev_main);
 }
 
 bool Tier::pumpRestoreNoThrow(Restore* r) {
     try {
         return pumpRestore(r);
-    } catch (const std::exception&) {
+    } catch (...) {
         r->failed = true;
         return true;
     }
@@ -942,7 +943,7 @@ bool Tier::pumpRestoreNoThrow(Restore* r) {
 bool Tier::pumpTailNoThrow(Restore* r) {
     try {
         return pumpTail(r);
-    } catch (const std::exception&) {
+    } catch (...) {
         r->failed = true;
         return true;
     }
@@ -1008,7 +1009,7 @@ bool Tier::pumpTail(Restore* r) {
         r->enqueued = true;
         return false;
     }
-    return ops_.eventDone(r->ev);
+    return ops_.eventDoneChecked(r->ev);
 }
 
 void Tier::endRestore(Restore* r) {

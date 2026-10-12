@@ -84,7 +84,13 @@ public:
         delete static_cast<int*>(e);
     }
     void eventRecord(Event, Stream) override {}
-    bool eventDone(Event) override { return true; }
+    bool eventDone(Event) override { return true; }  // like HipDeviceOps: a query error reads as complete
+    // fault injection: an asynchronous device error (the work before the event failed)
+    std::atomic<bool> event_error{false};
+    bool eventDoneChecked(Event) override {
+        if (event_error.load()) throw std::runtime_error("injected asynchronous device error");
+        return true;
+    }
     // the IO thread waits here on a read job's fence: the gate lets a test
     // hold SSD reads back deterministically
     void eventSync(Event) override {
@@ -2546,6 +2552,42 @@ static void testDeleteFails(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+// FIX-RC4-A P3-6: an asynchronous copy error (reported by the event query, not thrown by copyAsync) fails
+// the restore (cold prefill); it used to read as "complete and valid".
+static void testRestoreAsyncError(MockDeviceOps& ops) {
+    auto t = Tier::create(ops, 64ull << 20, 99, 0);
+    t->start(Config{}, kLay, 1);
+    DevSlot src(ops, 2, 7);
+    src.fill(55);
+    Entry* e = spill(*t, src, makeTokens(1700, 41));
+    CHECK(e != nullptr);
+    if (!e) return;
+    CHECK(tickIdle(*t));
+    DevSlot dst(ops, 2, 7);
+    std::size_t nm = 0;
+    const auto sp = dst.spans(e, 1, &nm);
+    ops.event_error = true;
+    Restore* r = t->beginRestore(e, sp, nm);
+    CHECK(r != nullptr);
+    if (r) {
+        bool done = false;
+        for (int i = 0; i < 100 && !done; ++i) done = t->pumpRestoreNoThrow(r);
+        CHECK(done && r->failed);
+        t->endRestore(r);
+    }
+    ops.event_error = false;
+    CHECK(e->pin == 0);
+    DevSlot ok(ops, 2, 7);
+    const auto sp2 = ok.spans(e, 1, &nm);
+    Restore* r2 = t->beginRestore(e, sp2, nm);
+    CHECK(r2 != nullptr);
+    if (r2) {
+        CHECK(runRestore(*t, r2));
+        t->endRestore(r2);
+        CHECK(ok.ckEq(src, 0) && ok.ckEq(src, 1) && ok.kvEq(src));
+    }
+}
+
 // ---- SSD-QUIET: write amplification of a benchmark-like request stream -------------------
 // Ornith-35B-A3B layout from the server log ("entry: 51.2 MiB per checkpoint, 9.0 MiB per 256-token
 // page", f16 KV), scaled by 1/amp_div so the default run stays small (WHIRL_TIER_AMP=full: real sizes).
@@ -2822,6 +2864,10 @@ int main(int argc, char** argv) {
     if (want("testDeleteFails")) {
         std::printf("-- %s\n", "testDeleteFails");
         testDeleteFails(ops, dir);
+    }
+    if (want("testRestoreAsyncError")) {
+        std::printf("-- %s\n", "testRestoreAsyncError");
+        testRestoreAsyncError(ops);
     }
     if (want("testWriteAmplification")) {
         std::printf("-- %s\n", "testWriteAmplification");

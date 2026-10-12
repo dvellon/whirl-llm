@@ -31,6 +31,7 @@ public:
             return true;
         }
     }
+    bool eventDoneChecked(Event e) override { return hip::eventDone(e); }  // throws hip::Error
     void eventSync(Event e) override { hip::eventSync(e); }
     void* hostMalloc(std::uint64_t bytes) override { return hip::hostMalloc(bytes); }
     void hostFree(void* p) override { hip::hostFree(p); }
