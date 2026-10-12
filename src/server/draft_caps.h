@@ -61,4 +61,15 @@ inline std::uint32_t literalSnapSets(std::uint32_t max_literal, std::optional<st
     return std::min(qwen35::gdn_max_snap, n);
 }
 
+// FR-DFL P3-4: the snapshot sets whirl-server allocates for the literal drafts right after the
+// DFlash2 setup and BEFORE sizing the KV pool (server_main), so the pool is sized after them and the
+// engine (which caps literal drafts by the sets that exist) drafts at all: --draft dflash without
+// DeltaNet replay only (with MTP the MTP caps decide; with replay no sets are needed). 0 = none.
+inline std::uint32_t dflashSnapSets(bool use_mtp, bool use_dflash, bool replay, std::uint32_t block, bool ngram,
+                                    std::optional<std::uint32_t> snap_env) {
+    if (use_mtp || !use_dflash || replay) return 0;
+    const std::uint32_t max_lit = std::max(block > 0 ? block - 1 : 0u, ngram ? qwen35::max_ng_drafts : 0u);
+    return literalSnapSets(std::min(max_lit, qwen35::gdn_max_snap), snap_env);
+}
+
 }  // namespace whirl::server

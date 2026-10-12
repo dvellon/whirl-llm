@@ -22,6 +22,8 @@
 #include "whirl/tokenizer.h"
 
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -2815,6 +2817,27 @@ void testFrCrossOrigin() {
 
 // P2-5: --draft dflash without DeltaNet replay (gfx1151 / 8060S): drafts are produced, output unchanged
 void testFrDFlashNoReplay() {
+    // FR-DFL P3-4: the decision server_main makes before sizing the KV pool (dflashSnapSets)
+    CHECK_EQ(dflashSnapSets(false, true, false, 8, false, std::nullopt), 7u);   // block 8: one full block
+    CHECK_EQ(dflashSnapSets(false, true, false, 16, false, std::nullopt), 15u);
+    CHECK_EQ(dflashSnapSets(false, true, false, 8, true, std::nullopt), std::min<std::uint32_t>(qwen35::max_ng_drafts, qwen35::gdn_max_snap));
+    CHECK_EQ(dflashSnapSets(false, true, false, 8, false, 12u), 12u);           // WHIRL_SNAP_SETS raises it
+    CHECK_EQ(dflashSnapSets(false, true, true, 8, true, std::nullopt), 0u);     // replay: none
+    CHECK_EQ(dflashSnapSets(true, false, false, 8, true, std::nullopt), 0u);    // MTP: the MTP caps decide
+    CHECK_EQ(dflashSnapSets(false, false, false, 8, true, std::nullopt), 0u);
+#ifdef WHIRL_SOURCE_DIR
+    {
+        // ... and server_main makes it after the DFlash2 setup, before the KV pool is allocated (the
+        // engine's own fallback allocation comes after the pool: the pool would not leave room)
+        std::ifstream in(std::string(WHIRL_SOURCE_DIR) + "/src/server/server_main.cpp", std::ios::binary);
+        const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const std::size_t setup = src.find("model.dflashSetup(opt.parallel");
+        const std::size_t sets = src.find("model.ensureSnapshots(dflashSnapSets(");
+        const std::size_t pool = src.find("model.allocKvPool(");
+        CHECK(setup != std::string::npos && sets != std::string::npos && pool != std::string::npos);
+        CHECK(setup < sets && sets < pool);
+    }
+#endif
     CHECK_EQ(literalSnapSets(15, std::nullopt), 15u);
     CHECK_EQ(literalSnapSets(7, 10u), 10u);
     CHECK_EQ(literalSnapSets(7, 99u), qwen35::gdn_max_snap);

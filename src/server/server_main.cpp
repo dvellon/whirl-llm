@@ -860,8 +860,7 @@ int serveMain(int argc, char** argv, const char* program) {
                     logW("WHIRL_SNAP_SETS={} is not a number (ignored)", *v);
                 }
             }
-            const std::uint32_t max_lit = std::max(model.dfr->block - 1, envOn("NGRAM", true) ? qwen35::max_ng_drafts : 0u);
-            model.ensureSnapshots(literalSnapSets(std::min(max_lit, qwen35::gdn_max_snap), snap_env));
+            model.ensureSnapshots(dflashSnapSets(use_mtp, use_dflash, model.gdn_replay, model.dfr->block, envOn("NGRAM", true), snap_env));
             std::uint64_t gdn_layers = 0;
             for (std::uint32_t li = 0; li < cfg.n_layer; ++li)
                 if (model.ssm_state[li] != 0) ++gdn_layers;

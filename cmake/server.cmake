@@ -82,6 +82,8 @@ add_executable(whirl-server-tests
   ${CMAKE_SOURCE_DIR}/src/model/spec.cpp)
 target_include_directories(whirl-server-tests PRIVATE ${CMAKE_SOURCE_DIR}/tests/server)
 target_link_libraries(whirl-server-tests PRIVATE whirl_server_core)
+# FR-DFL P3-4: source-order checks on server_main.cpp (not linked into the test binary)
+target_compile_definitions(whirl-server-tests PRIVATE WHIRL_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # end-to-end gates on a real model (GPU): drives whirl-server.exe or, as a
 # black box, the prototype exe; records outputs for cross-run comparison
