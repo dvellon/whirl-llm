@@ -2630,6 +2630,12 @@ void testFrPoolPrefill() {
         CHECK_EQ(completionText(rs[i]), decode(srv.model().greedyReference(makePrompt(6000 - 500 * i, 90 + i), 16, true)));
     }
     CHECK_EQ(srv.model().poison(), 0u);
+    // the residual path (a prefill that still runs out of pages) answers 503 + Retry-After
+    const std::string e503 = errorResponse(503, "full", "Retry-After: 5
+");
+    CHECK(e503.starts_with("HTTP/1.1 503 Service Unavailable
+Retry-After: 5
+Content-Type: application/json"));
 }
 
 // P3-8 (with P2-3): decode-time pool exhaustion is not a silent "length"

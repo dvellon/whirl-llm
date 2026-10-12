@@ -92,6 +92,7 @@ struct Job {
     TimePoint t_arrive{};
     bool sys_wait_logged = false;
     bool tier_wait_logged = false;
+    bool pool_wait_logged = false;  // FR-SRV P2-3
     bool pf_checked = false;
     // vision: the request's images (preprocessed), their spans and embeddings
     std::shared_ptr<JobVis> vis;
@@ -158,6 +159,8 @@ struct Final {
     std::optional<std::vector<ToolCall>> calls;
     std::string content;
     std::string reasoning;
+    // FR-SRV P3-8: why a "length" ended early ("" = max_tokens / context; "kv_pool_exhausted")
+    std::string cause;
 };
 
 struct StreamState {
@@ -215,6 +218,7 @@ struct Slot : cache::SlotCache {
     std::string finish = "length";
     bool done = false;
     bool stopped_str = false;
+    bool pool_cut = false;  // FR-SRV P3-8: ended because the KV pool had no page left (decode)
     std::uint32_t cycles = 0;
     std::uint32_t drafted = 0;
     std::uint32_t accepted = 0;
@@ -528,6 +532,10 @@ private:
     void failSlot(Slot& sl, const std::string& err);
     // FR-SRV P2-2: queued / running requests whose client disconnected end (slot freed)
     void reapDisconnected();
+    // FR-SRV P2-3: pool pages a prompt of n_tok tokens needs; pages free or evictable now minus
+    // what the running prefills still need
+    std::size_t pagesFor(std::uint64_t n_tok) const;
+    std::size_t poolAvailable() const;
     void failJobNoSlot(Job& job);
     void writeError(Job& job, int status, const std::string& msg);
     void logBatchStats(bool force);

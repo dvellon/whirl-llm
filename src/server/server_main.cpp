@@ -1069,8 +1069,8 @@ int serveMain(int argc, char** argv, const char* program) {
         {
             const std::uint64_t floor = static_cast<std::uint64_t>(slot_ctx_eff) + (opt.parallel > 1 ? std::min(floor_second_ctx, slot_ctx_eff) : 0);
             if (pool_tokens < floor)
-                logW("kv pool {} tokens < {} (one {}-token request + a second one reaching {}): concurrent long requests may end "
-                     "early (finish_reason length){}",
+                logW("kv pool {} tokens < {} (one {}-token request + a second one reaching {}): concurrent long requests wait in "
+                     "the queue, or end early while generating (finish_reason length, finish_cause kv_pool_exhausted){}",
                      pool_tokens, floor, slot_ctx_eff, opt.parallel > 1 ? std::min(floor_second_ctx, slot_ctx_eff) : 0,
                      model.kv_choice.kv == numerics::KvKind::f16 && !cfg.moe && nreq.mode == numerics::Mode::precise
                          ? "; --balance allows int8 KV (a longer pool)"

@@ -444,7 +444,7 @@ std::string httpResponse(int status, std::string_view ctype, std::string_view bo
     return r;
 }
 
-std::string errorResponse(int status, std::string_view msg) {
+std::string errorResponse(int status, std::string_view msg, std::string_view extra_headers) {
     std::string b = "{\"error\":{\"message\":";
     std::string_view m = msg.substr(0, std::min<std::size_t>(msg.size(), 3000));
     // keep the cut on a UTF-8 boundary
@@ -453,7 +453,9 @@ std::string errorResponse(int status, std::string_view msg) {
     appendJsonStr(b, m);
     b += std::format(",\"type\":\"{}\",\"code\":{}}}}}",
                      status >= 500 ? "server_error" : (status == 404 ? "not_found_error" : "invalid_request_error"), status);
-    return httpResponse(status, "application/json; charset=utf-8", b);
+    std::string r = httpResponse(status, "application/json; charset=utf-8", b);
+    if (!extra_headers.empty()) r.insert(r.find("\r\n") + 2, extra_headers);
+    return r;
 }
 
 std::string randomId(std::string_view prefix, std::size_t n, std::uint64_t (*next)(void*), void* ctx) {

@@ -1341,6 +1341,7 @@ bool Engine::startJob(Slot& sl, Job& job) {
     sl.finish = "length";
     sl.done = false;
     sl.stopped_str = false;
+    sl.pool_cut = false;
     sl.cycles = 0;
     sl.drafted = 0;
     sl.accepted = 0;
@@ -1741,8 +1742,12 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
         const bool room_ok = sl->pos + nd_room + 1 < ctx_ && ensurePages(*sl, sl->pos + nd_room + 2);
         if (!room_ok) {
             if (sl->pos + nd_room + 1 < ctx_)
-                logW("req {} | slot {} | kv pool exhausted at {} tokens (every page belongs to a running request)",
+            {
+                logW("req {} | slot {} | kv pool exhausted at {} tokens (every page belongs to a running request); "
+                     "finish_reason length, finish_cause kv_pool_exhausted",
                      sl->reqId(), sl->id, sl->pos);
+                sl->pool_cut = true;
+            }
             sl->finish = "length";
             sl->logits_ok = false;  // other work ran since its last cycle
             finishJob(*sl);
@@ -2338,7 +2343,8 @@ void Engine::finishJob(Slot& sl) {
     ops_.streamSync(m_.stream());
 
     // ---- final output
-    const Final fin = sl.st.finish(sl.out, sl.finish);
+    Final fin = sl.st.finish(sl.out, sl.finish);
+    if (sl.pool_cut && fin.reason == "length") fin.cause = "kv_pool_exhausted";
     const double tot_ms = msSince(sl.tp0);
     const std::uint32_t n_new = N - sl.reuse;
     Timings tim;
@@ -3004,11 +3010,17 @@ void Engine::failSlot(Slot& sl, const std::string& err) {
     Job* job = sl.job;
     if (!job) return;
     if (sl.restore != nullptr && sl.phase != Phase::restore) finishTail(sl, true);
-    logE("req {} | slot {} | failed: {} ({})", job->id, sl.id, err, ops_.lastErrorString());
+    // FR-SRV P2-3: the KV pool ran out while prefilling (decoding requests grew into the pages the
+    // admission counted on): a retryable 503, never a 500
+    const bool pool_full = err == "KvPoolFull" && sl.phase != Phase::decode;
+    if (pool_full) logW("req {} | slot {} | KV pool full during prefill: answered 503 (retry later)", job->id, sl.id);
+    else logE("req {} | slot {} | failed: {} ({})", job->id, sl.id, err, ops_.lastErrorString());
     if (sl.phase == Phase::decode && job->params.stream) {
         sl.st.fail();
     } else {
-        const std::string r = errorResponse(500, err);
+        const std::string r = pool_full ? errorResponse(503, "the KV cache pool is full (other requests hold every page); retry later",
+                                                        "Retry-After: 5\r\n")
+                                        : errorResponse(500, err);
         if (job->w) {
             job->w->write(r);
             job->w->flush();
@@ -3016,6 +3028,29 @@ void Engine::failSlot(Slot& sl, const std::string& err) {
     }
     dropCache(sl);
     releaseSlot(sl);
+}
+
+std::size_t Engine::pagesFor(std::uint64_t n_tok) const {
+    return static_cast<std::size_t>((n_tok + draftRoom() + 2 + kv_page - 1) / kv_page);
+}
+
+std::size_t Engine::poolAvailable() const {
+    std::size_t n = free_pages_.size(), owed = 0;
+    for (const QBatch& q : quarantine_) n += q.pages.size();
+    auto own = [&](const std::vector<std::int32_t>& pages) {
+        for (std::int32_t pg : pages)
+            if (page_ref_[static_cast<std::size_t>(pg)] == 1) ++n;
+    };
+    for (const Slot& sl : slots_) {
+        if (sl.phase == Phase::idle) {
+            own(sl.pages);  // evictable (its prefix cache is dropped)
+        } else if (sl.phase == Phase::prefill && sl.job) {
+            const std::size_t want = pagesFor(sl.n_prompt);
+            if (want > sl.pages.size()) owed += want - sl.pages.size();
+        }
+    }
+    for (const Spe& s : spes_) own(s.pages);
+    return n > owed ? n - owed : 0;
 }
 
 void Engine::reapDisconnected() {
@@ -3250,12 +3285,31 @@ void Engine::runLoop() {
         const std::uint64_t wake_seq0 = wake_seq_;  // a later arrival ends this iteration's wait (below)
         std::vector<Job*> admit;
         std::size_t qi = 0;
+        std::optional<std::size_t> pool_avail;  // FR-SRV P2-3 (computed when a request is about to start)
         while (qi < queue_.size() && n_busy + admit.size() < slots_.size()) {
             // item S: a new session whose system message another request is
             // prefilling right now waits for that checkpoint
             if (waitsForSys(*queue_[qi]) || waitsForTier(*queue_[qi])) {
                 ++qi;
                 continue;
+            }
+            // FR-SRV P2-3: a prompt the KV pool cannot hold next to the running requests waits in the
+            // queue (in order: later requests wait behind it) instead of failing mid-prefill. Alone it
+            // always starts (startJob rejects a prompt larger than the whole pool).
+            {
+                if (!pool_avail) pool_avail = poolAvailable();
+                Job& qj = *queue_[qi];
+                const std::size_t need = pagesFor(qj.tokens.size());
+                if (n_busy + admit.size() > 0 && need <= pool_pages_ && need > *pool_avail) {
+                    if (!qj.pool_wait_logged) {
+                        qj.pool_wait_logged = true;
+                        logI("req {} | queued: the KV pool cannot hold this prompt next to the running requests ({} pages needed, "
+                             "{} free or evictable); it starts when they finish",
+                             qj.id, need, *pool_avail);
+                    }
+                    break;
+                }
+                *pool_avail -= std::min(*pool_avail, need);
             }
             admit.push_back(queue_[qi]);
             queue_.erase(queue_.begin() + static_cast<std::ptrdiff_t>(qi));
@@ -3410,6 +3464,14 @@ void Engine::runLoop() {
 // ---------------------------------------------------------------------------
 // response writing (stream: SSE chunks as tokens arrive; else one JSON body)
 
+// FR-SRV P3-8: a "length" that came from the KV pool, not max_tokens: an extra choice field
+// (absent otherwise; OpenAI clients ignore unknown fields)
+static void appendCause(std::string& b, const Final& f) {
+    if (f.cause.empty()) return;
+    b += ",\"finish_cause\":";
+    appendJsonStr(b, f.cause);
+}
+
 void StreamState::send(const std::string& b) {
     if (gone) return;
     if (!job->w || !job->w->write(b)) fail();
@@ -3554,6 +3616,7 @@ void StreamState::end(Out& out, const Final& f, const Timings& tim, std::uint32_
         b += job->kind == JobKind::chat ? "{}" : "\"\"";
         b += ",\"logprobs\":null,\"finish_reason\":";
         appendJsonStr(b, f.reason);
+        appendCause(b, f);
         b += "}],\"usage\":";
         writeUsage(b, n_prompt, tim);
         b += ",\"timings\":";
@@ -3611,6 +3674,7 @@ void StreamState::end(Out& out, const Final& f, const Timings& tim, std::uint32_
         b += ",\"logprobs\":null,\"finish_reason\":";
     }
     appendJsonStr(b, f.reason);
+    appendCause(b, f);
     b += "}],\"usage\":";
     writeUsage(b, n_prompt, tim);
     b += ",\"timings\":";

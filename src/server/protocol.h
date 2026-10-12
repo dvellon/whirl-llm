@@ -117,7 +117,8 @@ void writeUsage(std::string& out, std::uint32_t n_prompt, const Timings& t);
 const char* statusText(int status);
 // Complete HTTP/1.1 response with Content-Length and Connection: close.
 std::string httpResponse(int status, std::string_view ctype, std::string_view body);
-std::string errorResponse(int status, std::string_view msg);
+// extra_headers: complete header lines (each ending in CRLF), e.g. "Retry-After: 5\r\n"
+std::string errorResponse(int status, std::string_view msg, std::string_view extra_headers = {});
 
 // Random id: prefix + n chars of [a-zA-Z0-9].
 std::string randomId(std::string_view prefix, std::size_t n, std::uint64_t (*next)(void*), void* ctx);

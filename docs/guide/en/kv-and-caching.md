@@ -50,8 +50,11 @@ layer all use the same scheme.
 prefix reuse). Before every prefill chunk and every decode cycle a slot ensures pages up to
 `pos + drafts + 2`. When the pool is empty the least recently used *idle* slot is evicted (its
 prefix cache is dropped and its pages reclaimed — or, with tiers enabled, spilled first, §8).
-If every page is held by running requests, the request ends with `finish_reason: length` (decode)
-or HTTP 500 (prefill). Pages carry reference counts so that shared prefixes (§5) can be mapped
+If every page is held by running requests: a request about to start waits in the queue until the
+pool can hold its prompt next to the running ones (it always starts when it is alone); a decoding
+request ends with `finish_reason: "length"` plus `"finish_cause": "kv_pool_exhausted"` in its
+choice (absent when max_tokens or the context ended it); a prefill that still runs out (decoding
+requests grew into the pages it counted on) is answered HTTP 503 with `Retry-After: 5`, never 500. Pages carry reference counts so that shared prefixes (§5) can be mapped
 read-only into several slots; pages still being read by a background copy go to a quarantine
 list and return to the free list only after the copy's fence.
 
