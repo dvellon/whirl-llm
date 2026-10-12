@@ -1,0 +1,14 @@
+@echo off
+rem Stand-in for whirl.exe used by golden_selftest.ps1 (no GPU). SPDX-License-Identifier: Apache-2.0
+rem Called as: golden MODEL --suite SUITE --MODE --device ARCH
+rem FAKEGOLD_FAIL_SUITE=SUITE: exit 3 for that suite; FAKEGOLD_NOSTEPS=1: header + info lines only.
+if "%FAKEGOLD_FAIL_SUITE%"=="%4" (
+  echo fake: failing suite %4
+  exit /b 3
+)
+echo G header arch=%7 suite=%4 mode=%5
+echo G info fake=1
+if "%FAKEGOLD_NOSTEPS%"=="1" exit /b 0
+echo G step0 ids=1,2,3 lh=aa
+echo G step1 ids=4,5 lh=bb
+exit /b 0

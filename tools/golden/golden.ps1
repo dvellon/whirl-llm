@@ -13,7 +13,8 @@
 # also identified by a hash of its size + first and last 4 MiB (tests/golden/models.txt, written by record).
 # The gate cannot pass vacuously: an empty model / mode / suite list, a run without "G" lines, an
 # empty reference file, or a suite ngram run that never drafted from the n-gram table (ng_cycles=0)
-# is an error (exit 2). The runner clears every WHIRL_* environment variable (a stray WHIRL_HIP_DEVICE
+# is an error (exit 2); a step line is a "G" line other than G model / G header / G info. record writes the
+# references and models.txt only when every case ran. CPU self-test: tools/golden/golden_selftest.ps1. The runner clears every WHIRL_* environment variable (a stray WHIRL_HIP_DEVICE
 # or WHIRL_MODE would change what is measured; --device selects the GPU) and restores them on exit.
 # Suites: single, pair, ngram (forced n-gram MTP drafts on a copy-the-text prompt); all three are the
 # default for both architectures.
@@ -24,7 +25,8 @@ param(
     [string[]]$Modes = @("precise", "balance", "fast"),
     [string[]]$Suites = @(),
     [string]$Exe = "",
-    [string]$Out = ""   # check: also keep the new outputs here (default: a temp folder)
+    [string]$Out = "",  # check: also keep the new outputs here (default: a temp folder)
+    [string]$GoldenRoot = ""  # reference tree (default tests\golden of this checkout; golden_selftest.ps1 uses a temp one)
 )
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -55,7 +57,8 @@ foreach ($v in @(Get-ChildItem Env: | Where-Object { $_.Name -like "WHIRL_*" -an
     [Environment]::SetEnvironmentVariable($v.Name, $null)
 }
 if (-not $env:AMD_LOG_LEVEL) { $env:AMD_LOG_LEVEL = "1" }
-$goldDir = Join-Path $root "tests\golden\$Arch"
+if (-not $GoldenRoot) { $GoldenRoot = Join-Path $root "tests\golden" }
+$goldDir = Join-Path $GoldenRoot $Arch
 if (-not $Out) { $Out = Join-Path ([System.IO.Path]::GetTempPath()) "whirl-golden-$Arch" }
 New-Item -ItemType Directory -Force $Out | Out-Null
 
@@ -102,10 +105,14 @@ function ModelHash([string]$path) {
         return ([BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($all)) -replace "-", "").ToLower()
     } finally { $fs.Dispose() }
 }
-$hashFile = Join-Path $root "tests\golden\models.txt"
+$hashFile = Join-Path $GoldenRoot "models.txt"
 $hashes = @{}
 if (Test-Path $hashFile) { foreach ($l in (Get-Content $hashFile)) { $p = $l -split " "; if ($p.Count -ge 4) { $hashes[$p[0]] = $p } } }
 $hashesChanged = $false
+# step lines: every "G ..." line except the model / header / info lines (a file or run without one proves nothing)
+function StepCount([string[]]$l) { return @($l | Where-Object { $_ -like "G *" -and $_ -notmatch "^G (model|header|info)( |$)" }).Count }
+# record: references are staged here and written with models.txt only when every case ran
+$staged = [ordered]@{}
 
 $fail = 0; $err = 0; $ran = 0; $t0 = Get-Date
 try {
@@ -142,8 +149,8 @@ foreach ($mk in $Models) {
                 continue
             }
             # a run that printed (almost) nothing must not become, or be compared with, a reference
-            if ($glines.Count -lt 2 -or -not ($glines[0] -like "G header *")) {
-                Write-Host ("FAIL  {0,-24} no golden output ({1} G lines)" -f $name, $glines.Count)
+            if ($glines.Count -lt 2 -or -not ($glines[0] -like "G header *") -or (StepCount $glines) -lt 1) {
+                Write-Host ("FAIL  {0,-24} no golden output ({1} G lines, {2} step lines)" -f $name, $glines.Count, (StepCount $glines))
                 $diag | Select-Object -Last 10 | ForEach-Object { Write-Host "      $_" }
                 $err++
                 continue
@@ -159,14 +166,13 @@ foreach ($mk in $Models) {
             $ran++
             $gold = Join-Path $goldDir "$mk\${mode}_$suite.txt"
             if ($Action -eq "record") {
-                New-Item -ItemType Directory -Force (Split-Path $gold) | Out-Null
-                [System.IO.File]::WriteAllLines($gold, [string[]]$lines)
-                Write-Host ("REC   {0,-24} {1} lines, {2:N0} s" -f $name, $lines.Count, $sec)
+                $staged[$gold] = [string[]]$lines
+                Write-Host ("REC   {0,-24} {1} lines, {2:N0} s (staged)" -f $name, $lines.Count, $sec)
                 continue
             }
             if (-not (Test-Path $gold)) { Write-Host "MISS  $name (no golden file $gold; run record)"; $err++; continue }
             $ref = @(Get-Content $gold)
-            if ($ref.Count -lt 3) { Write-Host "FAIL  $name golden file $gold is empty or has no step lines"; $err++; continue }
+            if ((StepCount $ref) -lt 1) { Write-Host "FAIL  $name golden file $gold is empty or has no step lines"; $err++; continue }
             $bad = $null
             for ($i = 0; $i -lt [Math]::Max($ref.Count, $lines.Count); $i++) {
                 $x = if ($i -lt $ref.Count) { $ref[$i] } else { "(missing)" }
@@ -197,8 +203,19 @@ foreach ($mk in $Models) {
 } finally {
     foreach ($k in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $savedEnv[$k]) }
 }
-if ($hashesChanged -and $err -eq 0) {
-    [System.IO.File]::WriteAllLines($hashFile, [string[]]@($hashes.Keys | Sort-Object | ForEach-Object { $hashes[$_] -join " " }))
+# record: the references and models.txt are written together, and only when no case failed (a partial
+# record would leave new references next to a stale model hash)
+if ($Action -eq "record" -and $err -eq 0) {
+    foreach ($gold in $staged.Keys) {
+        New-Item -ItemType Directory -Force (Split-Path $gold) | Out-Null
+        [System.IO.File]::WriteAllLines($gold, $staged[$gold])
+    }
+    if ($hashesChanged) {
+        New-Item -ItemType Directory -Force (Split-Path $hashFile) | Out-Null
+        [System.IO.File]::WriteAllLines($hashFile, [string[]]@($hashes.Keys | Sort-Object | ForEach-Object { $hashes[$_] -join " " }))
+    }
+} elseif ($Action -eq "record" -and $staged.Count -gt 0) {
+    Write-Host "golden record: $err case(s) failed: nothing written ($($staged.Count) staged reference(s) discarded, models.txt unchanged)"
 }
 $tot = ((Get-Date) - $t0).TotalSeconds
 if ($ran -eq 0) { Write-Host "golden: no case ran: refusing to report success"; exit 2 }
