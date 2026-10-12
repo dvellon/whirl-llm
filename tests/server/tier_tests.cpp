@@ -3183,7 +3183,8 @@ static void testCapTightRamEntries(MockDeviceOps& ops, const fs::path& dir) {
 // FIX-CACHE P2-1 (FR-CACHE, cap overrun): b borrows blocks of the LRU SSD-only entry a; b's write makes room
 // by dropping a, which drops b's own copy too. Before: the room was made for fb - old (b's old copy) but the
 // reservation charged the whole new file, so ssd_bytes ended up to one old copy over the cap. Now the room
-// is made again for the whole file.
+// is made again for the whole file; here it cannot be (c, in RAM, is newer than a: its copy is not dropped
+// for a write), so b's write is skipped and the cap holds.
 static void testCapOwnCopyDropped(MockDeviceOps& ops, const fs::path& dir) {
     std::error_code ec;
     fs::remove_all(dir, ec);
@@ -3220,7 +3221,9 @@ static void testCapOwnCopyDropped(MockDeviceOps& ops, const fs::path& dir) {
     t->start(env.cfg(8ull << 30), kLay, fp);
     CHECK(t->ssdEntries() == 3);
     Entry* eb = t->find(b.id);
-    CHECK(eb != nullptr && restoreMatches(*t, ops, eb, b));  // b back in RAM (clean), most recent
+    CHECK(eb != nullptr && restoreMatches(*t, ops, eb, b));  // b back in RAM (clean); raises a (b borrows its blocks)
+    Entry* ec0 = t->find(c.id);
+    CHECK(ec0 != nullptr && restoreMatches(*t, ops, ec0, c));  // c newer than a: a is the LRU victim
     eb = t->find(b.id);
     CHECK(eb != nullptr && eb->in_ram && eb->ssd.has_value());
     if (eb == nullptr || !eb->in_ram || !eb->ssd) return;
@@ -3242,7 +3245,8 @@ static void testCapOwnCopyDropped(MockDeviceOps& ops, const fs::path& dir) {
     CHECK(tickIdle(*t, 3000));
     CHECK(t->ssd_bytes <= t->cfg.ssd_cap && diskBytes(dir) <= t->cfg.ssd_cap);
     eb = t->find(b.id);
-    CHECK(eb != nullptr && eb->ssd.has_value() && !eb->hasDirty());
+    CHECK(eb != nullptr && !eb->ssd.has_value() && eb->in_ram);  // skipped: stays in RAM only
+    CHECK(t->find(c.id) != nullptr && t->find(c.id)->ssd.has_value());
     if (eb) CHECK(restoreMatches(*t, ops, eb, b));
     t.reset();
     fs::remove_all(dir, ec);
