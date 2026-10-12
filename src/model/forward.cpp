@@ -748,6 +748,13 @@ void Model::attnBlock(const AttnW& a, const KvLayer& lkv, u32 n) {
             if (!wide) ng = group(max_q1, groups).first;
             // q4 KV: attn_dq4 (one query per group, GQA group <= 8; lossy fast-mode path)
             const bool dq4 = !wide && max_q1 == 1 && attn_dq4 && k.attn_dq4 != nullptr && grp_q <= 8;
+            // WHIRL_ATTN_WS4=1 (testing only, not the default yet): attn_ws4, the 4-wave pipelined
+            // attn_wsplit1 (same arguments and partial bits for groups of one query)
+            static const bool ws4_env = [] {
+                const char* e = std::getenv("WHIRL_ATTN_WS4");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (ws4_env && !dq4 && !wide && max_q1 == 1 && k.attn_ws4 != nullptr) aw = k.attn_ws4;
             hip::launch(dq4 ? k.attn_dq4 : aw, D(cfg.n_head_kv, n_split, ng), D(dq4 ? 256 : 128), 0, stream, qf, kva, part_ml, part_acc,
                         I(cfg.n_head), I(cfg.n_head_kv), I(2 * hd), pos_buf, scale, gate, groups);
         } else {

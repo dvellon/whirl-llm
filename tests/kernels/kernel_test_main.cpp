@@ -109,10 +109,11 @@ int main(int argc, char** argv) {
     const Fam fams[] = {{"quant", kt::testQuant}, {"gemv", kt::testGemv}, {"gemm", kt::testGemm},
                         {"attn", kt::testAttn},   {"gdn", kt::testGdn},   {"moe", kt::testMoe},
                         {"moemx", kt::testMoeMx}, {"misc", kt::testMisc},   {"attnbench", kt::benchAttn},
-                        {"gemvh", kt::testGemvh}, {"gemvhbench", kt::benchGemvh}, {"dflash", kt::testDflash}};
+                        {"gemvh", kt::testGemvh}, {"gemvhbench", kt::benchGemvh}, {"dflash", kt::testDflash},
+                        {"ws4", kt::testAttnWs4}, {"ws4bench", kt::benchAttnWs4}};
     for (const Fam& f : fams) {
         if (!only.empty() && !only.count(f.name)) continue;
-        if (only.empty() && (std::string(f.name) == "attnbench" || std::string(f.name) == "gemvhbench")) continue;  // timing only, on request
+        if (only.empty() && (std::string(f.name) == "attnbench" || std::string(f.name) == "gemvhbench" || std::string(f.name) == "ws4bench")) continue;  // timing only, on request
         const auto t0 = std::chrono::steady_clock::now();
         std::printf("== %s\n", f.name);
         std::fflush(stdout);

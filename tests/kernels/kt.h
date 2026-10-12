@@ -197,6 +197,8 @@ void testAttn(Ctx& c);
 void testGemvh(Ctx& c);   // "gemvh": bitwise sweep of precise-decode gemvh/gemvh2
 void benchGemvh(Ctx& c);  // "gemvhbench": timing only
 void benchAttn(Ctx& c);  // "attnbench": timing only, run with --only attnbench
+void testAttnWs4(Ctx& c);   // "ws4": gfx1151 attn_ws4 bitwise == attn_wsplit1
+void benchAttnWs4(Ctx& c);  // "ws4bench": timing only, on request
 void testGdn(Ctx& c);
 void testMoe(Ctx& c);
 void testMoeMx(Ctx& c);

@@ -23,6 +23,7 @@
 #include "fused_decode.hip"        // decode fusions (norm+quant, fused DeltaNet)
 #include "misc_rows_norm.hip"      // norms, rope, elementwise
 #include "attn.hip"                // paged KV + decode / split / prefill attention
+#include "attn_ws4.hip"            // 4-wave pipelined split-K decode attention (attn_ws4)
 #include "gdn.hip"                 // Gated DeltaNet, kv_store, argmax
 #include "misc_probe_requant.hip"  // WMMA probes, Q6_K / Q8_0 -> Q4_K requant
 #include "draft_pick.hip"          // 2-bit MTP draft head, token tables, picks
