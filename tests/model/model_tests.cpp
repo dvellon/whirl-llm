@@ -1291,6 +1291,16 @@ void testLoadEstimate() {
         const std::uint64_t e = static_cast<std::uint64_t>(cfg.n_head_kv) * cfg.head_dim, q8 = e + e / 32 * 2;
         check(ev.kv_f16 == 2 * (4 * e) && ev.kv_q8v == 2 * (2 * e + q8) && ev.kv_q8h == 2 * (2 * q8), ("estimate: KV bytes per token" + tag).c_str());
         check(q::kvBytesPerTokenCfg(cfg, false, false, false) == 4 * e, ("kvBytesPerTokenCfg without MTP" + tag).c_str());
+        {
+            // FR-DFL P3-1: --draft dflash skips the MTP block: no nextn weights, no MTP KV layer
+            const q::LoadEstimate en = q::estimateLoad(f, cfg, false, true);
+            const std::string pre = "blk." + std::to_string(cfg.n_layer) + ".";
+            std::uint64_t nextn = 0;
+            for (const gguf::TensorInfo& t : f.tensors())
+                if (t.name.starts_with(pre)) nextn += t.nbytes();
+            check(!en.has_mtp && nextn > 0 && en.weights == all - nextn && en.kv_f16 == 4 * e && en.state == ev.state,
+                  ("estimate (no MTP block): nextn weights and the MTP KV layer not counted" + tag).c_str());
+        }
         // buffers: linear in the batch for multiples of 64, growing with it
         const auto b = [&](std::uint32_t B) { return q::bufferBytes(cfg, B, ev.ffs, ev.max_elems); };
         check(b(4096) - b(2048) == 2 * (b(2048) - b(1024)) && b(1024) - b(512) == b(576) - b(64) && b(64) > 0,

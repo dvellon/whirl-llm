@@ -394,11 +394,12 @@ u64 kvBytesPerTokenCfg(const Config& cfg, bool has_mtp, bool q8, bool kf16, bool
     return layers * ((q8 && !kf16 ? q : e * 2) + (q8 ? q : e * 2));
 }
 
-LoadEstimate estimateLoad(const gguf::File& f, const Config& cfg, bool embd_on_host) {
+LoadEstimate estimateLoad(const gguf::File& f, const Config& cfg, bool embd_on_host, bool no_mtp) {
     LoadEstimate r;
     const gguf::TensorInfo* emb = f.tensor("token_embd.weight");
     r.embd_on_host = embd_on_host && emb != nullptr && f.tensor("output.weight") != nullptr && emb->type != GgmlType::mxfp4;
-    r.has_mtp = cfg.n_nextn > 0 && f.tensor(Loader::bn(cfg.n_layer, "nextn.eh_proj.weight")) != nullptr;
+    r.has_mtp = !no_mtp && cfg.n_nextn > 0 && f.tensor(Loader::bn(cfg.n_layer, "nextn.eh_proj.weight")) != nullptr;
+    const std::string nextn_prefix = "blk." + std::to_string(cfg.n_layer) + ".";  // the MTP block (skipped with no_mtp)
     static constexpr std::string_view mats[] = {"attn_q.weight",  "attn_k.weight",    "attn_v.weight",   "attn_output.weight",
                                                 "attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight",
                                                 "ssm_out.weight", "ffn_gate.weight",  "ffn_up.weight",   "ffn_down.weight",
@@ -406,6 +407,7 @@ LoadEstimate estimateLoad(const gguf::File& f, const Config& cfg, bool embd_on_h
     r.ffs = cfg.n_ff;
     for (const gguf::TensorInfo& t : f.tensors()) {
         if (r.embd_on_host && t.name == "token_embd.weight") continue;
+        if (no_mtp && cfg.n_nextn > 0 && t.name.starts_with(nextn_prefix)) continue;
         r.weights += t.nbytes();
         if (t.type == GgmlType::mxfp4) r.weights += t.rows();  // per-row reference exponents
         // layer matrices of the main blocks (not the nextn block): scratch sizes
@@ -434,6 +436,12 @@ LoadEstimate estimateLoad(const gguf::File& f, const Config& cfg, bool embd_on_h
     r.kv_q8h = kvBytesPerTokenCfg(cfg, r.has_mtp, true, false);
     r.kv_q4 = kvBytesPerTokenCfg(cfg, r.has_mtp, true, false, true);
     return r;
+}
+
+u64 dflashWeightBytes(const gguf::File& draft) {
+    u64 b = 0;
+    for (const gguf::TensorInfo& t : draft.tensors()) b += t.nbytes() + (t.type == GgmlType::mxfp4 ? t.rows() : 0);
+    return b;
 }
 
 std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadStats& stats, const LoadOptions& opt) {

@@ -371,7 +371,10 @@ struct LoadEstimate {
     bool has_mtp = false;       // nextn layer present (one more KV layer)
     std::uint64_t kv_f16 = 0, kv_q8v = 0, kv_q8h = 0, kv_q4 = 0;  // KV bytes per token by format
 };
-LoadEstimate estimateLoad(const gguf::File& f, const Config& cfg, bool embd_on_host);
+// no_mtp: the load skips the MTP (nextn) block (--draft dflash): no nextn weights, no MTP KV layer.
+LoadEstimate estimateLoad(const gguf::File& f, const Config& cfg, bool embd_on_host, bool no_mtp = false);
+// Bytes a DFlash2 drafter's weights take in VRAM (Model::loadDrafter: every tensor, + MXFP4 row refs).
+std::uint64_t dflashWeightBytes(const gguf::File& draft);
 // Prefill / decode buffers of Model::load for prefill batch B.
 // fd_splits: attention split-K partials (resolveFdSplits: 64, 256 with q4 KV, WHIRL_FD_SPLITS).
 std::uint64_t bufferBytes(const Config& cfg, std::uint32_t B, std::uint64_t ffs, std::uint64_t max_elems, std::uint32_t fd_splits = 64);

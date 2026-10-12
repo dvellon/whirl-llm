@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "whirl/dflash_policy.h"
 #include "whirl/model.h"
 
 #include <algorithm>
@@ -70,6 +71,36 @@ inline std::uint32_t dflashSnapSets(bool use_mtp, bool use_dflash, bool replay, 
     if (use_mtp || !use_dflash || replay) return 0;
     const std::uint32_t max_lit = std::max(block > 0 ? block - 1 : 0u, ngram ? qwen35::max_ng_drafts : 0u);
     return literalSnapSets(std::min(max_lit, qwen35::gdn_max_snap), snap_env);
+}
+
+// FR-DFL P3-1: what --draft dflash adds to the VRAM fit check (vram::FitInput::fixed): drafter weights,
+// target-feature capture, per-slot context rings, draft scratch and, without replay, the literal-draft
+// snapshot sets (dflash::memory over the drafter's metadata).
+inline ::whirl::dflash::Mem dflashFitBytes(const qwen35::DFlashConfig& dc, std::uint64_t weights, const qwen35::Config& target,
+                                           std::uint32_t capture_rows, std::uint32_t slots, std::uint32_t snap_sets,
+                                           std::uint64_t snap_set_bytes) {
+    ::whirl::dflash::MemInput in;
+    in.weights = weights;
+    in.n_layer = dc.n_layer;
+    in.n_embd = dc.n_embd;
+    in.n_head = dc.n_head;
+    in.n_head_kv = dc.n_head_kv;
+    in.head_dim = dc.head_dim;
+    in.n_ff = dc.n_ff;
+    in.block = dc.block;
+    in.window = dc.window;
+    in.conv_k = dc.conv_k;
+    in.conv_group = dc.conv_group;
+    in.sel_topk = dc.sel_topk;
+    in.sel_rank = dc.sel_rank;
+    in.n_target_layers = static_cast<std::uint32_t>(dc.target_layers.size());
+    in.target_embd = target.n_embd;
+    in.vocab = target.n_vocab;
+    in.capture_rows = capture_rows;
+    in.slots = slots;
+    in.snap_sets = snap_sets;
+    in.snap_set_bytes = snap_set_bytes;
+    return ::whirl::dflash::memory(in);
 }
 
 }  // namespace whirl::server

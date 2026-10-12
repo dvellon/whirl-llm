@@ -2874,6 +2874,64 @@ void testFrDFlashNoReplay() {
     }
 }
 
+// FR-DFL P3-1: the VRAM fit check counts the DFlash2 drafter (official 27B drafter: weights ~1.9 GiB,
+// capture 200 MiB, 80 MiB of context ring per slot, ~65 MiB scratch, snapshot sets without replay)
+void testDFlashFit() {
+    constexpr std::uint64_t MiB = 1ull << 20, GiB = 1ull << 30;
+    qwen35::DFlashConfig dc;
+    dc.n_layer = 5, dc.n_embd = 5120, dc.n_head = 32, dc.n_head_kv = 8, dc.head_dim = 128, dc.n_ff = 17408;
+    dc.block = 8, dc.window = 2048, dc.conv_k = 2, dc.conv_group = 16, dc.sel_topk = 16, dc.sel_rank = 256;
+    dc.target_layers = {6, 20, 34, 48, 62};
+    qwen35::Config t;
+    t.n_embd = 5120;
+    t.n_vocab = 248320;
+    const std::uint64_t w = 1961 * MiB;
+    const whirl::dflash::Mem m = dflashFitBytes(dc, w, t, 2048, 4, 0, 0);
+    CHECK_EQ(m.weights, w);
+    CHECK_EQ(m.capture, 200 * MiB);                    // 5 target layers x 2048 rows x 5120 x f32
+    CHECK_EQ(m.rings, 4 * (80 * MiB + 2048 * 4));      // per slot: 5 layers x K,V x 2048 rows x 8 x 128 x f32 + positions
+    CHECK_EQ(m.scratch, 67998688u);                    // dflashSetup's draft block + 2048 ingest rows
+    CHECK_EQ(m.snapshots, 0u);
+    CHECK(m.total() > 2 * GiB + 400 * MiB && m.total() < 2 * GiB + 500 * MiB);
+    const whirl::dflash::Mem ms = dflashFitBytes(dc, w, t, 2048, 1, 15, 150 * MiB);  // replay-less: 15 sets
+    CHECK_EQ(ms.snapshots, 15 * 150 * MiB);
+    CHECK_EQ(ms.rings, 80 * MiB + 2048 * 4);
+    // a fit that has room without the drafter is reduced once the drafter is counted
+    vram::FitInput fi;
+    fi.weights = 15 * GiB;
+    fi.fixed = 512 * MiB;
+    fi.buf_per_row = 576 * 1024;
+    fi.buf_fixed = 64 * MiB;
+    fi.ckpt_bytes = 150 * MiB;
+    fi.parallel = 1;
+    fi.kv_per_token = 64 * 1024;
+    fi.pool_min_tokens = 32768;
+    fi.batch = 4096;
+    fi.n_ck = 4;
+    fi.n_spe = 2;
+    fi.avail = vram::fixedNeed(fi, 4096, 4, 2) + 40000ull * fi.kv_per_token;
+    const vram::FitPlan pa = vram::planFit(fi);
+    CHECK(!pa.reduced && pa.fits && pa.pool_tokens >= 39000);
+    vram::FitInput fd = fi;
+    fd.fixed += m.total();
+    const vram::FitPlan pb = vram::planFit(fd);
+    CHECK(pb.reduced);
+    CHECK(pb.batch < 4096 || pb.n_ck < 4);
+#ifdef WHIRL_SOURCE_DIR
+    {
+        // server_main adds it to the fit input before planFit, and decides --draft dflash before that
+        std::ifstream in(std::string(WHIRL_SOURCE_DIR) + "/src/server/server_main.cpp", std::ios::binary);
+        const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const std::size_t choose = src.find("whirl::dflash::choose(src, dm, why, true)");
+        const std::size_t est = src.find("qwen35::estimateLoad(f, cfg, lo.embd_on_host, use_dflash)");
+        const std::size_t add = src.find("fi.fixed += dm.total();");
+        const std::size_t plan = src.find("vram::planFit(fi)");
+        CHECK(choose != std::string::npos && est != std::string::npos && add != std::string::npos && plan != std::string::npos);
+        CHECK(choose < est && est < add && add < plan);
+    }
+#endif
+}
+
 // P3-1: a request arriving after the engine loop has stopped gets 503 at once (no hang)
 void testFrShutdown503() {
     ServerSetup su = baseSetup();
@@ -3094,6 +3152,7 @@ int main(int argc, char** argv) {
         {"fr_pool_decode", testFrPoolDecode},
         {"fr_cross_origin", testFrCrossOrigin},
         {"fr_dflash_noreplay", testFrDFlashNoReplay},
+        {"dflash_fit", testDFlashFit},
         {"fr_shutdown_503", testFrShutdown503},
         {"fr_protocol", testFrProtocol},
         {"fr_stop_tokens", testFrStopTokens},

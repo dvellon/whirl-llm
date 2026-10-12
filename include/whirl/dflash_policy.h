@@ -173,6 +173,38 @@ inline std::uint32_t captureRows(const Params& p, std::uint32_t window, std::uin
 // Ring rows of a slot's drafter context: the drafter's window, 2048 without one.
 inline std::uint32_t ringRows(std::uint32_t window) { return window > 0 ? window : 2048u; }
 
+// VRAM of --draft dflash beyond the target (FR-DFL P3-1: whirl-server's pre-load fit check), following
+// Model::loadDrafter / enableCapture / dflashSetup and the replay-less snapshot sets.
+struct MemInput {
+    std::uint64_t weights = 0;  // dflashWeightBytes()
+    std::uint32_t n_layer = 0, n_embd = 0, n_head = 0, n_head_kv = 0, head_dim = 0, n_ff = 0;
+    std::uint32_t block = 0, window = 0, conv_k = 0, conv_group = 1, sel_topk = 0, sel_rank = 0;
+    std::uint32_t n_target_layers = 0, target_embd = 0, vocab = 0;
+    std::uint32_t capture_rows = 0;  // captureRows()
+    std::uint32_t slots = 1;
+    std::uint32_t snap_sets = 0;           // server::dflashSnapSets() (0 with replay)
+    std::uint64_t snap_set_bytes = 0;      // one set: every DeltaNet layer's conv + ssm state
+};
+struct Mem {
+    std::uint64_t weights = 0, capture = 0, rings = 0, scratch = 0, snapshots = 0;
+    std::uint64_t total() const { return weights + capture + rings + scratch + snapshots; }
+};
+inline Mem memory(const MemInput& in) {
+    using u64 = std::uint64_t;
+    Mem m;
+    const u64 E = in.n_embd, B = in.block, P = B > 0 ? B - 1 : 0, kvw = static_cast<u64>(in.n_head_kv) * in.head_dim;
+    const u64 qw = static_cast<u64>(in.n_head) * in.head_dim, ds = 2ull * in.conv_k * (E / (in.conv_group ? in.conv_group : 1));
+    const u64 ring = ringRows(in.window), K = in.sel_topk, R = in.sel_rank;
+    const u64 ir = std::max<u64>(1, std::min<u64>(in.capture_rows, ring));  // dflashSetup's ingest rows
+    m.weights = in.weights;
+    m.capture = static_cast<u64>(in.n_target_layers) * in.capture_rows * in.target_embd * 4;
+    m.rings = static_cast<u64>(in.slots) * (static_cast<u64>(in.n_layer) * 2 * ring * kvw * 4 + ring * 4);
+    m.scratch = B * 4 * (2 + 5 * E + ds + 2 * qw + 2 * kvw + 2ull * in.n_ff) + P * in.vocab * 4 + P * K * 8 + P * R * 4 + P * K * K * 4 +
+                (1 + P) * 4 + ir * (E + 2 * kvw + 1) * 4;
+    m.snapshots = static_cast<u64>(in.snap_sets) * in.snap_set_bytes;
+    return m;
+}
+
 // Positions p0 .. p0 + m - 1 go to ring rows p % ring: [start, start + first) then [0, second).
 struct RingPieces {
     std::uint32_t start = 0, first = 0, second = 0;
