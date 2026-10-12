@@ -391,8 +391,15 @@ __device__ __forceinline__ void attn_ws4g_impl(const float *q, const KvArgs &kv,
     __shared__ __align__(16) _Float16 Qs[16 * CG][ws4::kQs];
     __shared__ __align__(16) _Float16 Ks[AW_K][ws4::kQs];
     __shared__ __align__(16) _Float16 Vt[ws4::kVtSize];
+    // Sc: scores [tile][kSc]; Ps: p (f16) [tile][kt][lane][8]; As: alpha [tile][16 columns]
+    constexpr int kPs = CG * 2 * 32 * 8, kAs = CG * 16;
+    static_assert(CG * ws4::kScSize * 4 + kPs * 2 + kAs * 4 <= AW_K * ws4::kQs * 2, "Sc / Ps / As fit in Ks");
     __shared__ __align__(16) float ScOwn[kAlias ? 4 : CG * ws4::kScSize];
+    __shared__ __align__(16) _Float16 PsOwn[kAlias ? 8 : kPs];
+    __shared__ __align__(16) float AsOwn[kAlias ? 4 : kAs];
     float *Sc = kAlias ? reinterpret_cast<float *>(&Ks[0][0]) : ScOwn;
+    _Float16 *Ps = kAlias ? reinterpret_cast<_Float16 *>(Sc + CG * ws4::kScSize) : PsOwn;
+    float *As = kAlias ? reinterpret_cast<float *>(Ps + kPs) : AsOwn;
     const int tv = threadIdx.x, lane = tv % WARP, wid = tv / WARP;
     const bool isv = wid >= 4;
     const int tq = tv & 127;
@@ -481,8 +488,10 @@ __device__ __forceinline__ void attn_ws4g_impl(const float *q, const KvArgs &kv,
             *(float4 *)&sp[ws4::sc_addr(qkt, lane, 4)] = (float4){scr[4], scr[5], scr[6], scr[7]};
         }
         ws4_lds_barrier();  // LB1: Sc written
+        // softmax of tile c once, in wave c (its m, l live there); p (f16) and alpha go to LDS
 #pragma unroll
         for (int c = 0; c < CG; ++c) {
+            if (wid != c) continue;
             float8 sc[AW_K / 16];
             const float *sp = Sc + c * ws4::kScSize;
 #pragma unroll
@@ -492,19 +501,30 @@ __device__ __forceinline__ void attn_ws4g_impl(const float *q, const KvArgs &kv,
                 sc[kt] = (float8){a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
             }
             half8 pt[AW_K / 16];
+            // tail chunk: rows before the chunk keep m, l (select)
+            float m2 = m[c], l2 = l[c];
+            const float alpha = aw_softmax_step(sc, pt, k0, lane, mp[c], b1, scale, m2, l2);
+            if (WS4G_NOTAIL || !tail || k0 <= mp[c]) {
+                m[c] = m2;
+                l[c] = l2;
+            }
+#pragma unroll
+            for (int kt = 0; kt < AW_K / 16; ++kt) *(half8 *)&Ps[(c * 2 + kt) * 32 * 8 + lane * 8] = pt[kt];
+            if (lane < 16) As[c * 16 + lane] = alpha;  // same in both half-waves (m, mx reduced over lane ^ 16)
+        }
+        ws4_lds_barrier();  // LBP: p, alpha written
+#pragma unroll
+        for (int c = 0; c < CG; ++c) {
+            half8 pt[AW_K / 16];
+#pragma unroll
+            for (int kt = 0; kt < AW_K / 16; ++kt) pt[kt] = *(const half8 *)&Ps[(c * 2 + kt) * 32 * 8 + lane * 8];
+            const float alpha = As[c * 16 + lane % 16];
             if (WS4G_NOTAIL || !tail) {
-                const float alpha = aw_softmax_step(sc, pt, k0, lane, mp[c], b1, scale, m[c], l[c]);
                 aw_pv<NDT>(o[c], alpha, pt, lane, vfrag);
             } else {
                 // tail chunk: rows before the chunk are skipped (kept by select), rows ending
                 // inside it take the variant P.V (keys past the row's position zeroed in V^T)
-                float m2 = m[c], l2 = l[c];
-                const float alpha = aw_softmax_step(sc, pt, k0, lane, mp[c], b1, scale, m2, l2);
                 const bool act = k0 <= mp[c];
-                if (act) {
-                    m[c] = m2;
-                    l[c] = l2;
-                }
                 half16 pb[AW_K / 16];
 #pragma unroll
                 for (int kt = 0; kt < AW_K / 16; ++kt) pb[kt] = join_halves(pt[kt], lane);
@@ -549,7 +569,7 @@ __device__ __forceinline__ void attn_ws4g_impl(const float *q, const KvArgs &kv,
 #pragma unroll
     for (int c = 0; c < CG; ++c) {
         if (!cvalid[c]) continue;
-        if (wid == 0 && lane < 16) {
+        if (wid == c && lane < 16) {  // the tile's softmax wave
             part_ml[ct[c] * ml_q + ((size_t)split * n_head + ch[c]) * 2 + 0] = m[c];
             part_ml[ct[c] * ml_q + ((size_t)split * n_head + ch[c]) * 2 + 1] = l[c];
         }

@@ -535,12 +535,34 @@ void testAttnWs4g(Ctx& c) {
     for (int i = 0; i < 8; ++i) ctxs.push_back(1 + static_cast<int>(c.rng() % static_cast<std::uint64_t>(maxpos)));
     const std::vector<float> q = c.randn(static_cast<std::size_t>(32) * kH * kQStr);
     Buf dq(q);
+    // WHIRL_KT_WS4G_HSACO: attn_ws4g* from this code object instead (mutation check of the test:
+    // a build with -DWS4G_NOTAIL=1 must fail)
+    std::vector<char> ximg;
+    hip::Module xmod;
+    bool have_x = false;
+    if (const char* e = std::getenv("WHIRL_KT_WS4G_HSACO")) {
+        if (std::FILE* fp = std::fopen(e, "rb")) {
+            std::fseek(fp, 0, SEEK_END);
+            ximg.resize(static_cast<std::size_t>(std::ftell(fp)));
+            std::fseek(fp, 0, SEEK_SET);
+            if (std::fread(ximg.data(), 1, ximg.size(), fp) != ximg.size()) ximg.clear();
+            std::fclose(fp);
+        }
+        if (!ximg.empty()) {
+            xmod = hip::Module::loadData(ximg.data(), c.mod.arch());
+            have_x = true;
+            std::printf("   attn_ws4g* from %s\n", e);
+        }
+    }
     for (F f : {F::f16, F::q8}) {
         const std::string tag = std::string(" [kv ") + fname(f) + "]";
         const auto fold = c.fnOpt(std::string("attn_wsplit1") + fsuf(f));
         const auto fsolo = c.fnOpt(std::string("attn_ws4") + fsuf(f));
         hip::Function fg[4];
-        for (int cg = 1; cg <= 3; ++cg) fg[cg] = c.fnOpt(std::string("attn_ws4g") + std::to_string(cg) + fsuf(f));
+        for (int cg = 1; cg <= 3; ++cg) {
+            const std::string nm = std::string("attn_ws4g") + std::to_string(cg) + fsuf(f);
+            fg[cg] = have_x ? xmod.getFunctionOpt(nm.c_str()) : c.fnOpt(nm);
+        }
         if (!fold || !fsolo || !fg[1] || !fg[2] || !fg[3]) {
             c.rep.skip("ws4g", std::string("attn_ws4g") + fsuf(f), "kernels not in this code object");
             continue;
