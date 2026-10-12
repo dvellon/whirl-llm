@@ -281,6 +281,8 @@ std::optional<KvMode> kvModeFromEnv();
 
 // ---- DFlash2 block-diffusion drafter (arch "dflash"; z-lab DFlash2, llama.cpp names):
 // loaded next to the target (WHIRL_DRAFT_MODEL), drafts with `--draft dflash`.
+// Most drafter layers accepted (FR-DFL P2-1; the official DFlash2 drafters have 5).
+inline constexpr std::uint32_t kDFlashMaxLayers = 64;
 struct DFlashConfig {
     std::uint32_t n_layer = 0, n_embd = 0, n_head = 0, n_head_kv = 0, head_dim = 0, n_ff = 0;
     std::uint32_t block = 0, conv_k = 0, conv_group = 0, sel_rank = 0, sel_topk = 0, window = 0;

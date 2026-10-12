@@ -339,6 +339,77 @@ MtpDefaults mtpDefaults(bool moe, hip::Arch arch) {
     return {8, 0.0f, 0, true};
 }
 
+namespace {
+
+// FIX-DFL (FR-DFL P2-1): the drafter forward (src/model/dflash.cpp) sizes its scratch, rings and kernel
+// launches from the metadata (DFlashConfig), while Loader::mat / vec upload whatever shape the file has
+// and matmul writes w.nrows outputs per row. Any tensor that disagrees with the metadata would write past
+// a scratch buffer or make a kernel read past a weight. So every tensor must have exactly the shape the
+// metadata gives (like Config::validateTensors for the target), matrices a known type whose rows cut into
+// whole blocks, vectors f32. Headers only: a mismatch is refused before anything is loaded and the caller
+// keeps the MTP drafts (dflashIncompatible -> dflash::choose).
+void validateDFlashTensors(const DFlashConfig& c, const gguf::File& f) {
+    using u64 = std::uint64_t;
+    using Shape = std::array<u64, 4>;
+    auto bad = [](const std::string& what) { throw ModelError("DraftModelMismatch", what); };
+    // block_count: at least one layer (dflashSetup reads layers[0]), at most kDFlashMaxLayers (the
+    // official drafters have 5; a huge count would allocate rings for nothing)
+    if (c.n_layer == 0 || c.n_layer > kDFlashMaxLayers)
+        bad("block_count " + std::to_string(c.n_layer) + " (1.." + std::to_string(kDFlashMaxLayers) + " supported)");
+    if (c.head_dim % 2 != 0) bad("head_dim " + std::to_string(c.head_dim) + " is odd (RoPE rotates pairs)");
+    if (c.n_ff == 0) bad("feed_forward_length 0");
+    auto fmt = [](const Shape& s) {
+        std::uint32_t nd = 4;
+        while (nd > 1 && s[nd - 1] == 1) --nd;
+        std::string r = "[";
+        for (std::uint32_t d = 0; d < nd; ++d) r += (d ? ", " : "") + std::to_string(s[d]);
+        return r + "]";
+    };
+    auto shape = [&](const std::string& name, Shape want) -> const gguf::TensorInfo& {
+        const gguf::TensorInfo* ti = f.tensor(name);
+        if (!ti) bad("missing tensor " + name);
+        const Shape got = {ti->ne[0], ti->ne[1], ti->ne[2], ti->ne[3]};
+        if (got != want) bad(name + " is " + fmt(got) + ", expected " + fmt(want) + " from the drafter's metadata");
+        return *ti;
+    };
+    auto mat = [&](const std::string& name, u64 ncols, u64 nrows) {
+        const gguf::TensorInfo& ti = shape(name, {ncols, nrows, 1, 1});
+        if (ti.nbytes() == 0) bad(name + ": type " + gguf::typeName(ti.type) + " with row length " + std::to_string(ncols));
+    };
+    auto vec = [&](const std::string& name, Shape want) {
+        const gguf::TensorInfo& ti = shape(name, want);
+        if (ti.type != GgmlType::f32) bad(name + ": type " + gguf::typeName(ti.type) + " (f32 expected)");
+    };
+    const u64 E = c.n_embd, HD = c.head_dim, QW = static_cast<u64>(c.n_head) * HD, KW = static_cast<u64>(c.n_head_kv) * HD;
+    const u64 F = c.n_ff, K = c.conv_k, DS = 2 * K * (E / c.conv_group);
+    vec("enc.output_norm.weight", {E, 1, 1, 1});
+    vec("output_norm.weight", {E, 1, 1, 1});
+    mat("selector_hidden.weight", E, c.sel_rank);
+    for (std::uint32_t il = 0; il < c.n_layer; ++il) {
+        auto n = [il](const char* s) { return "blk." + std::to_string(il) + "." + s; };
+        vec(n("attn_norm.weight"), {E, 1, 1, 1});
+        vec(n("ffn_norm.weight"), {E, 1, 1, 1});
+        vec(n("attn_q_norm.weight"), {HD, 1, 1, 1});
+        vec(n("attn_k_norm.weight"), {HD, 1, 1, 1});
+        mat(n("attn_q.weight"), E, QW);
+        mat(n("attn_k.weight"), E, KW);
+        mat(n("attn_v.weight"), E, KW);
+        mat(n("attn_output.weight"), QW, E);
+        mat(n("ffn_gate.weight"), E, F);
+        mat(n("ffn_up.weight"), E, F);
+        mat(n("ffn_down.weight"), F, E);
+        // dynamic convolution: projection rows = 2 sides x K taps x (E / group) channels (dflash_conv reads
+        // dyn[t * ds + c / group + G (tap + K side)]; dflashSetup sizes dyn from layer 0), static kernels
+        // [E][K][2] (base[(side K + tap) E + c])
+        mat(n("attn_conv_proj.weight"), E, DS);
+        mat(n("ffn_conv_proj.weight"), E, DS);
+        vec(n("attn_conv_base"), {E, K, 2, 1});
+        vec(n("ffn_conv_base"), {E, K, 2, 1});
+    }
+}
+
+}  // namespace
+
 DFlashConfig DFlashConfig::fromGguf(const gguf::File& f) {
     const std::string arch(f.getStringOr("general.architecture", ""));
     if (arch != "dflash") throw ModelError("UnsupportedArch", "draft model general.architecture = '" + arch + "' (expected dflash)");
@@ -389,6 +460,7 @@ void DFlashConfig::validate(const Config& t, const gguf::File& f) const {
             " keys > the drafter attention limit " + std::to_string(kernels::kDFlashMaxKeys));
     if (head_dim > 256) bad("head_dim " + std::to_string(head_dim) + " > 256 (one thread per dimension)");
     if (sel_topk > 16) bad("selector top-k " + std::to_string(sel_topk) + " > 16 (dflash_lattice: 32 x top-k threads <= 512)");
+    validateDFlashTensors(*this, f);  // FIX-DFL (FR-DFL P2-1): every tensor's shape / type
     const gguf::TensorInfo* fc = f.tensor("fc.weight");
     if (!fc || fc->ne[0] != static_cast<std::uint64_t>(target_layers.size()) * n_embd || fc->ne[1] != n_embd)
         bad("fc.weight is not [" + std::to_string(target_layers.size() * n_embd) + ", " + std::to_string(n_embd) + "]");
