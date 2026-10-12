@@ -1815,12 +1815,11 @@ struct ChatBuild {
     }
 };
 
-// FIX-CACHE P3-3 / P2-4 (FR-CACHE), the agent pattern on one slot: the main agent's long session goes idle
-// while a subagent with the same system prompt (another task) runs two turns; then the main agent resumes.
-// supersede 0: WHIRL_KV_SUPERSEDE=0 (P3-3: before, the subagent's spill overwrote the main session's entry
-// in place from the system prompt on -- the slot owned it -- so the main session was gone from the tiers);
-// supersede 1: on (P2-4: before, the subagent's second turn cut the idle main entry to the system prompt).
-// Now the main session is restored whole from the RAM tier (exact output).
+// FIX-CACHE P2-4 (FR-CACHE), the agent pattern on one slot: the main agent's long session goes idle while a
+// subagent with the same system prompt (another task) runs two turns; then the main agent resumes.
+// supersede 1: before, the subagent's second turn cut the idle main entry to the system prompt (verified:
+// resumed with 2505 cached of 8513); now it is only demoted and restored whole (exact output).
+// supersede 0 (WHIRL_KV_SUPERSEDE=0): the baseline the demotion must match.
 void testAgentIdleMain(bool supersede) {
     ServerSetup su = baseSetup();
     su.mc.parallel = 1;
@@ -1830,8 +1829,8 @@ void testAgentIdleMain(bool supersede) {
     su.tier_min = 512;
     su.eo.kv_supersede = supersede;
     const ChatBuild cb;
-    const auto main1 = cb.conv(1000, 901, {{6000, 902}});
-    const auto sub1 = cb.conv(1000, 901, {{500, 903}});
+    const auto main1 = cb.conv(2500, 901, {{6000, 902}});
+    const auto sub1 = cb.conv(2500, 901, {{500, 903}});
     TestServer srv(su);
     g_log.clear();
     const auto out_m1 = srv.model().greedyReference(main1, 40, true);
@@ -1857,6 +1856,48 @@ void testAgentIdleMain(bool supersede) {
 void testAgentIdleMainNoSupersede() { testAgentIdleMain(false); }
 void testAgentIdleMainSupersede() { testAgentIdleMain(true); }
 
+// FIX-CACHE P3-3 (FR-CACHE): a branch from an earlier turn (edit an earlier message) restores a long
+// session's inner checkpoint and takes the entry over (owner). Before: its spill updated the entry in place
+// from the branch point, so the original later turns were gone from the tiers. Now the branch gets a new
+// entry and the original session is restored whole when it resumes.
+void testBranchFromEarlierTurn() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 16384;
+    su.mc.pool_tokens = 16384;
+    su.tier = true;
+    su.tier_min = 512;
+    su.eo.n_ck = 4;
+    const ChatBuild cb;
+    const auto t1 = cb.conv(2500, 921, {{3000, 922}});
+    TestServer srv(su);
+    g_log.clear();
+    const auto o1 = srv.model().greedyReference(t1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(t1, 40))), decode(o1));
+    const auto t2 = cb.next(t1, o1, 6000, 923);
+    const auto o2 = srv.model().greedyReference(t2, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(t2, 40))), decode(o2));
+    // another conversation takes the slot (the session goes to the RAM tier)
+    const auto u = makePrompt(3000, 924);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(u, 40))), decode(srv.model().greedyReference(u, 40, true)));
+    // the branch: turn 2 edited (shares turn 1 only)
+    const auto b2 = cb.next(t1, o1, 300, 925);
+    auto rb = srv.post("/v1/completions", completionBody(b2, 40));
+    CHECK_EQ(completionText(rb), decode(srv.model().greedyReference(b2, 40, true)));
+    const std::uint64_t restores_b = srv.tierp()->stats.restores_ram;
+    // the original session resumes
+    const auto t3 = cb.next(t2, o2, 200, 926);
+    auto r = srv.post("/v1/completions", completionBody(t3, 40));
+    CHECK_EQ(completionText(r), decode(srv.model().greedyReference(t3, 40, true)));
+    std::fprintf(stderr, "  (branch: branch cached %llu, restores after branch %llu; original resumed with %llu cached of %zu)\n",
+                 static_cast<unsigned long long>(cachedTokens(rb)), static_cast<unsigned long long>(restores_b),
+                 static_cast<unsigned long long>(cachedTokens(r)), t2.size());
+    CHECK(restores_b >= 1);                 // the branch did restore turn 1 from the tier
+    CHECK(cachedTokens(rb) >= t1.size());
+    CHECK(cachedTokens(r) >= t2.size());    // the original later turn survived
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+
 // FIX-CACHE P2-4: an agent's compress (same system prompt and first task message, the middle history
 // dropped, a short summary) still cuts the old session to the shared part (same task lineage).
 void testSupersedeCompressCuts() {
@@ -1867,8 +1908,8 @@ void testSupersedeCompressCuts() {
     su.tier = true;
     su.tier_min = 512;
     const ChatBuild cb;
-    const auto old1 = cb.conv(1000, 911, {{500, 912}, {8000, 913}});
-    auto c1 = cb.conv(1000, 911, {{500, 912}, {300, 914}});
+    const auto old1 = cb.conv(2500, 911, {{500, 912}, {8000, 913}});
+    auto c1 = cb.conv(2500, 911, {{500, 912}, {300, 914}});
     TestServer srv(su);
     g_log.clear();
     const auto out_o = srv.model().greedyReference(old1, 40, true);
@@ -2312,6 +2353,7 @@ int main(int argc, char** argv) {
         {"restore_throws", testRestoreThrows},
         {"tier_inplace", testTierInPlaceRegen},
         {"ckpts_clamp", testServeCkptsClamp},
+        {"branch_turn", testBranchFromEarlierTurn},
         {"agent_idle_main", testAgentIdleMainNoSupersede},
         {"agent_idle_main_sup", testAgentIdleMainSupersede},
         {"supersede_compress", testSupersedeCompressCuts},
