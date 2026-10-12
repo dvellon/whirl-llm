@@ -1084,6 +1084,30 @@ void testDocQa() {
         CHECK_EQ(srv.model().poison(), 0u);
         CHECK_EQ(srv.model().hidMismatch(), 0u);
     }
+    // a follow-up turn first (its prompt-end / gen-end fill the set), then a new conversation with
+    // another question about the same document: the slot policy kept the first request's tail
+    for (const Case c : {Case{1, 4, true}, Case{2, 3, true}}) {
+        TestServer srv(tailSetup(c.np, c.n_ck, c.tail));
+        const auto doc = makePrompt(12000, 95);
+        const auto q1 = makePrompt(12100, 530, doc);
+        auto r1 = srv.post("/v1/completions", completionBody(q1, 24));
+        auto out1 = srv.model().greedyReference(q1, 24, true);
+        CHECK_EQ(completionText(r1), decode(out1));
+        std::vector<std::uint32_t> t2 = q1;
+        t2.insert(t2.end(), out1.begin(), out1.end());
+        t2 = makePrompt(static_cast<std::uint32_t>(t2.size() + 150), 531, t2);
+        auto r2 = srv.post("/v1/completions", completionBody(t2, 24));
+        CHECK_EQ(completionText(r2), decode(srv.model().greedyReference(t2, 24, true)));
+        CHECK(cachedTokens(r2) >= q1.size());  // gen-end of turn 1
+        const auto q2 = makePrompt(12090, 532, doc);
+        auto r3 = srv.post("/v1/completions", completionBody(q2, 24));
+        CHECK_EQ(completionText(r3), decode(srv.model().greedyReference(q2, 24, true)));
+        CHECK_EQ(cachedTokens(r3), coldTail(q1.size()));  // turn 1's tail, kept over its prompt-end
+        if (g_verbose)
+            std::printf("  doc_qa follow-up np %u: turn 2 cached %llu, new question cached %llu\n", c.np,
+                        (unsigned long long)cachedTokens(r2), (unsigned long long)cachedTokens(r3));
+        CHECK_EQ(srv.model().poison(), 0u);
+    }
 }
 
 // TAIL-CK bitwise guard: the tail checkpoint must sit on the cold chunk schedule. The mock's
