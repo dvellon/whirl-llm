@@ -305,15 +305,20 @@ std::optional<std::vector<ToolCall>> parseToolCalls(std::string_view region, con
         if (s == std::string_view::npos) break;
         const std::string_view after = rest.substr(s + 11);
         const std::size_t e = after.find("</tool_call>");
-        const std::string_view inner = trimWs(e != std::string_view::npos ? after.substr(0, e) : after);
-        rest = e != std::string_view::npos ? after.substr(e + 12) : std::string_view();
+        const bool closed = e != std::string_view::npos;
+        const std::string_view inner = trimWs(closed ? after.substr(0, e) : after);
+        rest = closed ? after.substr(e + 12) : std::string_view();
         if (startsWith(inner, "<function=")) {
             const std::size_t gt = inner.find('>');
             if (gt == std::string_view::npos) return std::nullopt;
             const std::string_view name = trimWs(inner.substr(10, gt - 10));
             if (name.empty()) return std::nullopt;
             std::string_view body = inner.substr(gt + 1);
-            if (const std::size_t k = body.find("</function>"); k != std::string_view::npos) body = body.substr(0, k);
+            const std::size_t fe = body.find("</function>");
+            // FR-SRV P2-1: a call cut before its end (max_tokens, a stop string, a full KV pool) is not a
+            // call: without </tool_call> it must at least be closed by </function>
+            if (!closed && fe == std::string_view::npos) return std::nullopt;
+            if (fe != std::string_view::npos) body = body.substr(0, fe);
             json::Object obj;
             for (;;) {
                 const std::size_t ps = body.find("<parameter=");
@@ -324,8 +329,9 @@ std::optional<std::vector<ToolCall>> parseToolCalls(std::string_view region, con
                 const std::string_view pname = trimWs(b2.substr(0, pg));
                 std::string_view vtext = b2.substr(pg + 1);
                 const std::size_t pe = vtext.find("</parameter>");
-                body = pe != std::string_view::npos ? vtext.substr(pe + 12) : std::string_view();
-                if (pe != std::string_view::npos) vtext = vtext.substr(0, pe);
+                if (pe == std::string_view::npos) return std::nullopt;  // a truncated value (FR-SRV P2-1)
+                body = vtext.substr(pe + 12);
+                vtext = vtext.substr(0, pe);
                 if (startsWith(vtext, "\n")) vtext.remove_prefix(1);
                 if (endsWith(vtext, "\n")) vtext.remove_suffix(1);
                 const auto ty = toolParamType(tools, name, pname);
@@ -340,6 +346,7 @@ std::optional<std::vector<ToolCall>> parseToolCalls(std::string_view region, con
             }
             calls.push_back({std::string(name), json::dumpPython(json::Value(std::move(obj)), true)});
         } else if (startsWith(inner, "{")) {
+            if (!closed) return std::nullopt;  // FR-SRV P2-1: a JSON call needs its </tool_call>
             json::Value v;
             try {
                 v = json::parse(inner);
@@ -367,7 +374,12 @@ ToolResolution resolveTools(const Out::View& v, std::string_view reason_in, cons
     if (v.stopped) r.reason = "stop";
     r.content = std::string(v.content);
     if (v.tool) {
-        if (auto calls = parseToolCalls(*v.tool, tools)) {
+        // FR-SRV P2-1: a generation cut by max_tokens (or a full KV pool) is never returned as tool calls,
+        // even when the calls so far parse: a later call or argument may be missing. The tool region
+        // stays text and finish_reason stays "length" (an agent must not run half a command).
+        std::optional<std::vector<ToolCall>> calls;
+        if (r.reason != "length") calls = parseToolCalls(*v.tool, tools);
+        if (calls) {
             r.calls = std::move(calls);
             r.reason = "tool_calls";
         } else {
