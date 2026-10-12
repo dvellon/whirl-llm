@@ -68,7 +68,7 @@ To be precise about what this means:
 | Driver | **AMD Software: Adrenalin Edition 26.8.1** (driver 32.0.31041.1004) or newer |
 | To run | only the driver (it installs `amdhip64_7.dll` and `amd_comgr_3.dll`). No HIP SDK, no ROCm, no Visual C++ runtime |
 | To build from source | HIP SDK 7.2 + Visual Studio 2022 Build Tools (MSVC) + CMake + Ninja — see [building.md](docs/building.md) |
-| Memory / disk | the server pins about 1/4 of host RAM (8–32 GiB; 16 GiB on a 64 GB PC) for the RAM cache tier and may use up to 64 GiB of SSD for the SSD tier by default; both are adjustable or can be turned off (`--kv-ram-mb`, `--kv-ssd-gb`). On the Radeon 8060S both tiers are off by default (its KV pool already lives in system memory) |
+| Memory / disk | the server pins about 1/4 of host RAM (8–32 GiB; 16 GiB on a 64 GB PC) for the RAM cache tier and may use up to 64 GiB of SSD for the SSD tier by default; both are adjustable or can be turned off (`--kv-ram-mb`, `--kv-ssd-gb`). On the Radeon 8060S the RAM tier is 1/8 of the OS-visible RAM (8 GiB on a 64 GB machine; off under 32 GB) and the SSD tier writes only at shutdown |
 
 Our test machine connects the R9700 as a USB4 / Thunderbolt eGPU; that works. Numbers on a card in a direct PCIe slot may differ slightly (mostly where data crosses the host link, such as model loading and the RAM / SSD tiers).
 

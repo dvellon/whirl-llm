@@ -214,10 +214,17 @@ pool ~341k tokens.
 
 **Radeon 8060S (unified memory) defaults.** The server's KV pool defaults to 262,144 tokens
 (f16 for every model: 17 GiB for the dense 27B) instead of "all VRAM left": on a 100 GiB UMA device
-the left-over would be most of system memory. The host tiers are **off** by default there: the RAM
-tier would copy KV pages from system memory to pinned system memory (no capacity gained, ~9 GiB of
-the CPU's share pinned), and the SSD tier hangs off the RAM tier. `--kv-ram-mb N` turns both on; the
-tier gates (`sys`, `restore_conc`, `tier`, `pool`) pass on the 8060S that way. Decided from the
+the left-over would be most of system memory. The host tiers are **on** by default there since 0.2.0
+(TIER-8S-DEF); they used to be off on the argument that the KV pool already is system memory, which
+does not hold on Windows: the BIOS splits the VRAM carve-out (the KV pool) from the OS RAM, the RAM
+tier is separate pinned OS memory, and a restore is a real copy. Measured (Qwen3.8-27B Q4_K_M,
+balance, 128k session): cold prefill 537 s, RAM-tier restore 0.34 s, SSD-tier restore after a restart
+2 s, decode speed unchanged. Size rule, from the OS-visible RAM only (not the 128 GB total):
+`clamp(OS-visible RAM / 8, one max-context entry (about 6 GiB for 27B at 262k), 16 GiB)`, at most 1/4
+of the RAM available at startup, off under 32 GB of OS-visible RAM; 8 GiB on a 64 GB machine. The
+startup log prints the size and the reason. The SSD tier runs in `shutdown` mode (no writes while
+running). `--kv-ram-mb N` / `WHIRL_KV_RAM_MB` are used as given, `--kv-ram-mb 0` turns both host tiers
+off, `--kv-ssd-gb 0` or `--kv-ssd-mode off` only the SSD tier. Decided from the
 capability `DeviceInfo::integrated`, not the architecture.
 
 ## <a id="checkpoints"></a>5. Prefix caching for a hybrid model: checkpoints
@@ -394,7 +401,7 @@ then KV page j at `nck × ck_stride + j × page_bytes` (13.0 MiB per page for q8
   32 GiB (the minimum wins over the cap), and at most half of the RAM available at startup (whole GiB;
   logged as a warning when it bites; under 1 GiB the tier is off) so pinning does not push the
   machine into paging. **16 GiB on a 64 GB PC.** `--kv-ram-mb N` / `WHIRL_KV_RAM_MB` are used as
-  given; on an integrated GPU (shared system memory) the tier is off unless a size is given. Why: in
+  given. On an integrated GPU (Radeon 8060S) the rule is different, see the 8060S section below. Why: in
   agent use (Hermes, 30–40k-token sessions, subagents) the 9 GiB default was 8.3 GiB full within an
   hour, after which LRU entries fell back to their slower SSD copies. The startup log line
   `kv tier: RAM tier size N MiB (reason)` shows the choice; the summary line shows the pinning time

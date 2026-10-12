@@ -146,7 +146,9 @@ const char* kHelpBody =
     "  --kv-ram-mb N            host RAM tier of the prefix cache in MiB of pinned memory (default: 1/4\n"
     "                           of physical RAM, at least 8 GiB or one full-length session, at most\n"
     "                           32 GiB, and at most half of the RAM available at startup; 0 = no host\n"
-    "                           tiers; Radeon 8060S: default 0, its KV pool already is system memory).\n"
+    "                           tiers; Radeon 8060S: OS-visible RAM / 8, at least one max-context entry,\n"
+    "                           at most 16 GiB and 1/4 of the RAM available at startup, off under 32 GB\n"
+    "                           of OS-visible RAM; the BIOS VRAM carve-out does not count).\n"
     "                           Idle sessions are copied there and restored instead of prefilled again\n"
     "  --kv-ssd-dir PATH        SSD tier directory (default %LOCALAPPDATA%\\whirl\\kvcache)\n"
     "  --kv-ssd-gb N            SSD tier size cap in GiB (default 64; 0 = no SSD tier)\n"
@@ -912,19 +914,24 @@ int serveMain(int argc, char** argv, const char* program) {
 
         // host tiers, VRAM side first (tier stream, pinned arena mapped for the
         // GPU): the KV pool below is sized after it
+        std::uint64_t entry_mb = 0;  // one max-context entry, whole GiB (floor of the integrated-GPU rule)
         const std::uint64_t ram_def = [&] {
             const std::uint64_t ck_stride = alignUp(n_gdn * (conv_bytes + ssm_bytes) + static_cast<std::uint64_t>(cfg.n_embd) * 4 +
                                                         static_cast<std::uint64_t>(V) * 4,
                                                     tier::block_bytes);
             const std::uint64_t full = static_cast<std::uint64_t>(slot_ctx) * model.kvBytesPerTokenFmt(false, false) + n_ck * ck_stride;
-            return std::max(tier::ram_auto_min_mb, alignUp(full, 1ull << 30) >> 20);
+            entry_mb = alignUp(full, 1ull << 30) >> 20;
+            return std::max(tier::ram_auto_min_mb, entry_mb);
         }();
         // size: explicit (--kv-ram-mb / WHIRL_KV_RAM_MB), else 1/4 of physical RAM
         // within [ram_def, 32 GiB] and at most half of the RAM available now;
-        // integrated GPU: the KV pool already lives in system memory, so the RAM
-        // tier (and the SSD tier behind it) is off unless asked for explicitly
+        // integrated GPU: OS-visible RAM / 8 within [one max-context entry, 16 GiB], at most
+        // 1/4 of the RAM available now, off under 32 GB. The KV pool there is the BIOS
+        // carve-out (separate from the OS RAM on Windows); the tier is extra pinned OS RAM,
+        // and a restore from it (and from the SSD tier behind it) replaces a prefill
         tier::RamTierInput rin;
         rin.floor_mb = ram_def;
+        rin.entry_mb = entry_mb;
         rin.integrated = info.integrated;
         if (opt.kv_ram_mb) {
             rin.explicit_mb = *opt.kv_ram_mb;

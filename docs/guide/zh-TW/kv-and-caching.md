@@ -133,10 +133,14 @@ f16 副本放在 attention 期間閒置的 prefill 緩衝區（預設 prefill ba
 由此得出的 server 預設：dense 27B → `--parallel 4`、每個請求 ≤ 131,072 token（`--ctx-per-slot`，上限 262,144）、balance 用 q8h（BAL-Q8 之前是 q8v）。MoE → f16、每個請求 131,072、池約 341k token。
 
 **Radeon 8060S（統一記憶體）的預設。** server 的 KV pool 預設 262,144 token（每個模型都是 f16：dense 27B 為
-17 GiB），而不是「剩下的全部 VRAM」：在 100 GiB 的 UMA 裝置上，剩下的就是大部分系統記憶體。那裡的 host 層預設**關閉**：
-RAM 層只會把 KV 頁從系統記憶體複製到 pinned 系統記憶體（容量沒有增加，還鎖住 CPU 那份約 9 GiB），而 SSD 層掛在 RAM
-層後面。`--kv-ram-mb N` 會把兩層都打開；這樣在 8060S 上 tier 相關 gate（`sys`、`restore_conc`、`tier`、`pool`）都通過。
-判斷依據是 `DeviceInfo::integrated` 這個能力，而不是架構名稱。
+17 GiB），而不是「剩下的全部 VRAM」：在 100 GiB 的 UMA 裝置上，剩下的就是大部分系統記憶體。那裡的 host 層自 0.2.0 起**預設開啟**
+（TIER-8S-DEF）。先前預設關閉的理由（「KV pool 本來就在系統記憶體」）在 Windows 上不成立：BIOS 把 VRAM 保留區和作業系統
+記憶體分開，KV pool 在保留區，RAM 層是另外 pin 住的作業系統記憶體，還原是一次真正的複製。實測（Qwen3.8-27B Q4_K_M，balance，
+128k）：冷 prefill 537 s、從 RAM 層還原 0.34 s、重啟後從 SSD 層還原 2 s，decode 速度不變。RAM 層大小的規則（只看作業系統可見
+記憶體，不看 128 GB 的總量）：`clamp(可見記憶體 / 8, 一個最大 context 條目, 16 GiB)`，且不超過啟動時可用記憶體的 1/4；可見記憶體
+低於 32 GB 則關閉，啟動日誌會寫明大小與原因。64 GB 的電腦為 8 GiB（實際多佔 8 GiB 作業系統記憶體）。SSD 層預設
+`--kv-ssd-mode shutdown`（執行中不寫碟，優雅關閉時才寫）。`--kv-ram-mb N` / `WHIRL_KV_RAM_MB` 照給定值；`--kv-ram-mb 0` 關閉兩層，
+`--kv-ssd-gb 0` 或 `--kv-ssd-mode off` 只關 SSD 層。判斷依據是 `DeviceInfo::integrated` 這個能力，而不是架構名稱。
 
 ## <a id="checkpoints"></a>5. 混合模型的前綴快取：檢查點
 
