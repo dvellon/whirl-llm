@@ -642,6 +642,12 @@ void testVramLimit() {
         }
     }
     CHECK_EQ(vram::min_prefill_batch, 1280u);
+    // the same floor for a user-set WHIRL_PREFILL_BATCH (REVIEW-RC4-C P2-3)
+    CHECK_EQ(vram::prefillBatchFloor(1u), 1280u);
+    CHECK_EQ(vram::prefillBatchFloor(512u), 1280u);
+    CHECK_EQ(vram::prefillBatchFloor(1279u), 1280u);
+    CHECK_EQ(vram::prefillBatchFloor(1280u), 1280u);
+    CHECK_EQ(vram::prefillBatchFloor(4096u), 4096u);
 }
 
 // server defaults by card size (vram::cardDefaults)

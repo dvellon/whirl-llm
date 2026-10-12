@@ -390,19 +390,31 @@ void MockModel::reset() {
     s.pend.clear();
 }
 
+// one prefill forward of n rows: the real model's limit (forward.cpp: n > max_batch -> BatchTooLarge)
+void MockModel::prefillRows(std::size_t n) {
+    if (n == 0 || n > mc_.max_batch) throw std::runtime_error("BatchTooLarge");
+    const auto r = static_cast<std::uint32_t>(n);
+    if (r > max_pf_rows_.load()) max_pf_rows_.store(r);
+}
+
 void MockModel::forward(std::span<const std::uint32_t> tokens, std::uint32_t pos0) {
+    prefillRows(tokens.size());
     cap_.clear();
     prefillOne(cur_, tokens, pos0, 0, 0, std::nullopt, false);
 }
 
 void MockModel::prefillMtpChunk(std::span<const std::uint32_t> tokens, std::uint32_t pos0, std::size_t off, std::size_t n,
                                 std::optional<server::DevPtr> prev_hidden) {
+    prefillRows(n);
     cap_.clear();
     prefillOne(cur_, tokens.subspan(off, n), pos0 + static_cast<std::uint32_t>(off), 0, 0,
                off == 0 ? prev_hidden : std::nullopt, true);
 }
 
 void MockModel::prefillSegs(std::span<const server::PSeg> segs, bool with_mtp) {
+    std::size_t rows = 0;
+    for (const server::PSeg& sg : segs) rows += sg.n;
+    prefillRows(rows);
     cap_.clear();
     std::uint32_t r0 = 0;
     for (std::size_t k = 0; k < segs.size(); ++k) {

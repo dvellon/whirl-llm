@@ -55,6 +55,14 @@ inline std::size_t prefillChunkLen(std::size_t remaining) {
     return remaining <= prefill_chunk + prefill_merge ? remaining : prefill_chunk;
 }
 
+// EngineOptions::prefill_exec for a prefill batch: whole schedule chunks, and a forward (+ the merged
+// tail) must fit the batch; never below one chunk (the batch is >= prefill_chunk + prefill_merge,
+// vram::min_prefill_batch). `requested`: WHIRL_PREFILL_CHUNK, default 2048.
+inline std::size_t prefillExecFor(std::size_t requested, std::uint32_t max_batch) {
+    const std::size_t mb = max_batch > prefill_merge ? max_batch - prefill_merge : 0;
+    return std::max(prefill_chunk, std::min(requested / prefill_chunk * prefill_chunk, mb / prefill_chunk * prefill_chunk));
+}
+
 // Connection writer (buffered; errors make it "gone").
 class Conn {
 public:
