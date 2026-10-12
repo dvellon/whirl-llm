@@ -299,6 +299,9 @@ struct DFlashConfig {
 // Before loading anything: empty when the DFlash2 drafter `draft` fits the target model `target`
 // (both GGUF headers only), else the reason (e.g. a MoE target such as Ornith has no drafter).
 std::string dflashIncompatible(const gguf::File& target, const gguf::File& draft);
+// Same for the drafter at draft_path, opening it first: a file that cannot be opened / parsed gives
+// the reason too (never throws). On success *opened (if given) holds the open file.
+std::string dflashIncompatibleFile(const gguf::File& target, const std::string& draft_path, std::optional<gguf::File>* opened = nullptr);
 
 struct DFlashLayerW {
     DevPtr attn_norm = 0, ffn_norm = 0, q_norm = 0, k_norm = 0;

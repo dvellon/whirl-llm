@@ -933,7 +933,7 @@ bool wantDFlash(const Args& a, const gguf::File& f) {
             std::fprintf(stderr, "note: %s\n", note.c_str());
     }
     std::string why;
-    if (*src == whirl::dflash::Source::dflash && dm) why = q::dflashIncompatible(f, gguf::File::open(*dm));
+    if (*src == whirl::dflash::Source::dflash && dm) why = q::dflashIncompatibleFile(f, *dm);
     const whirl::dflash::Choice c = whirl::dflash::choose(*src, dm, why, true);
     if (!c.warning.empty()) std::fprintf(stderr, "warning: %s\n", c.warning.c_str());
     return c.source == whirl::dflash::Source::dflash;

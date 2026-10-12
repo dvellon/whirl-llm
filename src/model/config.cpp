@@ -491,4 +491,19 @@ std::string dflashIncompatible(const gguf::File& target, const gguf::File& draft
     return {};
 }
 
+// FR-DFL P3-2: --draft-model / WHIRL_DRAFT_MODEL that cannot be opened or parsed (a typo, a stale
+// variable, a truncated download) is one more "no fitting drafter" case: the reason, the caller warns
+// and keeps the MTP drafts (docs/usage.md), instead of the exception stopping whirl-server / whirl chat.
+std::string dflashIncompatibleFile(const gguf::File& target, const std::string& draft_path, std::optional<gguf::File>* opened) {
+    std::optional<gguf::File> df;
+    try {
+        df.emplace(gguf::File::open(draft_path));
+    } catch (const std::exception& ex) {
+        return std::string("cannot open the drafter: ") + ex.what();
+    }
+    std::string why = dflashIncompatible(target, *df);
+    if (why.empty() && opened) *opened = std::move(df);
+    return why;
+}
+
 }  // namespace whirl::qwen35

@@ -645,10 +645,7 @@ int serveMain(int argc, char** argv, const char* program) {
             if (src == whirl::dflash::Source::dflash)
                 if (const std::string note = whirl::dflash::draftModelNote(dm_cli, env("DRAFT_MODEL")); !note.empty()) logI("{}", note);
             std::string why;
-            if (src == whirl::dflash::Source::dflash && dm) {
-                dfile.emplace(gguf::File::open(*dm));
-                why = qwen35::dflashIncompatible(f, *dfile);
-            }
+            if (src == whirl::dflash::Source::dflash && dm) why = qwen35::dflashIncompatibleFile(f, *dm, &dfile);
             const whirl::dflash::Choice ch = whirl::dflash::choose(src, dm, why, true);
             if (!ch.warning.empty()) logW("{}", ch.warning);
             use_dflash = ch.source == whirl::dflash::Source::dflash;

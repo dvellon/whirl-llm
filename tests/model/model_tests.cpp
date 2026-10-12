@@ -3,6 +3,7 @@
 // draft allocation (cycle cost, slot acceptance, allocDrafts).
 // SPDX-License-Identifier: Apache-2.0
 
+#include "whirl/dflash_policy.h"
 #include "whirl/gguf.h"
 #include "whirl/kernels_abi.h"
 #include "whirl/model.h"
@@ -870,6 +871,45 @@ void testDFlashTensors() {
     }
 }
 
+// FR-DFL P3-2: a --draft-model that cannot be opened / parsed is a reason (-> warning + MTP drafts), not
+// an exception that stops whirl-server / whirl chat
+void testDFlashDraftFile() {
+    const auto dense = targetImage("qwen35", 256, 100, 8).build();
+    const gguf::File tf = gguf::File::parse(dense);
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "whirl_fixdfl_p32";
+    std::filesystem::create_directories(dir);
+    std::string w;
+    bool threw = false;
+    try {
+        w = q::dflashIncompatibleFile(tf, (dir / "no_such_drafter.gguf").string());
+    } catch (...) {
+        threw = true;
+    }
+    check(!threw && w.find("cannot open the drafter") != std::string::npos, "dflashIncompatibleFile: a missing file is a reason (" + w + ")");
+    {
+        std::ofstream(dir / "garbage.gguf", std::ios::binary) << "not a gguf file";
+        threw = false;
+        try {
+            w = q::dflashIncompatibleFile(tf, (dir / "garbage.gguf").string());
+        } catch (...) {
+            threw = true;
+        }
+        check(!threw && w.find("cannot open the drafter") != std::string::npos, "dflashIncompatibleFile: an unparsable file is a reason (" + w + ")");
+    }
+    {
+        const auto draft = dflashImage(256, 100).build();
+        std::ofstream(dir / "ok.gguf", std::ios::binary).write(reinterpret_cast<const char*>(draft.data()), static_cast<std::streamsize>(draft.size()));
+        std::optional<gguf::File> opened;
+        w = q::dflashIncompatibleFile(tf, (dir / "ok.gguf").string(), &opened);
+        check(w.empty() && opened.has_value(), "dflashIncompatibleFile: a fitting drafter file opens (" + w + ")");
+    }
+    // the caller turns the reason into the fall-back warning (whirl/dflash_policy.h choose)
+    const auto ch = whirl::dflash::choose(whirl::dflash::Source::dflash, std::string("x.gguf"), "cannot open the drafter: x", true);
+    check(ch.source == whirl::dflash::Source::mtp && ch.warning.find("using MTP drafts") != std::string::npos, "dflash choose: unopenable drafter -> MTP");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 // --draft dflash: the header-only fit check before loading (a MoE target without a drafter of
 // its size keeps MTP)
 void testDFlashCompat() {
@@ -1412,6 +1452,7 @@ int main() {
     testDFlashConfig();
     testDFlashCompat();
     testDFlashTensors();
+    testDFlashDraftFile();
     testCycleCost();
     testSlotAccept();
     testAllocDrafts();
