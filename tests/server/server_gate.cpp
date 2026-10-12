@@ -49,6 +49,7 @@
 #include <optional>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1269,10 +1270,6 @@ void suiteSys() {
     {
         auto env = kv;
         env["WHIRL_KV_SSD_DIR"] = ssd;
-        // FIX-TEST-A: SSD-QUIET made "shutdown" the default SSD mode with a 5-min write delay, after which the
-        // dedup check below (SSD writes while the server runs) saw 0 writes; this server writes as CACHE-1 did
-        env["WHIRL_KV_SSD_MODE"] = "always";
-        env["WHIRL_KV_SSD_DELAY_MS"] = "0";
         ServerLease s("sys_tier", {"--parallel", "4"}, env, false);
         auto first = sysAsk(byName("S0"));
         B = boundary(*s.s);
@@ -1298,10 +1295,19 @@ void suiteSys() {
         check("sys: 4 concurrent sessions == cold, all reuse", ok, d);
         std::this_thread::sleep_for(std::chrono::seconds(3));
         s->waitTierIdle(60);  // pending SSD writes done before the stop
-        // CACHE-1 block dedup: sessions sharing the system prompt store its KV once
-        check("sys: SSD entries share the system prompt's KV blocks (dedup)",
-              s->logCount(R"(MiB, [1-9]\d* MiB shared with other entries)") >= 1,
-              std::format("{} SSD writes with shared blocks", s->logCount(R"(MiB, [1-9]\d* MiB shared with other entries)")));
+    }
+    {
+        // CACHE-1 block dedup: sessions sharing the system prompt store its KV once. FIX-TEST-A: counted in the
+        // sys_tier log after its graceful stop: since SSD-QUIET the default SSD mode writes at shutdown only (the
+        // check used to run while the server ran and saw 0 writes; the always mode skips these one-shot sessions)
+        const std::regex shared(R"(MiB, [1-9]\d* MiB shared with other entries)");
+        std::size_t n = 0;
+        std::string line;
+        std::istringstream in(readFile(g.work + "\\server_sys_tier.log"));
+        while (std::getline(in, line))
+            if (std::regex_search(line, shared)) ++n;
+        check("sys: SSD entries share the system prompt's KV blocks (dedup, written at shutdown)", n >= 1,
+              std::format("{} SSD writes with shared blocks", n));
     }
     {
         auto env = kv;
