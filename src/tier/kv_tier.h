@@ -211,6 +211,9 @@ struct Entry {
     bool ssd_stale = false;
     // restored at least once, or resumed in place (a multi-turn session); see Config::ssd_seen_filter
     bool reused = false;
+    // its SSD write was skipped: a file of nofit_fb bytes did not fit the cap (Tier::startWrite). Not
+    // retried until its size changes or SSD room was freed since (Tier::ssd_gen_ moved past nofit_gen).
+    std::uint64_t nofit_fb = 0, nofit_gen = 0;
 
     std::uint64_t kvOff(const Layout& l) const;
     std::uint64_t extent(const Layout& l) const;
@@ -421,7 +424,12 @@ private:
     void keepForeign(const std::wstring& path, std::uint64_t counted);
     void forgetForeign(const std::wstring& path);
     std::uint64_t fileBytes(const Entry* e) const;
-    bool ssdRoom(std::uint64_t need, Entry* keep);
+    // ram_copies: SSD copies of entries also in RAM may go too (only enforceCap: a write never drops
+    // them, the RAM entry would just be written again -- an endless rewrite loop under a tight cap)
+    bool ssdRoom(std::uint64_t need, Entry* keep, bool ram_copies = false);
+    void noFit(Entry* e, std::uint64_t fb);
+    // bumped whenever SSD room is freed (a file deleted or cut, an entry dropped to SSD-only)
+    std::uint64_t ssd_gen_ = 0;
     void submit(Job* j);
     void freeJob(Job* j);
     void makeHeader(const Entry* e, bool valid, std::uint8_t* buf) const;

@@ -3123,6 +3123,126 @@ static void testPowerLoss(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+// FIX-CACHE P2-1 (FR-CACHE): RAM entries whose files do not all fit the SSD cap, `always` mode (mode 0) and
+// the shutdown-mode flush (mode 1). Before: writing b dropped a's SSD copy (a RAM entry), a became dirty and
+// immediately due, its write dropped b's copy, ... an endless rewrite loop (the engine never idle, the SSD
+// written continuously). Now: a write never drops the SSD copy of a RAM entry; b is skipped (logged once),
+// the cap holds, the tier goes idle.
+static void testCapTightRamEntries(MockDeviceOps& ops, const fs::path& dir) {
+    for (int mode = 0; mode < 2; ++mode) {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        SsdEnv env{dir};
+        std::uint64_t seed = 9100 + static_cast<std::uint64_t>(mode) * 10;
+        auto t = Tier::create(ops, 256ull << 20, 91, 0);
+        const std::uint64_t f1 = fileBytesOf(2, (3000 + kLay.page_tokens - 1) / kLay.page_tokens);
+        Config c = env.cfg(f1 + f1 / 2);  // one 3000-token file fits, two do not
+        c.ssd_shutdown_only = mode == 1;
+        std::size_t nofit_logs = 0;
+        t->log_fn = [&](std::string_view m) {
+            if (m.find("not written to SSD") != std::string_view::npos) nofit_logs += 1;
+        };
+        t->start(c, kLay, 91);
+        Sess a(ops, 32), b(ops, 32);
+        a.toks = freshToks(3000, seed);
+        b.toks = freshToks(3000, seed);
+        spillSess(*t, a, 0);
+        if (mode == 0) CHECK(tickIdle(*t));
+        sleepMs(5);
+        spillSess(*t, b, 0);
+        if (mode == 1) t->flushing = true;
+        const bool idle = tickIdle(*t, 3000);
+        CHECK(idle);
+        std::printf("  mode %d: idle %d, ssd_writes %llu, ssd_bytes %llu (cap %llu), nofit logs %zu\n", mode, idle ? 1 : 0,
+                    static_cast<unsigned long long>(t->stats.ssd_writes), static_cast<unsigned long long>(t->ssd_bytes),
+                    static_cast<unsigned long long>(t->cfg.ssd_cap), nofit_logs);
+        CHECK(t->stats.ssd_writes == 1);
+        CHECK(t->ssd_bytes <= t->cfg.ssd_cap && diskBytes(dir) <= t->cfg.ssd_cap);
+        CHECK(nofit_logs == 1);
+        CHECK(countFiles(dir) == 1);
+        // more ticks: the skipped entry is not retried (nothing freed, same size), no new log
+        for (int i = 0; i < 20; ++i) t->tick();
+        CHECK(t->stats.ssd_writes == 1 && nofit_logs == 1);
+        // room freed (the written entry removed): the skipped one is written now
+        Entry* written = t->find(a.id) && t->find(a.id)->ssd ? t->find(a.id) : t->find(b.id);
+        CHECK(written != nullptr && written->ssd.has_value());
+        if (written) t->removeEntry(written);
+        CHECK(tickIdle(*t, 3000));
+        CHECK(t->stats.ssd_writes == 2 && countFiles(dir) == 1);
+        CHECK(t->ssd_bytes <= t->cfg.ssd_cap && diskBytes(dir) <= t->cfg.ssd_cap);
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+}
+
+// FIX-CACHE P2-1 (FR-CACHE, cap overrun): b borrows blocks of the LRU SSD-only entry a; b's write makes room
+// by dropping a, which drops b's own copy too. Before: the room was made for fb - old (b's old copy) but the
+// reservation charged the whole new file, so ssd_bytes ended up to one old copy over the cap. Now the room
+// is made again for the whole file.
+static void testCapOwnCopyDropped(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 9150;
+    const std::uint64_t fp = 94;
+    const auto sys = freshToks(2560, seed);
+    Sess a(ops, 32), b(ops, 32), c(ops, 32);
+    a.toks = sys;
+    {
+        auto x = freshToks(1000, seed);
+        a.toks.insert(a.toks.end(), x.begin(), x.end());
+    }
+    b.toks = sys;
+    {
+        auto x = freshToks(700, seed);
+        b.toks.insert(b.toks.end(), x.begin(), x.end());
+    }
+    c.toks = freshToks(3000, seed);
+    {
+        auto t = Tier::create(ops, 256ull << 20, 94, 0);
+        t->start(env.cfg(8ull << 30), kLay, fp);
+        spillSess(*t, a, 0);
+        CHECK(tickIdle(*t));
+        sleepMs(1100);  // distinct last-write seconds: the LRU order survives the restart
+        spillSess(*t, b, 0);
+        CHECK(tickIdle(*t));
+        sleepMs(1100);
+        spillSess(*t, c, 0);
+        CHECK(tickIdle(*t));
+        CHECK(t->dependentsOf(a.e).size() == 1);
+    }
+    auto t = Tier::create(ops, 256ull << 20, 95, 0);
+    t->start(env.cfg(8ull << 30), kLay, fp);
+    CHECK(t->ssdEntries() == 3);
+    Entry* eb = t->find(b.id);
+    CHECK(eb != nullptr && restoreMatches(*t, ops, eb, b));  // b back in RAM (clean), most recent
+    eb = t->find(b.id);
+    CHECK(eb != nullptr && eb->in_ram && eb->ssd.has_value());
+    if (eb == nullptr || !eb->in_ram || !eb->ssd) return;
+    const std::size_t bn = b.toks.size();
+    auto more = freshToks(600, seed);
+    b.toks.insert(b.toks.end(), more.begin(), more.end());
+    CHECK(!spillSess(*t, b, bn));  // in place, appended: dirty
+    eb = t->find(b.id);
+    const std::uint64_t fb = (kLay.dataOff() + eb->extent(kLay) + sector - 1) / sector * sector;
+    const std::uint64_t old0 = eb->ssd->alloc_bytes;
+    const std::uint64_t c_alloc = t->find(c.id)->ssd->alloc_bytes;
+    t->cfg.ssd_cap = c_alloc + fb - 1;
+    CHECK(t->ssd_bytes + fb - old0 > t->cfg.ssd_cap);  // a (LRU) must go for b's write
+    t->tick();  // b's write: dropping a drops b's own copy
+    std::printf("  ssd_bytes %llu (cap %llu, fb %llu, b old %llu), a %s, c %s\n", static_cast<unsigned long long>(t->ssd_bytes),
+                static_cast<unsigned long long>(t->cfg.ssd_cap), static_cast<unsigned long long>(fb),
+                static_cast<unsigned long long>(old0), t->find(a.id) ? "kept" : "gone", t->find(c.id) ? "kept" : "gone");
+    CHECK(t->ssd_bytes <= t->cfg.ssd_cap);
+    CHECK(tickIdle(*t, 3000));
+    CHECK(t->ssd_bytes <= t->cfg.ssd_cap && diskBytes(dir) <= t->cfg.ssd_cap);
+    eb = t->find(b.id);
+    CHECK(eb != nullptr && eb->ssd.has_value() && !eb->hasDirty());
+    if (eb) CHECK(restoreMatches(*t, ops, eb, b));
+    t.reset();
+    fs::remove_all(dir, ec);
+}
+
 // WHIRL_TIER_ONLY=<test name>: run only that test (regression proofs)
 static bool want(const char* name) {
     const char* only = std::getenv("WHIRL_TIER_ONLY");
@@ -3273,6 +3393,14 @@ int main(int argc, char** argv) {
     if (want("testWriteAmplification")) {
         std::printf("-- %s\n", "testWriteAmplification");
         testWriteAmplification(ops, dir);
+    }
+    if (want("testCapTightRamEntries")) {
+        std::printf("-- %s\n", "testCapTightRamEntries");
+        testCapTightRamEntries(ops, dir);
+    }
+    if (want("testCapOwnCopyDropped")) {
+        std::printf("-- testCapOwnCopyDropped\n");
+        testCapOwnCopyDropped(ops, dir);
     }
     if (want("testPowerLoss")) {
         std::printf("-- %s\n", "testPowerLoss");
