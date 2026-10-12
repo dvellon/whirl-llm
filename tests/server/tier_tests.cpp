@@ -1820,6 +1820,103 @@ static void testEvictionWrite(MockDeviceOps& ops, const fs::path& dir) {
     }
 }
 
+// FIX-RC4-A P1 (REVIEW-RC4-A P1-1): `always` mode, SSD cache at its cap, RAM tier full with a dirty entry
+// worth a write. Restoring (or prefetching) an SSD-only entry makes room in RAM; the eviction write of the
+// dirty victim makes room on SSD (LRU). The entry being restored is the SSD LRU entry at that point and
+// must never be the one dropped (it was deleted under beginRestore: use after free).
+static void testEvictionWriteSsdFull(MockDeviceOps& ops, const fs::path& dir) {
+    for (int mode = 0; mode < 2; ++mode) {  // 0: beginRestore, 1: prefetch
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        SsdEnv env{dir};
+        std::uint64_t seed = 9100 + static_cast<std::uint64_t>(mode) * 10;
+        auto t = Tier::create(ops, 72ull << 20, 91, 0);  // 36 blocks; a spilled 3000-token entry takes 11
+        Config c = env.cfg(4ull << 30);
+        c.ssd_delay_ms = 0;
+        t->start(c, kLay, 9);
+        Sess a(ops, 24), d(ops, 24), b(ops, 24), b2(ops, 24);
+        a.toks = freshToks(3000, seed);
+        d.toks = freshToks(3000, seed);
+        b.toks = freshToks(3000, seed);
+        b2.toks = freshToks(3000, seed);
+        spillSess(*t, a, 0);
+        const std::uint64_t id_a = a.id;
+        CHECK(tickIdle(*t));
+        sleepMs(5);
+        spillSess(*t, d, 0);
+        CHECK(tickIdle(*t));  // a, d written (clean, SSD copies)
+        CHECK(t->stats.ssd_writes == 2);
+        t->cfg.ssd_delay_ms = 600000;                      // later entries are not due
+        t->cfg.ssd_cap = t->ssd_bytes + t->ssd_bytes / 4;  // a + d fill the SSD tier
+        sleepMs(5);
+        spillSess(*t, b, 0);                               // dirty, not due
+        CHECK(restoreMatches(*t, ops, t->find(d.id), d));  // d used: more recent than b
+        sleepMs(5);
+        spillSess(*t, b2, 0);                              // a (LRU, clean) drops to its SSD copy
+        Entry* ea = t->find(id_a);
+        CHECK(ea != nullptr && !ea->in_ram && ea->ssd.has_value());
+        if (!ea || ea->in_ram) continue;
+        if (mode == 0) {
+            DevSlot dst(ops, 2, 24);
+            std::vector<Span> sp;
+            sp.push_back(Span{dst.ck[0], 0, kLay.ck_bytes, 0});
+            sp.push_back(Span{dst.kv, ea->kvOff(kLay), static_cast<std::uint64_t>(ea->pages) * kLay.page_bytes, 0xff});
+            Restore* r = t->beginRestore(ea, sp, sp.size());
+            const bool alive = t->find(id_a) == ea;
+            CHECK(alive);  // the restore target was deleted under beginRestore before FIX-RC4-A P1
+            if (!alive) {
+                std::printf("   P1: entry being restored was dropped by the room-making path (use after free)\n");
+                std::fflush(stdout);
+                std::_Exit(3);  // the heap is corrupt: do not continue
+            }
+            if (r) {
+                CHECK(runRestore(*t, r));
+                t->endRestore(r);
+                CHECK(std::memcmp(reinterpret_cast<void*>(dst.ck[0]), reinterpret_cast<void*>(a.d.ck[0]), kLay.ck_bytes) == 0);
+                CHECK(std::memcmp(reinterpret_cast<void*>(dst.kv), reinterpret_cast<void*>(a.d.kv),
+                                  static_cast<std::uint64_t>(ea->pages) * kLay.page_bytes) == 0);
+            } else {
+                // not now: the eviction write is running (the engine prefills cold); a stays intact
+                CHECK(t->roomPending());
+                CHECK(ea->pin == 0 && !ea->in_ram && ea->ssd.has_value() && ea->blocks.empty());
+                CHECK(tickIdle(*t));
+                ea = t->find(id_a);
+                CHECK(ea != nullptr);
+                if (ea) CHECK(restoreMatches(*t, ops, ea, a));  // room now (the written victim is clean)
+            }
+        } else {
+            bool started = t->prefetch(ea);
+            const bool alive = t->find(id_a) == ea;
+            CHECK(alive);
+            if (!alive) {
+                std::printf("   P1: entry being prefetched was dropped by the room-making path (use after free)\n");
+                std::fflush(stdout);
+                std::_Exit(3);
+            }
+            if (!started) {
+                CHECK(t->roomPending());
+                CHECK(ea->pin == 0 && !ea->in_ram && ea->ssd.has_value() && ea->blocks.empty());
+                CHECK(tickIdle(*t));
+                ea = t->find(id_a);
+                CHECK(ea != nullptr);
+                if (ea) started = t->prefetch(ea);
+                CHECK(started);
+            }
+            if (started) {
+                CHECK(tickIdle(*t));
+                ea = t->find(id_a);
+                CHECK(ea != nullptr && ea->in_ram);
+                if (ea) CHECK(restoreMatches(*t, ops, ea, a));
+            }
+        }
+        CHECK(t->ssd_bytes <= t->cfg.ssd_cap);
+        CHECK(tickIdle(*t));
+        for (const Entry* e : t->entries) CHECK(e->pin == 0 && e->ext_pin == 0);
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
+}
+
 // Shutdown mode: no write while running even with delay 0, a flush writes everything; always mode: the
 // flush (delay forced to 0 like Engine::flushTierOnStop) does not wait for the delay either.
 static void testShutdownFlush(MockDeviceOps& ops, const fs::path& dir) {
@@ -2409,6 +2506,12 @@ static void testWriteAmplification(MockDeviceOps& ops, const fs::path& dir) {
     CHECK(coalesced <= final_logical + final_logical / 10);  // stride padding only
     CHECK(per_turn > 2 * coalesced);
 }
+// WHIRL_TIER_ONLY=<test name>: run only that test (regression proofs)
+static bool want(const char* name) {
+    const char* only = std::getenv("WHIRL_TIER_ONLY");
+    return only == nullptr || *only == 0 || std::strcmp(only, name) == 0;
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // default: WHIRL_TEST_TMP, else %TEMP%\whirl-tests; this test uses <base>\tier_test_tmp
@@ -2417,59 +2520,115 @@ int main(int argc, char** argv) {
     else base = fs::temp_directory_path() / L"whirl-tests";
     fs::path dir = argc > 1 ? fs::path(argv[1]) : base / L"tier_test_tmp";
     MockDeviceOps ops;
-    std::printf("-- %s\n", "testHelpers");
-    testHelpers();
-    std::printf("-- %s\n", "testRamTierSize");
-    testRamTierSize();
-    std::printf("-- %s\n", "testLookup");
-    testLookup(ops);
-    std::printf("-- %s\n", "testEvictLru");
-    testEvictLru(ops);
-    std::printf("-- %s\n", "testTrimDropCk");
-    testTrimDropCk(ops);
-    std::printf("-- %s\n", "testRestoreRam");
-    testRestoreRam(ops);
+    if (want("testHelpers")) {
+        std::printf("-- %s\n", "testHelpers");
+        testHelpers();
+    }
+    if (want("testRamTierSize")) {
+        std::printf("-- %s\n", "testRamTierSize");
+        testRamTierSize();
+    }
+    if (want("testLookup")) {
+        std::printf("-- %s\n", "testLookup");
+        testLookup(ops);
+    }
+    if (want("testEvictLru")) {
+        std::printf("-- %s\n", "testEvictLru");
+        testEvictLru(ops);
+    }
+    if (want("testTrimDropCk")) {
+        std::printf("-- %s\n", "testTrimDropCk");
+        testTrimDropCk(ops);
+    }
+    if (want("testRestoreRam")) {
+        std::printf("-- %s\n", "testRestoreRam");
+        testRestoreRam(ops);
+    }
     CHECK(ops.live_events.load() == 0 && ops.live_host.load() == 0 && ops.live_streams.load() == 0);
-    std::printf("-- %s\n", "testSsd");
-    testSsd(ops, dir);
-    std::printf("-- %s\n", "testDedupRestart");
-    testDedupRestart(ops, dir);
-    std::printf("-- %s\n", "testOwnerRewrite");
-    testOwnerRewrite(ops, dir);
-    std::printf("-- %s\n", "testModesLock");
-    testModesLock(ops, dir);
-    std::printf("-- %s\n", "testSsdTruncated");
-    testSsdTruncated(ops, dir);
-    std::printf("-- %s\n", "testRestoreCopyThrows");
-    testRestoreCopyThrows(ops, dir);
-    std::printf("-- %s\n", "testLockFailClosed");
-    testLockFailClosed(ops, dir);
-    std::printf("-- %s\n", "testDedupCycle");
-    testDedupCycle(ops, dir);
-    std::printf("-- %s\n", "testSupersedeTrim");
-    testSupersedeTrim(ops, dir);
-    std::printf("-- %s\n", "testWorkflows");
-    testWorkflows(ops, dir);
-    std::printf("-- %s\n", "testQuietDefaults");
-    testQuietDefaults();
-    std::printf("-- %s\n", "testWriteDelay");
-    testWriteDelay(ops, dir);
-    std::printf("-- %s\n", "testEvictionWrite");
-    testEvictionWrite(ops, dir);
-    std::printf("-- %s\n", "testShutdownFlush");
-    testShutdownFlush(ops, dir);
-    std::printf("-- %s\n", "testFlushOrder");
-    testFlushOrder(ops, dir);
-    std::printf("-- %s\n", "testSeenOnce");
-    testSeenOnce(ops, dir);
-    std::printf("-- %s\n", "testStartupCleanupCap");
-    testStartupCleanupCap(ops, dir);
-    std::printf("-- %s\n", "testCapLruDedup");
-    testCapLruDedup(ops, dir);
-    std::printf("-- %s\n", "testExpiry");
-    testExpiry(ops, dir);
-    std::printf("-- %s\n", "testWriteAmplification");
-    testWriteAmplification(ops, dir);
+    if (want("testSsd")) {
+        std::printf("-- %s\n", "testSsd");
+        testSsd(ops, dir);
+    }
+    if (want("testDedupRestart")) {
+        std::printf("-- %s\n", "testDedupRestart");
+        testDedupRestart(ops, dir);
+    }
+    if (want("testOwnerRewrite")) {
+        std::printf("-- %s\n", "testOwnerRewrite");
+        testOwnerRewrite(ops, dir);
+    }
+    if (want("testModesLock")) {
+        std::printf("-- %s\n", "testModesLock");
+        testModesLock(ops, dir);
+    }
+    if (want("testSsdTruncated")) {
+        std::printf("-- %s\n", "testSsdTruncated");
+        testSsdTruncated(ops, dir);
+    }
+    if (want("testRestoreCopyThrows")) {
+        std::printf("-- %s\n", "testRestoreCopyThrows");
+        testRestoreCopyThrows(ops, dir);
+    }
+    if (want("testLockFailClosed")) {
+        std::printf("-- %s\n", "testLockFailClosed");
+        testLockFailClosed(ops, dir);
+    }
+    if (want("testDedupCycle")) {
+        std::printf("-- %s\n", "testDedupCycle");
+        testDedupCycle(ops, dir);
+    }
+    if (want("testSupersedeTrim")) {
+        std::printf("-- %s\n", "testSupersedeTrim");
+        testSupersedeTrim(ops, dir);
+    }
+    if (want("testWorkflows")) {
+        std::printf("-- %s\n", "testWorkflows");
+        testWorkflows(ops, dir);
+    }
+    if (want("testQuietDefaults")) {
+        std::printf("-- %s\n", "testQuietDefaults");
+        testQuietDefaults();
+    }
+    if (want("testWriteDelay")) {
+        std::printf("-- %s\n", "testWriteDelay");
+        testWriteDelay(ops, dir);
+    }
+    if (want("testEvictionWrite")) {
+        std::printf("-- %s\n", "testEvictionWrite");
+        testEvictionWrite(ops, dir);
+    }
+    if (want("testEvictionWriteSsdFull")) {
+        std::printf("-- %s\n", "testEvictionWriteSsdFull");
+        testEvictionWriteSsdFull(ops, dir);
+    }
+    if (want("testShutdownFlush")) {
+        std::printf("-- %s\n", "testShutdownFlush");
+        testShutdownFlush(ops, dir);
+    }
+    if (want("testFlushOrder")) {
+        std::printf("-- %s\n", "testFlushOrder");
+        testFlushOrder(ops, dir);
+    }
+    if (want("testSeenOnce")) {
+        std::printf("-- %s\n", "testSeenOnce");
+        testSeenOnce(ops, dir);
+    }
+    if (want("testStartupCleanupCap")) {
+        std::printf("-- %s\n", "testStartupCleanupCap");
+        testStartupCleanupCap(ops, dir);
+    }
+    if (want("testCapLruDedup")) {
+        std::printf("-- %s\n", "testCapLruDedup");
+        testCapLruDedup(ops, dir);
+    }
+    if (want("testExpiry")) {
+        std::printf("-- %s\n", "testExpiry");
+        testExpiry(ops, dir);
+    }
+    if (want("testWriteAmplification")) {
+        std::printf("-- %s\n", "testWriteAmplification");
+        testWriteAmplification(ops, dir);
+    }
     std::printf("tier tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

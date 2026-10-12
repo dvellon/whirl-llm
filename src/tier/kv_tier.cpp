@@ -579,6 +579,44 @@ bool Tier::ensureBlocks(Entry* e, std::size_t lb0, std::size_t lb1) {
     return true;
 }
 
+// ensureBlocks(e, 0, lb_end) for an SSD-only entry about to be read into RAM (restore, prefetch). Making
+// room in RAM may start an eviction write, which makes room on SSD by dropping LRU SSD copies, and may drop
+// the files referencing a block that write changes: e (an SSD-only entry is removed when its SSD copy goes)
+// and the owners of the blocks it borrows are held (pin / ext_pin: ssdDroppable, startWrite, gcOwners,
+// trimTo and expiry leave them alone) while that runs, so e is never deleted under its caller.
+bool Tier::ensureBlocksHeld(Entry* e, std::size_t lb_end) {
+    const std::uint64_t id = e->id;
+    std::vector<std::uint64_t> owners;
+    if (e->ssd) {
+        for (const BlkRef& r : e->ssd->tbl) {
+            if (r.owner == 0 || std::find(owners.begin(), owners.end(), r.owner) != owners.end()) continue;
+            owners.push_back(r.owner);
+        }
+    }
+    e->pin += 1;
+    for (std::uint64_t o : owners)
+        if (Entry* oe = find(o)) oe->ext_pin += 1;
+    bool ok = false;
+    {
+        ScopeExit unhold{[&] {
+            if (Entry* x = find(id))
+                if (x->pin > 0) x->pin -= 1;
+            for (std::uint64_t o : owners)
+                if (Entry* oe = find(o))
+                    if (oe->ext_pin > 0) oe->ext_pin -= 1;
+        }};
+        ok = ensureBlocks(e, 0, lb_end);
+    }
+    if (find(id) != e) return false;
+    if (e->ssd_stale && !e->io_busy) {
+        // its SSD copy was dropped while it was held (dropSsdCopy defers that for a held SSD-only entry)
+        e->ssd_stale = false;
+        dropSsdCopy(e);
+        return false;
+    }
+    return ok;
+}
+
 std::array<std::size_t, 2> Tier::lbRange(std::uint64_t off, std::uint64_t len) {
     return {static_cast<std::size_t>(off / block_bytes),
             static_cast<std::size_t>((off + len + block_bytes - 1) / block_bytes)};
@@ -699,7 +737,7 @@ Restore* Tier::beginRestore(Entry* e, std::span<const Span> spans, std::size_t n
         if (!ssd_dir_w_ || !refsOk(e)) return nullptr;
         // blocks for the whole extent (the entry becomes a RAM entry, clean)
         const std::size_t lb_end = static_cast<std::size_t>((e->extent(lay) + block_bytes - 1) / block_bytes);
-        if (!ensureBlocks(e, 0, lb_end)) return nullptr;
+        if (!ensureBlocksHeld(e, lb_end)) return nullptr;
         // blocks of invalid checkpoint slots are not needed
         for (std::uint32_t k = 0; k < e->nck; ++k)
             if (e->ck[k].valid == 0) dropCkBlocks(e, k);
@@ -781,7 +819,7 @@ Restore* Tier::beginRestore(Entry* e, std::span<const Span> spans, std::size_t n
 bool Tier::prefetch(Entry* e) {
     if (e->in_ram || e->io_busy || e->loading || !e->ssd || !ssd_dir_w_ || !refsOk(e)) return false;
     const std::size_t lb_end = static_cast<std::size_t>((e->extent(lay) + block_bytes - 1) / block_bytes);
-    if (!ensureBlocks(e, 0, lb_end)) return false;
+    if (!ensureBlocksHeld(e, lb_end)) return false;
     for (std::uint32_t k = 0; k < e->nck; ++k)
         if (e->ck[k].valid == 0) dropCkBlocks(e, k);
     auto job = std::make_unique<Job>();
@@ -1031,7 +1069,9 @@ void Tier::dropSsdCopy(Entry* e) {
     ScopeExit pop_guard{[&] { dropping_.erase(std::find(dropping_.begin(), dropping_.end(), id)); }};
     for (Entry* d : dependentsOf(e)) dropSsdCopy(d);
     if (!contains(e) || !e->ssd) return;
-    if (e->io_busy) {
+    // IO running, or an SSD-only entry held by ensureBlocksHeld (restore / prefetch about to read it):
+    // dropped once that is over
+    if (e->io_busy || (e->pin > 0 && !e->in_ram)) {
         e->ssd_stale = true;
         return;
     }

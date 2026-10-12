@@ -400,6 +400,7 @@ private:
     void dropRam(Entry* e);
     bool evictable(Entry* e, Entry* keep);
     bool makeRoom(std::size_t blocks, Entry* keep);
+    bool ensureBlocksHeld(Entry* e, std::size_t lb_end);
     bool contains(const Entry* e) const;
 
     std::wstring filePath(std::uint64_t id) const;
