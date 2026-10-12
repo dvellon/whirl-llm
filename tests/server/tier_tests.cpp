@@ -868,8 +868,13 @@ static void testRamTierSize() {
         CHECK(ig(64 * G, 24 * G).mb == 6144 && ig(64 * G, 24 * G).avail_limited);
         CHECK(ig(64 * G, 32 * G).mb == 8192 && !ig(64 * G, 32 * G).avail_limited);
         CHECK(ig(64 * G, 30 * G).mb == 7168 && ig(64 * G, 30 * G).avail_limited);
-        CHECK(ig(64 * G, 20 * G).mb == 5120);  // also below the entry floor: paging is worse
-        CHECK(ig(64 * G, 20 * G).reason.find("1/4 of the") != std::string::npos);
+        // FIX-CACHE P3-4: 1/4 of the available RAM below one entry -> one entry if within half of it, else off
+        CHECK(ig(64 * G, 20 * G).mb == 6144 && ig(64 * G, 20 * G).avail_limited);  // 1/4 = 5 GiB < 6, half = 10
+        CHECK(ig(64 * G, 20 * G).reason.find("max-context entry") != std::string::npos);
+        CHECK(ig(64 * G, 12 * G).mb == 6144);  // half = 6 GiB: still fits
+        CHECK(ig(64 * G, 11 * G).mb == 0 && ig(64 * G, 11 * G).avail_limited);  // half = 5 GiB < one entry: off
+        CHECK(ig(64 * G, 11 * G).reason.find("more than half") != std::string::npos);
+        CHECK(ig(64 * G, 22 * G, 0).mb == 5120);  // entry size unknown: the 1/4 limit as before
         CHECK(ig(64 * G, 3 * G).mb == 0 && ig(64 * G, 3 * G).avail_limited);  // 1/4 under 1 GiB: off
         CHECK(ig(64 * G, 0).mb == 8192);  // availability unknown: no cap
         // under 32 GB of OS-visible RAM: off, with the reason
