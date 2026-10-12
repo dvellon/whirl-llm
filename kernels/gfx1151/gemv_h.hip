@@ -9,20 +9,27 @@
 // (kernel test family gemvh checks every type against gemm_c0 and all gemms_c*).
 //
 // Three implementations (GEMVH-2; the sweep and the numbers are in audit/GEMVH-1151.md):
-//  * "direct" (q4_k q5_k q6_k q8_0): one wave = 16 weight rows, no LDS and no barriers. Every lane loads its row's
+//  * "direct" (q4_k q5_k q8_0): one wave = 16 weight rows, no LDS and no barriers. Every lane loads its row's
 //    16-byte pieces straight from global memory (lanes l and l + 16 read the same bytes; 2-byte aligned pieces use
 //    unaligned global loads, as the int8 Q6_K GEMV does), a ring of GhW<T>::DP units stays in registers so the next
 //    loads are in flight while the current one is decoded, and each lane decodes the whole 16-k fragment itself
 //    (no cross-lane join). The decoders reproduce dec_group_h<T> bit for bit; the byte -> half spreading is one
 //    v_perm_b32 per half2 (the low byte of a 0x64xx half is the byte).
-//  * "paired" (iq4_xs mxfp4 iq4_nl q3_k): same loads, but the WMMA reads the weight fragment of row r only from
-//    lane r (r even) or lane r + 16 (r odd) when the weights are its FIRST operand (probed on gfx1151), so the two
-//    lanes of a row each decode ONE of the two k-steps of a pair (half the decode work, half the registers) and
-//    swap with one permlanex16 per dword. The weights are therefore the first WMMA operand and the accumulator
-//    is D[weight row][token] (WMMA is commutative: the bits are those of the other operand order).
+//  * "paired" (q6_k iq4_xs mxfp4 iq4_nl q3_k): same loads, but the two lanes of a row (r and r + 16) each decode ONE
+//    of the two k-steps of a pair (half the decode work, half the load registers) and swap the result with one
+//    permlanex16 per dword; a per-lane select then gives both half-waves the identical A fragment of each step, as
+//    the documented wave32 WMMA layout requires (lanes 16-31 replicate 0-15; FIX-RC4-B: the GEMVH-2 version left the
+//    halves different and relied on which lanes one gfx1151 part happened to read). The weights are the first WMMA
+//    operand and the accumulator is D[weight row][token] (the bits are those of the other operand order).
 //  * "staged" (f16 iq3_s): the original design: the raw stages go through LDS (end of file).
 
 // ---- direct and paired implementations ----
+// WHIRL_GH_INJECT (kernel-test development only, never set by the build): 1 = paired lanes' k-steps swapped, 2 = the two
+// WMMAs of a pair in the wrong order, 3 = wrong half-superblock phase, 4 = half-waves holding different A fragments
+// (the pre-FIX-RC4-B layout). --only gemvh must fail for 1-3 (audit/FIX-RC4-B.md).
+#ifndef WHIRL_GH_INJECT
+#define WHIRL_GH_INJECT 0
+#endif
 __device__ __forceinline__ gs_u32x4 gh_ld16a2(const uint8_t *p) {
     gs_u32x4 v;
     __builtin_memcpy(&v, __builtin_assume_aligned(p, 2), 16);
@@ -124,39 +131,7 @@ template <> struct GhW<QT_Q5_K> {
         return gh_join(gh_b8h(w[0], w[1], (_Float16)0.f, hs, ha), gh_b8h(w[2], w[3], (_Float16)0.f, hs, ha));
     }
 };
-// ---- Q6_K (210-byte superblock, 2-byte aligned) ----
-template <> struct GhW<QT_Q6_K> {
-    static constexpr int UK = 16, UB = 210, DP = 2, SBE = 4;
-    struct Regs { gs_u32x4 ql[8]; gs_u32x4 qh[4]; gs_u32x4 sc; uint32_t d; };
-    static __device__ __forceinline__ void load(Regs &r, const uint8_t *rowp, int u) {
-        const uint8_t *b = rowp + (size_t)u * UB;
-#pragma unroll
-        for (int i = 0; i < 8; ++i) r.ql[i] = gh_ld16a2(b + 16 * i);
-#pragma unroll
-        for (int i = 0; i < 4; ++i) r.qh[i] = gh_ld16a2(b + 128 + 16 * i);
-        r.sc = gh_ld16a2(b + 192);
-        r.d = gh_ld16u(b + 208);
-    }
-    static __device__ __forceinline__ half16 frag(const Regs &r, int kk) {
-        const int n = kk >> 3, quarter = (kk >> 1) & 3, c = kk & 1;
-        const float d = gh_h2f(r.d);
-        const int sidx = 8 * n + c + 2 * quarter;
-        const float ds = d * (float)(int8_t)((r.sc[sidx >> 2] >> (8 * (sidx & 3))) & 0xFF);
-        const gs_u32x4 ql = r.ql[4 * n + 2 * (quarter & 1) + c], qh = r.qh[2 * n + c];
-        const int lsh = (quarter >> 1) ? 4 : 0, hsh = 2 * quarter;
-        half16 out;
-#pragma unroll
-        for (int wi = 0; wi < 4; ++wi) {
-            const uint32_t w = ((ql[wi] >> lsh) & 0x0F0F0F0Fu) | (((qh[wi] >> hsh) & 0x03030303u) << 4);
-            _Float16 x[4];
-            gh_x4(w, 32, x);
-#pragma unroll
-            for (int i = 0; i < 4; ++i) out[4 * wi + i] = (_Float16)(ds * (float)x[i]);
-        }
-        return out;
-    }
-};
-// ---- Q8_0 (34-byte blocks; unit = 4 blocks = 8 steps) ----
+// ---- Q8_0 (34-byte blocks of 32 k; unit = 2 blocks = 4 steps, UB = 68) ----
 template <> struct GhW<QT_Q8_0> {
     static constexpr int UK = 4, UB = 17 * 4, DP = 3, SBE = 2;
     struct Regs { gs_u32x4 q[4]; uint32_t d[4 / 2]; };
@@ -199,12 +174,10 @@ __device__ __forceinline__ void gemvh_direct_impl(const uint8_t *__restrict__ W,
     const uint8_t *rowp = W + (size_t)row * row_bytes;
     float8 acc[TN];
     const _Float16 *xr[TN];
-    bool xv[TN];
 #pragma unroll
     for (int j = 0; j < TN; ++j) {
         acc[j] = (float8){0, 0, 0, 0, 0, 0, 0, 0};
         const int t = j * 16 + rl;
-        xv[j] = t < n_tok;
         xr[j] = X + (size_t)min(t, n_tok - 1) * ncols;
     }
     Regs buf[DEPTH];
@@ -247,58 +220,6 @@ __device__ __forceinline__ void gemvh_direct_impl(const uint8_t *__restrict__ W,
 }
 
 template <int T> struct GhQ;
-template <> struct GhQ<QT_Q4_K> {
-    static constexpr int UK = 16, UB = 144, DP = 2, SBE = 4;
-    struct Regs { gs_u32x4 q[4]; uint32_t dm; uint32_t sc[3]; };
-    static __device__ __forceinline__ void load(Regs &r, const uint8_t *rowp, int u, int role) {
-        const uint8_t *b = rowp + (size_t)u * UB;
-        r.dm = gh_ld32a4(b);
-        r.sc[0] = gh_ld32a4(b + 4); r.sc[1] = gh_ld32a4(b + 8); r.sc[2] = gh_ld32a4(b + 12);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) r.q[j] = *(const gs_u32x4 *)(b + 16 + 32 * j + 16 * role);
-    }
-    // step 2m + role
-    static __device__ __forceinline__ half16 frag(const Regs &r, int m, int role, int ph) {
-        (void)ph;
-        (void)role;
-        const int s = m, hi = s & 1, j64 = s >> 1;
-        const float d = gh_h2f(r.dm), dmin = gh_h2f(r.dm >> 16);
-        int sc, mn;
-        gh_scale_min(r.sc, s, sc, mn);
-        const gs_u32x4 q = r.q[j64];
-        uint32_t w[4];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) w[i] = hi ? (q[i] >> 4) & 0x0F0F0F0F : q[i] & 0x0F0F0F0F;
-        const _Float16 hs = (_Float16)(d * sc), ha = (_Float16)(-dmin * mn);
-        return gh_join(gh_b8h(w[0], w[1], (_Float16)0.f, hs, ha), gh_b8h(w[2], w[3], (_Float16)0.f, hs, ha));
-    }
-};
-template <> struct GhQ<QT_Q5_K> {
-    static constexpr int UK = 16, UB = 176, DP = 2, SBE = 4;
-    struct Regs { gs_u32x4 q[4]; gs_u32x4 qh; uint32_t dm; uint32_t sc[3]; };
-    static __device__ __forceinline__ void load(Regs &r, const uint8_t *rowp, int u, int role) {
-        const uint8_t *b = rowp + (size_t)u * UB;
-        r.dm = gh_ld32a4(b);
-        r.sc[0] = gh_ld32a4(b + 4); r.sc[1] = gh_ld32a4(b + 8); r.sc[2] = gh_ld32a4(b + 12);
-        r.qh = *(const gs_u32x4 *)(b + 16 + 16 * role);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) r.q[j] = *(const gs_u32x4 *)(b + 48 + 32 * j + 16 * role);
-    }
-    static __device__ __forceinline__ half16 frag(const Regs &r, int m, int role, int ph) {
-        (void)ph;
-        (void)role;
-        const int s = m, hi = s & 1, j64 = s >> 1;
-        const float d = gh_h2f(r.dm), dmin = gh_h2f(r.dm >> 16);
-        int sc, mn;
-        gh_scale_min(r.sc, s, sc, mn);
-        const gs_u32x4 q = r.q[j64], h = r.qh;
-        uint32_t w[4];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) w[i] = (hi ? (q[i] >> 4) & 0x0F0F0F0F : q[i] & 0x0F0F0F0F) | (((h[i] >> s) & 0x01010101) << 4);
-        const _Float16 hs = (_Float16)(d * sc), ha = (_Float16)(-dmin * mn);
-        return gh_join(gh_b8h(w[0], w[1], (_Float16)0.f, hs, ha), gh_b8h(w[2], w[3], (_Float16)0.f, hs, ha));
-    }
-};
 template <> struct GhQ<QT_Q6_K> {
     static constexpr int UK = 16, UB = 210, DP = 2, SBE = 4;
     struct Regs { gs_u32x4 ql[4]; gs_u32x4 qh[2]; gs_u32x4 sc; uint32_t d; };
@@ -332,47 +253,22 @@ template <> struct GhQ<QT_Q6_K> {
         return out;
     }
 };
-template <> struct GhQ<QT_Q8_0> {
-    static constexpr int UK = 4, UB = 17 * 4, DP = 2, SBE = 4;
-    struct Regs { gs_u32x4 q[4 / 2]; uint32_t d[4 / 2]; };
-    static __device__ __forceinline__ void load(Regs &r, const uint8_t *rowp, int u, int role) {
-        const uint8_t *b = rowp + (size_t)u * UB;
-#pragma unroll
-        for (int i = 0; i < 4 / 2; ++i) {
-            r.d[i] = gh_ld16u(b + 34 * i);
-            r.q[i] = gh_ld16a2(b + 34 * i + 2 + 16 * role);
-        }
-    }
-    static __device__ __forceinline__ half16 frag(const Regs &r, int m, int role, int ph) {
-        (void)ph;
-        (void)role;
-        const float d = gh_h2f(r.d[m]);
-        const gs_u32x4 q = r.q[m];
-        half16 out;
-#pragma unroll
-        for (int wi = 0; wi < 4; ++wi) {
-            _Float16 x[4];
-            gh_x4(q[wi] ^ 0x80808080u, 128, x);
-#pragma unroll
-            for (int i = 0; i < 4; ++i) out[4 * wi + i] = (_Float16)(d * (float)x[i]);
-        }
-        return out;
-    }
-};
-// 136-byte superblocks (MXFP4 / IQ4_XS): 8 = 16 steps per unit (whole superblock) or 8 (half a superblock)
+// 136-byte superblocks (MXFP4 / IQ4_XS): a unit is half a superblock (8 steps, 128 k); unit u is half (u & 1) of
+// superblock u >> 1. load() and frag() both take that phase from the unit index (the caller passes sb & 1), so
+// any ring depth DP works.
 template <> struct GhQ<QT_MXFP4> {
-    static constexpr int UK = 8, UB = 136 * 8 / 16, DP = 2, SBE = 4, NCH = 8 / 2;
+    static constexpr int UK = 8, UB = 136 / 2, DP = 2, SBE = 4;
     struct Regs { gs_u32x4 q[8 / 2]; uint32_t sc[2]; };
     static __device__ __forceinline__ void load(Regs &r, const uint8_t *rowp, int u, int role) {
         (void)role;
-        const uint8_t *b = rowp + (size_t)(false ? u : (u >> 1)) * 136;
-        const int ph = false ? 0 : (u & 1);
+        const uint8_t *b = rowp + (size_t)(u >> 1) * 136;
+        const int ph = u & 1;
         r.sc[0] = gh_ld32a4(b); r.sc[1] = gh_ld32a4(b + 4);
 #pragma unroll
-        for (int i = 0; i < 8 / 2; ++i) r.q[i] = gh_ld16a2(b + 8 + 16 * (i + (false ? 0 : (8 / 2) * ph)));
+        for (int i = 0; i < 8 / 2; ++i) r.q[i] = gh_ld16a2(b + 8 + 16 * (i + 4 * ph));
     }
     static __device__ __forceinline__ half16 frag(const Regs &r, int m, int role, int ph) {
-        const int ib = m + (false ? 0 : (8 / 2) * ph);
+        const int ib = m + 4 * ph;  // ph = unit & 1 (half of the superblock)
         const float dl = e8m0_half((r.sc[ib >> 2] >> (8 * (ib & 3))) & 0xFF);
         const gs_u32x4 q = r.q[m];
         const int sh = 4 * role;
@@ -383,18 +279,18 @@ template <> struct GhQ<QT_MXFP4> {
     }
 };
 template <> struct GhQ<QT_IQ4_XS> {
-    static constexpr int UK = 8, UB = 136 * 8 / 16, DP = 2, SBE = 4;
+    static constexpr int UK = 8, UB = 136 / 2, DP = 2, SBE = 4;
     struct Regs { gs_u32x4 q[8 / 2]; uint32_t hdr, sl; };
     static __device__ __forceinline__ void load(Regs &r, const uint8_t *rowp, int u, int role) {
         (void)role;
-        const uint8_t *b = rowp + (size_t)(false ? u : (u >> 1)) * 136;
-        const int ph = false ? 0 : (u & 1);
+        const uint8_t *b = rowp + (size_t)(u >> 1) * 136;
+        const int ph = u & 1;
         r.hdr = gh_ld32a4(b); r.sl = gh_ld32a4(b + 4);
 #pragma unroll
-        for (int i = 0; i < 8 / 2; ++i) r.q[i] = gh_ld16a2(b + 8 + 16 * (i + (false ? 0 : (8 / 2) * ph)));
+        for (int i = 0; i < 8 / 2; ++i) r.q[i] = gh_ld16a2(b + 8 + 16 * (i + 4 * ph));
     }
     static __device__ __forceinline__ half16 frag(const Regs &r, int m, int role, int ph) {
-        const int ib = m + (false ? 0 : (8 / 2) * ph);
+        const int ib = m + 4 * ph;  // ph = unit & 1 (half of the superblock)
         const float d = gh_h2f(r.hdr);
         const int ls = ((r.sl >> (8 * (ib >> 1)) >> (4 * (ib & 1))) & 0xF) | ((((r.hdr >> 16) >> (2 * ib)) & 3) << 4);
         const gs_u32x4 q = r.q[m];
@@ -491,8 +387,12 @@ __device__ __forceinline__ void gemvh_paired_impl(const uint8_t *__restrict__ W,
     const int m0 = tile * 16;
     const int nsb = ncols / (16 * D::UK);
     const int rl = lane % 16;
-    // WMMA reads row r's A fragment from lane r (r even) or lane r + 16 (r odd): those lanes decode step 2m, their partners step 2m + 1
+    // lanes r and r + 16 (both hold row r) decode one k-step each of the pair (2m, 2m + 1): role 0 -> step 2m, role 1 -> 2m + 1
+#if defined(WHIRL_GH_ROLE_PARITY)
     const int role = ((lane & 1) == (lane >> 4)) ? 0 : 1;
+#else
+    const int role = lane >> 4;
+#endif
     const int row = min(m0 + rl, nrows - 1);
     const uint8_t *rowp = W + (size_t)row * row_bytes;
     float8 acc[TN];
@@ -516,14 +416,32 @@ __device__ __forceinline__ void gemvh_paired_impl(const uint8_t *__restrict__ W,
 #pragma unroll
                 for (int m = 0; m < D::UK / 2; ++m) {
                     if (m % (SB_EVERY / 2) == 0) __builtin_amdgcn_sched_barrier(0);
-                    const half16 f = D::frag(buf[u], m, role, u & 1);
-                    const half16 a0 = f, a1 = gh_xchg(f);
+#if WHIRL_GH_INJECT == 3
+                    const half16 f = D::frag(buf[u], m, role, (sb + 1) & 1);  // test injection: wrong half-superblock phase
+#else
+                    const half16 f = D::frag(buf[u], m, role, sb & 1);
+#endif
+                    // x = the partner lane's step. Both half-waves then hold the SAME A fragment for row r (the documented
+                    // wave32 WMMA layout: lanes 16-31 replicate lanes 0-15), whichever lanes the hardware reads.
+                    const half16 x = gh_xchg(f);
+#if WHIRL_GH_INJECT == 1
+                    const half16 a0 = role ? f : x, a1 = role ? x : f;  // test injection: the two lanes' steps swapped
+#elif WHIRL_GH_INJECT == 4
+                    const half16 a0 = f, a1 = x;  // test injection: the pre-FIX-RC4-B half-waves that differ (P2-1)
+#else
+                    const half16 a0 = role ? x : f, a1 = role ? f : x;
+#endif
 #pragma unroll
                     for (int j = 0; j < TN; ++j) {
                         const half16 b0 = ld_frag16(xr[j] + sb * (16 * D::UK) + (2 * m) * 16);
                         const half16 b1 = ld_frag16(xr[j] + sb * (16 * D::UK) + (2 * m + 1) * 16);
+#if WHIRL_GH_INJECT == 2
+                        acc[j] = WMMA16(a1, b1, acc[j]);  // test injection: k-steps of a pair accumulated out of order
+                        acc[j] = WMMA16(a0, b0, acc[j]);
+#else
                         acc[j] = WMMA16(a0, b0, acc[j]);
                         acc[j] = WMMA16(a1, b1, acc[j]);
+#endif
                     }
                 }
             }

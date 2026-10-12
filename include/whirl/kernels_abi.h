@@ -537,15 +537,26 @@ std::string gemmsName(QType t, int cfg, bool f16_out);
 // gemvh / gemvh2 on gfx1151 (one wave per 16 weight rows; the blocks loop over row tiles): launching every
 // tile as its own block leaves a partial last round and a long single-wave tail once the matrix has more
 // tiles than the GPU holds waves (17408 rows = 1088 tiles). The grid is cut to ceil(tiles / k) blocks with
-// k = ceil(tiles / kGemvhWaves), so each block gets k or k - 1 tiles. WHIRL_GEMVH_WAVES=<n> overrides (tests).
-inline unsigned gemvhGrid(unsigned nrows) {
-    static const unsigned cap = [] {
-        const char* e = std::getenv("WHIRL_GEMVH_WAVES");
-        const int v = e != nullptr ? std::atoi(e) : 640;
-        return static_cast<unsigned>(v > 0 ? v : 640);
-    }();
+// k = ceil(tiles / cap), so each block gets k or k - 1 tiles. Any grid gives the same bits (the kernel test
+// checks the capped production grid and small caps).
+inline unsigned gemvhGridCap(unsigned nrows, unsigned cap) {
     const unsigned tiles = (nrows + 15) / 16;
     const unsigned k = (tiles + cap - 1) / cap;
     return k > 1 ? (tiles + k - 1) / k : tiles;
+}
+// cap = kGemvhWavesPerCu x the current device's CUs (16 x 40 = 640 on the Radeon 8060S, where it was tuned;
+// a gfx1151 part with fewer CUs gets proportionally fewer blocks), read once per process (the gfx1151 path runs
+// on one device). WHIRL_GEMVH_WAVES=<n> overrides (tests).
+inline constexpr unsigned kGemvhWavesPerCu = 16;
+inline unsigned gemvhGrid(unsigned nrows) {
+    static const unsigned cap = [] {
+        if (const char* e = std::getenv("WHIRL_GEMVH_WAVES")) {
+            const int v = std::atoi(e);
+            if (v > 0) return static_cast<unsigned>(v);
+        }
+        const int cus = hip::describeDevice(hip::getDevice()).compute_units;
+        return cus > 0 ? kGemvhWavesPerCu * static_cast<unsigned>(cus) : 640u;
+    }();
+    return gemvhGridCap(nrows, cap);
 }
 }  // namespace whirl::kernels

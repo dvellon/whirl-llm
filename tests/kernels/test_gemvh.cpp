@@ -4,15 +4,16 @@
 // gemvh: for every exported type, ncols (even stage count, odd stage count, 5120), nrows (not a
 // multiple of 16 included), n_tok in {1,2,5,16,17,32} and accumulate 0/1, gemvh (n <= 16) and
 // gemvh2 (n <= 32) must equal the existing gemms_c* kernels and gemm_c0 bit for bit (accumulate
-// starts from the same random prefill).
+// starts from the same random prefill). Plus the 27B shapes at the production grid (FIX-RC4-B): 17408 x 5120 and
+// 5120 x 17408 (ncols 17408) launched with kernels::gemvhGrid (gfx1151: k >= 2 tiles per block) and with small caps
+// (k up to 11), every n in {1,5,16,17,32}, accumulate 0/1, against gemm_c0. Injected k-order / lane-role / phase
+// faults (WHIRL_GH_INJECT=1..3 in kernels/gfx1151/gemv_h.hip, loaded with WHIRL_KT_CODE_OBJECT) fail this family.
 // gemvhbench: us per call, GB/s of weight bytes and % of the memory-bandwidth peak for gemvh vs
 // gemms (the path precise decode used before), real Qwen3.8-27B shapes.
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
-#include <vector>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,9 @@ void testGemvh(Ctx& c) {
     const std::vector<int> ncolsL = c.quick ? std::vector<int>{512, 768} : std::vector<int>{256, 512, 768, 1280, 5120};
     const std::vector<int> nrowsL = c.quick ? std::vector<int>{7, 37, 100} : std::vector<int>{1, 7, 16, 17, 37, 100, 1003, 4099};
     const int ns[] = {1, 2, 5, 16, 17, 32};
+    if (c.mod.arch() == hip::Arch::gfx1151)
+        std::printf("   gemvh production grid: 17408 rows -> %u blocks, 248320 rows -> %u blocks (%d CUs)\n", wk::gemvhGrid(17408), wk::gemvhGrid(248320),
+                    hip::describeDevice(hip::getDevice()).compute_units);
     for (QType t : wk::kAllTypes) {
         const int ti = static_cast<int>(t);
         if (t == QType::f32 || (!c.k.gemvh[ti] && !c.k.gemvh2[ti])) continue;
@@ -90,8 +94,58 @@ void testGemvh(Ctx& c) {
                 }
             }
         }
+        // production shapes and grids (the sweep above stays below 640 tiles, where gemvhGrid returns one tile per block)
+        if (!c.quick) {
+            struct PS {
+                int nrows, ncols;
+            };
+            for (const PS ps : {PS{17408, 5120}, PS{5120, 17408}, PS{4099, 17408}}) {
+                const HostMat m = randomMat(c, t, ps.nrows, ps.ncols);
+                Buf w(m.data);
+                Buf x16 = makeX16(c, 32, ps.ncols);
+                const unsigned tiles = static_cast<unsigned>(cdiv(ps.nrows, 16));
+                std::vector<std::pair<std::string, unsigned>> grids;
+                if (c.mod.arch() == hip::Arch::gfx1151) {
+                    grids.push_back({"grid gemvhGrid", wk::gemvhGrid(static_cast<unsigned>(ps.nrows))});
+                    grids.push_back({"grid cap 100", wk::gemvhGridCap(static_cast<unsigned>(ps.nrows), 100)});
+                    grids.push_back({"grid cap 7", wk::gemvhGridCap(static_cast<unsigned>(ps.nrows), 7)});
+                } else {
+                    grids.push_back({"grid tiles", tiles});
+                }
+                for (int nt : {1, 5, 16, 17, 32}) {
+                    for (int acc = 0; acc < 2; ++acc) {
+                        const std::vector<float> init = c.randn(static_cast<std::size_t>(nt) * ps.nrows, 3.0f);
+                        auto run = [&](hip::Function f, hip::Dim3 grid, int nth) {
+                            Buf y(init);
+                            hip::launch(f, grid, {static_cast<unsigned>(nth), 1, 1}, 0, c.s, w.p(), m.row_bytes, x16.p(), y.p(), ps.ncols, ps.nrows, nt,
+                                        acc);
+                            c.sync();
+                            return y.down<float>(static_cast<std::size_t>(nt) * ps.nrows);
+                        };
+                        const auto& c0 = wk::kGemmCfgs[0];
+                        const std::vector<float> ref =
+                            run(c.k.gemmc[0][ti], hip::Dim3{cdiv(nt, c0.bn), cdiv(ps.nrows, c0.bm), 1}, c0.nth);
+                        for (const auto& [glab, g] : grids) {
+                            for (int which = 0; which < 2; ++which) {
+                                const hip::Function f = which == 0 ? c.k.gemvh[ti] : c.k.gemvh2[ti];
+                                if (!f || (which == 0 && nt > 16)) continue;
+                                const std::vector<float> y = run(f, hip::Dim3{g, 1, 1}, 32);
+                                ++checked;
+                                if (std::memcmp(y.data(), ref.data(), ref.size() * 4) != 0) {
+                                    ++bad;
+                                    if (first_bad.empty())
+                                        first_bad = std::string(which == 0 ? "gemvh " : "gemvh2 ") + glab + " (" + std::to_string(g) + " blocks) ncols " +
+                                                    std::to_string(ps.ncols) + " nrows " + std::to_string(ps.nrows) + " n " + std::to_string(nt) +
+                                                    " acc " + std::to_string(acc);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Result r;
-        r.name = std::string("gemvh/gemvh2 == gemm_c0 and gemms_c*, ncols x nrows x n x acc sweep (") + std::to_string(checked) + " runs) " +
+        r.name = std::string("gemvh/gemvh2 == gemm_c0 and gemms_c*, ncols x nrows x n x acc sweep + 27B shapes at the production grid (") + std::to_string(checked) + " runs) " +
                  wk::typeSuffix(t);
         r.kind = Kind::invariant;
         r.n = checked;

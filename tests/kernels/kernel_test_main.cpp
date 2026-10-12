@@ -7,6 +7,7 @@
 // families: quant gemv gemm attn gdn moe moemx misc
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <set>
 #include <sstream>
@@ -89,7 +90,23 @@ int main(int argc, char** argv) {
         hip::setDevice(dev);
         const auto info = hip::describeDevice(dev);
         std::printf("device %d: %s (%s)\n", dev, info.name.c_str(), info.gcn_arch.c_str());
-        c.mod = hip::Module::loadEmbedded();
+        // WHIRL_KT_CODE_OBJECT=<file>: test an externally built code object of the device's family instead of the
+        // embedded one (fault-injection builds, e.g. kernels/gfx1151/gemv_h.hip with -DWHIRL_GH_INJECT=1)
+        static std::string co_image;  // must outlive the module
+        if (const char* co = std::getenv("WHIRL_KT_CODE_OBJECT"); co != nullptr && *co != 0) {
+            std::FILE* fp = std::fopen(co, "rb");
+            if (fp == nullptr) throw std::runtime_error(std::string("WHIRL_KT_CODE_OBJECT: cannot open ") + co);
+            std::fseek(fp, 0, SEEK_END);
+            co_image.resize(static_cast<std::size_t>(std::ftell(fp)));
+            std::fseek(fp, 0, SEEK_SET);
+            const bool ok = std::fread(co_image.data(), 1, co_image.size(), fp) == co_image.size();
+            std::fclose(fp);
+            if (!ok) throw std::runtime_error(std::string("WHIRL_KT_CODE_OBJECT: cannot read ") + co);
+            c.mod = hip::Module::loadData(co_image.data(), hip::archFor(info.gcn_arch));
+            std::printf("code object: %s (WHIRL_KT_CODE_OBJECT)\n", co);
+        } else {
+            c.mod = hip::Module::loadEmbedded();
+        }
         c.k = whirl::kernels::KernelTable::load(c.mod, whirl::kernels::KvFormat::f16);
         // gfx1151 stores packed int8 scale words; the CPU references follow the code object
         kt::ref::setXdSum(c.k.caps.xd_sum);
