@@ -1786,6 +1786,29 @@ int cmdSeqtest(const Args& a) {
         lh_bad += vbad;
         out(fmt("  CLI verify rows (%u): %u/%u logits hashes differ from the solo rows\n", nv, vbad, nv));
     }
+    // FR-DFL: the literal-draft verify of whirl chat's DFlash2 / n-gram decode (verifyEnqueueEx, the
+    // dflashDecode path) with a DFlash2 block of 8 (7 drafts) and 16 (15 drafts): every row's logits
+    // bits must equal the solo decode row, in every numerics mode (fast: 4-bit KV)
+    for (const u32 nd : {7u, 15u}) {
+        if (nd + 1 > n_gen || nd + 1 > q::max_small_batch) continue;
+        m.selectSeq(0);
+        m.reset();
+        m.prefill(pa, 0);
+        const u32 first = m.argmax();
+        m.verifyEnqueueEx(first, nd, std::span<const u32>(ref[0]).subspan(1, nd), static_cast<u32>(pa.size()));
+        std::array<u32, q::max_small_batch> vo{};
+        (void)m.readCycle(std::span<u32>(vo.data(), nd + 1), std::span<u32>(vo.data(), 0));
+        u32 vbad = 0, tbad = 0;
+        for (u32 r = 0; r <= nd; ++r) {
+            vbad += rowHash(m, r) != lh[0][r + 1] ? 1 : 0;
+            tbad += vo[r] != ref[0][r + 1] ? 1 : 0;
+        }
+        lh_total += nd + 1;
+        lh_bad += vbad;
+        ok = ok && tbad == 0 && first == ref[0][0];
+        out(fmt("  literal-draft verify (verifyEnqueueEx, %u drafts = %u rows): %u/%u logits hashes and %u tokens differ from the solo rows\n",
+                nd, nd + 1, vbad, nd + 1, tbad));
+    }
     // P3-4 (informational, not part of ok): the prompt's last logits when the prefill is split in two
     // forwards at row a (a multiple of 64 = a CLI / server chunk start, or not) with t rows after it.
     // t <= 16 runs the second forward on the decode kernels (gemv / flash-decoding / fused GDN).
