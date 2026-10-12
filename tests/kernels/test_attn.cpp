@@ -204,6 +204,204 @@ std::vector<float> pickRows(const std::vector<float>& all, const std::vector<int
 
 int nSplit() { return std::min(wk::kFdMaxSplits, (kMaxCtx + wk::kFdChunk - 1) / wk::kFdChunk); }
 
+// FIX-K97 (FR-K97 P2-4): attn_dq4 at production split counts and long contexts. The q4 pool holds 16
+// physical pages (random q4 K / V, a per-page scale multiplier so the running max keeps moving) and the
+// page table maps up to 1025 logical pages onto them, so contexts up to 256k cost 4096 pool rows; the CPU
+// reference scores each physical row once per head and walks the logical keys (same math as attnRef).
+//   * grid.y 2 / 4 at 1100 keys (dq_per 576 / 320: 2-3 tiles per wave), 64 at 100k, 256 at 33k / 128k /
+//     256k (dq_per caps at 128 active splits: 2048 keys = 8 tiles per wave at 256k) vs CPU;
+//   * the 128-split cap: grid.y 256 == grid.y 128 for splits 0..127 (ml / acc bits), splits 128..255
+//     write (-inf, 0), and the combined outputs are bitwise equal;
+//   * random MTP draft windows (sink 256 + last W keys, W random) vs CPU over the same key set.
+void dq4Long(Ctx& c) {
+    const hip::Function fd = c.fnOpt("attn_dq4");
+    if (!fd || !c.k.caps.kv_q4) {
+        c.rep.skip("attndq4", "attn_dq4 long context", "kernel not in this code object");
+        return;
+    }
+    constexpr int kPhys = 16, kLogMax = 262144 / wk::kKvPage + 1;
+    const std::size_t rows = static_cast<std::size_t>(kPhys) * wk::kKvPage, n = rows * kRow;
+    std::vector<std::int8_t> k8(n), v8(n);
+    std::vector<std::uint16_t> ks(n / 32), vs(n / 32);
+    {
+        std::uniform_int_distribution<int> q4(-8, 7);
+        std::uniform_real_distribution<float> sc(0.12f, 0.25f), mul(0.6f, 1.4f);
+        for (auto& x : k8) x = static_cast<std::int8_t>(q4(c.rng));
+        for (auto& x : v8) x = static_cast<std::int8_t>(q4(c.rng));
+        for (int pg = 0; pg < kPhys; ++pg) {
+            const float m = mul(c.rng);
+            const std::size_t g0 = static_cast<std::size_t>(pg) * wk::kKvPage * kRow / 32, g1 = g0 + static_cast<std::size_t>(wk::kKvPage) * kRow / 32;
+            for (std::size_t g = g0; g < g1; ++g) {
+                ks[g] = f2h((c.rng() & 1 ? 1.f : -1.f) * sc(c.rng) * m);
+                vs[g] = f2h((c.rng() & 1 ? 1.f : -1.f) * sc(c.rng));
+            }
+        }
+    }
+    std::vector<int> ptab(kLogMax);
+    for (auto& x : ptab) x = static_cast<int>(c.rng() % kPhys);
+    Buf dk(pack4(k8)), dv(pack4(v8)), dks(ks), dvs(vs), dpt(ptab);
+    wk::KvArgs kv;
+    kv.k = dk.p();
+    kv.v = dv.p();
+    kv.ks = dks.p();
+    kv.vs = dvs.p();
+    kv.ptab = dpt.p();
+    kv.tab0 = 0;
+    auto val = [](const std::vector<std::int8_t>& qq, const std::vector<std::uint16_t>& s, std::size_t e) {
+        return static_cast<double>(h2f(d2h(static_cast<double>(qq[e]) * h2f(s[e >> 5]))));
+    };
+    // K / V values once (f16 of q * s, as the kernel reads them)
+    std::vector<double> kf(n), vf(n);
+    for (std::size_t e = 0; e < n; ++e) {
+        kf[e] = val(k8, ks, e);
+        vf[e] = val(v8, vs, e);
+    }
+    const int nq = 2;
+    const std::vector<float> q = c.randn(static_cast<std::size_t>(nq) * kHeads * kQStride);
+    Buf dq(q);
+    // CPU: query t at position pos[t], keys [0, pos], keys [256, win_lo) skipped
+    auto ref = [&](const std::vector<int>& pos, int win_lo, std::vector<double>& out, std::vector<double>& scale) {
+        out.assign(static_cast<std::size_t>(nq) * kHeads * kHd, 0.0);
+        scale.assign(out.size(), 0.0);
+        std::vector<double> sp(rows), wsum(rows);
+        auto prow = [&](int p) { return static_cast<std::size_t>(ptab[static_cast<std::size_t>(p / wk::kKvPage)]) * wk::kKvPage + p % wk::kKvPage; };
+        for (int t = 0; t < nq; ++t) {
+            const int np = pos[static_cast<std::size_t>(t)] + 1;
+            for (int hh = 0; hh < kHeads; ++hh) {
+                const int kvh = hh / kGrp;
+                const float* qv = q.data() + (static_cast<std::size_t>(t) * kHeads + hh) * kQStride;
+                for (std::size_t r = 0; r < rows; ++r) {
+                    const std::size_t base = (r * kKv + kvh) * kHd;
+                    double d = 0;
+                    for (int i = 0; i < kHd; ++i) d += static_cast<double>(qv[i]) * kf[base + i];
+                    sp[r] = d * kScale;
+                }
+                double m = -INFINITY;
+                for (int p = 0; p < np; ++p)
+                    if (!(p >= 256 && p < win_lo)) m = std::max(m, sp[prow(p)]);
+                std::fill(wsum.begin(), wsum.end(), 0.0);
+                double l = 0;
+                for (int p = 0; p < np; ++p) {
+                    if (p >= 256 && p < win_lo) continue;
+                    const double e = std::exp(sp[prow(p)] - m);
+                    wsum[prow(p)] += e;
+                    l += e;
+                }
+                for (int dd = 0; dd < kHd; ++dd) {
+                    double o = 0, a = 0;
+                    for (std::size_t r = 0; r < rows; ++r) {
+                        if (wsum[r] == 0) continue;
+                        const double vv = vf[(r * kKv + kvh) * kHd + dd];
+                        o += wsum[r] * vv;
+                        a += wsum[r] * std::fabs(vv);
+                    }
+                    const double g = 1.0 / (1.0 + std::exp(-static_cast<double>(qv[kHd + dd])));
+                    const std::size_t oi = (static_cast<std::size_t>(t) * kHeads + hh) * kHd + dd;
+                    out[oi] = o / l * g;
+                    scale[oi] = a / l * g;
+                }
+            }
+        }
+    };
+    struct Out {
+        std::vector<float> ml, acc, o;
+    };
+    auto run = [&](const std::vector<int>& pos, int ns, int win) {
+        Buf dp(pos), ml(static_cast<std::size_t>(nq) * ns * kHeads * 2 * 4), acc(static_cast<std::size_t>(nq) * ns * kHeads * kHd * 4),
+            out(static_cast<std::size_t>(nq) * kHeads * kHd * 4);
+        ml.fill(0x7f);  // garbage: every split must write its ml
+        acc.zero();
+        wk::AwGroups g{};
+        for (int r = 0; r < nq; ++r) {
+            g.first[r] = r;
+            g.count[r] = 1;
+        }
+        wk::KvArgs a = kv;
+        a.win = win;
+        hip::launch(fd, {kKv, static_cast<unsigned>(ns), static_cast<unsigned>(nq)}, {256, 1, 1}, 0, c.s, dq.p(), a, ml.p(), acc.p(), kHeads, kKv,
+                    kQStride, dp.p(), kScale, DevPtr{0}, g);
+        hip::launch(c.k.attn_combine, {kHeads, static_cast<unsigned>(nq), 1}, {256, 1, 1}, 0, c.s, ml.p(), acc.p(), dq.p(), out.p(), kHeads, kHd,
+                    kQStride, ns);
+        c.sync();
+        Out o;
+        o.ml = ml.down<float>(static_cast<std::size_t>(nq) * ns * kHeads * 2);
+        o.acc = acc.down<float>(static_cast<std::size_t>(nq) * ns * kHeads * kHd);
+        o.o = out.down<float>(static_cast<std::size_t>(nq) * kHeads * kHd);
+        return o;
+    };
+    auto winArg = [](int w, int min_ctx) { return ((w + 63) / 64) | ((min_ctx / 1024) << 16); };
+    struct Case {
+        int ctx, ns;
+    };
+    std::vector<Case> cases = {{1100, 2}, {1100, 4}, {33000, 256}, {100000, 64}, {131072 + 77, 256}, {262144, 256}};
+    if (c.quick) cases = {{1100, 2}, {33000, 256}, {262144, 256}};
+    for (const Case& cs : cases) {
+        const std::vector<int> pos = {cs.ctx - 1, cs.ctx - 2};  // two verify rows (one query per group)
+        const std::string tag = " (ctx " + std::to_string(cs.ctx) + ", grid.y " + std::to_string(cs.ns) + ") [kv q4 long]";
+        const Out o = run(pos, cs.ns, 0);
+        std::vector<double> ro, rs;
+        ref(pos, 0, ro, rs);
+        c.rep.add(cmpTol("attn_dq4 + combine vs CPU" + tag, o.o, ro, rs, 1e-2, 1e-4));
+        if (cs.ns == 256) {
+            // the cap: splits >= 128 empty, splits < 128 as with grid.y 128, outputs bitwise equal
+            const Out h = run(pos, 128, 0);
+            std::size_t bad_ml = 0, bad_acc = 0, bad_empty = 0, nml = 0, nempty = 0;
+            for (int t = 0; t < nq; ++t)
+                for (int sp = 0; sp < 256; ++sp)
+                    for (int hh = 0; hh < kHeads; ++hh) {
+                        const std::size_t i256 = (static_cast<std::size_t>(t) * 256 + sp) * kHeads + hh;
+                        if (sp >= 128) {
+                            bad_empty += !(o.ml[i256 * 2] == -INFINITY && o.ml[i256 * 2 + 1] == 0.f);
+                            ++nempty;
+                            continue;
+                        }
+                        const std::size_t i128 = (static_cast<std::size_t>(t) * 128 + sp) * kHeads + hh;
+                        bad_ml += std::memcmp(&o.ml[i256 * 2], &h.ml[i128 * 2], 8) != 0;
+                        bad_acc += std::memcmp(&o.acc[i256 * kHd], &h.acc[i128 * kHd], kHd * 4) != 0;
+                        ++nml;
+                    }
+            Result r1;
+            r1.name = "attn_dq4 grid.y 256: splits 128..255 write (-inf, 0)" + tag;
+            r1.n = nempty;
+            r1.mismatches = bad_empty;
+            r1.pass = bad_empty == 0;
+            c.rep.add(r1);
+            Result r2;
+            r2.name = "attn_dq4 grid.y 256 == grid.y 128 for splits 0..127 (ml, acc bits)" + tag;
+            r2.kind = Kind::invariant;
+            r2.n = 2 * nml;
+            r2.mismatches = bad_ml + bad_acc;
+            r2.pass = r2.mismatches == 0;
+            c.rep.add(r2);
+            c.rep.add(cmpExact("attn_dq4 grid.y 256 combined == grid.y 128 combined" + tag, o.o, h.o, Kind::invariant));
+        }
+        // random MTP draft windows, CPU over the same key set (attnRef's win_lo)
+        if (cs.ns > 1) {
+            std::uniform_int_distribution<int> uw(1, std::max(1, cs.ctx - 300));
+            int done = 0;
+            for (int it = 0; it < 8 && done < (c.quick ? 1 : 2); ++it) {
+                const int w = uw(c.rng);
+                const int w64 = (w + 63) / 64 * 64;
+                // each row's key set: sink + [max(256, (n_pos - W) & ~63), n_pos) when that start is > 256
+                bool same = true;
+                int w0 = 0;
+                for (int t = 0; t < nq; ++t) {
+                    const int np = pos[static_cast<std::size_t>(t)] + 1, s0 = std::max(256, (np - w64) & ~63);
+                    if (t == 0) w0 = s0;
+                    same = same && s0 == w0;
+                }
+                if (!same || w0 <= 256) continue;  // rows' window starts differ, or no window: draw again
+                ++done;
+                const Out ow = run(pos, cs.ns, winArg(w, 0));
+                std::vector<double> rwo, rws;
+                ref(pos, w0, rwo, rws);
+                c.rep.add(cmpTol("attn_dq4 draft window W " + std::to_string(w) + " (keys from " + std::to_string(w0) + ") vs CPU" + tag, ow.o, rwo, rws,
+                                 1e-2, 1e-4));
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void testAttn(Ctx& c) {
@@ -1152,6 +1350,12 @@ void testAttn(Ctx& c) {
     } else {
         c.rep.skip("attn", "set_rpos", "kernel not in this code object");
     }
+}
+
+// "attndq4": attn_dq4 long-context / 256-split checks (FIX-K97, see dq4Long)
+void testAttnDq4(Ctx& c) {
+    c.rep.family = "attndq4";
+    dq4Long(c);
 }
 
 }  // namespace kt
