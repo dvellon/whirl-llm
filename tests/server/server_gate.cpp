@@ -671,7 +671,9 @@ void suiteBasic() {
     // only the thinking Chinese prompt and the English summary are compared)
     for (const Case& c : cases)
         if (std::string(c.key) != "zh_nothink") cli_ref[c.key] = cliRun(c.prompt, c.think, c.max);
-    ServerLease s("basic", {}, {});
+    std::optional<ServerLease> s_opt;
+    s_opt.emplace("basic", std::vector<std::string>{}, std::map<std::string, std::string>{});
+    ServerLease& s = *s_opt;
     {
         auto h = test::httpRequest("127.0.0.1", g.port, "GET", "/health");
         check("basic: GET /health", h.status == 200 && h.body.find("\"status\":\"ok\"") != std::string::npos, h.body);
@@ -777,8 +779,11 @@ void suiteBasic() {
         }
         check("basic: multi-turn reuses the whole previous conversation", ok, detail);
     }
-    // concurrency: 4 different prompts at once == solo
-    {
+    // concurrency: 4 different prompts at once == solo. Fast mode with relaxed acceptance only
+    // guarantees quality within its gate, not concurrent == solo text (the draft cadence depends on
+    // the load), so there the relax-on comparison is informational and the gated check runs a
+    // server with WHIRL_RELAX=0 (it then tests the kernels' batch invariance).
+    auto concCheck = [&](const std::string& name, bool gated) {
         const std::vector<std::string> ps = {"Explain a hash map in two sentences.", "What is RAII? Two sentences.",
                                              "Write a Python one-liner that reverses a string.", P_ZH};
         std::vector<ChatResult> alone;
@@ -791,9 +796,26 @@ void suiteBasic() {
         for (std::size_t i = 0; i < ps.size(); ++i) {
             same = same && res[i].content == alone[i].content;
             d += res[i].content == alone[i].content ? "=" : "x";
-            record(std::format("basic/conc{}", i), alone[i].text());
+            if (gated) record(std::format("basic/conc{}", i), alone[i].text());
         }
-        check("basic: 4 concurrent requests == each alone", same, d);
+        if (gated)
+            check(name, same, d);
+        else
+            logLine(std::format("INFO {}: {} ({}; not a gate)", name, same ? "equal" : "differs", d));
+    };
+    auto envMode = [] {
+        auto it = g.server_env.find("WHIRL_MODE");
+        if (it != g.server_env.end()) return it->second;
+        const char* m = std::getenv("WHIRL_MODE");
+        return std::string(m ? m : "");
+    };
+    if (envMode() == "fast") {
+        concCheck("basic: 4 concurrent requests == each alone (fast, relaxacc on)", false);
+        s_opt.reset();
+        ServerLease s2("basic_norelax", {}, {{"WHIRL_RELAX", "0"}});
+        concCheck("basic: 4 concurrent requests == each alone (WHIRL_RELAX=0)", true);
+    } else {
+        concCheck("basic: 4 concurrent requests == each alone", true);
     }
 }
 

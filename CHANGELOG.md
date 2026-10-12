@@ -5,6 +5,10 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## Unreleased (0.2.0)
 
+### Fast-mode concurrency (conc8s)
+
+- GPUs without replay kernels (Radeon 8060S) now use the same relaxacc draft caps as the R9700 ({8, 7, 4, 3} for 1-4 slots, 14 snapshot sets, +0.9 GiB), so concurrent fast requests match solo ones in the gate; fast concurrent == solo is best effort, not guaranteed (documented). The server gate's concurrency check runs fast mode with `WHIRL_RELAX=0` and only reports the relax-on result.
+
 ### SSD tier: far fewer disk writes, hard size cap, expiry (SSD-QUIET)
 
 - **Default `--kv-ssd-mode` is now `shutdown`**: no SSD writes while the server runs; sessions stay in
