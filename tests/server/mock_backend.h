@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cstdint>
 #include <map>
+#include <map>
 #include <mutex>
 #include <set>
 #include <vector>
@@ -56,10 +57,20 @@ public:
 
     std::size_t liveAllocations() const;
     std::uint64_t copiedBytes() const { return copied_.load(); }
+    // fault injection: the nth copy (from now) whose source is pinned host memory (a tier restore
+    // copy) throws; 0: off
+    void failHostToDevCopy(std::uint64_t nth) {
+        host_copies_ = 0;
+        fail_host_copy_ = nth;
+    }
+    bool hostCopyFailArmed() const { return fail_host_copy_.load() != 0; }
 
 private:
+    bool isHost(tier::DevPtr p) const;
     mutable std::mutex mu_;
     std::set<void*> live_;
+    std::map<std::uintptr_t, std::uint64_t> host_;  // pinned host allocations (start -> bytes)
+    std::atomic<std::uint64_t> fail_host_copy_{0}, host_copies_{0};
     std::atomic<std::uint64_t> copied_{0};
     std::atomic<std::uintptr_t> next_handle_{0x1000};
 };

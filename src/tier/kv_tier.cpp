@@ -698,6 +698,14 @@ std::optional<Match> Tier::lookup(std::span<const std::uint32_t> toks) {
 
 Restore* Tier::beginRestore(Entry* e, std::span<const Span> spans, std::size_t n_main_spans) {
     auto r = std::make_unique<Restore>();
+    // events first: nothing below may throw once an SSD read job is submitted
+    ScopeExit ev_guard{[&] {
+        if (!r) return;  // handed to the caller
+        if (r->ev != nullptr) poolEvent(r->ev);
+        if (r->ev_main != nullptr) poolEvent(r->ev_main);
+    }};
+    r->ev = newEvent();
+    r->ev_main = newEvent();
     r->entry_id = e->id;
     r->t0 = std::chrono::steady_clock::now();
     // in use: the "unchanged for" clock of its SSD write restarts
@@ -793,26 +801,31 @@ Restore* Tier::beginRestore(Entry* e, std::span<const Span> spans, std::size_t n
         readSources(job.get(), e);
         job->fence = newEvent();
         ops_.eventRecord(job->fence, stream);
+        r->pos_of_lb.assign(e->blocks.size(), 0xffffffffu);
+        for (std::size_t k = 0; k < job->lbs.size(); ++k) {
+            if (job->lbs[k] < r->pos_of_lb.size()) r->pos_of_lb[job->lbs[k]] = static_cast<std::uint32_t>(k);
+        }
         e->in_ram = true;
         e->io_busy = true;
         e->loading = true;
         for (auto& d : e->dirty) d = 0;
         r->job = job.release();
         submit(r->job);
-    }
-    if (r->job != nullptr) {
+    } else if (r->job != nullptr) {
         r->pos_of_lb.assign(e->blocks.size(), 0xffffffffu);
         const auto& lbs = r->job->lbs;
         for (std::size_t k = 0; k < lbs.size(); ++k) {
             if (lbs[k] < r->pos_of_lb.size()) r->pos_of_lb[lbs[k]] = static_cast<std::uint32_t>(k);
         }
     }
-    r->ev = newEvent();
-    r->ev_main = newEvent();
     e->pin += 1;
     touch(e);
     Restore* rp = r.release();
-    pumpRestore(rp);
+    // the first pump enqueues most pieces (all of them for a RAM restore): a device exception here
+    // marks the restore failed (the caller prefills cold after ordering its stream behind what was
+    // enqueued, then ends the restore: pin released, an SSD read job reaped by tick) instead of
+    // leaking the Restore with the entry pinned and its copies unordered against the cold prefill
+    pumpRestoreNoThrow(rp);
     return rp;
 }
 
