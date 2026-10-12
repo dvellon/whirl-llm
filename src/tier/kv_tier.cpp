@@ -769,8 +769,9 @@ Restore* Tier::beginRestore(Entry* e, std::span<const Span> spans, std::size_t n
             Job* j = jobs_[i];
             if (j->kind == JobKind::read && j->entry_id == e->id) {
                 found = j;
-                jobs_[i] = jobs_.back();  // swapRemove
-                jobs_.pop_back();
+                // ordered erase (FLAKE-1): a swapRemove moved the newest job into this slot, so later
+                // jobs were reaped (and logged) out of submission order
+                jobs_.erase(jobs_.begin() + static_cast<std::ptrdiff_t>(i));
                 break;
             }
         }

@@ -2638,6 +2638,66 @@ static void testIdleWakeRoomPending(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+// FIX-RC4-A P3-7 (FLAKE-1 rest): a restore taking over a running prefetch removed the prefetch job from the
+// job list with a swapRemove, so the writes queued after it were reaped -- and logged -- out of order.
+static void testTakeoverKeepsJobOrder(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 9600;
+    const std::uint64_t fp = 82;
+    Sess p(ops, 24);
+    p.toks = freshToks(3000, seed);
+    {
+        auto t = Tier::create(ops, 256ull << 20, 103, 0);
+        t->start(env.cfg(4ull << 30), kLay, fp);
+        spillSess(*t, p, 0);
+        CHECK(tickIdle(*t));
+    }
+    auto t = Tier::create(ops, 256ull << 20, 104, 0);
+    std::vector<std::string> logs;
+    t->log_fn = [&](std::string_view s) { logs.emplace_back(s); };
+    t->start(env.cfg(4ull << 30), kLay, fp);
+    Entry* ep = t->find(p.id);
+    CHECK(ep != nullptr && !ep->in_ram);
+    if (!ep) return;
+    ops.closeGate();  // the prefetch read waits (the IO thread holds it)
+    CHECK(t->prefetch(ep));
+    Sess a(ops, 24), b(ops, 24), c(ops, 24);
+    Sess* w[3] = {&a, &b, &c};
+    for (Sess* s : w) {
+        s->toks = freshToks(3000, seed);
+        spillSess(*t, *s, 0);
+        sleepMs(2);
+    }
+    t->tick();  // writes of a, b, c queued after the prefetch: jobs [p, a, b, c]
+    DevSlot dst(ops, 2, 24);
+    std::vector<Span> sp;
+    sp.push_back(Span{dst.ck[0], 0, kLay.ck_bytes, 0});
+    sp.push_back(Span{dst.kv, ep->kvOff(kLay), static_cast<std::uint64_t>(ep->pages) * kLay.page_bytes, 0xff});
+    Restore* r = t->beginRestore(ep, sp, sp.size());  // takes the prefetch over
+    CHECK(r != nullptr);
+    ops.openGate();
+    if (r) {
+        CHECK(runRestore(*t, r));
+        t->endRestore(r);
+    }
+    // let every write finish before reaping, so the reap order is the job-list order
+    for (int i = 0; i < 2000 && countFiles(dir) < 4; ++i) sleepMs(5);
+    sleepMs(1500);
+    CHECK(tickIdle(*t));
+    std::vector<std::uint64_t> order;
+    for (const std::string& l : logs) {
+        const auto q = l.find("entry ");
+        if (l.find("written to SSD") == std::string::npos || q == std::string::npos) continue;
+        order.push_back(std::strtoull(l.c_str() + q + 6, nullptr, 16));
+    }
+    CHECK(order.size() == 3);
+    if (order.size() == 3) CHECK(order[0] == a.id && order[1] == b.id && order[2] == c.id);  // was c, a, b
+    t.reset();
+    fs::remove_all(dir, ec);
+}
+
 // ---- SSD-QUIET: write amplification of a benchmark-like request stream -------------------
 // Ornith-35B-A3B layout from the server log ("entry: 51.2 MiB per checkpoint, 9.0 MiB per 256-token
 // page", f16 KV), scaled by 1/amp_div so the default run stays small (WHIRL_TIER_AMP=full: real sizes).
@@ -2922,6 +2982,10 @@ int main(int argc, char** argv) {
     if (want("testIdleWakeRoomPending")) {
         std::printf("-- %s\n", "testIdleWakeRoomPending");
         testIdleWakeRoomPending(ops, dir);
+    }
+    if (want("testTakeoverKeepsJobOrder")) {
+        std::printf("-- %s\n", "testTakeoverKeepsJobOrder");
+        testTakeoverKeepsJobOrder(ops, dir);
     }
     if (want("testWriteAmplification")) {
         std::printf("-- %s\n", "testWriteAmplification");
