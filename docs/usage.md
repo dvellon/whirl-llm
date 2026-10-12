@@ -207,7 +207,7 @@ request slots, a prefix cache in VRAM and host RAM / SSD tiers for idle sessions
 | `--ctx-per-slot N` | longest context of one request (default min(pool, 131072); up to 262144) |
 | `--precise` / `--balance` / `--fast` / `--mode M` | numerics mode (default balance; `--precise`: f16 KV; when the f16 pool cannot hold a full request the context per request is lowered with a warning, or the server refuses to start if `--ctx` / `--ctx-per-slot` was given). See [numerics modes](#modes) |
 | `--mtp-drafts N` | fixed MTP drafts per cycle, 1–10 (default: chosen per model type by a cost model) |
-| `--draft mtp\|dflash` | draft source of the speculative decode (default `mtp`). `dflash`: the DFlash2 drafter GGUF given by `--draft-model` (block 8: up to 7 drafts per cycle); a model without a matching drafter (e.g. a MoE model) keeps `mtp`. n-gram drafts stay on in both modes; greedy outputs equal plain greedy decoding |
+| `--draft mtp\|dflash` | draft source of the speculative decode (default `mtp`). `dflash`: the DFlash2 drafter GGUF given by `--draft-model` (up to block - 1 drafts per cycle; the official 27B drafter has block 8: 7 drafts); a model without a matching drafter (e.g. a MoE model), a drafter file that cannot be opened or does not fit: `mtp` with a warning. n-gram drafts stay on in both modes; greedy outputs equal plain greedy decoding. Opt-in: see [when DFlash2 helps](#dflash) |
 | `--draft-model FILE` | DFlash2 drafter GGUF for `--draft dflash` (wins over `WHIRL_DRAFT_MODEL`, as for `chat`) |
 | `--decode-min-tps N` | decode floor: while other requests prefill, every streaming (decoding) request keeps at least N tok/s; prefill forwards are shortened and decode cycles interleaved to hold it (default 20; `0` = off, prefill forwards are not limited). Outputs are identical for any N ([server.md](guide/en/server.md#batching)) |
 | `--kv-ram-mb N` | host RAM tier of the prefix cache, MiB of pinned memory (default: 1/4 of physical RAM, at least 8 GiB or one full-length session if that is larger — about 9 GiB for the 27B model —, at most 32 GiB, and at most half of the RAM available at startup; 16 GiB on a 64 GB PC; integrated GPUs: OS-visible RAM / 8 within [one max-context entry (about 6 GiB for the 27B model at 262k), 16 GiB], at most 1/4 of the RAM available at startup, off under 32 GB of OS-visible RAM (the BIOS VRAM carve-out does not count; 8 GiB on a 64 GB machine)). The startup log prints the chosen size and why. Idle sessions are copied there and restored instead of prefilled again. `0` disables both host tiers. **Radeon 8060S** (integrated GPU): on by default with the size above (the KV pool is the BIOS carve-out, the tier is separate pinned OS RAM; a 128k session restores in 0.3 s from RAM or 2 s from SSD instead of a 537 s prefill); `--kv-ram-mb 0` turns both host tiers off, `--kv-ssd-gb 0` / `--kv-ssd-mode off` only the SSD tier |
@@ -237,6 +237,33 @@ Examples:
 # with image input
 .\whirl-server.exe C:\models\model.gguf --mmproj C:\models\mmproj-F16.gguf
 ```
+
+### <a id="dflash"></a>DFlash2 drafts (`--draft dflash`): when they help
+
+DFlash2 is an optional second draft source for Qwen3.8-27B (dense only; MoE models such as Ornith
+have no drafter and keep MTP). A small block-diffusion drafter proposes up to 7 tokens per cycle
+from the target's hidden states; the target verifies them exactly like n-gram drafts, so the text is
+the same as without drafts (greedy: plain greedy decoding of the same numerics mode; sampling: the
+same text for the same seed). Only the speed changes, and not always for the better. Measured on
+the R9700 against the default MTP drafts:
+
+| Workload | DFlash2 vs MTP |
+|---|---|
+| one user, short / medium context, English or predictable output (code, lists, repeated structure) | faster: up to +19..48% |
+| mostly-Chinese output | about 10% slower |
+| 4 concurrent users | about 39% slower |
+| long context (37k+ tokens) | slower (acceptance drops) |
+
+Use it for a single user with short or medium prompts and English-heavy or predictable output; keep
+the default `mtp` for several users, long contexts or mostly-Chinese replies. Costs: about 1.9 GiB of
+VRAM (drafter weights, target-feature capture, an 80 MiB context ring per slot), so the KV pool is
+smaller; the startup log prints the drafter's share and the VRAM fit check counts it. The MTP block
+is not loaded in this mode.
+
+Drafter: download `Qwen3.8-27B-DFlash2-Q8_0.gguf` from the Hugging Face repository
+`incoai/Qwen3.8-27B-DFlash2-GGUF` and pass it with `--draft-model FILE`. A Q4_K_M drafter is untested;
+an MXFP4 `fc.weight` is refused. A drafter whose tensors do not match its own metadata, or a file
+that cannot be opened, is refused with a warning and the MTP drafts are used.
 
 Memory note: with the defaults the server pins about a quarter of the host RAM for the RAM tier
 (8–32 GiB, at most half of the RAM free at startup; 16 GiB on a 64 GB PC; plus about 0.9 GiB when `--mmproj` is given) and may use up to 64 GiB on the SSD. Use `--kv-ram-mb` /
@@ -475,6 +502,10 @@ The output always equals plain greedy decoding (with sampling: the same distribu
 | `WHIRL_DRAFT_VOCAB=off\|64k\|48k\|FILE\|N` | MTP draft head over a frequency subset of the vocabulary. Default: the 64k subset embedded in the executable, used only for dense qwen35 models with the 2-bit draft head and a 248,320-token vocabulary (outputs unchanged). `off` = full draft head; `48k` = `draft_vocab\subset_48k.bin` next to the exe; FILE = uint32 little-endian token ids; N = the first N rows |
 | `WHIRL_NGRAM=0` | no n-gram (prompt-lookup) drafts |
 | `WHIRL_DRAFT_MODEL=FILE` | DFlash2 drafter GGUF for `--draft dflash` when `--draft-model` is not given (debug override; `--draft-model` wins) |
+| `WHIRL_DFLASH_PMIN=P` | `--draft dflash`: end the DFlash2 draft walk at a token whose probability is below P, 0..1 (default 0: the whole block) *(debug)* |
+| `WHIRL_DFLASH_NMIN=N` | `--draft dflash`: fewer than N drafts in a block = no drafts that cycle (default 0) *(debug)* |
+| `WHIRL_DFLASH_WARM=N` | server, `--draft dflash`: rows a slot's drafter context needs after a restore / reset before it drafts again (default 64) *(debug)* |
+| `WHIRL_DFLASH_CAPTURE_ROWS=N` | `--draft dflash`: target-feature capture rows per forward, at least 16 (default: the drafter's window, 2048; at most the prefill batch). Smaller values save VRAM but leave gaps in the drafter context after long prefills *(debug)* |
 | `WHIRL_NGRAM_MIN=N` | minimum matched suffix for an n-gram draft (default 3) |
 | `WHIRL_NGRAM_SLOPE=X` | prior cost of one more n-gram verify row, relative to a 1-draft cycle, until n-gram cycles are timed (default 0.015; Radeon 8060S 0.12) |
 | `WHIRL_NGRAM_MAX=N` | most n-gram drafts per cycle (default 15) |
