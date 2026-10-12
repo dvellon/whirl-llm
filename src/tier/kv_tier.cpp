@@ -376,6 +376,11 @@ void Tier::start(const Config& cfg_in, const Layout& lay_in, std::uint64_t finge
                            static_cast<double>(cleanup_.expired_bytes) / 1073741824.0, static_cast<unsigned long long>(cleanup_.bad_files),
                            static_cast<double>(cleanup_.bad_bytes) / 1073741824.0, static_cast<unsigned long long>(cleanup_.cap_files),
                            static_cast<double>(cleanup_.cap_bytes) / 1073741824.0));
+            if (log_fn && cleanup_.layout_files > 0)
+                log_fn(fmt("kv tier: %llu SSD cache files (%.2f GiB) were written with another per-slot context (--ctx / --parallel, "
+                           "or a smaller context chosen for the free VRAM) and cannot be used by this server; kept (a server with "
+                           "that context uses them again), counted against the cap, evicted first, expired when unused",
+                           static_cast<unsigned long long>(cleanup_.layout_files), static_cast<double>(cleanup_.layout_bytes) / 1073741824.0));
             if (log_fn && cleanup_.unreadable_files > 0)
                 log_fn(fmt("kv tier: %llu SSD cache files (%.2f GiB) could not be opened (in use by another program?); "
                            "kept and counted against the cap",
@@ -1859,19 +1864,35 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
             del = true;
             return;
         }
-        if (hd.version != file_version || hd.fingerprint != fingerprint_) {
-            // another model / build / format: counted against the cap, dropped first (or expired)
+        // kept but not used by this server: counted against the cap, dropped first (or expired)
+        const auto keepUnused = [&]() {
             if (cfg.expire_s > 0 && used < nowUnix() - static_cast<std::int64_t>(cfg.expire_s)) {
                 del = expired = true;
-                return;
+                return false;
             }
             foreign_.push_back(Foreign{pw, size, used});
             ssd_bytes += size;
+            return true;
+        };
+        if (hd.version != file_version || hd.fingerprint != fingerprint_) {  // another model / build / format
+            keepUnused();
             return;
         }
-        if (hd.valid == 0 || hd.n_tok == 0 || hd.n_tok > lay.tok_cap || hd.nck > max_ck || hd.ck_stride != lay.ckStride() ||
-            hd.page_bytes != lay.page_bytes || hd.data_off != lay.dataOff()) {
+        // same fingerprint, but the per-entry checkpoint / page sizes differ or the counts are impossible:
+        // the file is inconsistent (corrupt)
+        if (hd.n_tok == 0 || hd.nck > max_ck || hd.ck_stride != lay.ckStride() || hd.page_bytes != lay.page_bytes) {
             del = true;
+            return;
+        }
+        // (FIX-CACHE P2-2) written with another per-slot context (--ctx, --parallel, or a VRAM-based auto-shrink:
+        // the token / block-table regions, so the data offset, scale with it), or longer than a slot holds now:
+        // a valid file this server cannot use; kept like a foreign file (used again by a server with that context)
+        if (hd.data_off != lay.dataOff() || hd.tbl_off != header_bytes + lay.tokRegion() || hd.tok_off != header_bytes ||
+            hd.n_tok > lay.tok_cap) {
+            if (keepUnused()) {
+                cleanup_.layout_files += 1;
+                cleanup_.layout_bytes += size;
+            }
             return;
         }
         // the payload must be all there: a file cut short (disk full, external truncation) would
@@ -1894,7 +1915,7 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
         const std::uint64_t kv_off = static_cast<std::uint64_t>(hd.nck) * lay.ckStride();
         const std::size_t n_blk =
             hd.pages == 0 ? 0 : lbRange(kv_off, static_cast<std::uint64_t>(hd.pages) * lay.page_bytes)[1] - kv_off / block_bytes;
-        if (hd.n_blk != n_blk || n_blk > lay.maxKvBlocks() || hd.tbl_off != header_bytes + lay.tokRegion()) {
+        if (hd.n_blk != n_blk || n_blk > lay.maxKvBlocks()) {
             del = true;
             return;
         }

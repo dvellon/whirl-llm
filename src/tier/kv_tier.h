@@ -377,6 +377,8 @@ public:
         std::uint64_t cap_files = 0, cap_bytes = 0;          // evicted (LRU) to fit the cap
         // could not be opened (locked by another program): kept, counted against the cap, evicted first
         std::uint64_t unreadable_files = 0, unreadable_bytes = 0;
+        // written with another per-slot context (tok_cap: other file layout): kept, counted, evicted first
+        std::uint64_t layout_files = 0, layout_bytes = 0;
     };
     const Cleanup& cleanup() const { return cleanup_; }
     // the SSD directory is used by another process (SSD tier disabled)

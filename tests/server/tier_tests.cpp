@@ -3243,6 +3243,81 @@ static void testCapOwnCopyDropped(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+// FIX-CACHE P2-2 (FR-CACHE): a restart with another per-slot context (tok_cap: --ctx, --parallel, or the
+// VRAM-based auto-shrink) changes the file layout (dataOff). Before: the files of the same fingerprint were
+// deleted as corrupt. Now: kept like foreign files (counted against the cap, evicted first), and used again
+// by a server with the old context.
+static void testTokCapRestart(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 9200;
+    Sess a(ops, 32);
+    a.toks = freshToks(3000, seed);
+    std::uint64_t bytes1 = 0;
+    {
+        auto t = Tier::create(ops, 256ull << 20, 92, 0);
+        t->start(env.cfg(8ull << 30), kLay, 92);
+        spillSess(*t, a, 0);
+        CHECK(tickIdle(*t));
+        CHECK(t->ssdEntries() == 1);
+        bytes1 = t->ssd_bytes;
+    }
+    for (int k = 0; k < 2; ++k) {  // 0: smaller context, 1: larger
+        Layout l2 = kLay;
+        l2.tok_cap = k == 0 ? kLay.tok_cap / 2 : kLay.tok_cap * 2;
+        auto t2 = Tier::create(ops, 256ull << 20, 93, 0);
+        std::vector<std::string> logs;
+        t2->log_fn = [&](std::string_view m) { logs.emplace_back(m); };
+        t2->start(env.cfg(8ull << 30), l2, 92);
+        std::printf("  tok_cap %u -> %u: entries %zu, bad_files %llu, layout_files %llu, files on disk %zu\n", kLay.tok_cap, l2.tok_cap,
+                    t2->ssdEntries(), static_cast<unsigned long long>(t2->cleanup().bad_files),
+                    static_cast<unsigned long long>(t2->cleanup().layout_files), countFiles(dir));
+        CHECK(t2->cleanup().bad_files == 0);
+        CHECK(t2->cleanup().layout_files == 1);
+        CHECK(countFiles(dir) == 1);
+        CHECK(t2->ssdEntries() == 0);           // not usable with this layout
+        CHECK(t2->ssd_bytes == bytes1);         // counted against the cap
+        CHECK(!t2->lookup(a.toks).has_value());
+        bool logged = false;
+        for (const auto& l : logs) logged = logged || l.find("another per-slot context") != std::string::npos;
+        CHECK(logged);
+        if (k == 0) {
+            // evicted first: a new entry that needs the room replaces it
+            const std::uint64_t f1 = (l2.dataOff() + 2 * kLay.ckStride() +
+                                      static_cast<std::uint64_t>((2500 + kLay.page_tokens - 1) / kLay.page_tokens) * kLay.page_bytes + sector - 1) /
+                                     sector * sector;
+            t2.reset();
+            auto t3 = Tier::create(ops, 256ull << 20, 94, 0);
+            t3->start(env.cfg(std::max(bytes1, f1) + f1 / 2), l2, 92);
+            Sess b(ops, 32);
+            b.toks = freshToks(2500, seed);
+            spillSess(*t3, b, 0);
+            CHECK(tickIdle(*t3));
+            CHECK(t3->ssdEntries() == 1 && countFiles(dir) == 1);
+            CHECK(t3->ssd_bytes <= t3->cfg.ssd_cap);
+            CHECK(t3->find(a.id) == nullptr && t3->find(b.id) != nullptr);
+            t3.reset();
+            // re-create a's file for the next round
+            fs::remove_all(dir, ec);
+            auto t4 = Tier::create(ops, 256ull << 20, 95, 0);
+            t4->start(env.cfg(8ull << 30), kLay, 92);
+            a.id = 0;
+            spillSess(*t4, a, 0);
+            CHECK(tickIdle(*t4));
+        }
+    }
+    // back to the original context: the file is used again
+    auto t5 = Tier::create(ops, 256ull << 20, 96, 0);
+    t5->start(env.cfg(8ull << 30), kLay, 92);
+    CHECK(t5->ssdEntries() == 1 && t5->cleanup().layout_files == 0 && t5->cleanup().bad_files == 0);
+    Entry* ea = t5->find(a.id);
+    CHECK(ea != nullptr);
+    if (ea) CHECK(restoreMatches(*t5, ops, ea, a));
+    t5.reset();
+    fs::remove_all(dir, ec);
+}
+
 // WHIRL_TIER_ONLY=<test name>: run only that test (regression proofs)
 static bool want(const char* name) {
     const char* only = std::getenv("WHIRL_TIER_ONLY");
@@ -3393,6 +3468,10 @@ int main(int argc, char** argv) {
     if (want("testWriteAmplification")) {
         std::printf("-- %s\n", "testWriteAmplification");
         testWriteAmplification(ops, dir);
+    }
+    if (want("testTokCapRestart")) {
+        std::printf("-- testTokCapRestart\n");
+        testTokCapRestart(ops, dir);
     }
     if (want("testCapTightRamEntries")) {
         std::printf("-- %s\n", "testCapTightRamEntries");
