@@ -75,13 +75,17 @@ inline std::size_t execLen(std::size_t n, std::size_t sys, std::size_t think, st
                            std::size_t exec, std::span<const std::size_t> stops) {
     const std::size_t lim = schedNext(n, sys, think, imgs, cur);
     std::size_t len = prefillChunkLen(lim - cur);
-    if (exec <= prefill_chunk) return len;
-    while (cur + len < lim) {
-        if (std::find(stops.begin(), stops.end(), cur + len) != stops.end()) break;
-        const std::size_t nx = prefillChunkLen(lim - cur - len);
-        if (len + nx > exec + prefill_merge) break;
-        len += nx;
-    }
+    if (exec > prefill_chunk)
+        while (cur + len < lim) {
+            if (std::find(stops.begin(), stops.end(), cur + len) != stops.end()) break;
+            const std::size_t nx = prefillChunkLen(lim - cur - len);
+            if (len + nx > exec + prefill_merge) break;
+            len += nx;
+        }
+    // a kept checkpoint is a forward end (stops are schedule points, so this only bites if one is not:
+    // then the forward is split there, which the seqtest gate detects)
+    for (std::size_t st : stops)
+        if (st > cur && st < cur + len) len = st - cur;
     return len;
 }
 

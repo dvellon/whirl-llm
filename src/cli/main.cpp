@@ -1879,6 +1879,7 @@ int cmdSeqtest(const Args& a) {
             const std::array<std::size_t, 1> st = {r};
             std::vector<std::size_t> e = sched::forwardEnds(N, 0, th, noimg, 0, exec, st);
             e.erase(std::upper_bound(e.begin(), e.end(), r), e.end());
+            if (e.empty() || e.back() != r) e.push_back(r);  // the checkpoint holds the state after a forward that ended at r
             const std::vector<std::size_t> e2 = sched::forwardEnds(N, 0, th, noimg, r, exec, {});
             e.insert(e.end(), e2.begin(), e2.end());
             return e;
@@ -1915,8 +1916,8 @@ int cmdSeqtest(const Args& a) {
             sched_total += 1;
             out(fmt("    %-48s [%s]: %s\n", v.name, endsStr(v.ends).c_str(), !on ? "FAIL (a forward ends off the schedule)" : same ? "==" : "DIFFER (FAIL)"));
         }
-        // information only: splits the server never makes (cold forwards up to the split, then one
-        // forward to the end), and the CLI's own chunking
+        // information only: one extra split the server never makes (added to the reference's
+        // forwards), and the CLI's own chunking
         const std::pair<const char*, std::size_t> info[] = {
             {"split 64 rows after a schedule point", mid + 64},
             {"split 40 rows after a schedule point", mid + 40},
@@ -1925,8 +1926,8 @@ int cmdSeqtest(const Args& a) {
             {"last 9 rows as their own forward (decode kernels)", N - 9},
         };
         for (const auto& [name, sp] : info) {
-            std::vector<std::size_t> e = sched::forwardEnds(sp, 0, 0, noimg, 0, ex, {});
-            e.push_back(N);
+            std::vector<std::size_t> e = ref_ends;  // the reference's forwards with one more split at sp
+            if (std::find(e.begin(), e.end(), sp) == e.end()) e.insert(std::upper_bound(e.begin(), e.end(), sp), sp);
             out(fmt("    info: %-50s: %s\n", name, runEnds(ls, e) == ref ? "==" : "DIFFER"));
         }
         for (const std::size_t n2 : {N, static_cast<std::size_t>(long_n2)}) {
