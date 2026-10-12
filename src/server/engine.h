@@ -50,6 +50,9 @@ constexpr std::uint32_t k_big = 16384;
 constexpr std::uint32_t max_rows = qwen35::max_verify_rows;
 constexpr std::size_t prefill_chunk = 1024;
 constexpr std::size_t prefill_merge = 256;
+// TAIL-CK: per-slot checkpoints needed for the tail checkpoint (tail + prompt-end + gen-end); with
+// fewer, a tail would evict what a regenerate or the next chat turn resumes from, so none is taken
+constexpr std::size_t tail_ck_slots = cache::ckpt_keep_prefix_min;
 
 inline std::size_t prefillChunkLen(std::size_t remaining) {
     return remaining <= prefill_chunk + prefill_merge ? remaining : prefill_chunk;
@@ -196,6 +199,8 @@ struct Slot : cache::SlotCache {
     // vision: end of the prompt's last image (after <|vision_end|>), a chunk split
     // where a shared 'prefix' checkpoint is kept (0 = none)
     std::uint32_t img_ck = 0;
+    // TAIL-CK: slot checkpoint at the start of the prompt's last schedule chunk (0 = none)
+    std::uint32_t tail_ck = 0;
     bool on_sched = false;
     bool rs_shared = false;
     TimePoint tp0{};
@@ -334,6 +339,13 @@ struct EngineOptions {
     std::uint32_t sys_min = 2048;
     bool lcp_on = true;
     std::size_t n_ck = 2;
+    // TAIL-CK: a prompt of >= tail_ck_min tokens keeps a slot checkpoint (kind 'prefix') at the start
+    // of its last schedule chunk, so the same long document with another question resumes there on
+    // the second request (not only the third). Needs n_ck >= tail_ck_slots, so the tail never
+    // pushes out the prompt-end / gen-end checkpoints a regenerate or the next chat turn resumes from.
+    // WHIRL_TAIL_CK=0 turns it off (debug).
+    bool tail_ck = true;
+    std::uint32_t tail_ck_min = 4096;
     std::size_t n_spe = 2;
     bool ckpt_host = false;
     std::size_t prefill_exec = 2048;

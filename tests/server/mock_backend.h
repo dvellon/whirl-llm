@@ -91,6 +91,11 @@ struct MockConfig {
     // > 0: the next token depends on the last token only, drawn from the first `markov` words
     // (greedy output cycles: n-gram drafts hit)
     std::uint32_t markov = 0;
+    // > 0: chunk-schedule sensitivity (TAIL-CK bitwise guard): a prefill forward that starts at a
+    // position that is not a multiple of sched_grid perturbs the recurrent state, like a GPU forward
+    // split off the cold chunk schedule rounds differently; the greedy reference never splits, so
+    // any off-grid prefill split shows up as a changed output
+    std::uint32_t sched_grid = 0;
     // DFlash2 drafter (--draft dflash): block size, capture rows, probability that a draft is wrong
     bool dflash = false;
     std::uint32_t dfl_block = 8;

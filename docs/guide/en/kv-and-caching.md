@@ -242,8 +242,11 @@ needed if the new prompt ends exactly there).
 | `think-open` | just after `<think>\n` at the end of a thinking prompt (no logits) | next turn when the client drops reasoning |
 | `system` | end of the system message (≥ 2048 tokens) | new sessions with the same system prompt |
 | `prefix` | a chunk start inside a long common prefix | system prompts that end with per-session text |
+| `prefix` (tail, per slot) | start of the last schedule chunk of a prompt >= 4096 tokens (257..1280 before its end) | another question about the same long document |
 
-Each slot holds 2 checkpoints when `--parallel` > 1, 4 otherwise. A new request is placed on the
+Each slot holds 4 checkpoints with one slot, 3 with 2 to 4 slots, 1 with more. With 3 or more, a full
+set never overwrites its newest `prefix` (tail) checkpoint, so the tail, `prompt-end` and `gen-end`
+of the last request all stay; with fewer no tail checkpoint is taken (`WHIRL_TAIL_CK=0` turns it off). A new request is placed on the
 slot with the longest reusable prefix; KV is reused by truncation and the slot's state is loaded
 from the best checkpoint at or before that point.
 

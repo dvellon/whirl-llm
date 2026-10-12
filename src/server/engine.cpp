@@ -1320,6 +1320,20 @@ bool Engine::startJob(Slot& sl, Job& job) {
                 }
             }
         }
+        // TAIL-CK: the same long document with another question (one message each, REL3) shares
+        // everything up to the question; keep a slot checkpoint at the start of the prompt's last
+        // schedule chunk (257..1280 tokens before the end), so the next request resumes there instead
+        // of re-prefilling the whole document. Only on the cold schedule (kind 'prefix': reused only
+        // where it is on the new prompt's schedule too, as for the shared checkpoints), and only with
+        // enough slots that prompt-end / gen-end stay (EngineOptions::tail_ck, tail_ck_slots).
+        sl.tail_ck = 0;
+        if (opt_.tail_ck && sl.on_sched && sl.ckpts.size() >= tail_ck_slots && N >= opt_.tail_ck_min) {
+            const std::uint32_t t = static_cast<std::uint32_t>(schedFloor(toks, N - 1));
+            if (t > mt.reuse && t != sl.sys_split && t != sl.lcp_ck && t != sl.img_ck && t != sl.pf_split) {
+                sl.tail_ck = t;
+                logI("req {} | slot {} | keeping a tail checkpoint @{} ({} tokens before the prompt end)", job.id, sl.id, t, N - t);
+            }
+        }
     }
     sl.phase = Phase::prefill;
     // reset per-request counters
@@ -1377,6 +1391,7 @@ std::size_t Engine::chunkLen(const Slot& sl) const {
             if (&o != &sl && o.phase == Phase::decode) return n;
     while (cur + n < lim) {
         if (sl.lcp_ck > 0 && cur + n == sl.lcp_ck) break;  // a shared-prefix checkpoint is kept there
+        if (sl.tail_ck > 0 && cur + n == sl.tail_ck) break;  // TAIL-CK: the tail checkpoint is kept there
         const std::size_t nx = prefillChunkLen(lim - cur - n);
         if (n + nx > opt_.prefill_exec + prefill_merge) break;
         n += nx;
@@ -1396,6 +1411,11 @@ void Engine::maybeSplitCkpt(Slot& sl, DevPtr hid_row) {
             logW("req {} | slot {} | shared prefix: checkpoint @{} not kept: {} ({})", sl.reqId(), sl.id, cur, ex.what(),
                  ops_.lastErrorString());
         }
+    }
+    // TAIL-CK: slot checkpoint at the start of the last schedule chunk (cold-exact)
+    if (sl.tail_ck > 0 && cur == sl.tail_ck) {
+        m_.selectSeq(sl.id);
+        saveCkpt(sl, sl.tail_ck, "prefix", opt_.use_mtp ? std::optional<DevPtr>(hid_row) : std::nullopt, std::nullopt);
     }
     if (sl.pf_split == 0 || cur != sl.pf_split) return;
     m_.selectSeq(sl.id);

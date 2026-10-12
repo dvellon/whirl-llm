@@ -23,6 +23,11 @@ bool prefixEq(Tokens a, Tokens b);
 
 // Index metadata of a state checkpoint (the engine's Ckpt derives from it and
 // adds the device buffers).
+// TAIL-CK: with at least this many per-slot checkpoints, a full set never overwrites the newest
+// 'prefix' checkpoint (the tail checkpoint before a question: the next question about the same
+// document resumes there); fewer keep plain oldest-first replacement.
+inline constexpr std::size_t ckpt_keep_prefix_min = 3;
+
 struct CkptKey {
     bool valid = false;
     std::uint32_t pos = 0;
@@ -146,6 +151,8 @@ public:
                                     std::uint32_t reuse, std::uint32_t sys, const FloorFn& floor) const = 0;
 
     // insertion / eviction
+    // slot to write a checkpoint at pos: the one already at pos, else a free one, else the oldest
+    // (lowest seq) -- skipping the newest 'prefix' checkpoint when cks.size() >= ckpt_keep_prefix_min
     virtual std::size_t ckptSlotFor(View<const CkptKey> cks, std::uint32_t pos) const = 0;
     virtual int sharedVictim(View<const SpeKey> spes) const = 0;
     virtual Victim evictVictim(View<const SlotCache> slots, const SlotPred& evictable, View<const SpeKey> spes) const = 0;

@@ -255,6 +255,12 @@ $body = '{"messages":[{"role":"user","content":"2+3 等於多少？"}],"temperat
 Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
 ```
 
+### <a id="prefix-cache"></a>前綴快取：新請求會重用什麼
+
+DeltaNet 層只能從伺服器存過**檢查點**的位置接著跑（細節：[kv-and-caching.md](kv-and-caching.md#checkpoints)）。每個 slot 保存：提示詞結尾（`prompt-end`：同一個提示詞再來一次，例如重新生成）、回答結尾（`gen-end`：聊天或代理的下一回合），以及 0.2.0 起每個 4096 token 以上提示詞結尾附近的**尾端檢查點**。跨 session 共用的有：長 system 訊息，以及與先前 session 共同的前綴。
+
+**長文件問答。** 對同一份長文件問好幾個問題、每題一個請求（同一則 user 訊息裡放「文件＋問題」、沒有 system 訊息）：第二題會從第一題的尾端檢查點（最後一個 1024-token chunk 的起點，距提示詞結尾 257 到 1280 個 token）接著跑，只 prefill 剩下的部分，而不是整份文件。128k 文件約為 1.1k token 取代 131k（R9700：估計 1–2 秒，先前實測 107 秒）。條件：問題只在該點之後不同（約 256 token 以內的問題一定符合；更長的問題，或把文件放進 2048 token 以上的 system 訊息），且每個 slot 保留 3 個以上檢查點（預設：1 個 slot 時 4、2 到 4 個 slot 時 3）。輸出與不用快取時相同：尾端檢查點落在冷啟動的 chunk 排程上（precise 與 balance 與冷啟動逐位元一致）。每個 slot 檢查點佔 VRAM：Qwen3.8-27B 150.6 MiB、Ornith-1.5-35B-A3B 63.8 MiB；啟動日誌會列出數量與大小，VRAM 估算在 KV pool 會太小時把數量降到 2（尾端檢查點關閉）。`WHIRL_TAIL_CK=0` 可關閉（除錯用）。
+
 ### <a id="ssd-tier"></a>SSD 層如何儲存 session
 
 - **何時寫入。** `--kv-ssd-mode shutdown`（預設）：執行中完全不寫 SSD。session 留在主記憶體層，正常關閉（Ctrl+C，最多 60 秒）時寫入，
@@ -390,7 +396,7 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 |---|---|
 | `WHIRL_NO_PREFIX_CACHE=1` | 關閉前綴快取 |
 | `WHIRL_PREFIX_CACHE_VERIFY=1` | 每次快取命中後重新 prefill 並比對 *（診斷）* |
-| `WHIRL_SERVE_CKPTS=N` | 每個 slot 的前綴檢查點數（預設：1 個 slot 時 4、最多 4 個 slot 時 2、更多時 1；最多 8） |
+| `WHIRL_SERVE_CKPTS=N` | 每個 slot 的前綴檢查點數（預設：1 個 slot 時 4、最多 4 個 slot 時 3、更多時 1；最多 8；3 個以上才保留[尾端檢查點](#prefix-cache)） |
 | `WHIRL_SYS_MIN=N` | 至少 N 個 token 的 system 訊息會有自己的檢查點（預設 2048，0 = 關閉） |
 | `WHIRL_SYS_CKPTS=N` | 保留在 VRAM 的共用前綴檢查點數（預設 2） |
 | `WHIRL_SYS_LCP=0` | 不在多個 session 共同的前綴處建立檢查點 |
@@ -483,6 +489,7 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 | `WHIRL_TRACE_ND=1` | 記錄每個 decode 回合的草稿數 |
 | `WHIRL_LOOP_LOG=1` | 記錄每圈各階段的時間（伺服器） |
 | `WHIRL_TIER_VERIFY=1` | 每次 host 層寫出 / 還原都逐位元組驗證（伺服器） |
+| `WHIRL_TAIL_CK=0` | *（除錯）* 長提示詞結尾附近不保留[尾端檢查點](#prefix-cache)（日誌標示為覆寫）；同一份文件的第二個問題會重新 prefill 整份文件 |
 | `WHIRL_TIER_MIN_GAIN=N` | 只有能省下至少 N 個 token 時才從 host 層還原（預設 512） |
 
 ## <a id="files"></a>8. WHIRL 會寫入的檔案

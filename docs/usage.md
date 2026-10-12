@@ -290,6 +290,29 @@ $body = '{"messages":[{"role":"user","content":"What is 2+3?"}],"temperature":0,
 Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -ContentType 'application/json' -Body $body
 ```
 
+### <a id="prefix-cache"></a>Prefix cache: what a new request reuses
+
+DeltaNet layers can only resume where the server saved a **checkpoint** of their state (details:
+[kv-and-caching.md](guide/en/kv-and-caching.md#checkpoints)). Per slot: the end of the prompt
+(`prompt-end`: the same prompt again, e.g. regenerate), the end of the answer (`gen-end`: the next
+chat or agent turn) and, since 0.2.0, a **tail checkpoint** near the end of every prompt of 4096
+tokens or more. Shared between sessions: long system messages and prefixes common to earlier
+sessions.
+
+**Long-document Q&A.** Ask several questions about the same long document, each as its own request
+(`document + question` in one user message, no system message): the second question resumes from
+the first one's tail checkpoint (the start of its last 1024-token chunk, 257 to 1280 tokens before
+the prompt end) and prefills only the rest, instead of the whole document. On a 128k document that
+is about 1.1k tokens instead of 131k (R9700: an estimated 1-2 s instead of the 107 s measured before). Conditions: the questions
+differ only after that point (a question up to about 256 tokens always qualifies; put a long
+question, or the document, in a system message of 2048+ tokens otherwise), and the slot keeps 3 or
+more checkpoints (default: 4 with one slot, 3 with 2 to 4 slots). The output is the same as without
+the cache: the tail checkpoint lies on the cold-run chunk schedule (precise and balance stay bit
+identical to a cold run). Each per-slot checkpoint takes 150.6 MiB of VRAM for Qwen3.8-27B and
+63.8 MiB for Ornith-1.5-35B-A3B; the startup log lists the count and size, and the VRAM fit lowers
+the count to 2 (tail checkpoint off) when the KV pool would otherwise be small. `WHIRL_TAIL_CK=0`
+turns it off (debugging).
+
 ### <a id="ssd-tier"></a>How the SSD tier stores sessions
 
 - **When it writes.** `--kv-ssd-mode shutdown` (default): no SSD writes while the server runs.
@@ -462,7 +485,7 @@ The output always equals plain greedy decoding (with sampling: the same distribu
 |---|---|
 | `WHIRL_NO_PREFIX_CACHE=1` | disable the prefix cache |
 | `WHIRL_PREFIX_CACHE_VERIFY=1` | re-prefill after every cache hit and compare *(diagnostic)* |
-| `WHIRL_SERVE_CKPTS=N` | prefix checkpoints per slot (default 4 with one slot, 2 up to 4 slots, else 1; at most 8) |
+| `WHIRL_SERVE_CKPTS=N` | prefix checkpoints per slot (default 4 with one slot, 3 up to 4 slots, else 1; at most 8; 3 or more keep a [tail checkpoint](#prefix-cache)) |
 | `WHIRL_SYS_MIN=N` | system messages of at least N tokens get their own checkpoint (default 2048, 0 = off) |
 | `WHIRL_SYS_CKPTS=N` | shared prefix checkpoints kept in VRAM (default 2) |
 | `WHIRL_SYS_LCP=0` | no checkpoints at prefixes common to sessions |
@@ -559,6 +582,7 @@ Alternatives kept for A/B tests and numerics comparisons. The lossy ones are the
 | `WHIRL_TRACE_ND=1` | log the draft count of every decode cycle |
 | `WHIRL_LOOP_LOG=1` | log per-loop phase timing (server) |
 | `WHIRL_TIER_VERIFY=1` | byte-verify every host-tier spill / restore (server) |
+| `WHIRL_TAIL_CK=0` | *(debug)* no [tail checkpoint](#prefix-cache) near the end of long prompts (logged as an override); a second question about the same document then re-prefills it |
 | `WHIRL_TIER_MIN_GAIN=N` | restore from a host tier only when it saves at least N tokens (default 512) |
 
 ## <a id="files"></a>8. Files WHIRL writes

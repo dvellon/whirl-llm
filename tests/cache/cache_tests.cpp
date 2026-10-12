@@ -122,6 +122,24 @@ static void testCkptSlotFor() {
     cks[0].valid = false;
     CHECK(pc->ckptSlotFor(cks, 400) == 0);  // first free one
     CHECK(pc->ckptSlotFor(cks, 300) == 2);  // the same position wins over a free one
+    // TAIL-CK: a full set of >= ckpt_keep_prefix_min keeps its newest 'prefix' checkpoint
+    std::vector<Ck> t = {ck(100, 5), ck(200, 3), ck(300, 7)};
+    t[1].kind = "prefix";
+    t[0].kind = "prompt-end";
+    t[2].kind = "gen-end";
+    CHECK(pc->ckptSlotFor(t, 400) == 0);  // oldest is the tail: the next oldest goes
+    CHECK(pc->ckptSlotFor(t, 200) == 1);  // the same position: in place, also a 'prefix' one
+    t[0].kind = "prefix";                 // two 'prefix' ones: the older (seq 3) goes, the newest stays
+    CHECK(pc->ckptSlotFor(t, 400) == 1);
+    t.push_back(Ck{});
+    CHECK(pc->ckptSlotFor(t, 400) == 3);  // a free one first
+    // fewer than ckpt_keep_prefix_min: plain oldest first (2 per slot keeps prompt-end + gen-end)
+    std::vector<Ck> two = {ck(100, 3), ck(200, 4)};
+    two[0].kind = "prefix";
+    CHECK(pc->ckptSlotFor(two, 400) == 0);
+    std::vector<Ck> one = {ck(100, 3)};
+    one[0].kind = "prefix";
+    CHECK(pc->ckptSlotFor(one, 400) == 0);
 }
 
 static void testShared() {

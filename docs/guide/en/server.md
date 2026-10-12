@@ -45,7 +45,8 @@ Useful environment variables (all of them: [usage.md](../../usage.md#env)):
 | `WHIRL_POOL_RESERVE_MB` | VRAM reserve after the pool (default 768 dense / 1536 MoE) |
 | `WHIRL_NO_PREFIX_CACHE=1` | disable prefix caching |
 | `WHIRL_PREFIX_CACHE_VERIFY=1` | after every cache hit, re-prefill and compare logits (diagnostic) |
-| `WHIRL_SERVE_CKPTS` | checkpoints per slot (default 2 when `--parallel` > 1, else 4; at most 8) |
+| `WHIRL_SERVE_CKPTS` | checkpoints per slot (default 4 with one slot, 3 up to 4 slots, else 1; at most 8) |
+| `WHIRL_TAIL_CK=0` | debug: no tail checkpoint near the end of prompts >= 4096 tokens |
 | `WHIRL_MTP=0`, `WHIRL_NGRAM=0` | disable MTP / n-gram co-drafting |
 | `WHIRL_MTP_BATCH_DRAFTS=d1,d2,…` | draft caps by number of decoding slots |
 | `WHIRL_GATHER_MS` | burst-gather window for new requests (default 30, 0 = off) |

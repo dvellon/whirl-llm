@@ -43,7 +43,8 @@ Base URL 為 `http://127.0.0.1:8080/v1`；接受任何 API key。模型只載入
 | `WHIRL_POOL_RESERVE_MB` | 池之後保留的 VRAM（預設 dense 768 / MoE 1536） |
 | `WHIRL_NO_PREFIX_CACHE=1` | 停用前綴快取 |
 | `WHIRL_PREFIX_CACHE_VERIFY=1` | 每次快取命中後重新 prefill 並比對 logits（診斷用） |
-| `WHIRL_SERVE_CKPTS` | 每個 slot 的檢查點數（`--parallel` > 1 時預設 2，否則 4；最多 8） |
+| `WHIRL_SERVE_CKPTS` | 每個 slot 的檢查點數（預設：1 個 slot 時 4、最多 4 個 slot 時 3、更多時 1；最多 8） |
+| `WHIRL_TAIL_CK=0` | 除錯：4096 token 以上的提示詞不保留結尾附近的尾端檢查點 |
 | `WHIRL_MTP=0`、`WHIRL_NGRAM=0` | 停用 MTP / n-gram 共同草擬 |
 | `WHIRL_MTP_BATCH_DRAFTS=d1,d2,…` | 依 decode 中 slot 數決定的草稿上限 |
 | `WHIRL_GATHER_MS` | 新請求的突發收集視窗（預設 30，0 = 關閉） |
