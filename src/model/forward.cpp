@@ -202,16 +202,15 @@ void Model::matmul(const Mat& w, DevPtr xin, DevPtr y, u32 n, bool accumulate) {
         if (prof) prof->matmul_bytes += w.row_bytes * w.nrows;
         mark(head_phase ? OpClass::head : OpClass::matmul);
     };
-    // precise decode: every small batch (n = 1 too) on the f16 GEMM below
-    const bool prec_small = prec_dec && n <= gvMax();
-    if (n <= gvMax() && k.gemvq[t] != nullptr && !float_gemv && !prec_dec) {
+    const MatmulPath path = matmulPath(w, n);
+    if (path == MatmulPath::gemvq) {
         const DevPtr yy[1] = {y};
         gemvLaunch(std::span<const Mat>(&w, 1), xin, yy, n, acc);
-    } else if (n == 1 && !prec_small) {
+    } else if (path == MatmulPath::gemv1) {
         const u32 rows_per_block = 8;
         hip::launch(k.gemv1[t], D((w.nrows + rows_per_block - 1) / rows_per_block), D(256), 0, stream, w.ptr, w.row_bytes, xin, y, ncols,
                     nrows, ncols, nrows, acc);
-    } else if (!prec_small && floatGemvN(w, n)) {
+    } else if (path == MatmulPath::float_gemv) {
         // f32 / f16 weights, n = 2..gvMax() (16; 17..32 in a wide verify): f32 activations through
         // gemv_<T>_8 / _4 / _1, each token bitwise == the n = 1 gemv_<T>_1 (C-13; the f16 GEMM is
         // not). A code object without the _4 / _8 instances runs the _1 kernel per token.
@@ -219,13 +218,13 @@ void Model::matmul(const Mat& w, DevPtr xin, DevPtr y, u32 n, bool accumulate) {
         const hip::Dim3 grid = D((w.nrows + rows_per_block - 1) / rows_per_block);
         for (u32 t0 = 0; t0 < n;) {
             const u32 left = n - t0;
-            const u32 nt = left >= 8 && k.gemv8[t] != nullptr ? 8 : left >= 4 && k.gemv4[t] != nullptr ? 4 : 1;
+            const u32 nt = floatGemvStep(left, k.gemv8[t] != nullptr, k.gemv4[t] != nullptr);
             const hip::Function f = nt == 8 ? k.gemv8[t] : nt == 4 ? k.gemv4[t] : k.gemv1[t];
             hip::launch(f, grid, D(256), 0, stream, w.ptr, w.row_bytes, xin + static_cast<DevPtr>(t0) * w.ncols * 4,
                         y + static_cast<DevPtr>(t0) * w.nrows * 4, ncols, nrows, ncols, nrows, acc);
             t0 += nt;
         }
-    } else if (!prec_small && fp8_prefill && (fp8_mask & mm_class) != 0 && w.ty == GgmlType::mxfp4 && w.ref != 0 && k.gemm8[0] != nullptr) {
+    } else if (path == MatmulPath::gemm_fp8) {
         // MXFP4 x fp8 (per-token scaled activations, folded block exponents)
         const u32 count = n * w.ncols;
         if (x16_src != xin || x16_count != count || !x16_fp8) {
@@ -429,6 +428,18 @@ bool Model::gdnIn2(const GdnW& g, u32 n) const {
 // GEMV family too: 16, or 32 rows in a wide verify (RC-R1: those used to fall to the f16 GEMM,
 // which is not bitwise == n = 1). Only the n = 1 kernel is required (PREFILL-R2): without the
 // multi-token instances the launch loop runs it once per token.
+Model::MatmulPath Model::matmulPath(const Mat& w, u32 n) const {
+    const std::size_t t = ti(w.ty);
+    // precise decode: every small batch (n = 1 too) on the f16 GEMM
+    const bool prec_small = prec_dec && n <= gvMax();
+    if (n <= gvMax() && k.gemvq[t] != nullptr && !float_gemv && !prec_dec) return MatmulPath::gemvq;
+    if (n == 1 && !prec_small) return MatmulPath::gemv1;
+    if (!prec_small && floatGemvN(w, n)) return MatmulPath::float_gemv;
+    if (!prec_small && fp8_prefill && (fp8_mask & mm_class) != 0 && w.ty == GgmlType::mxfp4 && w.ref != 0 && k.gemm8[0] != nullptr)
+        return MatmulPath::gemm_fp8;
+    return MatmulPath::gemm_f16;
+}
+
 bool Model::floatGemvN(const Mat& w, u32 n) const {
     const std::size_t t = ti(w.ty);
     return n >= 2 && n <= gvMax() && (w.ty == GgmlType::f32 || w.ty == GgmlType::f16) && k.gemvq[t] == nullptr && k.gemv1[t] != nullptr;
