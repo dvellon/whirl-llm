@@ -1489,8 +1489,9 @@ static void testDedupCycle(MockDeviceOps& ops, const fs::path& dir) {
         BlkRef rb = eb->ssd->tbl.back();
         rb.owner = id_a;
         eb->ssd->tbl.back() = rb;
-        CHECK(!t->dependentClosure(ea).empty());
-        CHECK(std::find(t->dependentClosure(ea).begin(), t->dependentClosure(ea).end(), id_a) != t->dependentClosure(ea).end());
+        const std::vector<std::uint64_t> clo = t->dependentClosure(ea);  // one vector (begin/end of two temporaries was UB)
+        CHECK(!clo.empty());
+        CHECK(std::find(clo.begin(), clo.end(), id_a) != clo.end());
         t->removeEntry(ea);  // used to recurse until the stack overflowed
         CHECK(t->find(id_a) == nullptr);
     }
@@ -2698,6 +2699,115 @@ static void testTakeoverKeepsJobOrder(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+// FIX-RC4-A weak tests: (1) a reference cycle already on disk (an older build could write one) is removed
+// at startup by validateRefs; (2) the owner of a borrowed block truncated -- at startup (the owner goes,
+// the borrower with it) and under a running server (the borrower's restore fails on the short borrowed
+// block: need = block_bytes).
+static Header readHeader(const fs::path& f) {
+    Header h{};
+    const auto v = readFile(f);
+    if (v.size() >= sizeof h) std::memcpy(&h, v.data(), sizeof h);
+    return h;
+}
+
+static void testDedupStartupCycleOwnerTrunc(MockDeviceOps& ops, const fs::path& dir) {
+    const std::uint64_t fp = 83;
+    for (int mode = 0; mode < 3; ++mode) {  // 0: cycle on disk, 1: owner cut at startup, 2: owner cut while running
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        SsdEnv env{dir};
+        std::uint64_t seed = 9700 + static_cast<std::uint64_t>(mode) * 10;
+        const auto sys = freshToks(2560, seed);
+        Sess a(ops, 24), b(ops, 24);
+        a.toks = sys;
+        b.toks = sys;
+        {
+            auto x = freshToks(1500, seed);
+            a.toks.insert(a.toks.end(), x.begin(), x.end());
+            auto y = freshToks(1500, seed);
+            b.toks.insert(b.toks.end(), y.begin(), y.end());
+        }
+        std::uint32_t borrowed_lb = 0;
+        {
+            auto t = Tier::create(ops, 256ull << 20, 105, 0);
+            t->start(env.cfg(4ull << 30), kLay, fp);
+            spillSess(*t, a, 0);
+            CHECK(tickIdle(*t));
+            spillSess(*t, b, 0);
+            CHECK(tickIdle(*t));
+            CHECK(t->dependentsOf(t->find(a.id)).size() == 1);
+            Entry* eb = t->find(b.id);
+            if (eb && eb->ssd)
+                for (const BlkRef& r : eb->ssd->tbl)
+                    if (r.owner == a.id) borrowed_lb = std::max(borrowed_lb, r.owner_lb);
+            CHECK(borrowed_lb > 0);
+        }
+        const fs::path fa = entryFile(dir, fp, a.id), fb = entryFile(dir, fp, b.id);
+        if (mode == 0) {
+            // a's last (own) block becomes a reference to b's last (own) block: a -> b and b -> a
+            const Header ha = readHeader(fa), hb = readHeader(fb);
+            CHECK(ha.n_blk > 0 && hb.n_blk > 0);
+            const auto vb = readFile(fb);
+            BlkRef rb{};
+            const std::uint64_t ob = hb.tbl_off + static_cast<std::uint64_t>(hb.n_blk - 1) * sizeof(BlkRef);
+            if (vb.size() >= ob + sizeof rb) std::memcpy(&rb, vb.data() + ob, sizeof rb);
+            CHECK(rb.owner == 0 && (rb.h0 != 0 || rb.h1 != 0));
+            BlkRef ra = rb;
+            ra.owner = b.id;
+            ra.owner_lb = static_cast<std::uint32_t>(static_cast<std::uint64_t>(hb.nck) * kLay.ckStride() / block_bytes) + hb.n_blk - 1;
+            FILE* f = _wfopen(fa.c_str(), L"r+b");
+            CHECK(f != nullptr);
+            if (f) {
+                std::fseek(f, static_cast<long>(ha.tbl_off + static_cast<std::uint64_t>(ha.n_blk - 1) * sizeof(BlkRef)), SEEK_SET);
+                std::fwrite(&ra, sizeof ra, 1, f);
+                std::fclose(f);
+            }
+            std::vector<std::string> logs;
+            auto t = Tier::create(ops, 256ull << 20, 106, 0);
+            t->log_fn = [&](std::string_view l) { logs.emplace_back(l); };
+            t->start(env.cfg(4ull << 30), kLay, fp);
+            bool cyc = false;
+            for (const auto& l : logs) cyc = cyc || l.find("reference cycle") != std::string::npos;
+            CHECK(cyc);
+            for (const Entry* e : t->entries) {
+                const auto clo = t->dependentClosure(e);
+                CHECK(std::find(clo.begin(), clo.end(), e->id) == clo.end());  // no cycle left
+            }
+            CHECK(countFiles(dir) == t->ssdEntries());
+            CHECK(t->ssd_bytes == diskBytes(dir));
+        } else if (mode == 1) {
+            fs::resize_file(fa, kLay.dataOff() + static_cast<std::uint64_t>(borrowed_lb) * block_bytes + block_bytes / 2, ec);
+            CHECK(!ec);
+            auto t = Tier::create(ops, 256ull << 20, 107, 0);
+            t->start(env.cfg(4ull << 30), kLay, fp);
+            CHECK(t->find(a.id) == nullptr && t->find(b.id) == nullptr);  // the borrower goes with its owner
+            CHECK(countFiles(dir) == 0 && t->ssd_bytes == 0);
+        } else {
+            auto t = Tier::create(ops, 256ull << 20, 108, 0);
+            t->start(env.cfg(4ull << 30), kLay, fp);
+            Entry* eb = t->find(b.id);
+            CHECK(eb != nullptr && t->find(a.id) != nullptr);
+            if (!eb) continue;
+            // cut inside the block b borrows: a's own extent is not read, only b's borrowed block is short
+            fs::resize_file(fa, kLay.dataOff() + static_cast<std::uint64_t>(borrowed_lb) * block_bytes + block_bytes / 2, ec);
+            CHECK(!ec);
+            DevSlot dst(ops, 2, 24);
+            std::vector<Span> sp;
+            sp.push_back(Span{dst.ck[0], 0, kLay.ck_bytes, 0});
+            sp.push_back(Span{dst.kv, eb->kvOff(kLay), static_cast<std::uint64_t>(eb->pages) * kLay.page_bytes, 0xff});
+            Restore* r = t->beginRestore(eb, sp, sp.size());
+            CHECK(r != nullptr);
+            if (r) {
+                CHECK(!runRestore(*t, r) && r->failed);
+                t->endRestore(r);
+            }
+            CHECK(tickIdle(*t));
+            for (const Entry* e : t->entries) CHECK(e->pin == 0 && e->ext_pin == 0 && !e->io_busy);
+        }
+        fs::remove_all(dir, ec);
+    }
+}
+
 // ---- SSD-QUIET: write amplification of a benchmark-like request stream -------------------
 // Ornith-35B-A3B layout from the server log ("entry: 51.2 MiB per checkpoint, 9.0 MiB per 256-token
 // page", f16 KV), scaled by 1/amp_div so the default run stays small (WHIRL_TIER_AMP=full: real sizes).
@@ -2986,6 +3096,10 @@ int main(int argc, char** argv) {
     if (want("testTakeoverKeepsJobOrder")) {
         std::printf("-- %s\n", "testTakeoverKeepsJobOrder");
         testTakeoverKeepsJobOrder(ops, dir);
+    }
+    if (want("testDedupStartupCycleOwnerTrunc")) {
+        std::printf("-- %s\n", "testDedupStartupCycleOwnerTrunc");
+        testDedupStartupCycleOwnerTrunc(ops, dir);
     }
     if (want("testWriteAmplification")) {
         std::printf("-- %s\n", "testWriteAmplification");
