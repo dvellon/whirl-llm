@@ -7,6 +7,7 @@
 // (header "w h tw th\n" then the prototype's preprocessed bytes) and the source
 // image NAME.png / NAME.jpg next to it, checks decode + resize bit-exactly.
 
+#include "../test_env.h"
 #include "whirl/common.h"
 #include "whirl/vision.h"
 
@@ -183,12 +184,53 @@ static void testRgbRefs(const std::string& dir) {
     }
 }
 
+// FIX-TEST-A (FR-TEST P3-1): the image embedding key. Mutation M6 (key over the pixels only) passed
+// every test: the server tests' MockVision hashes on its own and Vision::prepareRgb was never called.
+static void testImageKey() {
+    vision::Hparams hp;  // min_tokens 8, max_tokens 4096
+    vision::Rgb a;
+    a.w = 64;
+    a.h = 96;
+    a.px.resize(static_cast<std::size_t>(a.w) * a.h * 3);
+    for (std::size_t i = 0; i < a.px.size(); ++i) a.px[i] = static_cast<std::uint8_t>(i * 7 + 3);
+    const auto k = vision::imageKey(42, hp, a);
+    CHECK(k == vision::imageKey(42, hp, a));  // deterministic
+    // same pixels, width and height swapped (a different image)
+    vision::Rgb t = a;
+    std::swap(t.w, t.h);
+    CHECK(vision::imageKey(42, hp, t) != k);
+    // a different mmproj (other weights -> other embeddings)
+    CHECK(vision::imageKey(43, hp, a) != k);
+    // different token limits (other preprocessing)
+    vision::Hparams h2 = hp;
+    h2.min_tokens = 16;
+    CHECK(vision::imageKey(42, h2, a) != k);
+    h2 = hp;
+    h2.max_tokens = 1024;
+    vision::Rgb big;  // large enough that max_tokens changes the target size
+    big.w = 2048;
+    big.h = 2048;
+    big.px.assign(static_cast<std::size_t>(big.w) * big.h * 3, 9);
+    CHECK(vision::imageKey(42, h2, big) != vision::imageKey(42, hp, big));
+    h2 = hp;
+    h2.max_tokens = 4095;  // same target size for a small image, still part of the key
+    CHECK(vision::imageKey(42, h2, a) != k);
+    // one pixel byte
+    vision::Rgb p = a;
+    p.px[100] ^= 1;
+    CHECK(vision::imageKey(42, hp, p) != k);
+    // the key itself (informational; the prefix cache keys on it)
+    std::printf("image key: %s\n", hex(k).c_str());
+}
+
 int main(int argc, char** argv) {
+    whirl::test::clearWhirlEnv();  // FR-TEST P3-11
     testSha();
     testWyhash();
     testTargetSize();
     testResize();
     testExpandRope();
+    testImageKey();
     if (argc > 1) testRgbRefs(argv[1]);
     std::printf("vision tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
