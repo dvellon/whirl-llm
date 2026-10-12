@@ -2588,6 +2588,56 @@ static void testRestoreAsyncError(MockDeviceOps& ops) {
     }
 }
 
+// FIX-RC4-A P3-5: an idle engine sleeps until Tier::nextWake(); with nothing waiting for a write it must
+// still wake for the periodic expiry check (nextDue() alone is empty then: it slept forever).
+// P3-1: a spill larger than the whole RAM tier does not leave roomPending() set (busy loop).
+static void testIdleWakeRoomPending(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    {
+        auto t = Tier::create(ops, 64ull << 20, 100, 0);
+        Config c = env.cfg(4ull << 30);
+        c.expire_check_ms = 3600ull * 1000;
+        t->start(c, kLay, 80);
+        CHECK(tickIdle(*t));
+        CHECK(!t->nextDue().has_value());
+        const auto w = t->nextWake();
+        CHECK(w.has_value());
+        if (w) {
+            const auto now = std::chrono::steady_clock::now();
+            CHECK(*w > now && *w <= now + std::chrono::hours(1) + std::chrono::seconds(5));
+        }
+    }
+    {
+        auto t = Tier::create(ops, 64ull << 20, 101, 0);  // 32 blocks
+        Config c = env.cfg(4ull << 30);
+        c.ssd_delay_ms = 600000;
+        c.expire_s = 0;
+        t->start(c, kLay, 81);
+        CHECK(!t->nextWake().has_value());  // expiry off and nothing waiting: nothing timed
+        std::uint64_t seed = 9500;
+        Sess a(ops, 24), b(ops, 24), d(ops, 24);
+        a.toks = freshToks(3000, seed);
+        b.toks = freshToks(3000, seed);
+        d.toks = freshToks(3000, seed);
+        spillSess(*t, a, 0);
+        sleepMs(5);
+        spillSess(*t, b, 0);
+        t->tick();
+        spillSess(*t, d, 0);
+        CHECK(t->roomPending());  // a's eviction write will free its blocks
+        Entry* eb = t->find(b.id);
+        CHECK(eb != nullptr);
+        if (eb) {
+            CHECK(!t->ensureBlocks(eb, 0, 100));  // more than the whole tier
+            CHECK(!t->roomPending());
+        }
+        CHECK(tickIdle(*t));
+    }
+    fs::remove_all(dir, ec);
+}
+
 // ---- SSD-QUIET: write amplification of a benchmark-like request stream -------------------
 // Ornith-35B-A3B layout from the server log ("entry: 51.2 MiB per checkpoint, 9.0 MiB per 256-token
 // page", f16 KV), scaled by 1/amp_div so the default run stays small (WHIRL_TIER_AMP=full: real sizes).
@@ -2868,6 +2918,10 @@ int main(int argc, char** argv) {
     if (want("testRestoreAsyncError")) {
         std::printf("-- %s\n", "testRestoreAsyncError");
         testRestoreAsyncError(ops);
+    }
+    if (want("testIdleWakeRoomPending")) {
+        std::printf("-- %s\n", "testIdleWakeRoomPending");
+        testIdleWakeRoomPending(ops, dir);
     }
     if (want("testWriteAmplification")) {
         std::printf("-- %s\n", "testWriteAmplification");

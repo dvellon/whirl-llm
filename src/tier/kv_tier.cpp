@@ -596,7 +596,10 @@ bool Tier::ensureBlocks(Entry* e, std::size_t lb0, std::size_t lb1) {
         if (lb >= e->blocks.size() || e->blocks[lb] == no_block) missing += 1;
     }
     if (missing == 0) return true;
-    if (missing > n_blocks_) return false;
+    if (missing > n_blocks_) {
+        room_pending_ = false;  // never possible: no write to wait for (a stale flag kept the engine busy)
+        return false;
+    }
     if (!makeRoom(missing, e)) return false;
     while (e->blocks.size() < lb1) {
         e->blocks.push_back(no_block);

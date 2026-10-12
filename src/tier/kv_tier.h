@@ -353,6 +353,13 @@ public:
     bool waitOnly() const { return wait_only_; }
     // earliest time an entry becomes due for its SSD write (nullopt: none waiting)
     std::optional<std::chrono::steady_clock::time_point> nextDue() const { return next_due_; }
+    // when tick() has timed work next: a due SSD write, or the periodic SSD expiry check (an idle
+    // engine must wake for it too, or an idle server never expires files)
+    std::optional<std::chrono::steady_clock::time_point> nextWake() const {
+        std::optional<std::chrono::steady_clock::time_point> w = next_due_;
+        if (ssd_dir_w_ && cfg.expire_s > 0 && cfg.expire_check_ms > 0 && (!w || next_expiry_ < *w)) w = next_expiry_;
+        return w;
+    }
     // RAM evictions started SSD writes that will free blocks when they finish (retry the spill then)
     bool roomPending() const { return room_pending_; }
 
