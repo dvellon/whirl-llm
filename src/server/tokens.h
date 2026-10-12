@@ -31,6 +31,9 @@ public:
     // Prompt starting with "<|im_start|>" "system": the position after the
     // first "<|im_end|>" and the "\n" that follows it. 0 = none.
     std::size_t sysBoundary(std::span<const std::uint32_t> toks) const;
+    // The start of the turn after the one starting at `from` (the position after its "<|im_end|>" and
+    // newline, where the next "<|im_start|>" is). 0 = none.
+    std::size_t nextTurn(std::span<const std::uint32_t> toks, std::size_t from) const;
 
     // token id -> id of the same text with every CR LF as LF (itself when
     // there is no CR LF or no such token).

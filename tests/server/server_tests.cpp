@@ -192,8 +192,10 @@ public:
         http_->stop();
         http_.reset();
         engine_->attachTier(nullptr);
-        engine_.reset();
+        // FR-CACHE P3-5: the tier first (its destructor joins the IO thread, whose wake callback calls into
+        // the engine), then the engine -- the product's order (server_main declares the tier after the engine)
         tier_.reset();
+        engine_.reset();
         model_.reset();
     }
     HttpResult post(const std::string& path, const std::string& body) {
@@ -1692,6 +1694,235 @@ void testTiers() {
     std::filesystem::remove_all(dir, ec);
 }
 
+
+// FR-CACHE revert-check (engine.cpp spillSlot's tier_pages clamp): in-place spill after a same-slot
+// regenerate (reuse < the entry's length), then eviction and a restore of the regenerated branch: the
+// entry's pages past the divergence must have been re-copied (without the clamp the restore returns the
+// old branch's KV and the output differs; the rest of this suite passed with the clamp removed).
+void testTierInPlaceRegen() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 8192;
+    su.mc.pool_tokens = 4096;
+    su.tier = true;
+    su.tier_min = 512;
+    su.eo.n_ck = 4;
+    const auto pa = makePrompt(3000, 801);
+    const auto pb = makePrompt(3200, 802);
+    TestServer srv(su);
+    g_log.clear();
+    const auto outa = srv.model().greedyReference(pa, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pa, 40))), decode(outa));
+    std::vector<std::uint32_t> base = pa;
+    base.insert(base.end(), outa.begin(), outa.end());
+    const auto p2 = makePrompt(static_cast<std::uint32_t>(base.size() + 300), 803, base);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(p2, 40))), decode(srv.model().greedyReference(p2, 40, true)));
+    // regenerate turn 2 with another user message: resumes at the gen-end checkpoint of turn 1
+    const auto p3 = makePrompt(static_cast<std::uint32_t>(base.size() + 300), 804, base);
+    const auto out3 = srv.model().greedyReference(p3, 40, true);
+    auto r3 = srv.post("/v1/completions", completionBody(p3, 40));
+    CHECK_EQ(completionText(r3), decode(out3));
+    const std::size_t inplace = g_log.count("in place");
+    CHECK(inplace >= 1);
+    // B evicts the slot
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pb, 40))), decode(srv.model().greedyReference(pb, 40, true)));
+    std::vector<std::uint32_t> p4 = p3;
+    p4.insert(p4.end(), out3.begin(), out3.end());
+    p4 = makePrompt(static_cast<std::uint32_t>(p4.size() + 200), 805, p4);
+    auto r4 = srv.post("/v1/completions", completionBody(p4, 40));
+    CHECK_EQ(completionText(r4), decode(srv.model().greedyReference(p4, 40, true)));
+    CHECK(srv.tierp()->stats.restores_ram >= 1);
+    CHECK(cachedTokens(r4) > base.size());
+    CHECK_EQ(srv.model().poison(), 0u);
+    std::fprintf(stderr, "  (tier_inplace: in-place spills %zu, restores_ram %llu, cached %u)\n", inplace,
+                 static_cast<unsigned long long>(srv.tierp()->stats.restores_ram), static_cast<unsigned>(cachedTokens(r4)));
+}
+
+// FIX-CACHE P2-3 (FR-CACHE): more prefix checkpoints per slot than a tier entry holds (WHIRL_SERVE_CKPTS=12).
+// Before: tier::Entry::ck, Slot::rs_map / rs_tail and beginRestore's `chosen` (max_ck = 8) were read and
+// written out of bounds. Now the count is clamped to max_ck (warning); spill / restore stay exact.
+void testServeCkptsClamp() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 8192;
+    su.mc.pool_tokens = 4096;
+    su.tier = true;
+    su.tier_min = 512;
+    su.eo.n_ck = 12;
+    const auto pa = makePrompt(3000, 811);
+    const auto pb = makePrompt(3200, 812);
+    g_log.clear();
+    TestServer srv(su);
+    CHECK(g_log.count("above the maximum") >= 1);
+    const auto outa = srv.model().greedyReference(pa, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pa, 40))), decode(outa));
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pb, 40))), decode(srv.model().greedyReference(pb, 40, true)));
+    std::vector<std::uint32_t> pa2 = pa;
+    pa2.insert(pa2.end(), outa.begin(), outa.end());
+    pa2 = makePrompt(static_cast<std::uint32_t>(pa2.size() + 300), 813, pa2);
+    auto r = srv.post("/v1/completions", completionBody(pa2, 40));
+    CHECK_EQ(completionText(r), decode(srv.model().greedyReference(pa2, 40, true)));
+    CHECK(srv.tierp()->stats.restores_ram >= 1);
+    CHECK(cachedTokens(r) >= pa.size());
+    std::size_t over = 0;
+    for (const tier::Entry* e : srv.tierp()->entries) over += e->nck > tier::max_ck ? 1 : 0;
+    CHECK_EQ(over, 0u);
+    CHECK(!srv.tierp()->entries.empty());
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+
+// Chat-shaped token prompts (ChatML special tokens + random body ids) for the supersede / branch tests.
+struct ChatBuild {
+    ChatTokens ct;
+    std::uint32_t user = 0, assistant = 0;
+    ChatBuild() : ct(tok()) {
+        user = static_cast<std::uint32_t>(tok().encode("user", false).at(0));
+        assistant = static_cast<std::uint32_t>(tok().encode("assistant", false).at(0));
+    }
+    // "<|im_start|>" role "\n" body "<|im_end|>" "\n"
+    void turn(std::vector<std::uint32_t>& v, std::uint32_t role, std::uint32_t n, std::uint64_t seed) const {
+        v.push_back(ct.im_start);
+        v.push_back(role);
+        v.push_back(ct.nl);
+        const auto b = makePrompt(n, seed);
+        v.insert(v.end(), b.begin(), b.end());
+        v.push_back(ct.im_end);
+        v.push_back(ct.nl);
+    }
+    void genPrompt(std::vector<std::uint32_t>& v) const {
+        v.push_back(ct.im_start);
+        v.push_back(assistant);
+        v.push_back(ct.nl);
+    }
+    // system + user turns (bodies n_i) + generation prompt
+    std::vector<std::uint32_t> conv(std::uint32_t sys_n, std::uint64_t sys_seed, std::initializer_list<std::pair<std::uint32_t, std::uint64_t>> users) const {
+        std::vector<std::uint32_t> v;
+        turn(v, ct.system, sys_n, sys_seed);
+        for (const auto& u : users) turn(v, user, u.first, u.second);
+        genPrompt(v);
+        return v;
+    }
+    // previous prompt + its completion + "<|im_end|>" + newline + a new user turn + generation prompt
+    std::vector<std::uint32_t> next(const std::vector<std::uint32_t>& prev, const std::vector<std::uint32_t>& out, std::uint32_t n,
+                                    std::uint64_t seed) const {
+        std::vector<std::uint32_t> v = prev;
+        v.insert(v.end(), out.begin(), out.end());
+        v.push_back(ct.im_end);
+        v.push_back(ct.nl);
+        turn(v, user, n, seed);
+        genPrompt(v);
+        return v;
+    }
+};
+
+// FIX-CACHE P2-4 (FR-CACHE), the agent pattern on one slot: the main agent's long session goes idle while a
+// subagent with the same system prompt (another task) runs two turns; then the main agent resumes.
+// supersede 1: before, the subagent's second turn cut the idle main entry to the system prompt (verified:
+// resumed with 2505 cached of 8513); now it is only demoted and restored whole (exact output).
+// supersede 0 (WHIRL_KV_SUPERSEDE=0): the baseline the demotion must match.
+void testAgentIdleMain(bool supersede) {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 16384;
+    su.mc.pool_tokens = 16384;
+    su.tier = true;
+    su.tier_min = 512;
+    su.eo.kv_supersede = supersede;
+    const ChatBuild cb;
+    const auto main1 = cb.conv(2500, 901, {{6000, 902}});
+    const auto sub1 = cb.conv(2500, 901, {{500, 903}});
+    TestServer srv(su);
+    g_log.clear();
+    const auto out_m1 = srv.model().greedyReference(main1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(main1, 40))), decode(out_m1));
+    const auto out_s1 = srv.model().greedyReference(sub1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(sub1, 40))), decode(out_s1));
+    const auto sub2 = cb.next(sub1, out_s1, 200, 904);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(sub2, 40))), decode(srv.model().greedyReference(sub2, 40, true)));
+    if (supersede) CHECK(g_log.count("looks superseded") >= 1);  // the rule still marks it (system prompt shared)
+    const auto main2 = cb.next(main1, out_m1, 200, 905);
+    auto r = srv.post("/v1/completions", completionBody(main2, 40));
+    CHECK_EQ(completionText(r), decode(srv.model().greedyReference(main2, 40, true)));
+    std::fprintf(stderr, "  (agent supersede=%d: main resumed with %llu cached of %zu, restores_ram %llu, superseded %llu, demoted %llu)" "\n",
+                 supersede ? 1 : 0, static_cast<unsigned long long>(cachedTokens(r)), main1.size(),
+                 static_cast<unsigned long long>(srv.tierp()->stats.restores_ram), static_cast<unsigned long long>(srv.tierp()->stats.superseded),
+                 static_cast<unsigned long long>(srv.tierp()->stats.demoted));
+    CHECK(cachedTokens(r) >= main1.size());
+    CHECK(srv.tierp()->stats.restores_ram >= 1);
+    CHECK_EQ(srv.tierp()->stats.superseded, 0u);
+    if (supersede) CHECK(srv.tierp()->stats.demoted >= 1);
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+void testAgentIdleMainNoSupersede() { testAgentIdleMain(false); }
+void testAgentIdleMainSupersede() { testAgentIdleMain(true); }
+
+// FIX-CACHE P3-3 (FR-CACHE): a branch from an earlier turn (edit an earlier message) restores a long
+// session's inner checkpoint and takes the entry over (owner). Before: its spill updated the entry in place
+// from the branch point, so the original later turns were gone from the tiers. Now the branch gets a new
+// entry and the original session is restored whole when it resumes.
+void testBranchFromEarlierTurn() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 16384;
+    su.mc.pool_tokens = 16384;
+    su.tier = true;
+    su.tier_min = 512;
+    su.eo.n_ck = 4;
+    const ChatBuild cb;
+    const auto t1 = cb.conv(2500, 921, {{3000, 922}});
+    TestServer srv(su);
+    g_log.clear();
+    const auto o1 = srv.model().greedyReference(t1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(t1, 40))), decode(o1));
+    const auto t2 = cb.next(t1, o1, 6000, 923);
+    const auto o2 = srv.model().greedyReference(t2, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(t2, 40))), decode(o2));
+    // another conversation takes the slot (the session goes to the RAM tier)
+    const auto u = makePrompt(3000, 924);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(u, 40))), decode(srv.model().greedyReference(u, 40, true)));
+    // the branch: turn 2 edited (shares turn 1 only)
+    const auto b2 = cb.next(t1, o1, 300, 925);
+    auto rb = srv.post("/v1/completions", completionBody(b2, 40));
+    CHECK_EQ(completionText(rb), decode(srv.model().greedyReference(b2, 40, true)));
+    const std::uint64_t restores_b = srv.tierp()->stats.restores_ram;
+    // the original session resumes
+    const auto t3 = cb.next(t2, o2, 200, 926);
+    auto r = srv.post("/v1/completions", completionBody(t3, 40));
+    CHECK_EQ(completionText(r), decode(srv.model().greedyReference(t3, 40, true)));
+    std::fprintf(stderr, "  (branch: branch cached %llu, restores after branch %llu; original resumed with %llu cached of %zu)\n",
+                 static_cast<unsigned long long>(cachedTokens(rb)), static_cast<unsigned long long>(restores_b),
+                 static_cast<unsigned long long>(cachedTokens(r)), t2.size());
+    CHECK(restores_b >= 1);                 // the branch did restore turn 1 from the tier
+    CHECK(cachedTokens(rb) >= t1.size());
+    CHECK(cachedTokens(r) >= t2.size());    // the original later turn survived
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+
+// FIX-CACHE P2-4: an agent's compress (same system prompt and first task message, the middle history
+// dropped, a short summary) still cuts the old session to the shared part (same task lineage).
+void testSupersedeCompressCuts() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 16384;
+    su.mc.pool_tokens = 16384;
+    su.tier = true;
+    su.tier_min = 512;
+    const ChatBuild cb;
+    const auto old1 = cb.conv(2500, 911, {{500, 912}, {8000, 913}});
+    auto c1 = cb.conv(2500, 911, {{500, 912}, {300, 914}});
+    TestServer srv(su);
+    g_log.clear();
+    const auto out_o = srv.model().greedyReference(old1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(old1, 40))), decode(out_o));
+    const auto out_c1 = srv.model().greedyReference(c1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(c1, 40))), decode(out_c1));
+    const auto c2 = cb.next(c1, out_c1, 200, 915);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(c2, 40))), decode(srv.model().greedyReference(c2, 40, true)));
+    CHECK(g_log.count("superseded (compact / compress): cut") >= 1);
+    CHECK(srv.tierp()->stats.superseded >= 1);
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+
 // FIX-RC4-A P2-1 (RESTORE-EXC): a device copy throwing while a restore is under way -- in the first pump
 // inside Tier::beginRestore (RAM restore: every piece is copied there) or in a later pump (SSD restore) --
 // fails the restore cleanly through the engine: the request is prefilled cold (same output), no entry
@@ -2120,6 +2351,12 @@ int main(int argc, char** argv) {
         {"tiers", testTiers},
         {"restore_conc", testRestoreConcurrent},
         {"restore_throws", testRestoreThrows},
+        {"tier_inplace", testTierInPlaceRegen},
+        {"ckpts_clamp", testServeCkptsClamp},
+        {"branch_turn", testBranchFromEarlierTurn},
+        {"agent_idle_main", testAgentIdleMainNoSupersede},
+        {"agent_idle_main_sup", testAgentIdleMainSupersede},
+        {"supersede_compress", testSupersedeCompressCuts},
         {"sampling", testSampling},
         {"stop_eos", testStopAndEos},
     };

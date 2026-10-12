@@ -103,6 +103,15 @@ Engine::Engine(ServerModel& model, tier::DeviceOps& ops, const Tokenizer& tok, c
     if (opt_.parallel < 1 || opt_.parallel > gdn_max_seg) throw std::runtime_error("parallel must be 1..16");
     if (opt_.n_ck == 0 || opt_.no_prefix_cache) opt_.n_spe = 0;
     if (opt_.no_prefix_cache) opt_.n_ck = 0;
+    // FR-CACHE P2-3: a tier entry, Slot::rs_map / rs_tail and beginRestore's `chosen` hold at most max_ck
+    // checkpoints (server_main clamps WHIRL_SERVE_CKPTS already; this guards every other caller)
+    static_assert(std::tuple_size_v<decltype(Slot::rs_map)> == tier::max_ck);
+    static_assert(std::tuple_size_v<decltype(Slot::rs_tail)> == tier::max_ck);
+    static_assert(std::tuple_size_v<decltype(tier::Entry::ck)> == tier::max_ck);
+    if (opt_.n_ck > tier::max_ck) {
+        logW("prefix checkpoints per slot {} above the maximum {}; using {}", opt_.n_ck, tier::max_ck, tier::max_ck);
+        opt_.n_ck = tier::max_ck;
+    }
     {
         cache::Config pc;
         pc.enabled = !opt_.no_prefix_cache;
@@ -2409,8 +2418,14 @@ void Engine::spillSlot(Slot& sl) {
     bool fresh = true;
     if (sl.tier_id != 0) {
         if (tier::Entry* old = t->find(sl.tier_id)) {
+            // in place only when this slot's content continues the entry or diverged near its end
+            // (retry / regenerate / edit-last: the old tail is abandoned). A long tail is another
+            // branch -- a conversation that shares only a prefix (a subagent with the same system
+            // prompt on the main agent's slot, or another slot that restored a shorter checkpoint of
+            // it): a new entry, the old branch stays in the tiers (FR-CACHE P3-3).
+            const bool near_end = cache::nearEndDivergence(old->n_tok, static_cast<std::size_t>(sl.tier_pages) * kv_page);
             if (old->in_ram && old->owner && *old->owner == sl.id && old->pin == 0 && !old->loading &&
-                old->nck == sl.ckpts.size()) {
+                old->nck == sl.ckpts.size() && near_end) {
                 if (old->io_busy) {
                     // an SSD write is reading it: retry when that is done
                     sl.spill_wanted = true;
@@ -2420,6 +2435,8 @@ void Engine::spillSlot(Slot& sl) {
                 fresh = false;
                 x->reused = true;  // the session grew by appending (resumed): worth an SSD write
                 vp = std::min(sl.tier_pages, old->n_tok / kv_page);
+            } else if (!near_end && old->owner && *old->owner == sl.id) {
+                old->owner.reset();  // this slot no longer extends it (another branch now)
             }
         }
     }
@@ -2541,15 +2558,19 @@ void Engine::supersedeMark(const Slot& sl, tier::Entry* x) {
     const cache::Tokens nt(x->tokens.data(), x->n_tok);
     const std::size_t sys = ct_.sysBoundary(nt);
     if (sys == 0 || sys >= nt.size()) return;
+    // FR-CACHE P2-4: cut only an entry of the same task lineage (it shares the first message after the
+    // system prompt too); one sharing only the system prompt is demoted, never cut
+    const std::size_t task = ct_.nextTurn(nt, sys);
+    const std::size_t task_end = task > sys ? task : std::numeric_limits<std::size_t>::max();
     for (tier::Entry* e : t->entries) {
         if (e == x || e->n_tok == 0) continue;
         const cache::Tokens ot(e->tokens.data(), std::min<std::size_t>(e->n_tok, e->tokens.size()));
-        const cache::Supersede sp = cache::supersedes(ot, nt, sys);
+        const cache::Supersede sp = cache::supersedes(ot, nt, sys, {}, task_end);
         if (!sp.yes) continue;
-        supersede_.mark(x->id, e->id, sp.keep, tierStamp(e));
-        logI("slot {} | kv tier: entry {:016x} ({} tok) looks superseded by this conversation (shares {} tok); cut after its next "
+        supersede_.mark(x->id, e->id, sp.keep, tierStamp(e), sp.cut);
+        logI("slot {} | kv tier: entry {:016x} ({} tok) looks superseded by this conversation (shares {} tok); {} after its next "
              "turn unless used again",
-             sl.id, e->id, e->n_tok, sp.keep);
+             sl.id, e->id, e->n_tok, sp.keep, sp.cut ? "cut" : "evicted first (shares only the system prompt: not cut)");
     }
 }
 
@@ -2564,6 +2585,16 @@ void Engine::supersedeApply(const Slot& sl, tier::Entry* x) {
         for (auto it = pend.begin(); it != pend.end();) {
             tier::Entry* e = t->find(it->old_id);
             if (e == nullptr || tierStamp(e) != it->stamp) {  // gone, or used again
+                it = pend.erase(it);
+                continue;
+            }
+            if (!it->cut) {
+                // a compact, or another conversation with the same system prompt (a subagent while the
+                // main agent waits): kept whole, but the first RAM / SSD eviction victim (no SSD write for it)
+                t->demote(e);
+                logI("slot {} | kv tier: entry {:016x} ({} tok) not used since a conversation with the same system prompt "
+                     "started: kept, evicted first under RAM / SSD pressure",
+                     sl.id, it->old_id, e->n_tok);
                 it = pend.erase(it);
                 continue;
             }
@@ -2895,12 +2926,12 @@ void Engine::logTier() {
     const tier::Stats& s = t->stats;
     logI("kv tier | RAM {:.2f} / {:.2f} GiB in {} entries, SSD {:.2f} GiB in {} entries | spills {} ({:.0f} MiB), restores RAM "
          "{} / SSD {} ({:.0f} MiB), SSD writes {} ({:.0f} MiB written since start, {:.0f} MiB shared instead of written), RAM "
-         "evictions {}, dropped {}, superseded {}, spill waits {}, pages copied on write {}, quarantine waits {}",
+         "evictions {}, dropped {}, superseded {} (demoted {}), spill waits {}, pages copied on write {}, quarantine waits {}",
          static_cast<double>(t->ramUsedBytes()) / 1073741824.0, static_cast<double>(t->cfg.ram_bytes) / 1073741824.0,
          t->countRam(), static_cast<double>(t->ssd_bytes) / 1073741824.0, t->ssdEntries(), s.spills,
          static_cast<double>(s.spill_bytes) / 1048576.0, s.restores_ram, s.restores_ssd,
          static_cast<double>(s.restore_bytes) / 1048576.0, s.ssd_writes, static_cast<double>(s.ssd_write_bytes) / 1048576.0,
-         static_cast<double>(s.ssd_dedup_bytes) / 1048576.0, s.ram_evictions, s.dropped, s.superseded, stat_spill_waits_, stat_cow_pages_, stat_q_waits_);
+         static_cast<double>(s.ssd_dedup_bytes) / 1048576.0, s.ram_evictions, s.dropped, s.superseded, s.demoted, stat_spill_waits_, stat_cow_pages_, stat_q_waits_);
 }
 
 // Shutdown (stop()): finished sessions still waiting for their spill go to the RAM

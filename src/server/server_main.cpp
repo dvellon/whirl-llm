@@ -521,6 +521,10 @@ int serveMain(int argc, char** argv, const char* program) {
         const bool no_pc = envOn("NO_PREFIX_CACHE", false);
         const std::size_t ck_def = opt.parallel == 1 ? n_ckpt_default : (opt.parallel <= 4 ? n_ckpt_default_par : 1);
         std::size_t n_ck = no_pc ? 0 : envU32("SERVE_CKPTS", static_cast<std::uint32_t>(ck_def));
+        if (n_ck > tier::max_ck) {  // FR-CACHE P2-3: tier entries / restore maps hold at most max_ck checkpoints
+            logW("WHIRL_SERVE_CKPTS={} is above the maximum ({}); using {}", n_ck, tier::max_ck, tier::max_ck);
+            n_ck = tier::max_ck;
+        }
         std::uint32_t n_spe_plan = (n_ck == 0 || no_pc) ? 0 : envU32("SYS_CKPTS", static_cast<std::uint32_t>(n_spe_default));
         // VRAM estimate before loading: when the KV pool left after weights, prefill buffers and
         // checkpoints would be small, lower the prefill batch and the checkpoint counts first

@@ -263,19 +263,24 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -Conten
   就先寫入，否則直接丟棄。`always` 只寫值得保留的 session：前綴至少被重用（還原）過一次，或已被後續回合接續過；沒有人再回來用的一次性 prompt 不會寫入（benchmark 連續送不同 prompt 幾乎不寫）。正常關閉時由最近使用的 session 開始寫。`off`：完全不寫 SSD 檔案（主記憶體層照常運作）。原因：benchmark 或 agent 連續送出大量不同的長 prompt 時，
   每個請求會寫數 GB，幾分鐘就是數百 GB，會損耗 SSD。
 - **容量上限與過期。** 資料夾實際佔用的磁碟空間（以真正配置的位元組計，稀疏檔中共用的區塊是洞，不重複計算）不會超過
-  `--kv-ssd-gb`（預設 64 GiB）。滿了就刪最久沒用的 session（連同借用其區塊的檔案）；其他模型、版本或 KV 格式的檔案最先刪。
+  `--kv-ssd-gb`（預設 64 GiB）。滿了就刪最久沒用的 session（連同借用其區塊的檔案）；其他模型、版本或 KV 格式的檔案最先刪，
+  用另一個 per-slot context（`--ctx`／`--parallel`，或依空閒 VRAM 自動縮小）寫的檔也一樣：這些檔會保留、計入容量，
+  換回那個 context 的 server 會再用到。主記憶體裡的 session 若檔案放不進容量上限就不寫入（只留在主記憶體，log 記一次）。
   超過 7 天沒被使用的檔案會自動刪除（啟動時與每小時一次）；無法使用的檔案（當機寫一半、損毀、不是 WHIRL 快取檔）在啟動時刪除。
   啟動 log 有一行：檔案數、佔用 GiB、容量上限，以及刪了什麼、為什麼。
 - **只寫有變動的部分。** 續接的對話只寫新的 KV page 與變動的 checkpoint，不會整段重寫。SSD 上其他檔案已存有、
   且 token 前綴相同的 KV 區塊（共用的系統提示與工具定義、retry 或 compact 之前的部分）不再重寫：新檔案只記錄引用
   （稀疏檔，該區塊從另一個檔案讀取）。只有 token 前綴相同且 128-bit 內容雜湊相同的區塊才會共用。
-- **被取代的 session。** agent 做 compact 或刪減歷史時（同一個系統提示、新對話只和舊 session 共用前面一段、且明顯較短），
-  在新對話完成第二輪、且舊 session 期間沒有再被使用時，把舊 session 截到共用的部分。retry、regenerate、修改最後一則訊息、
-  不同系統提示都不會觸發。`WHIRL_KV_SUPERSEDE=0` 可關閉。
+- **被取代的 session。** agent 刪減歷史時（同一個系統提示和第一則任務訊息、中間被刪掉、新對話明顯較短），
+  在新對話完成第二輪、且舊 session 期間沒有再被使用時，把舊 session 截到共用的部分。新對話只和舊 session 共用系統提示時
+  （用摘要取代歷史的 compact，或只是同一個系統提示的另一段對話，例如主 agent 等待時在跑的 subagent），舊 session 不會被截斷：
+  整段保留，只在主記憶體層或 SSD 層需要空間時最先被逐出（主記憶體逐出時也不寫入 SSD）；之後再被使用就恢復正常。
+  retry、regenerate、修改最後一則訊息、不同系統提示都不會觸發。`WHIRL_KV_SUPERSEDE=0` 可關閉。
 - **太短的 session**（少於 2048 token，`WHIRL_KV_TIER_MIN`）不保留：重新 prefill 和還原差不多快。
-- **安全性。** 快取以 token 前綴精確比對；還原的就是當初存下的位元組。每個檔案有含校驗的 token 清單、header 最後才寫；
-  當機寫一半的檔、引用的共用區塊已不存在或不相符的檔、其他版本／模型／模式／KV 格式的檔，一律不會還原
-  （其他版本的檔計入容量並優先刪除）。任何故障最壞只是少命中，不會讓輸出不同。
+- **安全性。** 快取以 token 前綴精確比對；還原的就是當初存下的位元組。每個檔案有含校驗的 token 清單、header 最後才寫
+  （前後有 flush 屏障，當機或斷電不會留下有效 header 蓋在其他位元組上）；被截短的檔、引用的共用區塊已不存在或與記錄的雜湊不符的檔、
+  其他版本／模型／模式／KV 格式的檔，一律不會還原（其他版本的檔計入容量並優先刪除）。KV 與 checkpoint 資料本身讀取時不做校驗：
+  這些檢查擋得住當機、斷電、截斷與過期的檔，擋不住檔案內容被 bit rot 或壞軌悄悄改掉；這類故障仰賴磁碟與檔案系統本身。
 - **一個資料夾一個 server。** 第二個 server 指到使用中的資料夾（`whirl.lock`）時會不使用 SSD 層並在 log 說明；
   請給每個 server 各自的 `--kv-ssd-dir`。
 - **寫入量。** log 的 `kv tier |` 行與 `GET /props`（`kv_ssd.bytes_written`、`bytes_shared`、`bytes_used`、`entries`、
@@ -385,7 +390,7 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 |---|---|
 | `WHIRL_NO_PREFIX_CACHE=1` | 關閉前綴快取 |
 | `WHIRL_PREFIX_CACHE_VERIFY=1` | 每次快取命中後重新 prefill 並比對 *（診斷）* |
-| `WHIRL_SERVE_CKPTS=N` | 每個 slot 的前綴檢查點數（預設：1 個 slot 時 4、最多 4 個 slot 時 2、更多時 1） |
+| `WHIRL_SERVE_CKPTS=N` | 每個 slot 的前綴檢查點數（預設：1 個 slot 時 4、最多 4 個 slot 時 2、更多時 1；最多 8） |
 | `WHIRL_SYS_MIN=N` | 至少 N 個 token 的 system 訊息會有自己的檢查點（預設 2048，0 = 關閉） |
 | `WHIRL_SYS_CKPTS=N` | 保留在 VRAM 的共用前綴檢查點數（預設 2） |
 | `WHIRL_SYS_LCP=0` | 不在多個 session 共同的前綴處建立檢查點 |
@@ -408,7 +413,7 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 | `WHIRL_KV_SSD_MODE=always\|shutdown\|off` | = `--kv-ssd-mode`（預設 shutdown） |
 | `WHIRL_KV_SSD_EXPIRE_S=S` | 超過 S 秒沒用的 SSD 快取檔刪除（預設 604800 = 7 天；測試用） |
 | `WHIRL_KV_SSD_DEDUP=0` | 即使其他 SSD 檔案已有相同區塊也照寫（預設：共用） |
-| `WHIRL_KV_SUPERSEDE=0` | 保留被 agent compact／刪減取代的 session（預設：截到共用部分） |
+| `WHIRL_KV_SUPERSEDE=0` | 保留被 agent 刪減取代的 session（預設：連第一則任務訊息都共用時截到共用部分；只共用系統提示時只是最先逐出） |
 | `WHIRL_MMPROJ=FILE` | 視覺編碼器（= `--mmproj`） |
 | `WHIRL_VIS_IDLE_S=N` | N 秒沒有圖片就釋放視覺編碼器（= `--vis-idle-s`） |
 | `WHIRL_VIS_CACHE_MB=N` | 圖片 embedding 快取，MiB（= `--vis-cache-mb`） |

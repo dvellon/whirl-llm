@@ -376,11 +376,20 @@ void Tier::start(const Config& cfg_in, const Layout& lay_in, std::uint64_t finge
                            static_cast<double>(cleanup_.expired_bytes) / 1073741824.0, static_cast<unsigned long long>(cleanup_.bad_files),
                            static_cast<double>(cleanup_.bad_bytes) / 1073741824.0, static_cast<unsigned long long>(cleanup_.cap_files),
                            static_cast<double>(cleanup_.cap_bytes) / 1073741824.0));
+            if (log_fn && cleanup_.layout_files > 0)
+                log_fn(fmt("kv tier: %llu SSD cache files (%.2f GiB) were written with another per-slot context (--ctx / --parallel, "
+                           "or a smaller context chosen for the free VRAM) and cannot be used by this server; kept (a server with "
+                           "that context uses them again), counted against the cap, evicted first, expired when unused",
+                           static_cast<unsigned long long>(cleanup_.layout_files), static_cast<double>(cleanup_.layout_bytes) / 1073741824.0));
             if (log_fn && cleanup_.unreadable_files > 0)
                 log_fn(fmt("kv tier: %llu SSD cache files (%.2f GiB) could not be opened (in use by another program?); "
                            "kept and counted against the cap",
                            static_cast<unsigned long long>(cleanup_.unreadable_files),
                            static_cast<double>(cleanup_.unreadable_bytes) / 1073741824.0));
+            if (log_fn && cfg.ssd_cap < cfg.ram_bytes)
+                log_fn(fmt("kv tier: the SSD cap (%.2f GiB) is smaller than the RAM tier (%.2f GiB): not every RAM entry "
+                           "can have an SSD copy; one that does not fit stays in RAM only",
+                           static_cast<double>(cfg.ssd_cap) / 1073741824.0, static_cast<double>(cfg.ram_bytes) / 1073741824.0));
             next_expiry_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg.expire_check_ms);
         }
         io_thread_ = std::thread([this] { ioThread(); });
@@ -469,6 +478,7 @@ void Tier::persistUse() {
 }
 
 void Tier::touch(Entry* e) {
+    e->demoted = false;
     lru_seq_ += 1;
     e->lru = lru_seq_;
     touchOwners(e);
@@ -500,6 +510,9 @@ bool Tier::gpuIdle(Entry* e) {
 // ---- entries ------------------------------------------------------------------
 
 Entry* Tier::newEntry(std::uint32_t nck) {
+    // Entry::ck / the file header hold max_ck checkpoints (FR-CACHE P2-3: more read and wrote past them)
+    if (nck > max_ck) throw TierError("kv tier: an entry holds at most 8 checkpoints");
+    static_assert(max_ck == 8);
     auto e = std::make_unique<Entry>();
     e->id = rng_() | 1;
     e->nck = nck;
@@ -541,6 +554,7 @@ void Tier::removeEntry(Entry* e) {
 void Tier::dropRam(Entry* e) {
     stats.ram_evictions += 1;
     if (e->ssd) {
+        ssd_gen_ += 1;  // an SSD-only entry now: ssdRoom may drop it
         releaseBlocks(e, 0);
         e->in_ram = false;
         e->owner.reset();
@@ -568,6 +582,7 @@ bool Tier::evictable(Entry* e, Entry* keep) {
 // its RAM blocks are freed by a later pass) if it is worth a disk write (>= min_tokens, SSD tier
 // in `always` mode); else it is dropped (older consistent SSD copy, or gone: a cold prefill later).
 bool Tier::evictWanted(const Entry* v) const {
+    if (v->demoted) return false;  // probably superseded: not worth a disk write
     if (!ssd_dir_w_ || cfg.ssd_shutdown_only || v->n_tok < cfg.min_tokens || v->n_tok == 0 || !seenOk(v)) return false;
     return !v->ssd || v->hasDirty();  // clean: nothing to write
 }
@@ -699,6 +714,7 @@ void Tier::dropCkBlocks(Entry* e, std::uint32_t k) {
 // ---- copies (tier stream) -------------------------------------------------------
 
 std::uint64_t Tier::copyOut(Entry* e, std::span<const Span> spans) {
+    if (e->demoted) touch(e);  // updated in place: its session went on
     std::uint64_t bytes = 0;
     for (const Span& s : spans) {
         std::uint64_t done = 0;
@@ -1196,6 +1212,13 @@ void Tier::gcOwners() {
     }
 }
 
+void Tier::demote(Entry* e) {
+    if (!contains(e) || e->demoted) return;
+    e->demoted = true;
+    e->lru = 0;  // older than every touched entry
+    stats.demoted += 1;
+}
+
 // Superseded session: cut e to tokens [0, keep) -- rounded down to its last
 // checkpoint at or below keep, up to the KV pages other files reference.
 std::uint64_t Tier::trimTo(Entry* e, std::uint32_t keep) {
@@ -1253,6 +1276,7 @@ std::uint64_t Tier::trimTo(Entry* e, std::uint32_t keep) {
         const std::uint64_t fb = alignUp(lay.dataOff() + kvo + static_cast<std::uint64_t>(sn.pages) * lay.page_bytes, sector);
         const std::uint64_t alloc = satSub(fb, static_cast<std::uint64_t>(n_ref) * block_bytes);
         ssd_bytes = satSub(ssd_bytes, satSub(sn.alloc_bytes, alloc));
+        ssd_gen_ += 1;
         sn.alloc_bytes = std::min(sn.alloc_bytes, alloc);
         sn.file_bytes = fb;
         e->meta_dirty = true;
@@ -1338,6 +1362,7 @@ void Tier::deleteFile(std::uint64_t id, std::uint64_t size) {
         return;
     }
     ssd_bytes = satSub(ssd_bytes, size);
+    ssd_gen_ += 1;
     stats.ssd_evictions += 1;
 }
 
@@ -1372,9 +1397,10 @@ void Tier::forgetForeign(const std::wstring& path) {
 
 std::uint64_t Tier::fileBytes(const Entry* e) const { return alignUp(lay.dataOff() + e->extent(lay), sector); }
 
-// Make room on SSD for `need` more bytes (LRU: foreign files, SSD-only
-// entries, SSD copies of RAM entries). false: cannot.
-bool Tier::ssdRoom(std::uint64_t need, Entry* keep) {
+// Make room on SSD for `need` more bytes (LRU: foreign files, SSD-only entries; SSD copies of RAM
+// entries only with ram_copies). false: cannot. Dropping an SSD-only entry also drops the copies of
+// the entries borrowing its blocks (dependents), RAM entries and `keep` included.
+bool Tier::ssdRoom(std::uint64_t need, Entry* keep, bool ram_copies) {
     for (Foreign& f : foreign_) f.tried = false;
     while (ssd_bytes + need > cfg.ssd_cap) {
         // oldest foreign file first (one that cannot be deleted now stays counted; tried once per pass)
@@ -1387,13 +1413,16 @@ bool Tier::ssdRoom(std::uint64_t need, Entry* keep) {
                 continue;
             }
             ssd_bytes = satSub(ssd_bytes, foreign_[oi].size);
+            ssd_gen_ += 1;
             foreign_.erase(foreign_.begin() + static_cast<std::ptrdiff_t>(oi));
             stats.ssd_evictions += 1;
             continue;
         }
         Entry* victim = nullptr;
         for (Entry* e : entries) {
-            if (e == keep || !e->ssd || !ssdDroppable(e)) continue;
+            // (FIX-CACHE P2-1) not the SSD copy of a RAM entry: it would only be written again, and with
+            // RAM entries larger than the cap two of them dropped each other's copy forever
+            if (e == keep || !e->ssd || (e->in_ram && !ram_copies) || !ssdDroppable(e)) continue;
             if (victim == nullptr || e->lru < victim->lru) victim = e;
         }
         if (victim == nullptr) return false;
@@ -1454,9 +1483,26 @@ void Tier::makeHeader(const Entry* e, bool valid, std::uint8_t* buf) const {
 // Queue an SSD write of e's dirty blocks (main thread; e is idle on the GPU).
 // KV blocks that repeat a block already on SSD (same token prefix, same
 // content hash) become references instead of writes.
+// A write that cannot get room under the cap is skipped (the entry stays in RAM only); logged once
+// per entry, not retried until its size changes or room was freed (ssd_gen_).
+void Tier::noFit(Entry* e, std::uint64_t fb) {
+    const bool first = e->nofit_fb == 0;
+    e->nofit_fb = fb;
+    e->nofit_gen = ssd_gen_;
+    if (first && log_fn)
+        log_fn(fmt("kv tier: entry %016llx (%u tok, file %.0f MiB) not written to SSD: no room under the cap (%.2f GiB; "
+                   "%.2f GiB used by files that cannot be dropped for it); it stays in RAM only",
+                   static_cast<unsigned long long>(e->id), e->n_tok, static_cast<double>(fb) / 1048576.0,
+                   static_cast<double>(cfg.ssd_cap) / 1073741824.0, static_cast<double>(ssd_bytes) / 1073741824.0));
+}
+
 void Tier::startWrite(Entry* e) {
     const std::uint64_t fb = fileBytes(e);
-    if (fb > cfg.ssd_cap) return;
+    if (e->nofit_fb == fb && e->nofit_gen == ssd_gen_) return;  // skipped before, nothing changed since
+    if (fb > cfg.ssd_cap) {
+        noFit(e, fb);
+        return;
+    }
     const std::uint64_t kvo = e->kvOff(lay);
     const std::uint32_t kv_lb0 = static_cast<std::uint32_t>(kvo / block_bytes);
     const std::size_t lb_end = static_cast<std::size_t>((e->extent(lay) + block_bytes - 1) / block_bytes);
@@ -1487,9 +1533,19 @@ void Tier::startWrite(Entry* e) {
         forgetForeign(filePath(e->id));
     } catch (...) {
     }
-    const std::uint64_t old0 = e->ssd ? e->ssd->alloc_bytes : 0;
-    if (!ssdRoom(satSub(fb, old0), e)) return;
-    const std::uint64_t old = e->ssd ? e->ssd->alloc_bytes : 0;  // ssdRoom may have dropped it
+    // room for fb minus e's current copy; ssdRoom may drop that copy too (e borrows blocks of the victim):
+    // then room for the whole file is made (FIX-CACHE P2-1: the reservation below charges ssd_bytes - old + fb)
+    std::uint64_t old = e->ssd ? e->ssd->alloc_bytes : 0;
+    for (;;) {
+        if (!ssdRoom(satSub(fb, old), e)) {
+            noFit(e, fb);
+            return;
+        }
+        const std::uint64_t now_old = e->ssd ? e->ssd->alloc_bytes : 0;
+        if (now_old == old) break;
+        old = now_old;
+    }
+    e->nofit_fb = 0;
     auto j = std::make_unique<Job>();
     j->kind = JobKind::write;
     j->entry_id = e->id;
@@ -1650,7 +1706,10 @@ bool Tier::tick() {
                     if (log_fn) log_fn("kv tier: SSD write failed or superseded; the entry stays in RAM only");
                     // the IO thread deleted the file of a failed write; a superseded one is deleted here.
                     // One that cannot be deleted stays counted as a foreign file.
-                    if (removeFile(j->path)) ssd_bytes = satSub(ssd_bytes, j->reserved);
+                    if (removeFile(j->path)) {
+                        ssd_bytes = satSub(ssd_bytes, j->reserved);
+                        ssd_gen_ += 1;
+                    }
                     else keepForeign(j->path, j->reserved);
                     if (e->ssd)
                         for (Entry* d : dependentsOf(e)) dropSsdCopy(d);
@@ -1667,6 +1726,7 @@ bool Tier::tick() {
                     const std::uint64_t alloc = allocBytes(e, n_ref);
                     j->snap->alloc_bytes = alloc;
                     ssd_bytes = satSub(ssd_bytes, j->reserved) + alloc;
+                    if (alloc < j->reserved) ssd_gen_ += 1;
                     e->ssd = std::move(j->snap);
                     j->snap.reset();
                     for (auto lb : j->lbs) {
@@ -1817,19 +1877,35 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
             del = true;
             return;
         }
-        if (hd.version != file_version || hd.fingerprint != fingerprint_) {
-            // another model / build / format: counted against the cap, dropped first (or expired)
+        // kept but not used by this server: counted against the cap, dropped first (or expired)
+        const auto keepUnused = [&]() {
             if (cfg.expire_s > 0 && used < nowUnix() - static_cast<std::int64_t>(cfg.expire_s)) {
                 del = expired = true;
-                return;
+                return false;
             }
             foreign_.push_back(Foreign{pw, size, used});
             ssd_bytes += size;
+            return true;
+        };
+        if (hd.version != file_version || hd.fingerprint != fingerprint_) {  // another model / build / format
+            keepUnused();
             return;
         }
-        if (hd.valid == 0 || hd.n_tok == 0 || hd.n_tok > lay.tok_cap || hd.nck > max_ck || hd.ck_stride != lay.ckStride() ||
-            hd.page_bytes != lay.page_bytes || hd.data_off != lay.dataOff()) {
+        // same fingerprint, but the per-entry checkpoint / page sizes differ or the counts are impossible:
+        // the file is inconsistent (corrupt)
+        if (hd.n_tok == 0 || hd.nck > max_ck || hd.ck_stride != lay.ckStride() || hd.page_bytes != lay.page_bytes) {
             del = true;
+            return;
+        }
+        // (FIX-CACHE P2-2) written with another per-slot context (--ctx, --parallel, or a VRAM-based auto-shrink:
+        // the token / block-table regions, so the data offset, scale with it), or longer than a slot holds now:
+        // a valid file this server cannot use; kept like a foreign file (used again by a server with that context)
+        if (hd.data_off != lay.dataOff() || hd.tbl_off != header_bytes + lay.tokRegion() || hd.tok_off != header_bytes ||
+            hd.n_tok > lay.tok_cap) {
+            if (keepUnused()) {
+                cleanup_.layout_files += 1;
+                cleanup_.layout_bytes += size;
+            }
             return;
         }
         // the payload must be all there: a file cut short (disk full, external truncation) would
@@ -1852,7 +1928,7 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
         const std::uint64_t kv_off = static_cast<std::uint64_t>(hd.nck) * lay.ckStride();
         const std::size_t n_blk =
             hd.pages == 0 ? 0 : lbRange(kv_off, static_cast<std::uint64_t>(hd.pages) * lay.page_bytes)[1] - kv_off / block_bytes;
-        if (hd.n_blk != n_blk || n_blk > lay.maxKvBlocks() || hd.tbl_off != header_bytes + lay.tokRegion()) {
+        if (hd.n_blk != n_blk || n_blk > lay.maxKvBlocks()) {
             del = true;
             return;
         }
@@ -1938,6 +2014,7 @@ void Tier::expireSweep() {
                 continue;
             }
             ssd_bytes = satSub(ssd_bytes, foreign_[i].size);
+            ssd_gen_ += 1;
             cleanup_.expired_files += 1;
             cleanup_.expired_bytes += foreign_[i].size;
             foreign_.erase(foreign_.begin() + static_cast<std::ptrdiff_t>(i));
@@ -1962,7 +2039,7 @@ void Tier::expireSweep() {
 void Tier::enforceCap() {
     const std::uint64_t before = ssd_bytes;
     const std::size_t nf = foreign_.size() + ssdEntries();
-    ssdRoom(0, nullptr);
+    ssdRoom(0, nullptr, true);
     cleanup_.cap_bytes += satSub(before, ssd_bytes);
     cleanup_.cap_files += satSub(nf, foreign_.size() + ssdEntries());
 }
