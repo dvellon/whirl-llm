@@ -629,7 +629,14 @@ u32 Model::beginDecode(u32 n_past) {
 
 // Gated full-attention sublayer on h (already attn-normed) for n tokens at
 // pos_buf, adding into x.
+void Model::draftAttn(const AttnW& a, u32 n) {
+    // restored on every exit, also when attnBlock throws (OVH-C1)
+    ValueScope<std::int32_t> draft_win(attn_win, draftWindowArg(draft_window, draft_window_min));
+    attnBlock(a, mtpKv(), n);
+}
+
 void Model::attnBlock(const AttnW& a, const KvLayer& lkv, u32 n) {
+    if (attn_test_hook) attn_test_hook(attn_test_ctx, attn_win);
     const u32 hd = cfg.head_dim;
     const bool batched = bplan != nullptr || mtp_batch;
     const DevPtr kvb = batched ? kvbase_buf : 0;
@@ -1247,12 +1254,7 @@ void Model::mtpEnqueue(DevPtr hidden, std::span<const u32> tokens, DevPtr dev_to
         rmsnormQ8(x, mw.attn_norm, h, n);
     else
         rmsnorm(x, mw.attn_norm, h, E, n, E, E);
-    {
-        // drafts only: sink + last W positions; restored on every exit, also when attnBlock throws
-        // (the engine keeps serving after a failed step, the trunk must not inherit the window)
-        ValueScope<std::int32_t> draft_win(attn_win, draftWindowArg(draft_window, draft_window_min));
-        attnBlock(mw.attn, mtpKv(), n);
-    }
+    draftAttn(mw.attn, n);  // drafts only: sink + last W positions (OVH-C1)
     if (mw.moe)
         moeBlock(mw.post_norm, mw.ffn_gate, mw.ffn_up, mw.ffn_down, *mw.moe, n);
     else
@@ -1499,12 +1501,7 @@ void Model::mtpBatchStepEx(std::span<const MSeg> segs, u32 r, bool draft) {
     rmsnorm(hidden, mw.hnorm, mtp_cat + E * 4, static_cast<u32>(E), n, static_cast<u32>(E), static_cast<u32>(2 * E));
     matmul(mw.eh_proj, mtp_cat, x, n, false);
     rmsnormQ8(x, mw.attn_norm, h, n);
-    {
-        // drafts only: sink + last W positions; restored on every exit, also when attnBlock throws
-        // (the engine keeps serving after a failed step, the trunk must not inherit the window)
-        ValueScope<std::int32_t> draft_win(attn_win, draftWindowArg(draft_window, draft_window_min));
-        attnBlock(mw.attn, mtpKv(), n);
-    }
+    draftAttn(mw.attn, n);  // drafts only: sink + last W positions (OVH-C1)
     if (mw.moe)
         moeBlock(mw.post_norm, mw.ffn_gate, mw.ffn_up, mw.ffn_down, *mw.moe, n);
     else

@@ -654,6 +654,13 @@ public:
     std::uint32_t draft_rows = 0;
     std::optional<DevPtr> draft_map;
     std::int32_t attn_win = 0;  // KvArgs::win of the current attnBlock (set around the MTP calls only)
+    // The MTP draft attention (both MTP call sites, mtpEnqueue and mtpBatchStepEx): attnBlock of the
+    // MTP layer with attn_win = the draft window, restored on every exit, also when attnBlock throws
+    // (OVH-C1: the engine keeps serving after a failed step, the trunk must not inherit the window).
+    void draftAttn(const AttnW& a, std::uint32_t n);
+    // test seam (tests/model, no GPU): called first in attnBlock with the window it will use; may throw
+    void (*attn_test_hook)(void* ctx, std::int32_t win) = nullptr;
+    void* attn_test_ctx = nullptr;
     // DFlash2 drafter (loadDrafter) and the target hidden capture it needs. Capture slot j of
     // cap_buf holds x at the input of layer dflash->cfg.target_layers[j] for the last cap_n rows
     // of the latest run() (layer-major: [slot][cap_rows][n_embd] f32). Off unless enabled.

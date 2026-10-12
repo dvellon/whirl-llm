@@ -17,6 +17,9 @@
 #include <map>
 #include <fstream>
 #include <functional>
+#include <format>
+#include <iterator>
+#include <regex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -1192,7 +1195,56 @@ void testFloatGemvDispatch() {
     check(cover, "float dispatch: GEMV loop steps cover n tokens (8 / 4 / 1 by the instances present)");
 }
 
+// OVH-C1: the MTP draft window (Model::attn_win) is set only around the MTP draft attention and restored
+// when that attention throws. (a) Model::draftAttn, through the attnBlock test hook (throws before any
+// GPU work): the hook sees the draft window, and attn_win is back to its previous value after the throw.
+// (b) both MTP call sites in forward.cpp go through draftAttn and nothing else assigns attn_win (a call
+// site reverted to "attn_win = ...; attnBlock(); attn_win = 0;" fails here).
+void testDraftWindowRestore() {
+    struct Seen {
+        std::int32_t win = -1;
+        int calls = 0;
+    } seen;
+    q::Model m;
+    m.draft_window = 16384;
+    m.draft_window_min = 65536;
+    m.attn_test_ctx = &seen;
+    m.attn_test_hook = [](void* ctx, std::int32_t win) {
+        auto* s = static_cast<Seen*>(ctx);
+        s->win = win;
+        ++s->calls;
+        throw q::ModelError("TestThrow", "attnBlock failed");
+    };
+    for (const std::int32_t before : {0, 7}) {
+        m.attn_win = before;
+        bool threw = false;
+        try {
+            m.draftAttn(q::AttnW{}, 1);
+        } catch (const q::ModelError&) {
+            threw = true;
+        }
+        check(threw && seen.win == q::draftWindowArg(16384, 65536) && seen.win != 0,
+              "OVH-C1: draftAttn runs attnBlock with the draft window");
+        check(m.attn_win == before, "OVH-C1: attn_win restored after the draft attention threw (before = " + std::to_string(before) + ")");
+    }
+    check(seen.calls == 2, "OVH-C1: test hook reached");
+#ifdef WHIRL_SOURCE_DIR
+    std::ifstream in(std::string(WHIRL_SOURCE_DIR) + "/src/model/forward.cpp", std::ios::binary);
+    const std::string fw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    check(!fw.empty(), "OVH-C1: src/model/forward.cpp readable");
+    std::size_t sites = 0, raw_mtp_attn = 0, assigns = 0;
+    for (std::size_t p = fw.find("draftAttn(mw.attn, n)"); p != std::string::npos; p = fw.find("draftAttn(mw.attn, n)", p + 1)) ++sites;
+    for (std::size_t p = fw.find("attnBlock(mw.attn"); p != std::string::npos; p = fw.find("attnBlock(mw.attn", p + 1)) ++raw_mtp_attn;
+    const std::regex asg(R"(\battn_win\s*=[^=])");
+    for (auto it = std::sregex_iterator(fw.begin(), fw.end(), asg); it != std::sregex_iterator(); ++it) ++assigns;
+    check(sites == 2 && raw_mtp_attn == 0 && assigns == 0,
+          std::format("OVH-C1: both MTP call sites use draftAttn ({} sites, {} raw MTP attnBlock calls, {} attn_win assignments)", sites,
+                      raw_mtp_attn, assigns));
+#endif
+}
+
 int main() {
+    testDraftWindowRestore();
     testFloatGemvDispatch();
     testArchWhitelist();
     testLoadEstimate();
