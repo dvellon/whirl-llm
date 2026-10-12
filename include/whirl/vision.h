@@ -207,6 +207,7 @@ private:
     MergerOff mo_;
     std::uint64_t layer0_ = 0, merger_ = 0, total_ = 0;
     hip::Module module_;
+    std::uint32_t attn_threads_ = 128;  // vis_attn2 block: 128 (gfx1201), 256 (gfx1151: 8 waves x 16 queries)
     Funcs f_;
     DevPtr resident_ = 0;
     hip::Stream copy_stream_ = nullptr;

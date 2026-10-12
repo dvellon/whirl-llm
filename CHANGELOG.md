@@ -5,6 +5,12 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## Unreleased (0.2.0)
 
+### Image input on the Radeon 8060S (VIS-8S)
+
+- `--mmproj` / `image_url` parts now work on gfx1151 (Radeon 8060S); the server used to refuse with `MropeUnsupported`. The gfx1151 code object gains the multi-section RoPE attention prep (`attn_prep_m`, `_q8`, `_q8h`, `_q8v`, `_q4`) and `set_rpos`; the vision encoder (`kernels/vision/vision.hip`) is built per architecture, with gfx11 WMMA fragment layouts for its GEMM and attention kernels (f16 inputs, f32 accumulation as on the R9700; no fp8 is involved).
+- Accuracy: 8060S embeddings vs an f32 numpy reference, relative L2 0.16-0.30%, minimum cosine >= 0.9995 on 4 images (R9700: 0.16-0.31%); vs the R9700, relative L2 0.09-0.23%. R9700 vision output unchanged (embeddings bit-identical to before; its vision code object disassembles identically).
+- New `whirl-kernel-test --only vision`: every encoder kernel against a CPU reference (both GPUs). `audit/VIS-8S.md`.
+
 ### Long-document Q&A: the second question reuses the document (TAIL-CK)
 
 - Prompts of 4096+ tokens keep a per-slot **tail checkpoint** at the start of their last 1024-token chunk, on the cold-run chunk schedule (precise / balance output stays bit identical to a cold run). Another question about the same document (`document + question` in one message) now resumes there and prefills about 0.3k-1.3k tokens instead of the whole document; before, only the third question was served from the cache (REL3: 131k document, second question 107 s on the R9700, 589 s on the 8060S). `-np 2..4` now default to 3 checkpoints per slot (was 2; +150.6 MiB VRAM per slot for Qwen3.8-27B, +63.8 MiB for Ornith-1.5-35B-A3B, counted in the VRAM fit, which drops back to 2 when VRAM is tight); a full set keeps its newest tail checkpoint, so regenerate (prompt-end) and next-turn (gen-end) reuse are unchanged. With fewer than 3 checkpoints per slot no tail is taken. `WHIRL_TAIL_CK=0` turns it off (debug). `audit/TAIL-CK.md`.

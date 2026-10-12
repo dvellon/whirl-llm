@@ -4,7 +4,8 @@
 
 > **Status.** Image input is in WHIRL 0.1.0 for gfx1201 (`whirl chat --mmproj … --image …`, server
 > `--mmproj` with OpenAI `image_url` parts). On our test images the C++ encoder's embeddings are
-> bit-identical to the research build's. Not available on gfx1151 yet. Options:
+> bit-identical to the research build's. Since 0.2.0 also on gfx1151 (Radeon 8060S), see
+> [§7](#gfx1151). Options:
 > [usage.md](../../usage.md#serve).
 
 **Who this helps:** anyone adding a vision encoder to a memory-constrained text server — how to add
@@ -103,4 +104,5 @@ system-checkpoint and restore gates, vision gate dense + MXFP4.
 - Done: the encoder, the scheduler integration and the gate are in the C++ engine (`src/vision/`,
   `kernels/vision/`, `whirl-server-gate --suite vis`).
 - Confirm the cause of the MTP acceptance drop (§4.2).
-- gfx1151: multi-section RoPE kernel and encoder kernels.
+- Done (0.2.0): gfx1151 multi-section RoPE kernels and encoder kernels (§7).
+- gfx1151: encoder speed (§7: attention and GEMM run at a fraction of the WMMA peak).

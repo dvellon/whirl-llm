@@ -369,6 +369,7 @@ void Vision::loadModule() {
     if (img.empty())
         throw VisionError("NoVisionKernels", std::string("this build has no ") + hip::archName(arch) + " vision code object");
     module_ = hip::Module::loadData(img.data(), arch);
+    attn_threads_ = arch == hip::Arch::gfx1151 ? 256 : 128;  // kernels/vision/vision.hip vis_attn2 (per architecture)
     f_.patchify = module_.getFunction("vis_patchify");
     f_.pos_ln = module_.getFunction("vis_pos_ln");
     f_.resid_ln = module_.getFunction("vis_resid_ln");
@@ -555,7 +556,7 @@ EncodeStats Vision::encode(const Prepared& p, std::span<const Region> lend, hip:
         hip::launch(f_.qkv_prep, Dim3{Np / 64, n_head, 1}, Dim3{256, 1, 1}, 0, stream, T, L + lo.qkv_b, Qb, Kb, Vb, static_cast<i32>(N),
                     static_cast<i32>(Np), static_cast<i32>(pw), theta_scale);
         pm(stream, 2);
-        hip::launch(f_.attn, Dim3{Np / 128, n_head, 1}, Dim3{128, 1, 1}, 0, stream, Qb, Kb, Vb, Ab, static_cast<i32>(N), static_cast<i32>(Np),
+        hip::launch(f_.attn, Dim3{Np / 128, n_head, 1}, Dim3{attn_threads_, 1, 1}, 0, stream, Qb, Kb, Vb, Ab, static_cast<i32>(N), static_cast<i32>(Np),
                     scale_log2);
         pm(stream, 3);
         launchGemm(stream, L + lo.out_w, Ab, T, E, E, N);

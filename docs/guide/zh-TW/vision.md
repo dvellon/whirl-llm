@@ -4,7 +4,7 @@
 
 > **狀態。** 圖片輸入已收錄在 WHIRL 0.1.0（gfx1201）：`whirl chat --mmproj … --image …`，以及伺服器的
 > `--mmproj` 搭配 OpenAI `image_url`。在我們的測試圖片上，C++ 編碼器的 embedding 與研究建置逐位元相同。
-> gfx1151 尚不支援。選項見[使用參考](usage.md#serve)。
+> 從 0.2.0 起 gfx1151（Radeon 8060S）也支援，見 [§7](#gfx1151)。選項見[使用參考](usage.md#serve)。
 
 **對誰有幫助：** 任何要在記憶體受限的文字伺服器（server）上加入視覺編碼器的人 — 如何在不佔用純文字使用者 VRAM 的前提下加入圖片輸入 — 以及任何在除錯「輸出取決於伺服器在目前請求*之前*做過什麼」問題的人。
 
@@ -73,4 +73,5 @@
 
 - 已完成：編碼器、排程器整合與 gate 都已在 C++ 引擎中（`src/vision/`、`kernels/vision/`、`whirl-server-gate --suite vis`）。
 - 確認 MTP 接受率下降的原因（§4.2）。
-- gfx1151：多段 RoPE kernel 與編碼器 kernel。
+- 已完成（0.2.0）：gfx1151 多段 RoPE kernel 與編碼器 kernel（§7）。
+- gfx1151：編碼器速度（§7：attention 與 GEMM 只用到 WMMA 峰值的一小部分）。

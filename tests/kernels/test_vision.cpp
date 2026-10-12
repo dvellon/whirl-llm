@@ -100,7 +100,9 @@ void testAttnV(Ctx& c, const hip::Module& m) {
         Buf dout(o0);
         const double scale = 1.0 / std::sqrt(static_cast<double>(VD));
         const float scale_log2 = static_cast<float>(scale * 1.4426950408889634);
-        hip::launch(f, {static_cast<unsigned>(Np / 128), static_cast<unsigned>(VH), 1}, {128, 1, 1}, 0, c.s, dq.p(), dk.p(), dv.p(), dout.p(), N,
+        // block: 128 threads (gfx1201: 4 waves x 32 queries), 256 (gfx1151: 8 waves x 16), as Vision::encode
+        const unsigned nth = c.mod.arch() == hip::Arch::gfx1151 ? 256 : 128;
+        hip::launch(f, {static_cast<unsigned>(Np / 128), static_cast<unsigned>(VH), 1}, {nth, 1, 1}, 0, c.s, dq.p(), dk.p(), dv.p(), dout.p(), N,
                     Np, scale_log2);
         c.sync();
         const std::vector<float> got = fromH(dout.down<std::uint16_t>(o0.size()));
