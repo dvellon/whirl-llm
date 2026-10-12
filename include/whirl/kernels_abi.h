@@ -544,18 +544,19 @@ inline unsigned gemvhGridCap(unsigned nrows, unsigned cap) {
     const unsigned k = (tiles + cap - 1) / cap;
     return k > 1 ? (tiles + k - 1) / k : tiles;
 }
-// cap = kGemvhWavesPerCu x the current device's CUs (16 x 40 = 640 on the Radeon 8060S, where it was tuned;
-// a gfx1151 part with fewer CUs gets proportionally fewer blocks), read once per process (the gfx1151 path runs
-// on one device). WHIRL_GEMVH_WAVES=<n> overrides (tests).
-inline constexpr unsigned kGemvhWavesPerCu = 16;
+// cap = kGemvhWavesPerMp x the current device's multiProcessorCount, which HIP reports in WGPs (dual CUs) on RDNA:
+// 32 x 20 = 640 on the Radeon 8060S (40 CUs), where 640 was tuned (FIX-RC4-B measured 20 there); a gfx1151 part
+// with fewer CUs gets proportionally fewer blocks. Read once per process (the gfx1151 path runs on one device).
+// WHIRL_GEMVH_WAVES=<n> overrides (tests).
+inline constexpr unsigned kGemvhWavesPerMp = 32;
 inline unsigned gemvhGrid(unsigned nrows) {
     static const unsigned cap = [] {
         if (const char* e = std::getenv("WHIRL_GEMVH_WAVES")) {
             const int v = std::atoi(e);
             if (v > 0) return static_cast<unsigned>(v);
         }
-        const int cus = hip::describeDevice(hip::getDevice()).compute_units;
-        return cus > 0 ? kGemvhWavesPerCu * static_cast<unsigned>(cus) : 640u;
+        const int mps = hip::describeDevice(hip::getDevice()).compute_units;
+        return mps > 0 ? kGemvhWavesPerMp * static_cast<unsigned>(mps) : 640u;
     }();
     return gemvhGridCap(nrows, cap);
 }

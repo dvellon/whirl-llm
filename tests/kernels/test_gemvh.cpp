@@ -41,7 +41,7 @@ void testGemvh(Ctx& c) {
     const std::vector<int> nrowsL = c.quick ? std::vector<int>{7, 37, 100} : std::vector<int>{1, 7, 16, 17, 37, 100, 1003, 4099};
     const int ns[] = {1, 2, 5, 16, 17, 32};
     if (c.mod.arch() == hip::Arch::gfx1151)
-        std::printf("   gemvh production grid: 17408 rows -> %u blocks, 248320 rows -> %u blocks (%d CUs)\n", wk::gemvhGrid(17408), wk::gemvhGrid(248320),
+        std::printf("   gemvh production grid: 17408 rows -> %u blocks, 248320 rows -> %u blocks (multiProcessorCount %d)\n", wk::gemvhGrid(17408), wk::gemvhGrid(248320),
                     hip::describeDevice(hip::getDevice()).compute_units);
     for (QType t : wk::kAllTypes) {
         const int ti = static_cast<int>(t);
