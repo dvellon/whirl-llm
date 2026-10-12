@@ -509,6 +509,9 @@ bool Tier::gpuIdle(Entry* e) {
 // ---- entries ------------------------------------------------------------------
 
 Entry* Tier::newEntry(std::uint32_t nck) {
+    // Entry::ck / the file header hold max_ck checkpoints (FR-CACHE P2-3: more read and wrote past them)
+    if (nck > max_ck) throw TierError("kv tier: an entry holds at most 8 checkpoints");
+    static_assert(max_ck == 8);
     auto e = std::make_unique<Entry>();
     e->id = rng_() | 1;
     e->nck = nck;

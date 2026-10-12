@@ -103,6 +103,15 @@ Engine::Engine(ServerModel& model, tier::DeviceOps& ops, const Tokenizer& tok, c
     if (opt_.parallel < 1 || opt_.parallel > gdn_max_seg) throw std::runtime_error("parallel must be 1..16");
     if (opt_.n_ck == 0 || opt_.no_prefix_cache) opt_.n_spe = 0;
     if (opt_.no_prefix_cache) opt_.n_ck = 0;
+    // FR-CACHE P2-3: a tier entry, Slot::rs_map / rs_tail and beginRestore's `chosen` hold at most max_ck
+    // checkpoints (server_main clamps WHIRL_SERVE_CKPTS already; this guards every other caller)
+    static_assert(std::tuple_size_v<decltype(Slot::rs_map)> == tier::max_ck);
+    static_assert(std::tuple_size_v<decltype(Slot::rs_tail)> == tier::max_ck);
+    static_assert(std::tuple_size_v<decltype(tier::Entry::ck)> == tier::max_ck);
+    if (opt_.n_ck > tier::max_ck) {
+        logW("prefix checkpoints per slot {} above the maximum {}; using {}", opt_.n_ck, tier::max_ck, tier::max_ck);
+        opt_.n_ck = tier::max_ck;
+    }
     {
         cache::Config pc;
         pc.enabled = !opt_.no_prefix_cache;

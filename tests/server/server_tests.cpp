@@ -1736,6 +1736,39 @@ void testTierInPlaceRegen() {
                  static_cast<unsigned long long>(srv.tierp()->stats.restores_ram), static_cast<unsigned>(cachedTokens(r4)));
 }
 
+// FIX-CACHE P2-3 (FR-CACHE): more prefix checkpoints per slot than a tier entry holds (WHIRL_SERVE_CKPTS=12).
+// Before: tier::Entry::ck, Slot::rs_map / rs_tail and beginRestore's `chosen` (max_ck = 8) were read and
+// written out of bounds. Now the count is clamped to max_ck (warning); spill / restore stay exact.
+void testServeCkptsClamp() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 8192;
+    su.mc.pool_tokens = 4096;
+    su.tier = true;
+    su.tier_min = 512;
+    su.eo.n_ck = 12;
+    const auto pa = makePrompt(3000, 811);
+    const auto pb = makePrompt(3200, 812);
+    g_log.clear();
+    TestServer srv(su);
+    CHECK(g_log.count("above the maximum") >= 1);
+    const auto outa = srv.model().greedyReference(pa, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pa, 40))), decode(outa));
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pb, 40))), decode(srv.model().greedyReference(pb, 40, true)));
+    std::vector<std::uint32_t> pa2 = pa;
+    pa2.insert(pa2.end(), outa.begin(), outa.end());
+    pa2 = makePrompt(static_cast<std::uint32_t>(pa2.size() + 300), 813, pa2);
+    auto r = srv.post("/v1/completions", completionBody(pa2, 40));
+    CHECK_EQ(completionText(r), decode(srv.model().greedyReference(pa2, 40, true)));
+    CHECK(srv.tierp()->stats.restores_ram >= 1);
+    CHECK(cachedTokens(r) >= pa.size());
+    std::size_t over = 0;
+    for (const tier::Entry* e : srv.tierp()->entries) over += e->nck > tier::max_ck ? 1 : 0;
+    CHECK_EQ(over, 0u);
+    CHECK(!srv.tierp()->entries.empty());
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+
 // FIX-RC4-A P2-1 (RESTORE-EXC): a device copy throwing while a restore is under way -- in the first pump
 // inside Tier::beginRestore (RAM restore: every piece is copied there) or in a later pump (SSD restore) --
 // fails the restore cleanly through the engine: the request is prefilled cold (same output), no entry
@@ -2165,6 +2198,7 @@ int main(int argc, char** argv) {
         {"restore_conc", testRestoreConcurrent},
         {"restore_throws", testRestoreThrows},
         {"tier_inplace", testTierInPlaceRegen},
+        {"ckpts_clamp", testServeCkptsClamp},
         {"sampling", testSampling},
         {"stop_eos", testStopAndEos},
     };
