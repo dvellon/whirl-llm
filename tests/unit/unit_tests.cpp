@@ -1153,6 +1153,18 @@ void testDflashPolicy() {
         CHECK_EQ(w.size(), std::size_t{4});
         CHECK(p.p_min == 0.0f && p.n_min == 0 && p.warm == 64 && !p.capture_rows);
         w.clear();
+        // FR-DFL P2-2: fewer capture rows than one verify of a full block (16) are refused
+        for (const char* bad : {"4", "7", "15"}) {
+            envm = {{"DFLASH_CAPTURE_ROWS", bad}};
+            p = d::parseParams(env, w);
+            CHECK(!p.capture_rows);
+            CHECK(w.size() == 1 && w[0].find(">= 16") != std::string::npos);
+            w.clear();
+        }
+        envm = {{"DFLASH_CAPTURE_ROWS", "16"}};
+        p = d::parseParams(env, w);
+        CHECK(w.empty() && p.capture_rows && *p.capture_rows == d::kMinCaptureRows);
+        w.clear();
         envm = {{"DFLASH_PMIN", "1"}, {"DFLASH_NMIN", "99999999999"}, {"DFLASH_PMIN_X", "z"}};
         p = d::parseParams(env, w);
         CHECK(p.p_min == 1.0f && w.size() == 1 && w[0].find("DFLASH_NMIN") != std::string::npos);
@@ -1231,6 +1243,20 @@ void testDflashPolicy() {
         d::Range r0{0, 10};
         CHECK(d::ready(r0, 10, 64));  // short prompt: min(pos, warm)
         CHECK_EQ(d::planIngest(r0, 8, 8, 0, 0, 10).n, 0u);
+    }
+    // FR-DFL P2-2: whirl chat's ingest after a verify (verifyIngest): capture rows < verify rows never
+    // index before the capture buffer (was cap_n - (nd + 1): 4 - 8 wrapped to 4294967292)
+    {
+        d::Ingest g = d::verifyIngest(8, 8, 3, 100);  // full capture: rows 0..2 kept
+        CHECK(g.any && g.cap_row == 0 && g.n == 3 && g.pos == 100 && g.gap == 0);
+        g = d::verifyIngest(4, 8, 8, 100);  // capture holds verify rows 4..7, all kept
+        CHECK(g.any && g.cap_row == 0 && g.n == 4 && g.pos == 104 && g.gap == 4 && g.cap_row + g.n <= 4);
+        g = d::verifyIngest(4, 8, 6, 100);  // kept rows 0..5: rows 4, 5 are capture rows 0, 1
+        CHECK(g.any && g.cap_row == 0 && g.n == 2 && g.pos == 104);
+        g = d::verifyIngest(4, 8, 2, 100);  // kept rows 0..1 are not in the capture
+        CHECK(!g.any && g.n == 0);
+        g = d::verifyIngest(2048, 8, 8, 7);  // capture larger than the verify (cap_n = rows of the last forward)
+        CHECK(g.any && g.cap_row == 0 && g.n == 8 && g.pos == 7);
     }
 }
 

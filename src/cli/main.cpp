@@ -864,7 +864,9 @@ DecodeResult dflashDecode(q::Model& model, const Tok& tok, u32 first, u32 n_prom
         }
         // the verify ran nd + 1 rows: keep acc + 1 of them, and their features
         if (acc < nd) model.restoreSnapshot(acc + 1);
-        model.dflashIngest(0, model.cap_buf, model.cap_rows, model.cap_n - (nd + 1), acc + 1, p);
+        // (FR-DFL P2-2: via planIngest, so a capture shorter than the verify never reads before cap_buf)
+        if (const whirl::dflash::Ingest g = whirl::dflash::verifyIngest(model.cap_n, nd + 1, acc + 1, p); g.any)
+            model.dflashIngest(0, model.cap_buf, model.cap_rows, g.cap_row, g.n, g.pos);
         for (u32 r = 0; r < acc + 1; ++r) {
             if (!done) done = emit(outv[r]);
             if (opt.ngram) hist.push_back(outv[r]);

@@ -94,6 +94,11 @@ enum class DraftKind : std::uint8_t { mtp = 0, ngram = 1, dflash = 2 };
 inline bool relaxAppliesTo(DraftKind k, bool relax_on) { return relax_on && k == DraftKind::mtp; }
 inline bool relaxApplies(Source s, bool relax_on) { return relaxAppliesTo(s == Source::dflash ? DraftKind::dflash : DraftKind::mtp, relax_on); }
 
+// Fewest capture rows accepted (WHIRL_DFLASH_CAPTURE_ROWS): one verify of a full draft block of the
+// largest block size validate() allows (16). Fewer rows than a verify left whirl chat's ingest
+// pointing before the capture buffer (FR-DFL P2-2); every ingest also goes through planIngest now.
+inline constexpr std::uint32_t kMinCaptureRows = 16;
+
 // Settings from the environment (WHIRL_DFLASH_PMIN / _NMIN / _WARM / _CAPTURE_ROWS).
 struct Params {
     float p_min = 0;                           // walk stops at a token with probability below p_min
@@ -152,8 +157,8 @@ Params parseParams(Env&& env, std::vector<std::string>& warnings) {
     }
     if (auto v = env("DFLASH_CAPTURE_ROWS")) {
         std::uint32_t r = 0;
-        if (detail::parseU32(*v, r) && r > 0) p.capture_rows = r;
-        else warnings.push_back("WHIRL_DFLASH_CAPTURE_ROWS=" + *v + " ignored (a row count > 0)");
+        if (detail::parseU32(*v, r) && r >= kMinCaptureRows) p.capture_rows = r;
+        else warnings.push_back("WHIRL_DFLASH_CAPTURE_ROWS=" + *v + " ignored (a row count >= " + std::to_string(kMinCaptureRows) + ")");
     }
     return p;
 }
@@ -237,6 +242,15 @@ inline Ingest planIngest(Range& r, std::uint32_t capture_n, std::uint32_t run_ro
     g.pos = p;
     r.hi = pos0 + n;
     return g;
+}
+
+// whirl chat / bench (one sequence): after a verify of verify_rows rows (the anchor + drafts) whose
+// last capture_n rows were captured, the first keep rows stay; their features go into the drafter
+// context at positions pos ... The capture may hold fewer rows than the verify (then only the kept
+// rows inside it are ingested, the earlier ones are a gap): never a row before the capture buffer.
+inline Ingest verifyIngest(std::uint32_t capture_n, std::uint32_t verify_rows, std::uint32_t keep, std::uint32_t pos) {
+    Range r{0, pos};
+    return planIngest(r, capture_n, verify_rows, 0, keep, pos);
 }
 
 }  // namespace whirl::dflash
