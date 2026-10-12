@@ -1267,9 +1267,16 @@ bool Engine::startJob(Slot& sl, Job& job) {
         if (mt.reuse == 0) {
             dflReset(sl, 0);
         } else {
-            m_.dflashTrim(sl.id, mt.reuse);
-            sl.dfl_hi = std::min(sl.dfl_hi, mt.reuse);
-            sl.dfl_lo = std::min(sl.dfl_lo, sl.dfl_hi);
+            // (FR-DFL P3-3: only rows the context ring still holds count; none left -> cold at reuse)
+            const ::whirl::dflash::Trim tr =
+                ::whirl::dflash::trimForReuse(::whirl::dflash::Range{sl.dfl_lo, sl.dfl_hi}, mt.reuse, m_.dflashRing());
+            if (tr.reset) {
+                dflReset(sl, mt.reuse);
+            } else {
+                m_.dflashTrim(sl.id, mt.reuse);
+                sl.dfl_lo = tr.r.lo;
+                sl.dfl_hi = tr.r.hi;
+            }
         }
     }
     {

@@ -104,6 +104,11 @@ struct MockConfig {
     // FR-DFL P2-3: a wrong draft is the target row's runner-up (logit 8.65 vs 10: p / p_max 0.26, inside
     // relaxacc's greedy top-k / alpha 0.1 window) instead of a random text token
     bool dfl_miss_runner_up = false;
+    // FR-DFL P3-3: context ring rows (0 = unlimited map): an ingest of position p drops p - ring, p - 2 ring, ...
+    // like the real ring; dfl_need_ctx > 0: a draft whose context lacks one of the min(pos, need) rows
+    // before pos counts in dflHoles() (the engine called the slot ready with rows the ring no longer has)
+    std::uint32_t dfl_ring = 0;
+    std::uint32_t dfl_need_ctx = 0;
     // FR-SRV P2-5: false = the DeltaNet verify keeps snapshot sets instead of replaying kept rows
     // (gfx1151 / Radeon 8060S, WHIRL_GDN_REPLAY=0): the state after a verify holds every row, and
     // restoreSeqSnapshot(s, j) rolls it back to snapshot set j. Sets are allocated lazily by a verify
@@ -168,6 +173,8 @@ public:
     std::vector<std::uint32_t> dflashDraft(std::uint32_t s, std::uint32_t anchor, std::uint32_t pos, float p_min,
                                            std::uint32_t n_min) override;
     void dflashTrim(std::uint32_t s, std::uint32_t keep) override;
+    std::uint32_t dflashRing() const override { return mc_.dfl_ring; }
+    std::uint64_t dflHoles() const { return dfl_holes_; }
     // DFlash2: ingested rows that did not match the capture (wrong row / sequence / position),
     // context rows from another lineage seen by a draft, draft blocks run
     std::uint64_t dflBad() const { return dfl_bad_; }
@@ -234,7 +241,7 @@ private:
     void capRow(std::uint32_t seq, std::uint32_t tok, const State& st);
     std::vector<CapRow> cap_;
     std::vector<std::map<std::uint32_t, State>> dfl_ctx_;
-    std::uint64_t dfl_bad_ = 0, dfl_stale_ = 0, dfl_blocks_ = 0;
+    std::uint64_t dfl_bad_ = 0, dfl_stale_ = 0, dfl_blocks_ = 0, dfl_holes_ = 0;
 
     tier::DeviceOps& ops_;
     const Tokenizer& tok_;

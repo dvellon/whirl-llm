@@ -208,6 +208,28 @@ struct Range {
 // min(pos, warm) rows long (after a restore the earlier rows have no features).
 inline bool ready(const Range& r, std::uint32_t pos, std::uint32_t warm) { return r.hi == pos && pos - r.lo >= std::min(pos, warm); }
 
+// Prefix reuse at `reuse` (the slot keeps positions < reuse, the rest is rewritten): the context rows
+// at positions >= reuse go, and of the run [lo, hi) only what the ring still holds stays usable: the
+// ring keeps the last `ring` positions ingested (hi - ring .. hi - 1; ring 0 = no limit). When nothing
+// below reuse is left (e.g. a 2048-row ring after 5000 positions, reuse 2000) the context restarts
+// cold at reuse (reset: the caller drops every row) instead of claiming [lo, reuse) (FR-DFL P3-3).
+struct Trim {
+    Range r;
+    bool reset = false;
+};
+inline Trim trimForReuse(Range r, std::uint32_t reuse, std::uint32_t ring) {
+    Trim t;
+    const std::uint32_t old_hi = r.hi;
+    t.r.hi = std::min(r.hi, reuse);
+    t.r.lo = std::min(r.lo, t.r.hi);
+    if (ring > 0 && old_hi > ring) t.r.lo = std::max(t.r.lo, old_hi - ring);
+    if (t.r.lo >= t.r.hi && r.lo < r.hi) {
+        t.r = Range{reuse, reuse};
+        t.reset = true;
+    }
+    return t;
+}
+
 // One ingest after a forward / verify of run_rows rows whose last capture_n rows were captured:
 // rows r0 .. r0 + n - 1 of it are positions pos0 .. of the slot.
 struct Ingest {

@@ -128,6 +128,7 @@ public:
         return m_.dflashDraft(s, anchor, pos, p_min, n_min);
     }
     void dflashTrim(std::uint32_t s, std::uint32_t keep) override { m_.dflashTrim(s, keep); }
+    std::uint32_t dflashRing() const override { return m_.dfr ? m_.dfr->ring : 0; }
     void profileFlush(std::size_t slots) override {
         if (prof_mtp_[slots]) prof_mtp_[slots]->flush();
         if (prof_ver_[slots]) prof_ver_[slots]->flush();

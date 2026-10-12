@@ -1426,6 +1426,39 @@ void testDFlashRollback() {
     }
 }
 
+// FR-DFL P3-3: prefix reuse into a slot whose context ring was overwritten long ago (ring 512, the
+// slot ran to ~3060, the next request reuses 2048 positions): no context row below the reuse point
+// survives, so the slot restarts cold at the reuse point (warm-up counted in dfl_cold) instead of
+// drafting at once against rows the ring no longer holds (dflHoles: a draft missing one of the
+// warm rows before it). Outputs equal the reference either way.
+void testDFlashTrimRing() {
+    ServerSetup su = dflashSetup(false);
+    su.mc.parallel = 1;
+    su.eo.tail_ck_min = 2048;
+    su.eo.n_ck = 4;
+    su.mc.dfl_ring = 512;
+    su.mc.dfl_need_ctx = 400;
+    su.eo.dfl_warm = 400;
+    TestServer srv(su);
+    const auto p1 = makePrompt(3000, 81);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(p1, 60))), decode(srv.model().greedyReference(p1, 60, true)));
+    const Engine::Stats s1 = srv.engine().stats();
+    CHECK_EQ(srv.model().dflHoles(), 0u);
+    // (TAIL-CK: p1's slot checkpoint at the start of its last schedule chunk, 2048)
+    const std::vector<std::uint32_t> pre(p1.begin(), p1.begin() + 2100);
+    const auto p2 = makePrompt(2130, 82, pre);
+    auto r2 = srv.post("/v1/completions", completionBody(p2, 60));
+    CHECK_EQ(completionText(r2), decode(srv.model().greedyReference(p2, 60, true)));
+    const std::uint64_t reused = cachedTokens(r2);
+    CHECK(reused >= 1024 && reused <= 2100);
+    const Engine::Stats s2 = srv.engine().stats();
+    CHECK_EQ(srv.model().dflHoles(), 0u);       // never drafted against rows the ring lost
+    CHECK(s2.dfl_cold > s1.dfl_cold);           // the warm-up after the reset is counted
+    CHECK_EQ(srv.model().dflBad(), 0u);
+    CHECK_EQ(srv.model().dflStale(), 0u);
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+
 // host tier restore with DFlash2: the restored session has KV and state but no drafter rows (reset
 // at the restore point); outputs equal the reference and no stale row reaches a draft
 void testDFlashTier() {
@@ -2998,6 +3031,7 @@ int main(int argc, char** argv) {
         {"greedy_reference", testGreedyMatchesReference},
         {"stream", testStreamEqualsNonStream},
         {"prefix_cache", testPrefixCacheMultiTurn},
+        {"dflash_trim_ring", testDFlashTrimRing},
         {"doc_qa", testDocQa},
         {"tail_ck_sched", testTailCkOnSchedule},
         {"tail_ck_regress", testTailCkRegression},

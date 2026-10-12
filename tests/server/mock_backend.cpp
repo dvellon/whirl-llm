@@ -622,6 +622,11 @@ void MockModel::dflashIngest(std::uint32_t s, std::uint32_t row0, std::uint32_t 
         const CapRow& c = cap_[base + row0 + i];
         if (c.seq != s || c.st.pos != pos0 + i) dfl_bad_ += 1;
         dfl_ctx_[s][pos0 + i] = c.st;
+        if (mc_.dfl_ring > 0)
+            for (std::uint32_t q = pos0 + i; q >= mc_.dfl_ring;) {
+                q -= mc_.dfl_ring;
+                dfl_ctx_[s].erase(q);
+            }
     }
 }
 
@@ -634,6 +639,12 @@ std::vector<std::uint32_t> MockModel::dflashDraft(std::uint32_t s, std::uint32_t
     dfl_blocks_ += 1;
     std::vector<std::uint32_t> out;
     const auto& m = dfl_ctx_[s];
+    if (mc_.dfl_need_ctx > 0)
+        for (std::uint32_t p = pos - std::min(pos, mc_.dfl_need_ctx); p < pos; ++p)
+            if (!m.count(p)) {
+                dfl_holes_ += 1;
+                break;
+            }
     auto it = pos > 0 ? m.find(pos - 1) : m.end();
     if (it == m.end()) {
         // no context row before the anchor: guesses

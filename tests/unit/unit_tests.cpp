@@ -1244,6 +1244,21 @@ void testDflashPolicy() {
         CHECK(d::ready(r0, 10, 64));  // short prompt: min(pos, warm)
         CHECK_EQ(d::planIngest(r0, 8, 8, 0, 0, 10).n, 0u);
     }
+    // FR-DFL P3-3: prefix reuse trims the run to positions < reuse that the ring still holds
+    {
+        d::Trim t = d::trimForReuse(d::Range{0, 5000}, 2000, 2048);  // ring holds 2952..4999: nothing below 2000
+        CHECK(t.reset && t.r.lo == 2000 && t.r.hi == 2000);
+        t = d::trimForReuse(d::Range{0, 3000}, 2000, 2048);  // ring holds 952..2999: [952, 2000) stays
+        CHECK(!t.reset && t.r.lo == 952 && t.r.hi == 2000);
+        t = d::trimForReuse(d::Range{0, 1500}, 2000, 2048);  // all in the ring, below reuse: unchanged
+        CHECK(!t.reset && t.r.lo == 0 && t.r.hi == 1500);
+        t = d::trimForReuse(d::Range{100, 5000}, 4000, 0);  // no ring limit: the old rule
+        CHECK(!t.reset && t.r.lo == 100 && t.r.hi == 4000);
+        t = d::trimForReuse(d::Range{3500, 5000}, 3000, 2048);  // run started after reuse: nothing left
+        CHECK(t.reset && t.r.lo == 3000 && t.r.hi == 3000);
+        t = d::trimForReuse(d::Range{0, 0}, 500, 2048);  // empty run: no reset (the next ingest counts the gap)
+        CHECK(!t.reset && t.r.lo == 0 && t.r.hi == 0);
+    }
     // FR-DFL P2-2: whirl chat's ingest after a verify (verifyIngest): capture rows < verify rows never
     // index before the capture buffer (was cap_n - (nd + 1): 4 - 8 wrapped to 4294967292)
     {
