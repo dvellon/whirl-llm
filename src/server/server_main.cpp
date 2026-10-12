@@ -9,6 +9,7 @@
 
 #include "backend.h"
 #include "cache/fingerprint.h"
+#include "draft_caps.h"
 #include "engine.h"
 #include "http.h"
 #include "log.h"
@@ -793,20 +794,25 @@ int serveMain(int argc, char** argv, const char* program) {
             logI("DeltaNet verify: replay of kept rows ({:.1f} MiB per slot), no snapshot sets",
                  static_cast<double>(model.pendLayerBytes() * model.gdn_ord[cfg.n_layer - 1]) / (1024.0 * 1024.0));
         }
+        std::uint32_t lit_snap_sets = 0;  // engine: snapshot sets for n-gram / DFlash2 drafts (0 = all)
         if (use_mtp && !model.gdn_replay) {
-            if (!bd_env)
-                for (std::uint32_t k = 2; k <= gdn_max_seg; ++k) batch_drafts[k] = std::min(batch_drafts[k], 8 / k);
-            std::uint32_t need = drafts;
-            for (std::uint32_t k = 1; k <= opt.parallel; ++k) need = std::max(need, k * std::min(batch_drafts[k], drafts));
+            std::optional<std::uint32_t> snap_env;
             if (auto v = env("SNAP_SETS")) {
                 std::uint32_t x = 0;
                 try {
                     x = static_cast<std::uint32_t>(std::stoul(*v));
                 } catch (const std::exception&) {
                 }
-                need = std::max(need, std::min(x, qwen35::gdn_max_snap));
+                snap_env = x;
             }
-            model.ensureSnapshots(std::min(qwen35::gdn_max_snap, need));
+            const SnapDraftCaps sc = snapshotDraftCaps(batch_drafts, drafts, opt.parallel, bd_env.has_value(), snap_env, model.relax.on);
+            batch_drafts = sc.caps;
+            lit_snap_sets = sc.lit_sets;
+            model.ensureSnapshots(sc.sets);
+            std::string tbl;
+            for (std::uint32_t k = 1; k <= opt.parallel; ++k) tbl += (k > 1 ? ", " : "") + std::to_string(std::min(batch_drafts[k], drafts));
+            logI("MTP under load, DeltaNet snapshot sets: max drafts per cycle with 1..{} decoding slots: {{ {} }}; {} snapshot sets ({} for n-gram drafts)",
+                 opt.parallel, tbl, model.snap_sets, lit_snap_sets > 0 ? std::to_string(lit_snap_sets) : std::string("all"));
         }
 
         // engine (checkpoint buffers, shared checkpoints, sampling buffers)
@@ -851,6 +857,7 @@ int serveMain(int argc, char** argv, const char* program) {
         eo.mtp_adapt = adapt;
         eo.mtp_auto = auto_mode;
         eo.batch_drafts = batch_drafts;
+        eo.ng_snap_sets = lit_snap_sets;
         eo.no_prefix_cache = no_pc;
         eo.verify_cache = env("PREFIX_CACHE_VERIFY").has_value();
         eo.seg_prefill = envOn("SEG_PREFILL", true);

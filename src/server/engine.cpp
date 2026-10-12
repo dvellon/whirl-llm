@@ -1732,6 +1732,8 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
     std::size_t n_ng = 0;
     // replay keeps no snapshot sets: the verify row budget is the only shared limit
     const std::uint32_t snap_cap = m_.gdnReplay() ? vrows_ : std::min(qwen35::gdn_max_snap, m_.snapSets());
+    // literal drafts (n-gram, DFlash2) per slot: the snapshot budget they had before CONC-8S
+    const std::uint32_t lit_cap = (m_.gdnReplay() || opt_.ng_snap_sets == 0) ? snap_cap : std::min(snap_cap, opt_.ng_snap_sets);
     const std::uint32_t Au = static_cast<std::uint32_t>(A);
     // the verify writes KV rows pos .. pos + drafts: stay inside the pages mapped
     // for the slot and the context
@@ -1744,11 +1746,11 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
     // DFlash2: drafts per slot within the shared verify rows / snapshot sets
     std::uint32_t dfl_lim = 0;
     if (opt_.use_dflash) {
-        dfl_lim = ::whirl::dflash::draftLimit(m_.dflashMaxDrafts() + 1, qwen35::max_ng_drafts, snap_cap, vrows_, Au, m_.fusedDecode());
+        dfl_lim = ::whirl::dflash::draftLimit(m_.dflashMaxDrafts() + 1, qwen35::max_ng_drafts, lit_cap, vrows_, Au, m_.fusedDecode());
     }
     const qwen35::DraftTiming& dtm = dtiming_[std::min<std::size_t>(A, gdn_max_seg)];
     if (opt_.ngram && (opt_.use_mtp || opt_.use_dflash)) {
-        std::uint32_t lim = std::min({qwen35::max_ng_drafts, snap_cap / Au, vrows_ / Au > 0 ? vrows_ / Au - 1 : 0u});
+        std::uint32_t lim = std::min({qwen35::max_ng_drafts, lit_cap / Au, vrows_ / Au > 0 ? vrows_ / Au - 1 : 0u});
         if (opt_.ngram_max > 0) lim = std::min(lim, opt_.ngram_max);
         if (!m_.fusedDecode()) lim = std::min(lim, 1u);
         const qwen35::DraftTiming& tm = opt_.use_dflash ? dtm : timing_[std::min<std::size_t>(A, gdn_max_seg)];
