@@ -3277,7 +3277,7 @@ static void testTokCapRestart(MockDeviceOps& ops, const fs::path& dir) {
         CHECK(t2->cleanup().layout_files == 1);
         CHECK(countFiles(dir) == 1);
         CHECK(t2->ssdEntries() == 0);           // not usable with this layout
-        CHECK(t2->ssd_bytes == bytes1);         // counted against the cap
+        CHECK(t2->ssd_bytes > 0 && t2->ssd_bytes == diskBytes(dir));  // counted against the cap (on-disk bytes)
         CHECK(!t2->lookup(a.toks).has_value());
         bool logged = false;
         for (const auto& l : logs) logged = logged || l.find("another per-slot context") != std::string::npos;
