@@ -5,6 +5,10 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## Unreleased (0.2.0)
 
+### Long-document Q&A: the second question reuses the document (TAIL-CK)
+
+- Prompts of 4096+ tokens keep a per-slot **tail checkpoint** at the start of their last 1024-token chunk, on the cold-run chunk schedule (precise / balance output stays bit identical to a cold run). Another question about the same document (`document + question` in one message) now resumes there and prefills about 0.3k-1.3k tokens instead of the whole document; before, only the third question was served from the cache (REL3: 131k document, second question 107 s on the R9700, 589 s on the 8060S). `-np 2..4` now default to 3 checkpoints per slot (was 2; +150.6 MiB VRAM per slot for Qwen3.8-27B, +63.8 MiB for Ornith-1.5-35B-A3B, counted in the VRAM fit, which drops back to 2 when VRAM is tight); a full set keeps its newest tail checkpoint, so regenerate (prompt-end) and next-turn (gen-end) reuse are unchanged. With fewer than 3 checkpoints per slot no tail is taken. `WHIRL_TAIL_CK=0` turns it off (debug). `audit/TAIL-CK.md`.
+
 ### RAM and SSD tier on by default on the Radeon 8060S (TIER-8S-DEF)
 
 - On integrated GPUs the host RAM tier of the prefix cache (and with it the SSD tier, mode `shutdown`) is **on by default**; it used to be off because the KV pool "already lives in system memory". On Windows the BIOS splits the VRAM carve-out (the KV pool) from the OS RAM, so the tier is separate pinned OS memory and a restore is a real copy. Measured on the 8060S (Qwen3.8-27B Q4_K_M, balance): a 128k session restores in 0.34 s from the RAM tier and 2 s from the SSD tier after a restart, against 537 s of prefill; decode speed unchanged (`audit/TIER-8S.md`).

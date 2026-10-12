@@ -153,8 +153,9 @@ transformer 可以重用任何 KV 區塊已被快取的前綴。DeltaNet 層做�
 | `think-open` | 思考提示詞結尾 `<think>\n` 的正後方（無 logits） | 客戶端丟掉思考內容時的下一回合 |
 | `system` | system 訊息結尾（≥ 2048 token） | 使用相同系統提示詞的新 session |
 | `prefix` | 長共同前綴內的某個 chunk 起點 | 結尾帶有各 session 專屬文字的系統提示詞 |
+| `prefix`（尾端，每 slot） | 4096 token 以上提示詞最後一個排程 chunk 的起點（距結尾 257..1280） | 對同一份長文件的另一個問題 |
 
-當 `--parallel` > 1 時每個 slot 保存 2 個檢查點，否則 4 個。新請求會被放到可重用前綴最長的 slot；KV 以截斷方式重用，slot 的狀態則從該點或之前最佳的檢查點載入。
+每個 slot 保存的檢查點數：1 個 slot 時 4 個、2 到 4 個 slot 時 3 個、更多時 1 個。3 個以上時，存滿後不會覆寫最新的 `prefix`（尾端）檢查點，因此上一個請求的尾端、`prompt-end` 與 `gen-end` 都保留；少於 3 個則不建立尾端檢查點（`WHIRL_TAIL_CK=0` 可關閉）。新請求會被放到可重用前綴最長的 slot；KV 以截斷方式重用，slot 的狀態則從該點或之前最佳的檢查點載入。
 
 ### <a id="think-open"></a>5.1 多回合快取為何沒命中，以及修正
 

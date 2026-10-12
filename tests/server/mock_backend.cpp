@@ -370,6 +370,7 @@ void MockModel::prefillOne(std::uint32_t si, std::span<const std::uint32_t> toks
     if (mtp && pos0 > 0 && prev_hidden) {
         if (readHidden(*prev_hidden).pos != pos0 - 1) hid_mismatch_ += 1;
     }
+    if (mc_.sched_grid > 0 && pos0 % mc_.sched_grid != 0 && !toks.empty()) writeH(s, mix(readH(s), 0x7a11c0ffeeull, pos0));
     const State st = runRows(s, toks, pos0, r0, true);
     writeLogits(logits_row, st.h, st.kv);
     if (mtp && !toks.empty()) {

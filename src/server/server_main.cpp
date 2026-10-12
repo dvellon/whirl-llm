@@ -99,7 +99,11 @@ constexpr std::uint32_t ctx_per_slot_default = 131072;
 constexpr std::uint32_t floor_second_ctx = 65536;
 constexpr std::uint32_t serve_prefill_batch = 4096;
 constexpr std::size_t n_ckpt_default = 4;
-constexpr std::size_t n_ckpt_default_par = 2;
+// -np 2..4: 3 per slot (TAIL-CK: tail checkpoint before the question + prompt-end + gen-end; with 2
+// the tail would push out what a regenerate or the next turn resumes from), about 150.6 MiB each
+// for Qwen3.8-27B, 63.8 MiB for Ornith-1.5-35B-A3B; the KV-fit estimate below counts them and
+// lowers them to 2 (tail off) when VRAM is tight
+constexpr std::size_t n_ckpt_default_par = 3;
 constexpr std::size_t n_spe_default = 2;
 // KV pool (tokens, smallest format) below which startup lowers the prefill batch / checkpoints
 constexpr std::uint32_t vram_tight_pool = 16384;
@@ -912,6 +916,7 @@ int serveMain(int argc, char** argv, const char* program) {
         eo.kv_supersede = envU32("KV_SUPERSEDE", 1) != 0;
         eo.lcp_on = envOn("SYS_LCP", true);
         eo.n_ck = n_ck;
+        eo.tail_ck = envOn("TAIL_CK", true);  // debug knob: WHIRL_TAIL_CK=0 turns the tail checkpoint off
         eo.n_spe = (n_ck == 0 || no_pc) ? 0 : n_spe_plan;
         eo.ckpt_host = envOn("CKPT_HOST", false);
         eo.prefill_exec = prefill_exec;
@@ -1072,6 +1077,19 @@ int serveMain(int argc, char** argv, const char* program) {
                              (1024.0 * 1024.0);
         if (no_pc) logI("prefix cache: disabled (WHIRL_NO_PREFIX_CACHE)");
         else logI("prefix cache: {} checkpoint(s) per slot x {:.1f} MiB ({} DeltaNet layers of recurrent state + logits row)", n_ck, ck_mb, n_gdn);
+        if (!no_pc) {
+            if (!eo.tail_ck)
+                logW("prefix cache: tail checkpoint off (WHIRL_TAIL_CK=0, debug override): a second question about the same long "
+                     "document re-prefills it");
+            else if (n_ck >= tail_ck_slots)
+                logI("prefix cache: tail checkpoint on: prompts >= {} tokens keep one of the {} per-slot checkpoints ({:.1f} MiB) at the "
+                     "start of their last chunk, so another question about the same document resumes there",
+                     eo.tail_ck_min, n_ck, ck_mb);
+            else
+                logI("prefix cache: tail checkpoint off ({} checkpoint(s) per slot, needs {}; WHIRL_SERVE_CKPTS={} turns it on at "
+                     "+{:.1f} MiB VRAM per slot each)",
+                     n_ck, tail_ck_slots, tail_ck_slots, ck_mb);
+        }
         {
             const double st_mib = static_cast<double>(n_gdn * (conv_bytes + ssm_bytes)) / (1024.0 * 1024.0);
             const double snap_mib = st_mib * model.snap_sets;

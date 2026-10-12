@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <string_view>
 
 namespace whirl::cache {
 
@@ -156,20 +157,33 @@ public:
     }
 
     std::size_t ckptSlotFor(View<const CkptKey> cks, std::uint32_t pos) const override {
-        std::size_t slot = 0;
+        // TAIL-CK: the newest 'prefix' checkpoint is kept while the set is large enough (it is the
+        // tail checkpoint of the last long prompt; older ones go first, prompt-end / gen-end of the
+        // same request outlive it as before because the set has room for all three)
+        int keep = -1;
+        if (cks.size() >= ckpt_keep_prefix_min)
+            for (std::size_t i = 0; i < cks.size(); ++i) {
+                const CkptKey& c = cks[i];
+                if (c.valid && std::string_view(c.kind) == "prefix" && (keep < 0 || c.seq > cks[static_cast<std::size_t>(keep)].seq))
+                    keep = static_cast<int>(i);
+            }
+        int slot = -1;
         for (std::size_t i = 0; i < cks.size(); ++i) {
             const CkptKey& c = cks[i];
-            if (c.valid && c.pos == pos) {
-                slot = i;
-                break;
+            if (c.valid && c.pos == pos) return i;
+            if (static_cast<int>(i) == keep) continue;
+            if (slot < 0) {
+                slot = static_cast<int>(i);
+                continue;
             }
+            const CkptKey& b = cks[static_cast<std::size_t>(slot)];
             if (!c.valid) {
-                if (cks[slot].valid) slot = i;
-            } else if (cks[slot].valid && c.seq < cks[slot].seq) {
-                slot = i;
+                if (b.valid) slot = static_cast<int>(i);
+            } else if (b.valid && c.seq < b.seq) {
+                slot = static_cast<int>(i);
             }
         }
-        return slot;
+        return slot < 0 ? 0 : static_cast<std::size_t>(slot);
     }
 
     int sharedVictim(View<const SpeKey> spes) const override {
