@@ -1692,6 +1692,50 @@ void testTiers() {
     std::filesystem::remove_all(dir, ec);
 }
 
+
+// FR-CACHE revert-check (engine.cpp spillSlot's tier_pages clamp): in-place spill after a same-slot
+// regenerate (reuse < the entry's length), then eviction and a restore of the regenerated branch: the
+// entry's pages past the divergence must have been re-copied (without the clamp the restore returns the
+// old branch's KV and the output differs; the rest of this suite passed with the clamp removed).
+void testTierInPlaceRegen() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 8192;
+    su.mc.pool_tokens = 4096;
+    su.tier = true;
+    su.tier_min = 512;
+    su.eo.n_ck = 4;
+    const auto pa = makePrompt(3000, 801);
+    const auto pb = makePrompt(3200, 802);
+    TestServer srv(su);
+    g_log.clear();
+    const auto outa = srv.model().greedyReference(pa, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pa, 40))), decode(outa));
+    std::vector<std::uint32_t> base = pa;
+    base.insert(base.end(), outa.begin(), outa.end());
+    const auto p2 = makePrompt(static_cast<std::uint32_t>(base.size() + 300), 803, base);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(p2, 40))), decode(srv.model().greedyReference(p2, 40, true)));
+    // regenerate turn 2 with another user message: resumes at the gen-end checkpoint of turn 1
+    const auto p3 = makePrompt(static_cast<std::uint32_t>(base.size() + 300), 804, base);
+    const auto out3 = srv.model().greedyReference(p3, 40, true);
+    auto r3 = srv.post("/v1/completions", completionBody(p3, 40));
+    CHECK_EQ(completionText(r3), decode(out3));
+    const std::size_t inplace = g_log.count("in place");
+    CHECK(inplace >= 1);
+    // B evicts the slot
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pb, 40))), decode(srv.model().greedyReference(pb, 40, true)));
+    std::vector<std::uint32_t> p4 = p3;
+    p4.insert(p4.end(), out3.begin(), out3.end());
+    p4 = makePrompt(static_cast<std::uint32_t>(p4.size() + 200), 805, p4);
+    auto r4 = srv.post("/v1/completions", completionBody(p4, 40));
+    CHECK_EQ(completionText(r4), decode(srv.model().greedyReference(p4, 40, true)));
+    CHECK(srv.tierp()->stats.restores_ram >= 1);
+    CHECK(cachedTokens(r4) > base.size());
+    CHECK_EQ(srv.model().poison(), 0u);
+    std::fprintf(stderr, "  (tier_inplace: in-place spills %zu, restores_ram %llu, cached %u)\n", inplace,
+                 static_cast<unsigned long long>(srv.tierp()->stats.restores_ram), static_cast<unsigned>(cachedTokens(r4)));
+}
+
 // FIX-RC4-A P2-1 (RESTORE-EXC): a device copy throwing while a restore is under way -- in the first pump
 // inside Tier::beginRestore (RAM restore: every piece is copied there) or in a later pump (SSD restore) --
 // fails the restore cleanly through the engine: the request is prefilled cold (same output), no entry
@@ -2120,6 +2164,7 @@ int main(int argc, char** argv) {
         {"tiers", testTiers},
         {"restore_conc", testRestoreConcurrent},
         {"restore_throws", testRestoreThrows},
+        {"tier_inplace", testTierInPlaceRegen},
         {"sampling", testSampling},
         {"stop_eos", testStopAndEos},
     };
