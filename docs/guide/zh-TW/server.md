@@ -26,9 +26,10 @@ Base URL 為 `http://127.0.0.1:8080/v1`；接受任何 API key。模型只載入
 | `--ctx-per-slot N` | 每個請求的上下文上限 | 131,072（最大 262,144） |
 | `--mtp-drafts N` | MTP 草稿上限 1–10 | dense：自動，上限 8；MoE：1 |
 | `--decode-min-tps N` | 其他請求 prefill 時，每個串流請求的 decode 保底速度（[§6](#batching)）；0 = 關閉 | 20 |
-| `--kv-ram-mb N` | pinned RAM KV 層大小；0 會停用 RAM 與 SSD 層 | 實體記憶體的 1/4，範圍 [max(8 GiB, 一個完整 f16 session + 檢查點), 32 GiB]，且不超過啟動時可用記憶體的一半；64 GB 的電腦為 16 GiB；整合式 GPU 預設關閉 |
+| `--kv-ram-mb N` | pinned RAM KV 層大小；0 會停用 RAM 與 SSD 層 | 實體記憶體的 1/4，範圍 [max(8 GiB, 一個完整 f16 session + 檢查點), 32 GiB]，且不超過啟動時可用記憶體的一半；64 GB 的電腦為 16 GiB；整合式 GPU（Radeon 8060S）：OS 可見記憶體 / 8，範圍 [一個最大上下文 entry（27B 模型 262k 約 6 GiB）, 16 GiB]，且不超過啟動時可用記憶體的 1/4，OS 可見記憶體不到 32 GB 時關閉（BIOS VRAM 保留不計；64 GB 機器為 8 GiB） |
 | `--kv-ssd-dir` / `--kv-ssd-gb N` | SSD 層目錄 / 大小上限；0 GB 停用 SSD | 每位使用者的本機 app-data 目錄 / 64 |
-| `--kv-ssd-mode always\|shutdown\|off` | SSD 層何時寫入（shutdown＝只在正常關閉時；off＝不寫 SSD 檔案） | always |
+| `--kv-ssd-mode shutdown\|always\|off` | SSD 層何時寫入（shutdown＝只在正常關閉時寫，執行中不寫；always＝閒置超過 `--kv-ssd-delay` 的 session；off＝不寫 SSD 檔案） | shutdown |
+| `--kv-ssd-delay SEC` | `always` 模式：session 連續 SEC 秒沒變動才寫入 | 300 |
 | `--log-file` | 記錄檔（同時印到主控台） | 每位使用者的本機 app-data 目錄 |
 | `--alias` | `/v1/models` 回報的模型 id | GGUF 檔名 |
 | `--mmproj FILE`、`--vis-idle-s`、`--vis-mode`、`--vis-cache-mb` | 影像輸入（[vision.md](vision.md)） | off / 60 / auto / 1024 |
