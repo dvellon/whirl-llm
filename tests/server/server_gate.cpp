@@ -650,6 +650,14 @@ std::optional<std::string> cliRun(const std::string& prompt, bool think, int max
                        L" --max-tokens " + std::to_wstring(max_tokens) + L" --no-stream";
     SetEnvironmentVariableW(L"WHIRL_THINK", think ? L"1" : L"0");
     SetEnvironmentVariableW(L"WHIRL_R9700_LOCK_HELD", std::to_wstring(GetCurrentProcessId()).c_str());
+    // FIX-TEST-A: the CLI reference runs in the servers' configuration (--server-env, e.g. WHIRL_MODE=precise);
+    // without it a precise server was compared with a default-mode (balance) CLI
+    std::map<std::string, std::optional<std::string>> env_before;
+    for (const auto& [k, v] : g.server_env) {
+        const char* old = std::getenv(k.c_str());
+        env_before[k] = old ? std::optional<std::string>(old) : std::nullopt;
+        SetEnvironmentVariableW(widen(k).c_str(), widen(v).c_str());
+    }
     SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
     HANDLE oh = CreateFileW(widen(out).c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, 0, nullptr);
     STARTUPINFOW si{};
@@ -665,6 +673,7 @@ std::optional<std::string> cliRun(const std::string& prompt, bool think, int max
     CloseHandle(oh);
     if (!ok) {
         g_lock.release();
+        for (const auto& [k, v] : env_before) SetEnvironmentVariableW(widen(k).c_str(), v ? widen(*v).c_str() : nullptr);
         return std::nullopt;
     }
     WaitForSingleObject(pi.hProcess, 900000);
@@ -672,6 +681,7 @@ std::optional<std::string> cliRun(const std::string& prompt, bool think, int max
     CloseHandle(pi.hThread);
     g_lock.release();
     SetEnvironmentVariableW(L"WHIRL_THINK", nullptr);
+    for (const auto& [k, v] : env_before) SetEnvironmentVariableW(widen(k).c_str(), v ? widen(*v).c_str() : nullptr);
     std::string s = readFile(out);
     std::string t;
     for (char c : s)

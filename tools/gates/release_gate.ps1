@@ -18,8 +18,8 @@
 #   WHIRL_GATE_DENSE   Qwen3.8-27B Q4_K_M GGUF          WHIRL_GATE_MOE     Ornith-1.5-35B-A3B MXFP4 GGUF
 #   WHIRL_GATE_MX      a dense MXFP4 GGUF (kernel test)  WHIRL_GATE_DFLASH  DFlash2 drafter GGUF
 #   WHIRL_GATE_TEXT_ROOT  llama.cpp checkout (server gate texts)
-#   WHIRL_GATE_LOCK_SCRIPT  optional: a script defining Enter-R9700Lock; each GPU step then runs in its
-#                           own process holding that lock for that step only (other agents interleave)
+#   WHIRL_GATE_LOCK_SCRIPT  optional: a script defining Enter-R9700Lock; each GPU step then holds
+#                           that lock for its own duration only (other agents interleave)
 # Steps (-List prints them): CPU test binaries, gate / golden self-tests, golden xcheck; kernel test
 # --require-all; selftest dense + MoE x 3 modes; golden check; seqtest dense x 3 modes and MoE precise +
 # balance; bench DFlash2 x 3 modes (hashes equal, drafts > 0); server gate balance + fast basic,mt_cache,
@@ -101,10 +101,10 @@ function GateCmd([string]$model, [string]$suites, [string]$mode, [string[]]$extr
            "--port", "$port", "--work", "@WORK@", "--kv", "auto")
     if ($mode) { $a += @("--server-env", "WHIRL_MODE=$mode") }
     if ($Device -eq "8060s") { $a += @("--server-env", "WHIRL_DEVICE=8060s") }
-    return $a + $extra
+    return @($a + @($extra | Where-Object { $_ }))
 }
 $ssdOff = @("--server-env", "WHIRL_KV_SSD_MODE=off")
-$ram8s = if ($Device -eq "8060s") { @("--server-env", "WHIRL_KV_RAM_MB=8192") } else { @() }
+$ram8s = @(if ($Device -eq "8060s") { "--server-env"; "WHIRL_KV_RAM_MB=8192" })
 AddStep "srv_balance" $true (GateCmd $Q "basic,mt_cache" "balance" $ssdOff) $gateRule
 AddStep "srv_fast" $true (GateCmd $Q "basic,mt_cache" "fast" $ssdOff) $gateRule
 AddStep "srv_precise_cli" $true (GateCmd $Q "basic" "precise" ($ssdOff + @("--cli", $exe["whirl"]))) $gateRule
@@ -169,15 +169,19 @@ try {
         $c = -1
         foreach ($k in $s.env.Keys) { [Environment]::SetEnvironmentVariable($k, $s.env[$k]) }
         try {
+            # hold the R9700 lock for this step only, in this process (a child pwsh in between lost the
+            # server gate's output after its first Ctrl+C server stop)
+            $held = $null
             if ($s.gpu -and $lock -and -not $env:WHIRL_R9700_LOCK_HELD -and $Device -eq "r9700") {
-                # hold the R9700 lock for this step only, in a child process
-                $q = ($cmd | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ","
-                $script = ". '$lock'; `$__l = Enter-R9700Lock; `$a = @($q); & `$a[0] @(`$a | Select-Object -Skip 1); exit `$LASTEXITCODE"
-                & $pwsh -NoProfile -Command $script *> $log
-            } else {
-                & $cmd[0] @($cmd | Select-Object -Skip 1) *> $log
+                . $lock
+                $held = Enter-R9700Lock
             }
-            $c = $LASTEXITCODE
+            try {
+                & $cmd[0] @($cmd | Select-Object -Skip 1) *> $log
+                $c = $LASTEXITCODE
+            } finally {
+                if ($held) { $held.Close(); Remove-Item Env:WHIRL_R9700_LOCK_HELD -ErrorAction SilentlyContinue }
+            }
         } catch {
             "release gate: step did not run: $_" | Add-Content $log
             $c = -1
