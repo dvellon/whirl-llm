@@ -332,6 +332,17 @@ void MockModel::writeLogits(std::uint32_t row, std::uint64_t h, std::uint64_t kv
     x[top] = 10.0f;
 }
 
+// the second-highest logit of writeLogits(h, kv): the first candidate j = 1, 2, ... that is not the top
+std::uint32_t MockModel::runnerUp(std::uint64_t h, std::uint64_t kv) const {
+    const std::uint32_t top = nextToken(h, kv);
+    const std::uint64_t seed = mix(h, kv, 99);
+    for (std::uint32_t j = 1; j < 16; ++j) {
+        const std::uint32_t c = text_ids_[mix(seed, j, 5) % text_ids_.size()];
+        if (c != top) return c;
+    }
+    return top;
+}
+
 void MockModel::writeHidden(server::DevPtr dst, const State& st) const {
     std::uint64_t* p = at<std::uint64_t>(dst);
     p[0] = st.h;
@@ -611,6 +622,11 @@ void MockModel::dflashIngest(std::uint32_t s, std::uint32_t row0, std::uint32_t 
         const CapRow& c = cap_[base + row0 + i];
         if (c.seq != s || c.st.pos != pos0 + i) dfl_bad_ += 1;
         dfl_ctx_[s][pos0 + i] = c.st;
+        if (mc_.dfl_ring > 0)
+            for (std::uint32_t q = pos0 + i; q >= mc_.dfl_ring;) {
+                q -= mc_.dfl_ring;
+                dfl_ctx_[s].erase(q);
+            }
     }
 }
 
@@ -623,6 +639,12 @@ std::vector<std::uint32_t> MockModel::dflashDraft(std::uint32_t s, std::uint32_t
     dfl_blocks_ += 1;
     std::vector<std::uint32_t> out;
     const auto& m = dfl_ctx_[s];
+    if (mc_.dfl_need_ctx > 0)
+        for (std::uint32_t p = pos - std::min(pos, mc_.dfl_need_ctx); p < pos; ++p)
+            if (!m.count(p)) {
+                dfl_holes_ += 1;
+                break;
+            }
     auto it = pos > 0 ? m.find(pos - 1) : m.end();
     if (it == m.end()) {
         // no context row before the anchor: guesses
@@ -651,7 +673,8 @@ std::vector<std::uint32_t> MockModel::dflashDraft(std::uint32_t s, std::uint32_t
     for (std::uint32_t r = 0; r + 1 < mc_.dfl_block; ++r) {
         const std::uint32_t truth = nextToken(ch.h, ch.kv);
         const double u = static_cast<double>(mix(ch.h, 0xDF, p) >> 11) * (1.0 / 9007199254740992.0);
-        const std::uint32_t d = u < mc_.dfl_miss ? text_ids_[mix(ch.h, 0xD2, p) % text_ids_.size()] : truth;
+        std::uint32_t d = u < mc_.dfl_miss ? text_ids_[mix(ch.h, 0xD2, p) % text_ids_.size()] : truth;
+        if (u < mc_.dfl_miss && mc_.dfl_miss_runner_up) d = runnerUp(ch.h, ch.kv);
         out.push_back(d);
         p += 1;
         ch.h = stepH(ch.h, d, p);

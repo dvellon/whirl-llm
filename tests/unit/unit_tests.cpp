@@ -1136,6 +1136,10 @@ void testDflashPolicy() {
     // relaxacc: MTP drafts only (DFlash2 keeps exact acceptance in fast mode)
     CHECK(d::relaxApplies(d::Source::mtp, true) && !d::relaxApplies(d::Source::mtp, false));
     CHECK(!d::relaxApplies(d::Source::dflash, true) && !d::relaxApplies(d::Source::dflash, false));
+    // FR-DFL P2-3: the engine's per-slot rule (draft source codes 0 MTP, 1 n-gram, 2 DFlash2)
+    CHECK(d::relaxAppliesTo(d::DraftKind::mtp, true) && !d::relaxAppliesTo(d::DraftKind::mtp, false));
+    CHECK(!d::relaxAppliesTo(d::DraftKind::ngram, true) && !d::relaxAppliesTo(d::DraftKind::dflash, true));
+    CHECK(static_cast<int>(d::DraftKind::mtp) == 0 && static_cast<int>(d::DraftKind::ngram) == 1 && static_cast<int>(d::DraftKind::dflash) == 2);
     // environment
     {
         std::map<std::string, std::string> envm;
@@ -1154,6 +1158,18 @@ void testDflashPolicy() {
         p = d::parseParams(env, w);
         CHECK_EQ(w.size(), std::size_t{4});
         CHECK(p.p_min == 0.0f && p.n_min == 0 && p.warm == 64 && !p.capture_rows);
+        w.clear();
+        // FR-DFL P2-2: fewer capture rows than one verify of a full block (16) are refused
+        for (const char* bad : {"4", "7", "15"}) {
+            envm = {{"DFLASH_CAPTURE_ROWS", bad}};
+            p = d::parseParams(env, w);
+            CHECK(!p.capture_rows);
+            CHECK(w.size() == 1 && w[0].find(">= 16") != std::string::npos);
+            w.clear();
+        }
+        envm = {{"DFLASH_CAPTURE_ROWS", "16"}};
+        p = d::parseParams(env, w);
+        CHECK(w.empty() && p.capture_rows && *p.capture_rows == d::kMinCaptureRows);
         w.clear();
         envm = {{"DFLASH_PMIN", "1"}, {"DFLASH_NMIN", "99999999999"}, {"DFLASH_PMIN_X", "z"}};
         p = d::parseParams(env, w);
@@ -1233,6 +1249,35 @@ void testDflashPolicy() {
         d::Range r0{0, 10};
         CHECK(d::ready(r0, 10, 64));  // short prompt: min(pos, warm)
         CHECK_EQ(d::planIngest(r0, 8, 8, 0, 0, 10).n, 0u);
+    }
+    // FR-DFL P3-3: prefix reuse trims the run to positions < reuse that the ring still holds
+    {
+        d::Trim t = d::trimForReuse(d::Range{0, 5000}, 2000, 2048);  // ring holds 2952..4999: nothing below 2000
+        CHECK(t.reset && t.r.lo == 2000 && t.r.hi == 2000);
+        t = d::trimForReuse(d::Range{0, 3000}, 2000, 2048);  // ring holds 952..2999: [952, 2000) stays
+        CHECK(!t.reset && t.r.lo == 952 && t.r.hi == 2000);
+        t = d::trimForReuse(d::Range{0, 1500}, 2000, 2048);  // all in the ring, below reuse: unchanged
+        CHECK(!t.reset && t.r.lo == 0 && t.r.hi == 1500);
+        t = d::trimForReuse(d::Range{100, 5000}, 4000, 0);  // no ring limit: the old rule
+        CHECK(!t.reset && t.r.lo == 100 && t.r.hi == 4000);
+        t = d::trimForReuse(d::Range{3500, 5000}, 3000, 2048);  // run started after reuse: nothing left
+        CHECK(t.reset && t.r.lo == 3000 && t.r.hi == 3000);
+        t = d::trimForReuse(d::Range{0, 0}, 500, 2048);  // empty run: no reset (the next ingest counts the gap)
+        CHECK(!t.reset && t.r.lo == 0 && t.r.hi == 0);
+    }
+    // FR-DFL P2-2: whirl chat's ingest after a verify (verifyIngest): capture rows < verify rows never
+    // index before the capture buffer (was cap_n - (nd + 1): 4 - 8 wrapped to 4294967292)
+    {
+        d::Ingest g = d::verifyIngest(8, 8, 3, 100);  // full capture: rows 0..2 kept
+        CHECK(g.any && g.cap_row == 0 && g.n == 3 && g.pos == 100 && g.gap == 0);
+        g = d::verifyIngest(4, 8, 8, 100);  // capture holds verify rows 4..7, all kept
+        CHECK(g.any && g.cap_row == 0 && g.n == 4 && g.pos == 104 && g.gap == 4 && g.cap_row + g.n <= 4);
+        g = d::verifyIngest(4, 8, 6, 100);  // kept rows 0..5: rows 4, 5 are capture rows 0, 1
+        CHECK(g.any && g.cap_row == 0 && g.n == 2 && g.pos == 104);
+        g = d::verifyIngest(4, 8, 2, 100);  // kept rows 0..1 are not in the capture
+        CHECK(!g.any && g.n == 0);
+        g = d::verifyIngest(2048, 8, 8, 7);  // capture larger than the verify (cap_n = rows of the last forward)
+        CHECK(g.any && g.cap_row == 0 && g.n == 8 && g.pos == 7);
     }
 }
 

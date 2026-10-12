@@ -3,6 +3,7 @@
 // draft allocation (cycle cost, slot acceptance, allocDrafts).
 // SPDX-License-Identifier: Apache-2.0
 
+#include "whirl/dflash_policy.h"
 #include "whirl/gguf.h"
 #include "whirl/kernels_abi.h"
 #include "whirl/model.h"
@@ -84,6 +85,16 @@ struct GgufImage {
         u64(kv, vals.size());
         for (std::int32_t v : vals) u32(kv, static_cast<std::uint32_t>(v));
         ++n_kv;
+    }
+    // FIX-DFL: a tensor of up to 4 dimensions (type f32 = 0 by default, nbytes of payload)
+    void tensorN(const std::string& name, const std::vector<std::uint64_t>& ne, std::uint32_t type = 0, std::uint64_t nbytes = 0) {
+        str(ti, name);
+        u32(ti, static_cast<std::uint32_t>(ne.size()));
+        for (std::uint64_t x : ne) u64(ti, x);
+        u32(ti, type);
+        u64(ti, 0);
+        ++n_t;
+        data_bytes = std::max(data_bytes, nbytes);
     }
     // tensor infos only (an unknown type: no payload needed, shapes still readable)
     std::uint64_t n_t = 0;
@@ -589,6 +600,52 @@ void testDraftVocab() {
           "draft vocab: embedded 64k subset (65536 ascending ids < 248320, specials included)");
 }
 
+// FIX-DFL (FR-DFL P2-1): the drafter trunk of dflashImage (5 layers, 4 heads / 2 KV heads of 16, FFN 96,
+// conv K 2 / group 16), every tensor f32 with its payload. g_trunk_edit (tests only) replaces one tensor's
+// shape / type, or drops it, to build malformed drafters.
+struct TrunkEdit {
+    std::string name;
+    std::vector<std::uint64_t> ne;  // empty: keep the shape
+    std::uint32_t type = 0;
+    bool drop = false;
+};
+const TrunkEdit* g_trunk_edit = nullptr;
+void addDFlashTrunk(GgufImage& g, std::uint32_t embd, std::uint32_t rank) {
+    const std::uint64_t E = embd, HD = 16, QW = 4 * HD, KW = 2 * HD, F = 96, K = 2, DS = 2 * K * (E / 16);
+    auto add = [&](const std::string& name, std::vector<std::uint64_t> ne) {
+        std::uint32_t ty = 0;
+        if (g_trunk_edit && g_trunk_edit->name == name) {
+            if (g_trunk_edit->drop) return;
+            if (!g_trunk_edit->ne.empty()) ne = g_trunk_edit->ne;
+            ty = g_trunk_edit->type;
+        }
+        std::uint64_t n = 1;
+        for (std::uint64_t x : ne) n *= x;
+        g.tensorN(name, ne, ty, ty == 0 ? 4 * n : ty == 1 ? 2 * n : ty == 8 ? n / 32 * 34 : 0);
+    };
+    add("enc.output_norm.weight", {E});
+    add("output_norm.weight", {E});
+    add("selector_hidden.weight", {E, rank});
+    for (int il = 0; il < 5; ++il) {
+        const std::string b = "blk." + std::to_string(il) + ".";
+        add(b + "attn_norm.weight", {E});
+        add(b + "ffn_norm.weight", {E});
+        add(b + "attn_q_norm.weight", {HD});
+        add(b + "attn_k_norm.weight", {HD});
+        add(b + "attn_q.weight", {E, QW});
+        add(b + "attn_k.weight", {E, KW});
+        add(b + "attn_v.weight", {E, KW});
+        add(b + "attn_output.weight", {QW, E});
+        add(b + "ffn_gate.weight", {E, F});
+        add(b + "ffn_up.weight", {E, F});
+        add(b + "ffn_down.weight", {F, E});
+        add(b + "attn_conv_proj.weight", {E, DS});
+        add(b + "ffn_conv_proj.weight", {E, DS});
+        add(b + "attn_conv_base", {E, K, 2});
+        add(b + "ffn_conv_base", {E, K, 2});
+    }
+}
+
 void testDraftWindowArg() {
     check(q::draftWindowArg(0, 65536) == 0, "draft window: W = 0 is off");
     check(q::draftWindowArg(8192, 65536) == (128 | 64 << 16), "draft window: W / 64 | threshold / 1024 << 16");
@@ -633,7 +690,14 @@ GgufImage dflashImage(std::uint32_t embd, std::uint32_t vocab, bool mask = true,
     g.kvU32(a + ".attention.sliding_window", 2048);
     g.kvI32Array(a + ".target_layers", {2, 4, 6});
     if (mask) g.kvU32("tokenizer.ggml.mask_token_id", 95);
-    g.tensor("fc.weight", 3ull * embd, embd);
+    if (g_trunk_edit && g_trunk_edit->name == "fc.weight") {  // FR-DFL P3-7: fc of another type (bytes by ggml type)
+        const std::uint32_t ty = g_trunk_edit->type;
+        const std::uint64_t n = 3ull * embd * embd;
+        g.tensor("fc.weight", 3ull * embd, embd, ty, ty == 39 ? n / 32 * 17 : ty == 8 ? n / 32 * 34 : ty == 1 ? 2 * n : 0);
+    } else {
+        g.tensor("fc.weight", 3ull * embd, embd, 0, 3ull * embd * embd * 4);
+    }
+    addDFlashTrunk(g, embd, rank);
     g.tensor("selector_predecessor.weight", rank, vocab, sel_ty, selRowBytes(sel_ty, rank) * vocab);
     g.tensor("selector_successor.weight", rank, vocab, ty2, selRowBytes(ty2, rank) * vocab);
     return g;
@@ -773,6 +837,131 @@ GgufImage targetImage(const char* arch, std::uint32_t embd, std::uint32_t vocab,
     g.kvU32(a + ".ssm.inner_size", 512);
     g.tensor("token_embd.weight", embd, vocab);
     return g;
+}
+
+// FIX-DFL (FR-DFL P2-1): every drafter tensor must match the metadata (the forward sizes its scratch from
+// the metadata and matmul writes w.nrows outputs: a larger tensor wrote past the scratch on the GPU)
+void testDFlashTensors() {
+    q::Config t;
+    t.n_embd = 64;
+    t.n_layer = 8;
+    t.n_vocab = 100;
+    auto why = [&](const TrunkEdit& e) {
+        g_trunk_edit = &e;
+        const auto img = dflashImage(64, 100).build();
+        g_trunk_edit = nullptr;
+        try {
+            const gguf::File f = gguf::File::parse(img);
+            q::DFlashConfig::fromGguf(f).validate(t, f);
+        } catch (const q::ModelError& ex) {
+            return ex.code() + ": " + ex.what();
+        } catch (const std::exception& ex) {
+            return std::string("other: ") + ex.what();
+        }
+        return std::string();
+    };
+    auto rejected = [&](const TrunkEdit& e, const char* what) {
+        const std::string w = why(e);
+        check(w.rfind("DraftModelMismatch", 0) == 0, std::string("DFlash2 tensors: ") + what + " rejected (" + w + ")");
+    };
+    check(why(TrunkEdit{}).empty(), "DFlash2 tensors: the well-formed drafter accepted (" + why(TrunkEdit{}) + ")");
+    const std::uint64_t E = 64, DS = 2 * 2 * (64 / 16);
+    rejected({"blk.0.attn_q.weight", {E, 80}}, "attn_q with more rows than n_head x head_dim");
+    rejected({"blk.2.attn_k.weight", {E, 48}}, "attn_k with more rows than n_head_kv x head_dim");
+    rejected({"blk.4.attn_v.weight", {E, 16}}, "attn_v with fewer rows");
+    rejected({"blk.1.attn_output.weight", {E / 2, E}}, "attn_output with fewer columns than n_head x head_dim");
+    rejected({"blk.0.ffn_up.weight", {E, 128}}, "ffn_up with more rows than feed_forward_length");
+    rejected({"blk.3.ffn_gate.weight", {E, 128}}, "ffn_gate with more rows than feed_forward_length");
+    rejected({"blk.2.ffn_down.weight", {128, E}}, "ffn_down with more columns than feed_forward_length");
+    rejected({"blk.3.ffn_conv_proj.weight", {E, 2 * DS}}, "a later layer's ffn_conv_proj larger than layer 0's (dyn scratch)");
+    rejected({"blk.1.attn_conv_proj.weight", {E, 2 * DS}}, "a later layer's attn_conv_proj larger than layer 0's");
+    rejected({"blk.0.attn_conv_proj.weight", {E, DS / 2}}, "attn_conv_proj with fewer rows than 2 K (E / group)");
+    rejected({"blk.0.attn_conv_base", {E, 2, 1}}, "attn_conv_base with one side");
+    rejected({"blk.4.ffn_conv_base", {E / 2, 2, 2}}, "ffn_conv_base of half the channels");
+    rejected({"selector_hidden.weight", {E, 16}}, "selector_hidden with rows != selector_rank");
+    rejected({"enc.output_norm.weight", {E / 2}}, "enc.output_norm shorter than n_embd");
+    rejected({"output_norm.weight", {E / 2}}, "output_norm shorter than n_embd");
+    rejected({"blk.2.attn_norm.weight", {E / 2}}, "attn_norm shorter than n_embd");
+    rejected({"blk.2.ffn_norm.weight", {E - 1}}, "ffn_norm shorter than n_embd");
+    rejected({"blk.0.attn_q_norm.weight", {8}}, "attn_q_norm shorter than head_dim");
+    rejected({"blk.0.attn_k_norm.weight", {8}}, "attn_k_norm shorter than head_dim");
+    rejected({"blk.4.attn_v.weight", {}, 0, true}, "a missing layer tensor");
+    rejected({"blk.1.attn_norm.weight", {}, 1}, "an f16 norm vector");
+    rejected({"blk.1.attn_q.weight", {}, 1000}, "a matrix of an unknown type");
+    // FR-DFL P3-7: fc is split into per-target-layer column blocks: MXFP4 (repacked, per-row reference) refused
+    rejected({"fc.weight", {}, 39}, "an MXFP4 fc");
+    check(why({"fc.weight", {}, 8}).empty(), "DFlash2 tensors: a Q8_0 fc accepted (" + why({"fc.weight", {}, 8}) + ")");
+    check(why({"fc.weight", {}, 1}).empty(), "DFlash2 tensors: an f16 fc accepted");
+    rejected({"fc.weight", {}, 1000}, "an fc of an unknown type");
+    // block_count / head_dim limits (the metadata the shapes come from)
+    const auto img = dflashImage(64, 100).build();
+    const gguf::File f = gguf::File::parse(img);
+    const q::DFlashConfig c = q::DFlashConfig::fromGguf(f);
+    auto meta = [&](auto edit) {
+        q::DFlashConfig c2 = c;
+        edit(c2);
+        try {
+            c2.validate(t, f);
+        } catch (const q::ModelError& ex) {
+            return ex.code() + ": " + ex.what();
+        }
+        return std::string();
+    };
+    const std::string w0 = meta([](q::DFlashConfig& x) { x.n_layer = 0; });
+    check(w0.find("block_count 0") != std::string::npos, "DFlash2 tensors: block_count 0 rejected (" + w0 + ")");
+    const std::string wbig = meta([](q::DFlashConfig& x) { x.n_layer = q::kDFlashMaxLayers + 1; });
+    check(wbig.find("block_count") != std::string::npos, "DFlash2 tensors: block_count past the limit rejected (" + wbig + ")");
+    const std::string whd = meta([](q::DFlashConfig& x) { x.head_dim = 15; });
+    check(whd.rfind("DraftModelMismatch", 0) == 0, "DFlash2 tensors: odd head_dim rejected (" + whd + ")");
+    // the header-only fit check the server / CLI run before loading reports it (-> MTP drafts + warning)
+    {
+        TrunkEdit e{"blk.3.ffn_up.weight", {256, 192}};
+        g_trunk_edit = &e;
+        const auto draft = dflashImage(256, 100).build();
+        g_trunk_edit = nullptr;
+        const auto dense = targetImage("qwen35", 256, 100, 8).build();
+        const std::string w = q::dflashIncompatible(gguf::File::parse(dense), gguf::File::parse(draft));
+        check(w.find("blk.3.ffn_up.weight") != std::string::npos, "dflashIncompatible: a malformed drafter tensor named (" + w + ")");
+    }
+}
+
+// FR-DFL P3-2: a --draft-model that cannot be opened / parsed is a reason (-> warning + MTP drafts), not
+// an exception that stops whirl-server / whirl chat
+void testDFlashDraftFile() {
+    const auto dense = targetImage("qwen35", 256, 100, 8).build();
+    const gguf::File tf = gguf::File::parse(dense);
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "whirl_fixdfl_p32";
+    std::filesystem::create_directories(dir);
+    std::string w;
+    bool threw = false;
+    try {
+        w = q::dflashIncompatibleFile(tf, (dir / "no_such_drafter.gguf").string());
+    } catch (...) {
+        threw = true;
+    }
+    check(!threw && w.find("cannot open the drafter") != std::string::npos, "dflashIncompatibleFile: a missing file is a reason (" + w + ")");
+    {
+        std::ofstream(dir / "garbage.gguf", std::ios::binary) << "not a gguf file";
+        threw = false;
+        try {
+            w = q::dflashIncompatibleFile(tf, (dir / "garbage.gguf").string());
+        } catch (...) {
+            threw = true;
+        }
+        check(!threw && w.find("cannot open the drafter") != std::string::npos, "dflashIncompatibleFile: an unparsable file is a reason (" + w + ")");
+    }
+    {
+        const auto draft = dflashImage(256, 100).build();
+        std::ofstream(dir / "ok.gguf", std::ios::binary).write(reinterpret_cast<const char*>(draft.data()), static_cast<std::streamsize>(draft.size()));
+        std::optional<gguf::File> opened;
+        w = q::dflashIncompatibleFile(tf, (dir / "ok.gguf").string(), &opened);
+        check(w.empty() && opened.has_value(), "dflashIncompatibleFile: a fitting drafter file opens (" + w + ")");
+    }
+    // the caller turns the reason into the fall-back warning (whirl/dflash_policy.h choose)
+    const auto ch = whirl::dflash::choose(whirl::dflash::Source::dflash, std::string("x.gguf"), "cannot open the drafter: x", true);
+    check(ch.source == whirl::dflash::Source::mtp && ch.warning.find("using MTP drafts") != std::string::npos, "dflash choose: unopenable drafter -> MTP");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 // --draft dflash: the header-only fit check before loading (a MoE target without a drafter of
@@ -1156,6 +1345,16 @@ void testLoadEstimate() {
         const std::uint64_t e = static_cast<std::uint64_t>(cfg.n_head_kv) * cfg.head_dim, q8 = e + e / 32 * 2;
         check(ev.kv_f16 == 2 * (4 * e) && ev.kv_q8v == 2 * (2 * e + q8) && ev.kv_q8h == 2 * (2 * q8), ("estimate: KV bytes per token" + tag).c_str());
         check(q::kvBytesPerTokenCfg(cfg, false, false, false) == 4 * e, ("kvBytesPerTokenCfg without MTP" + tag).c_str());
+        {
+            // FR-DFL P3-1: --draft dflash skips the MTP block: no nextn weights, no MTP KV layer
+            const q::LoadEstimate en = q::estimateLoad(f, cfg, false, true);
+            const std::string pre = "blk." + std::to_string(cfg.n_layer) + ".";
+            std::uint64_t nextn = 0;
+            for (const gguf::TensorInfo& t : f.tensors())
+                if (t.name.starts_with(pre)) nextn += t.nbytes();
+            check(!en.has_mtp && nextn > 0 && en.weights == all - nextn && en.kv_f16 == 4 * e && en.state == ev.state,
+                  ("estimate (no MTP block): nextn weights and the MTP KV layer not counted" + tag).c_str());
+        }
         // buffers: linear in the batch for multiples of 64, growing with it
         const auto b = [&](std::uint32_t B) { return q::bufferBytes(cfg, B, ev.ffs, ev.max_elems); };
         check(b(4096) - b(2048) == 2 * (b(2048) - b(1024)) && b(1024) - b(512) == b(576) - b(64) && b(64) > 0,
@@ -1317,6 +1516,8 @@ int main() {
     testDFlashConfig();
     testGemmrMoeShape();
     testDFlashCompat();
+    testDFlashTensors();
+    testDFlashDraftFile();
     testCycleCost();
     testSlotAccept();
     testAllocDrafts();

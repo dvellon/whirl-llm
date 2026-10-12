@@ -14,7 +14,8 @@
 //     bitwise verify as plain decoding, and acceptance is EXACT in every numerics mode
 //     (precise / balance / fast). relaxacc (fast) relaxes MTP drafts only (relax_accept.h), so with
 //     --draft dflash the output equals plain greedy decoding of the same numerics mode; for
-//     sampling the reply is a function of (target logits, seed) only. relaxApplies() is the rule.
+//     sampling the reply is a function of (target logits, seed) only. relaxAppliesTo() is the rule
+//     (the server engine calls it per slot; whirl chat's dflashDecode has no relaxed acceptance).
 #pragma once
 
 #include <algorithm>
@@ -86,7 +87,17 @@ inline Choice choose(Source requested, const std::optional<std::string>& draft_m
 }
 
 // relaxacc (fast mode) relaxes MTP drafts only; n-gram and DFlash2 drafts keep exact acceptance.
-inline bool relaxApplies(Source s, bool relax_on) { return relax_on && s == Source::mtp; }
+// The server engine asks relaxAppliesTo() for every slot's drafts (engine.cpp decodeCycle: the top-k
+// launch, greedy relaxed acceptance and typical sampling acceptance), so this is the one rule.
+// DraftKind values are the engine's per-slot draft source codes.
+enum class DraftKind : std::uint8_t { mtp = 0, ngram = 1, dflash = 2 };
+inline bool relaxAppliesTo(DraftKind k, bool relax_on) { return relax_on && k == DraftKind::mtp; }
+inline bool relaxApplies(Source s, bool relax_on) { return relaxAppliesTo(s == Source::dflash ? DraftKind::dflash : DraftKind::mtp, relax_on); }
+
+// Fewest capture rows accepted (WHIRL_DFLASH_CAPTURE_ROWS): one verify of a full draft block of the
+// largest block size validate() allows (16). Fewer rows than a verify left whirl chat's ingest
+// pointing before the capture buffer (FR-DFL P2-2); every ingest also goes through planIngest now.
+inline constexpr std::uint32_t kMinCaptureRows = 16;
 
 // Settings from the environment (WHIRL_DFLASH_PMIN / _NMIN / _WARM / _CAPTURE_ROWS).
 struct Params {
@@ -146,8 +157,8 @@ Params parseParams(Env&& env, std::vector<std::string>& warnings) {
     }
     if (auto v = env("DFLASH_CAPTURE_ROWS")) {
         std::uint32_t r = 0;
-        if (detail::parseU32(*v, r) && r > 0) p.capture_rows = r;
-        else warnings.push_back("WHIRL_DFLASH_CAPTURE_ROWS=" + *v + " ignored (a row count > 0)");
+        if (detail::parseU32(*v, r) && r >= kMinCaptureRows) p.capture_rows = r;
+        else warnings.push_back("WHIRL_DFLASH_CAPTURE_ROWS=" + *v + " ignored (a row count >= " + std::to_string(kMinCaptureRows) + ")");
     }
     return p;
 }
@@ -161,6 +172,38 @@ inline std::uint32_t captureRows(const Params& p, std::uint32_t window, std::uin
 
 // Ring rows of a slot's drafter context: the drafter's window, 2048 without one.
 inline std::uint32_t ringRows(std::uint32_t window) { return window > 0 ? window : 2048u; }
+
+// VRAM of --draft dflash beyond the target (FR-DFL P3-1: whirl-server's pre-load fit check), following
+// Model::loadDrafter / enableCapture / dflashSetup and the replay-less snapshot sets.
+struct MemInput {
+    std::uint64_t weights = 0;  // dflashWeightBytes()
+    std::uint32_t n_layer = 0, n_embd = 0, n_head = 0, n_head_kv = 0, head_dim = 0, n_ff = 0;
+    std::uint32_t block = 0, window = 0, conv_k = 0, conv_group = 1, sel_topk = 0, sel_rank = 0;
+    std::uint32_t n_target_layers = 0, target_embd = 0, vocab = 0;
+    std::uint32_t capture_rows = 0;  // captureRows()
+    std::uint32_t slots = 1;
+    std::uint32_t snap_sets = 0;           // server::dflashSnapSets() (0 with replay)
+    std::uint64_t snap_set_bytes = 0;      // one set: every DeltaNet layer's conv + ssm state
+};
+struct Mem {
+    std::uint64_t weights = 0, capture = 0, rings = 0, scratch = 0, snapshots = 0;
+    std::uint64_t total() const { return weights + capture + rings + scratch + snapshots; }
+};
+inline Mem memory(const MemInput& in) {
+    using u64 = std::uint64_t;
+    Mem m;
+    const u64 E = in.n_embd, B = in.block, P = B > 0 ? B - 1 : 0, kvw = static_cast<u64>(in.n_head_kv) * in.head_dim;
+    const u64 qw = static_cast<u64>(in.n_head) * in.head_dim, ds = 2ull * in.conv_k * (E / (in.conv_group ? in.conv_group : 1));
+    const u64 ring = ringRows(in.window), K = in.sel_topk, R = in.sel_rank;
+    const u64 ir = std::max<u64>(1, std::min<u64>(in.capture_rows, ring));  // dflashSetup's ingest rows
+    m.weights = in.weights;
+    m.capture = static_cast<u64>(in.n_target_layers) * in.capture_rows * in.target_embd * 4;
+    m.rings = static_cast<u64>(in.slots) * (static_cast<u64>(in.n_layer) * 2 * ring * kvw * 4 + ring * 4);
+    m.scratch = B * 4 * (2 + 5 * E + ds + 2 * qw + 2 * kvw + 2ull * in.n_ff) + P * in.vocab * 4 + P * K * 8 + P * R * 4 + P * K * K * 4 +
+                (1 + P) * 4 + ir * (E + 2 * kvw + 1) * 4;
+    m.snapshots = static_cast<u64>(in.snap_sets) * in.snap_set_bytes;
+    return m;
+}
 
 // Positions p0 .. p0 + m - 1 go to ring rows p % ring: [start, start + first) then [0, second).
 struct RingPieces {
@@ -197,6 +240,28 @@ struct Range {
 // min(pos, warm) rows long (after a restore the earlier rows have no features).
 inline bool ready(const Range& r, std::uint32_t pos, std::uint32_t warm) { return r.hi == pos && pos - r.lo >= std::min(pos, warm); }
 
+// Prefix reuse at `reuse` (the slot keeps positions < reuse, the rest is rewritten): the context rows
+// at positions >= reuse go, and of the run [lo, hi) only what the ring still holds stays usable: the
+// ring keeps the last `ring` positions ingested (hi - ring .. hi - 1; ring 0 = no limit). When nothing
+// below reuse is left (e.g. a 2048-row ring after 5000 positions, reuse 2000) the context restarts
+// cold at reuse (reset: the caller drops every row) instead of claiming [lo, reuse) (FR-DFL P3-3).
+struct Trim {
+    Range r;
+    bool reset = false;
+};
+inline Trim trimForReuse(Range r, std::uint32_t reuse, std::uint32_t ring) {
+    Trim t;
+    const std::uint32_t old_hi = r.hi;
+    t.r.hi = std::min(r.hi, reuse);
+    t.r.lo = std::min(r.lo, t.r.hi);
+    if (ring > 0 && old_hi > ring) t.r.lo = std::max(t.r.lo, old_hi - ring);
+    if (t.r.lo >= t.r.hi && r.lo < r.hi) {
+        t.r = Range{reuse, reuse};
+        t.reset = true;
+    }
+    return t;
+}
+
 // One ingest after a forward / verify of run_rows rows whose last capture_n rows were captured:
 // rows r0 .. r0 + n - 1 of it are positions pos0 .. of the slot.
 struct Ingest {
@@ -231,6 +296,15 @@ inline Ingest planIngest(Range& r, std::uint32_t capture_n, std::uint32_t run_ro
     g.pos = p;
     r.hi = pos0 + n;
     return g;
+}
+
+// whirl chat / bench (one sequence): after a verify of verify_rows rows (the anchor + drafts) whose
+// last capture_n rows were captured, the first keep rows stay; their features go into the drafter
+// context at positions pos ... The capture may hold fewer rows than the verify (then only the kept
+// rows inside it are ingested, the earlier ones are a gap): never a row before the capture buffer.
+inline Ingest verifyIngest(std::uint32_t capture_n, std::uint32_t verify_rows, std::uint32_t keep, std::uint32_t pos) {
+    Range r{0, pos};
+    return planIngest(r, capture_n, verify_rows, 0, keep, pos);
 }
 
 }  // namespace whirl::dflash

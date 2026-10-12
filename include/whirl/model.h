@@ -281,6 +281,8 @@ std::optional<KvMode> kvModeFromEnv();
 
 // ---- DFlash2 block-diffusion drafter (arch "dflash"; z-lab DFlash2, llama.cpp names):
 // loaded next to the target (WHIRL_DRAFT_MODEL), drafts with `--draft dflash`.
+// Most drafter layers accepted (FR-DFL P2-1; the official DFlash2 drafters have 5).
+inline constexpr std::uint32_t kDFlashMaxLayers = 64;
 struct DFlashConfig {
     std::uint32_t n_layer = 0, n_embd = 0, n_head = 0, n_head_kv = 0, head_dim = 0, n_ff = 0;
     std::uint32_t block = 0, conv_k = 0, conv_group = 0, sel_rank = 0, sel_topk = 0, window = 0;
@@ -297,6 +299,9 @@ struct DFlashConfig {
 // Before loading anything: empty when the DFlash2 drafter `draft` fits the target model `target`
 // (both GGUF headers only), else the reason (e.g. a MoE target such as Ornith has no drafter).
 std::string dflashIncompatible(const gguf::File& target, const gguf::File& draft);
+// Same for the drafter at draft_path, opening it first: a file that cannot be opened / parsed gives
+// the reason too (never throws). On success *opened (if given) holds the open file.
+std::string dflashIncompatibleFile(const gguf::File& target, const std::string& draft_path, std::optional<gguf::File>* opened = nullptr);
 
 struct DFlashLayerW {
     DevPtr attn_norm = 0, ffn_norm = 0, q_norm = 0, k_norm = 0;
@@ -366,7 +371,10 @@ struct LoadEstimate {
     bool has_mtp = false;       // nextn layer present (one more KV layer)
     std::uint64_t kv_f16 = 0, kv_q8v = 0, kv_q8h = 0, kv_q4 = 0;  // KV bytes per token by format
 };
-LoadEstimate estimateLoad(const gguf::File& f, const Config& cfg, bool embd_on_host);
+// no_mtp: the load skips the MTP (nextn) block (--draft dflash): no nextn weights, no MTP KV layer.
+LoadEstimate estimateLoad(const gguf::File& f, const Config& cfg, bool embd_on_host, bool no_mtp = false);
+// Bytes a DFlash2 drafter's weights take in VRAM (Model::loadDrafter: every tensor, + MXFP4 row refs).
+std::uint64_t dflashWeightBytes(const gguf::File& draft);
 // Prefill / decode buffers of Model::load for prefill batch B.
 // fd_splits: attention split-K partials (resolveFdSplits: 64, 256 with q4 KV, WHIRL_FD_SPLITS).
 std::uint64_t bufferBytes(const Config& cfg, std::uint32_t B, std::uint64_t ffs, std::uint64_t max_elems, std::uint32_t fd_splits = 64);

@@ -543,12 +543,32 @@ int serveMain(int argc, char** argv, const char* program) {
             n_ck = tier::max_ck;
         }
         std::uint32_t n_spe_plan = (n_ck == 0 || no_pc) ? 0 : envU32("SYS_CKPTS", static_cast<std::uint32_t>(n_spe_default));
+        // --draft dflash: check the drafter against the target before loading (headers only, before the
+        // VRAM fit check, which counts the drafter instead of the MTP block); a
+        // model without a matching drafter keeps the MTP drafts (whirl/dflash_policy.h)
+        bool use_dflash = false;
+        std::optional<std::string> dm_resolved;
+        std::optional<gguf::File> dfile;
+        {
+            const std::optional<std::string> dm_cli = opt.draft_model.empty() ? std::nullopt : std::optional<std::string>(opt.draft_model);
+            const auto dm = dm_resolved = whirl::dflash::resolveDraftModel(dm_cli, env("DRAFT_MODEL"));
+            const auto src = *whirl::dflash::parseSource(opt.draft);
+            if (src == whirl::dflash::Source::dflash)
+                if (const std::string note = whirl::dflash::draftModelNote(dm_cli, env("DRAFT_MODEL")); !note.empty()) logI("{}", note);
+            std::string why;
+            if (src == whirl::dflash::Source::dflash && dm) why = qwen35::dflashIncompatibleFile(f, *dm, &dfile);
+            const whirl::dflash::Choice ch = whirl::dflash::choose(src, dm, why, true);
+            if (!ch.warning.empty()) logW("{}", ch.warning);
+            use_dflash = ch.source == whirl::dflash::Source::dflash;
+            if (use_dflash) lo.no_mtp = true;
+            else dfile.reset();
+        }
         // VRAM estimate before loading: when the KV pool left after weights, prefill buffers and
         // checkpoints would be small, lower the prefill batch and the checkpoint counts first
         // (only values the user did not set; nothing changes when the pool has room). Not on the
         // UMA iGPU, whose VRAM numbers do not bound what it can allocate.
         if (!is_uma) {
-            const qwen35::LoadEstimate est = qwen35::estimateLoad(f, cfg, lo.embd_on_host);
+            const qwen35::LoadEstimate est = qwen35::estimateLoad(f, cfg, lo.embd_on_host, use_dflash);  // dflash: no MTP block
             const hip::MemInfo mf = hip::memInfo();
             const hip::WddmMemInfo w = hip::wddmMemInfo();
             const bool res_explicit = env("POOL_RESERVE_MB").has_value();
@@ -571,6 +591,28 @@ int serveMain(int argc, char** argv, const char* program) {
             // load-time state, per-slot state + replay rows, draft head (64k rows, 2 bit), slack; and the
             // ~4% more that WDDM sees for this process than the sum of its allocations
             fi.fixed = est.state + opt.parallel * (st1 + pend1) + (est.has_mtp ? 65536ull * cfg.n_embd * 5 / 16 : 0) + (256ull << 20);
+            if (use_dflash) {
+                // FR-DFL P3-1: the DFlash2 drafter (weights, capture, rings per slot, scratch, replay-less
+                // snapshot sets) instead of the MTP block / draft head / MTP KV layer (est above)
+                std::vector<std::string> pw;
+                const whirl::dflash::Params dp = whirl::dflash::parseParams([](const char* n) { return env(n); }, pw);
+                const qwen35::DFlashConfig dc = qwen35::DFlashConfig::fromGguf(*dfile);
+                std::optional<std::uint32_t> snap_env;
+                if (auto v = env("SNAP_SETS")) {
+                    try {
+                        snap_env = static_cast<std::uint32_t>(std::stoul(*v));
+                    } catch (const std::exception&) {
+                    }
+                }
+                const std::uint32_t sets = dflashSnapSets(false, true, envOn("GDN_REPLAY", true), dc.block, envOn("NGRAM", true), snap_env);
+                const whirl::dflash::Mem dm = dflashFitBytes(dc, qwen35::dflashWeightBytes(*dfile), cfg,
+                                                             whirl::dflash::captureRows(dp, dc.window, lo.max_batch), opt.parallel, sets, st1);
+                fi.fixed += dm.total();
+                logI("VRAM estimate: DFlash2 drafter {:.2f} GiB (weights {:.2f}, capture {:.0f} MiB, rings {:.0f} MiB, scratch {:.0f} MiB, "
+                     "snapshot sets {:.0f} MiB); no MTP block",
+                     dm.total() / 1073741824.0, dm.weights / 1073741824.0, dm.capture / 1048576.0, dm.rings / 1048576.0,
+                     dm.scratch / 1048576.0, dm.snapshots / 1048576.0);
+            }
             fi.fixed += (est.weights + fi.fixed) / 25;
             // the mode's KV format (numerics::chooseKv; the code object is not loaded yet: only dGPUs
             // reach here, and the R9700 code object has q4 KV kernels since FC-1c)
@@ -633,28 +675,6 @@ int serveMain(int argc, char** argv, const char* program) {
         }
         // whole schedule chunks, and a forward (+ the merged tail) must fit the prefill batch
         prefill_exec = prefillExecFor(prefill_exec, lo.max_batch);
-        // --draft dflash: check the drafter against the target before loading (headers only); a
-        // model without a matching drafter keeps the MTP drafts (whirl/dflash_policy.h)
-        bool use_dflash = false;
-        std::optional<std::string> dm_resolved;
-        std::optional<gguf::File> dfile;
-        {
-            const std::optional<std::string> dm_cli = opt.draft_model.empty() ? std::nullopt : std::optional<std::string>(opt.draft_model);
-            const auto dm = dm_resolved = whirl::dflash::resolveDraftModel(dm_cli, env("DRAFT_MODEL"));
-            const auto src = *whirl::dflash::parseSource(opt.draft);
-            if (src == whirl::dflash::Source::dflash)
-                if (const std::string note = whirl::dflash::draftModelNote(dm_cli, env("DRAFT_MODEL")); !note.empty()) logI("{}", note);
-            std::string why;
-            if (src == whirl::dflash::Source::dflash && dm) {
-                dfile.emplace(gguf::File::open(*dm));
-                why = qwen35::dflashIncompatible(f, *dfile);
-            }
-            const whirl::dflash::Choice ch = whirl::dflash::choose(src, dm, why, true);
-            if (!ch.warning.empty()) logW("{}", ch.warning);
-            use_dflash = ch.source == whirl::dflash::Source::dflash;
-            if (use_dflash) lo.no_mtp = true;
-            else dfile.reset();
-        }
         std::unique_ptr<qwen35::Model> mp = qwen35::Model::load(f, 0, stats, lo);
         qwen35::Model& model = *mp;
         {
@@ -863,8 +883,7 @@ int serveMain(int argc, char** argv, const char* program) {
                     logW("WHIRL_SNAP_SETS={} is not a number (ignored)", *v);
                 }
             }
-            const std::uint32_t max_lit = std::max(model.dfr->block - 1, envOn("NGRAM", true) ? qwen35::max_ng_drafts : 0u);
-            model.ensureSnapshots(literalSnapSets(std::min(max_lit, qwen35::gdn_max_snap), snap_env));
+            model.ensureSnapshots(dflashSnapSets(use_mtp, use_dflash, model.gdn_replay, model.dfr->block, envOn("NGRAM", true), snap_env));
             std::uint64_t gdn_layers = 0;
             for (std::uint32_t li = 0; li < cfg.n_layer; ++li)
                 if (model.ssm_state[li] != 0) ++gdn_layers;

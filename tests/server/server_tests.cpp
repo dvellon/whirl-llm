@@ -22,6 +22,8 @@
 #include "whirl/tokenizer.h"
 
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -1302,20 +1304,49 @@ void testDFlashGreedy() {
 // item on in the engine (whirl-server also turns it off for --draft dflash), so the output is the
 // greedy reference whatever the drafter proposes
 void testDFlashRelaxExact() {
-    ServerSetup su = dflashSetup(false);
-    su.mc.dfl_miss = 0.3;
-    su.eo.relax.on = true;
-    TestServer srv(su);
-    for (std::uint32_t n : {7u, 600u}) {
-        const auto p = makePrompt(n, 90 + n);
-        const auto ref = srv.model().greedyReference(p, 100, true);
-        auto r = srv.post("/v1/completions", completionBody(p, 100, false));
-        CHECK_EQ(r.status, 200);
-        CHECK_EQ(completionText(r), decode(ref));
+    // FR-DFL P2-3: the wrong drafts must be ones relaxacc WOULD keep (random tokens never fell inside
+    // its top-k / alpha window, so applying relaxacc to DFlash2 drafts went unnoticed): runner_up makes
+    // every wrong draft the row's second-best token at p / p_max = 0.26 >= alpha 0.1
+    for (bool runner_up : {false, true}) {
+        ServerSetup su = dflashSetup(false);
+        su.mc.dfl_miss = 0.3;
+        su.mc.dfl_miss_runner_up = runner_up;
+        su.eo.relax.on = true;
+        TestServer srv(su);
+        g_log.clear();
+        for (std::uint32_t n : {7u, 600u}) {
+            const auto p = makePrompt(n, 90 + n);
+            const auto ref = srv.model().greedyReference(p, 100, true);
+            auto r = srv.post("/v1/completions", completionBody(p, 100, false));
+            CHECK_EQ(r.status, 200);
+            CHECK_EQ(completionText(r), decode(ref));
+        }
+        const Engine::Stats st = srv.engine().stats();
+        CHECK(st.dfl_cycles > 0 && st.dfl_accepted > 0 && st.dfl_accepted < st.dfl_drafted);
+        CHECK_EQ(srv.model().dflBad(), 0u);
+        // the per-request relaxacc log (written when each request finishes)
+        for (int i = 0; i < 500 && g_log.count("relaxacc: ") < 2; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK_EQ(g_log.count("relaxacc: 0 of"), 2u);  // the per-request log: no draft kept by the relaxed rule
     }
-    const Engine::Stats st = srv.engine().stats();
-    CHECK(st.dfl_cycles > 0 && st.dfl_accepted > 0 && st.dfl_accepted < st.dfl_drafted);
-    CHECK_EQ(srv.model().dflBad(), 0u);
+    // sampling: relaxacc's typical acceptance must not touch DFlash2 drafts either (seeded text ==
+    // plain decoding of the same seed)
+    {
+        ServerSetup su = dflashSetup(false);
+        su.mc.dfl_miss = 0.3;
+        su.mc.dfl_miss_runner_up = true;
+        su.eo.relax.on = true;
+        TestServer a(su);
+        ServerSetup su_plain = baseSetup(false);
+        su_plain.eo.ngram = false;
+        TestServer b(su_plain);
+        const auto p = makePrompt(400, 78);
+        const std::string body = std::format("{{\"prompt\":{},\"max_tokens\":60,\"temperature\":0.8,\"seed\":9,\"ignore_eos\":true}}", idsJson(p));
+        auto ra = a.post("/v1/completions", body);
+        auto rb = b.post("/v1/completions", body);
+        CHECK_EQ(ra.status, 200);
+        CHECK_EQ(completionText(ra), completionText(rb));
+        CHECK(a.engine().stats().dfl_cycles > 0);
+    }
 }
 
 // n-gram and DFlash2 drafts in the same requests (a repetitive toy model: the output cycles, so
@@ -1395,6 +1426,39 @@ void testDFlashRollback() {
         CHECK(w.engine().stats().dfl_cold > 0);
         CHECK_EQ(w.model().dflStale(), 0u);
     }
+}
+
+// FR-DFL P3-3: prefix reuse into a slot whose context ring was overwritten long ago (ring 512, the
+// slot ran to ~3060, the next request reuses 2048 positions): no context row below the reuse point
+// survives, so the slot restarts cold at the reuse point (warm-up counted in dfl_cold) instead of
+// drafting at once against rows the ring no longer holds (dflHoles: a draft missing one of the
+// warm rows before it). Outputs equal the reference either way.
+void testDFlashTrimRing() {
+    ServerSetup su = dflashSetup(false);
+    su.mc.parallel = 1;
+    su.eo.tail_ck_min = 2048;
+    su.eo.n_ck = 4;
+    su.mc.dfl_ring = 512;
+    su.mc.dfl_need_ctx = 400;
+    su.eo.dfl_warm = 400;
+    TestServer srv(su);
+    const auto p1 = makePrompt(3000, 81);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(p1, 60))), decode(srv.model().greedyReference(p1, 60, true)));
+    const Engine::Stats s1 = srv.engine().stats();
+    CHECK_EQ(srv.model().dflHoles(), 0u);
+    // (TAIL-CK: p1's slot checkpoint at the start of its last schedule chunk, 2048)
+    const std::vector<std::uint32_t> pre(p1.begin(), p1.begin() + 2100);
+    const auto p2 = makePrompt(2130, 82, pre);
+    auto r2 = srv.post("/v1/completions", completionBody(p2, 60));
+    CHECK_EQ(completionText(r2), decode(srv.model().greedyReference(p2, 60, true)));
+    const std::uint64_t reused = cachedTokens(r2);
+    CHECK(reused >= 1024 && reused <= 2100);
+    const Engine::Stats s2 = srv.engine().stats();
+    CHECK_EQ(srv.model().dflHoles(), 0u);       // never drafted against rows the ring lost
+    CHECK(s2.dfl_cold > s1.dfl_cold);           // the warm-up after the reset is counted
+    CHECK_EQ(srv.model().dflBad(), 0u);
+    CHECK_EQ(srv.model().dflStale(), 0u);
+    CHECK_EQ(srv.model().poison(), 0u);
 }
 
 // host tier restore with DFlash2: the restored session has KV and state but no drafter rows (reset
@@ -2753,6 +2817,27 @@ void testFrCrossOrigin() {
 
 // P2-5: --draft dflash without DeltaNet replay (gfx1151 / 8060S): drafts are produced, output unchanged
 void testFrDFlashNoReplay() {
+    // FR-DFL P3-4: the decision server_main makes before sizing the KV pool (dflashSnapSets)
+    CHECK_EQ(dflashSnapSets(false, true, false, 8, false, std::nullopt), 7u);   // block 8: one full block
+    CHECK_EQ(dflashSnapSets(false, true, false, 16, false, std::nullopt), 15u);
+    CHECK_EQ(dflashSnapSets(false, true, false, 8, true, std::nullopt), std::min<std::uint32_t>(qwen35::max_ng_drafts, qwen35::gdn_max_snap));
+    CHECK_EQ(dflashSnapSets(false, true, false, 8, false, 12u), 12u);           // WHIRL_SNAP_SETS raises it
+    CHECK_EQ(dflashSnapSets(false, true, true, 8, true, std::nullopt), 0u);     // replay: none
+    CHECK_EQ(dflashSnapSets(true, false, false, 8, true, std::nullopt), 0u);    // MTP: the MTP caps decide
+    CHECK_EQ(dflashSnapSets(false, false, false, 8, true, std::nullopt), 0u);
+#ifdef WHIRL_SOURCE_DIR
+    {
+        // ... and server_main makes it after the DFlash2 setup, before the KV pool is allocated (the
+        // engine's own fallback allocation comes after the pool: the pool would not leave room)
+        std::ifstream in(std::string(WHIRL_SOURCE_DIR) + "/src/server/server_main.cpp", std::ios::binary);
+        const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const std::size_t setup = src.find("model.dflashSetup(opt.parallel");
+        const std::size_t sets = src.find("model.ensureSnapshots(dflashSnapSets(");
+        const std::size_t pool = src.find("model.allocKvPool(");
+        CHECK(setup != std::string::npos && sets != std::string::npos && pool != std::string::npos);
+        CHECK(setup < sets && sets < pool);
+    }
+#endif
     CHECK_EQ(literalSnapSets(15, std::nullopt), 15u);
     CHECK_EQ(literalSnapSets(7, 10u), 10u);
     CHECK_EQ(literalSnapSets(7, 99u), qwen35::gdn_max_snap);
@@ -2787,6 +2872,64 @@ void testFrDFlashNoReplay() {
         CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(p, 100))), decode(srv.model().greedyReference(p, 100, true)));
         CHECK_EQ(srv.model().poison(), 0u);
     }
+}
+
+// FR-DFL P3-1: the VRAM fit check counts the DFlash2 drafter (official 27B drafter: weights ~1.9 GiB,
+// capture 200 MiB, 80 MiB of context ring per slot, ~65 MiB scratch, snapshot sets without replay)
+void testDFlashFit() {
+    constexpr std::uint64_t MiB = 1ull << 20, GiB = 1ull << 30;
+    qwen35::DFlashConfig dc;
+    dc.n_layer = 5, dc.n_embd = 5120, dc.n_head = 32, dc.n_head_kv = 8, dc.head_dim = 128, dc.n_ff = 17408;
+    dc.block = 8, dc.window = 2048, dc.conv_k = 2, dc.conv_group = 16, dc.sel_topk = 16, dc.sel_rank = 256;
+    dc.target_layers = {6, 20, 34, 48, 62};
+    qwen35::Config t;
+    t.n_embd = 5120;
+    t.n_vocab = 248320;
+    const std::uint64_t w = 1961 * MiB;
+    const whirl::dflash::Mem m = dflashFitBytes(dc, w, t, 2048, 4, 0, 0);
+    CHECK_EQ(m.weights, w);
+    CHECK_EQ(m.capture, 200 * MiB);                    // 5 target layers x 2048 rows x 5120 x f32
+    CHECK_EQ(m.rings, 4 * (80 * MiB + 2048 * 4));      // per slot: 5 layers x K,V x 2048 rows x 8 x 128 x f32 + positions
+    CHECK_EQ(m.scratch, 67998688u);                    // dflashSetup's draft block + 2048 ingest rows
+    CHECK_EQ(m.snapshots, 0u);
+    CHECK(m.total() > 2 * GiB + 400 * MiB && m.total() < 2 * GiB + 500 * MiB);
+    const whirl::dflash::Mem ms = dflashFitBytes(dc, w, t, 2048, 1, 15, 150 * MiB);  // replay-less: 15 sets
+    CHECK_EQ(ms.snapshots, 15 * 150 * MiB);
+    CHECK_EQ(ms.rings, 80 * MiB + 2048 * 4);
+    // a fit that has room without the drafter is reduced once the drafter is counted
+    vram::FitInput fi;
+    fi.weights = 15 * GiB;
+    fi.fixed = 512 * MiB;
+    fi.buf_per_row = 576 * 1024;
+    fi.buf_fixed = 64 * MiB;
+    fi.ckpt_bytes = 150 * MiB;
+    fi.parallel = 1;
+    fi.kv_per_token = 64 * 1024;
+    fi.pool_min_tokens = 32768;
+    fi.batch = 4096;
+    fi.n_ck = 4;
+    fi.n_spe = 2;
+    fi.avail = vram::fixedNeed(fi, 4096, 4, 2) + 40000ull * fi.kv_per_token;
+    const vram::FitPlan pa = vram::planFit(fi);
+    CHECK(!pa.reduced && pa.fits && pa.pool_tokens >= 39000);
+    vram::FitInput fd = fi;
+    fd.fixed += m.total();
+    const vram::FitPlan pb = vram::planFit(fd);
+    CHECK(pb.reduced);
+    CHECK(pb.batch < 4096 || pb.n_ck < 4);
+#ifdef WHIRL_SOURCE_DIR
+    {
+        // server_main adds it to the fit input before planFit, and decides --draft dflash before that
+        std::ifstream in(std::string(WHIRL_SOURCE_DIR) + "/src/server/server_main.cpp", std::ios::binary);
+        const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const std::size_t choose = src.find("whirl::dflash::choose(src, dm, why, true)");
+        const std::size_t est = src.find("qwen35::estimateLoad(f, cfg, lo.embd_on_host, use_dflash)");
+        const std::size_t add = src.find("fi.fixed += dm.total();");
+        const std::size_t plan = src.find("vram::planFit(fi)");
+        CHECK(choose != std::string::npos && est != std::string::npos && add != std::string::npos && plan != std::string::npos);
+        CHECK(choose < est && est < add && add < plan);
+    }
+#endif
 }
 
 // P3-1: a request arriving after the engine loop has stopped gets 503 at once (no hang)
@@ -2969,6 +3112,7 @@ int main(int argc, char** argv) {
         {"greedy_reference", testGreedyMatchesReference},
         {"stream", testStreamEqualsNonStream},
         {"prefix_cache", testPrefixCacheMultiTurn},
+        {"dflash_trim_ring", testDFlashTrimRing},
         {"doc_qa", testDocQa},
         {"tail_ck_sched", testTailCkOnSchedule},
         {"tail_ck_regress", testTailCkRegression},
@@ -3008,6 +3152,7 @@ int main(int argc, char** argv) {
         {"fr_pool_decode", testFrPoolDecode},
         {"fr_cross_origin", testFrCrossOrigin},
         {"fr_dflash_noreplay", testFrDFlashNoReplay},
+        {"dflash_fit", testDFlashFit},
         {"fr_shutdown_503", testFrShutdown503},
         {"fr_protocol", testFrProtocol},
         {"fr_stop_tokens", testFrStopTokens},

@@ -1267,9 +1267,16 @@ bool Engine::startJob(Slot& sl, Job& job) {
         if (mt.reuse == 0) {
             dflReset(sl, 0);
         } else {
-            m_.dflashTrim(sl.id, mt.reuse);
-            sl.dfl_hi = std::min(sl.dfl_hi, mt.reuse);
-            sl.dfl_lo = std::min(sl.dfl_lo, sl.dfl_hi);
+            // (FR-DFL P3-3: only rows the context ring still holds count; none left -> cold at reuse)
+            const ::whirl::dflash::Trim tr =
+                ::whirl::dflash::trimForReuse(::whirl::dflash::Range{sl.dfl_lo, sl.dfl_hi}, mt.reuse, m_.dflashRing());
+            if (tr.reset) {
+                dflReset(sl, mt.reuse);
+            } else {
+                m_.dflashTrim(sl.id, mt.reuse);
+                sl.dfl_lo = tr.r.lo;
+                sl.dfl_hi = tr.r.hi;
+            }
         }
     }
     {
@@ -1784,6 +1791,10 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
     std::array<std::uint32_t, gdn_max_seg> ng_n{}, ng_ml{};
     std::array<std::array<std::uint32_t, qwen35::max_ng_drafts>, gdn_max_seg> ng_d{};
     std::array<std::uint8_t, gdn_max_seg> dsrc{};  // 0 MTP / none, 1 n-gram, 2 DFlash2
+    // relaxacc (fast) applies to MTP drafts only: one rule for every site below (FR-DFL P2-3)
+    auto relaxes = [&](std::size_t k) {
+        return whirl::dflash::relaxAppliesTo(static_cast<whirl::dflash::DraftKind>(dsrc[k]), opt_.relax.on);
+    };
     std::size_t n_ng = 0;
     // replay keeps no snapshot sets: the verify row budget is the only shared limit
     const std::uint32_t snap_cap = m_.gdnReplay() ? vrows_ : std::min(qwen35::gdn_max_snap, m_.snapSets());
@@ -2018,7 +2029,7 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
     for (std::size_t k = 0; k < A; ++k) {
         Slot& sl = *act[k];
         if (sl.greedy) {
-            if (opt_.relax.on && nd_of[k] > 0 && ng_n[k] == 0) {
+            if (relaxes(k) && nd_of[k] > 0) {
                 any_relax = true;
                 launchTopk(row_of[k], nd_of[k], rk, 1.0f, relax_dev_, max_rows, row_of[k]);
             }
@@ -2128,7 +2139,7 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
                     continue;
                 }
                 // n-gram drafts are copies of the history: relaxing them feeds repetition loops
-                if (!opt_.relax.on || is_ng) break;
+                if (!relaxes(k)) break;
                 // relaxacc: verify row acc (conditioned on drafts 0..acc-1) keeps a near-argmax draft
                 const std::size_t gr = row0 + acc;
                 const auto* rids = reinterpret_cast<const std::int32_t*>(relax_host_.data()) + gr * rk;
@@ -2150,7 +2161,7 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
             // and MTP draft r was drawn on the device from the draft distribution q by the same race
             // (whirl/spec_sample.h); otherwise inverse CDF and the draft argmax. Either way the reply
             // is a function of (target logits, seed) only: drafts change speed, never text.
-            const bool typ = opt_.relax.on && !is_ng;
+            const bool typ = relaxes(k);
             sl.sm.row_base = row0;
             for (;;) {
                 prepareRow(sl.sm, acc);
@@ -2395,10 +2406,11 @@ void Engine::finishJob(Slot& sl) {
              job.id, sl.id, sl.drafted, sl.accepted, sl.drafted > 0 ? 100.0 * sl.accepted / sl.drafted : 0.0,
              sl.cycles > 0 ? static_cast<double>(sl.accepted + sl.cycles) / sl.cycles : 0.0, sl.cycles);
         if (opt_.ngram) logI("req {} | slot {} | n-gram drafts in {} of {} cycles", job.id, sl.id, sl.ng_cycles, sl.cycles);
-        if (opt_.relax.on)
-            logI("req {} | slot {} | relaxacc: {} of {} accepted drafts kept by the relaxed rule (greedy: mean ln p_max/p_kept {:.3f})",
-                 job.id, sl.id, sl.relaxed, sl.accepted, sl.relaxed > 0 ? sl.relax_gap / sl.relaxed : 0.0);
     }
+    // (whatever the draft source: with DFlash2 drafts it must stay 0, FR-DFL P2-3)
+    if (opt_.relax.on && (opt_.use_mtp || opt_.use_dflash))
+        logI("req {} | slot {} | relaxacc: {} of {} accepted drafts kept by the relaxed rule (greedy: mean ln p_max/p_kept {:.3f})",
+             job.id, sl.id, sl.relaxed, sl.accepted, sl.relaxed > 0 ? sl.relax_gap / sl.relaxed : 0.0);
     if (!sl.greedy && (sl.sm.big_used > 0 || sl.sm.full_used > 0))
         logI("req {} | slot {} | sampler fallbacks: top-{} {}x, full row {}x", job.id, sl.id, k_big, sl.sm.big_used,
              sl.sm.full_used);

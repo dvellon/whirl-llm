@@ -5,6 +5,26 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## Unreleased (0.2.0)
 
+### DFlash2 speculative decoding (`--draft dflash`, opt-in)
+
+- `--draft mtp|dflash` for `whirl chat` / `whirl bench` / `whirl-server` (default `mtp`). With
+  `--draft dflash --draft-model FILE` (else `WHIRL_DRAFT_MODEL`; the command line wins) a DFlash2
+  drafter GGUF that fits the model (Hugging Face `incoai/Qwen3.8-27B-DFlash2-GGUF`,
+  `Qwen3.8-27B-DFlash2-Q8_0.gguf`, Apache-2.0) proposes up to block - 1 (7) tokens per cycle from the
+  target's hidden states; the MTP block is then not loaded. n-gram drafts stay on and the cost model
+  picks n-gram or DFlash2 per cycle. DFlash2 drafts are verified like n-gram drafts with exact
+  acceptance in every numerics mode (relaxacc in `--fast` relaxes MTP drafts only), so greedy output
+  equals plain greedy decoding of the same mode and a seeded sampling reply does not depend on the
+  drafts. Checked on the R9700 in `--fast` (4-bit KV): the 8- and 16-row literal-draft verify gives logits bit-identical to single-row decode (`whirl seqtest --fast`), and `whirl bench --fast --draft dflash` reproduces the plain-decode token stream.
+- When it helps (R9700, vs MTP): one user, short / medium context, English-heavy or predictable
+  output: up to +19..48%. Slower: 4 concurrent users (about -39%), long contexts (37k+ tokens),
+  mostly-Chinese output (about -10%). Costs about 1.9 GiB of VRAM (weights, capture, an 80 MiB context
+  ring per slot), so the KV pool is smaller; the VRAM fit check counts it. A Q4_K_M drafter is untested.
+  See docs/usage.md (DFlash2 drafts).
+- Without a fitting drafter (a MoE model, a drafter whose tensors do not match its metadata, an MXFP4
+  `fc.weight`, a file that cannot be opened) or without the `dflash_*` kernels in the code object: a
+  warning and the MTP drafts. The kernels are in both kernel sets (gfx1201, gfx1151).
+
 ### Long-document Q&A: the second question reuses the document (TAIL-CK)
 
 - Prompts of 4096+ tokens keep a per-slot **tail checkpoint** at the start of their last 1024-token chunk, on the cold-run chunk schedule (precise / balance output stays bit identical to a cold run). Another question about the same document (`document + question` in one message) now resumes there and prefills about 0.3k-1.3k tokens instead of the whole document; before, only the third question was served from the cache (REL3: 131k document, second question 107 s on the R9700, 589 s on the 8060S). `-np 2..4` now default to 3 checkpoints per slot (was 2; +150.6 MiB VRAM per slot for Qwen3.8-27B, +63.8 MiB for Ornith-1.5-35B-A3B, counted in the VRAM fit, which drops back to 2 when VRAM is tight); a full set keeps its newest tail checkpoint, so regenerate (prompt-end) and next-turn (gen-end) reuse are unchanged. With fewer than 3 checkpoints per slot no tail is taken. `WHIRL_TAIL_CK=0` turns it off (debug). `audit/TAIL-CK.md`.
@@ -255,6 +275,23 @@ selftest in every mode unchanged).
   overwriting the other branch in place. On integrated GPUs the RAM tier is at least one
   max-context entry (or off, with a log line, when that is more than half the available RAM).
 
+### Fixes from the DFlash2 review (FIX-DFL)
+
+- The drafter GGUF is checked tensor by tensor against its metadata before anything is loaded
+  (q/k/v/o, gate/up/down, conv_proj / conv_base, selector_hidden, norms, 1..64 layers): a malformed
+  drafter could make the GPU write past its scratch buffers; it now falls back to MTP with the reason.
+  An MXFP4 `fc.weight` is refused (the drafter splits fc into column blocks).
+- `whirl chat` / `bench` with `--draft dflash`: `WHIRL_DFLASH_CAPTURE_ROWS` below the verify rows
+  made the drafter read far outside the capture buffer (GPU page fault); the ingest now goes through
+  the same plan as the server and values below 16 are ignored with a warning.
+- `--draft-model` that cannot be opened or parsed now warns and keeps MTP, as documented (it stopped
+  the program).
+- whirl-server: the VRAM fit check counts the DFlash2 drafter (and no longer the MTP block it does not
+  load); after prefix reuse the drafter context keeps only rows its ring still holds (a slot that had
+  run far past the reuse point drafted against an empty context and the cold-cycle count missed it);
+  relaxacc's "MTP drafts only" rule has one implementation, and the regression test now fails if
+  relaxacc is applied to DFlash2 drafts; the replay-less snapshot-set decision is a tested function.
+
 ### Fixes from the server review (FIX-SRV)
 
 - **Behaviour change:** cross-origin requests are refused. A non-GET request with an Origin that is
@@ -286,19 +323,6 @@ selftest in every mode unchanged).
 Routine bug-fix release: no new features, no speed changes. The changes harden input handling (GGUF
 files, HTTP requests, tokenizer vocabularies); inference code paths are unchanged, so outputs are
 bit-identical to 0.1.3.
-
-### DFlash2 speculative decoding (`--draft dflash`, in development)
-
-- `--draft mtp|dflash` for `whirl chat` / `whirl bench` / `whirl-server`: with
-  `--draft-model FILE` (else `WHIRL_DRAFT_MODEL`; the command line wins) = a DFlash2 drafter GGUF that fits the model (incoai/Qwen3.8-27B-DFlash2,
-  Apache-2.0), the block-diffusion drafter proposes up to block - 1 (7) tokens per cycle from the
-  target's hidden states at its target layers; the MTP block is then not loaded and the KV pool is
-  sized after the drafter. n-gram drafts stay on. DFlash2 drafts are verified like n-gram drafts
-  with exact acceptance in every mode (relaxacc in `--fast` relaxes MTP drafts only), so the output
-  equals plain greedy decoding of the same mode. Without a fitting drafter or without the
-  `dflash_*` kernels in the code object: a warning and the MTP drafts. The kernels are in both
-  kernel sets (gfx1201, gfx1151). Ported from the r97-rc DFlash2 series onto 0.2.0 (DFLASH-1a);
-  **not yet run on a GPU**: correctness and speed checks are the next step.
 
 ### Fixes
 

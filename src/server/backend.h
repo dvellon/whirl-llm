@@ -151,6 +151,9 @@ public:
     }
     // forget slot s's context rows at positions >= keep
     virtual void dflashTrim(std::uint32_t s, std::uint32_t keep) { (void)s, (void)keep; }
+    // rows of a slot's context ring (position p goes to row p % ring: an ingest overwrites the row of
+    // position p - ring); 0 = no limit
+    virtual std::uint32_t dflashRing() const { return 0; }
 };
 
 // Production backend over a loaded qwen35::Model (setupSeqs / allocKvPool done).

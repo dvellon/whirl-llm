@@ -864,7 +864,9 @@ DecodeResult dflashDecode(q::Model& model, const Tok& tok, u32 first, u32 n_prom
         }
         // the verify ran nd + 1 rows: keep acc + 1 of them, and their features
         if (acc < nd) model.restoreSnapshot(acc + 1);
-        model.dflashIngest(0, model.cap_buf, model.cap_rows, model.cap_n - (nd + 1), acc + 1, p);
+        // (FR-DFL P2-2: via planIngest, so a capture shorter than the verify never reads before cap_buf)
+        if (const whirl::dflash::Ingest g = whirl::dflash::verifyIngest(model.cap_n, nd + 1, acc + 1, p); g.any)
+            model.dflashIngest(0, model.cap_buf, model.cap_rows, g.cap_row, g.n, g.pos);
         for (u32 r = 0; r < acc + 1; ++r) {
             if (!done) done = emit(outv[r]);
             if (opt.ngram) hist.push_back(outv[r]);
@@ -931,7 +933,7 @@ bool wantDFlash(const Args& a, const gguf::File& f) {
             std::fprintf(stderr, "note: %s\n", note.c_str());
     }
     std::string why;
-    if (*src == whirl::dflash::Source::dflash && dm) why = q::dflashIncompatible(f, gguf::File::open(*dm));
+    if (*src == whirl::dflash::Source::dflash && dm) why = q::dflashIncompatibleFile(f, *dm);
     const whirl::dflash::Choice c = whirl::dflash::choose(*src, dm, why, true);
     if (!c.warning.empty()) std::fprintf(stderr, "warning: %s\n", c.warning.c_str());
     return c.source == whirl::dflash::Source::dflash;
@@ -1783,6 +1785,29 @@ int cmdSeqtest(const Args& a) {
         lh_total += nv;
         lh_bad += vbad;
         out(fmt("  CLI verify rows (%u): %u/%u logits hashes differ from the solo rows\n", nv, vbad, nv));
+    }
+    // FR-DFL: the literal-draft verify of whirl chat's DFlash2 / n-gram decode (verifyEnqueueEx, the
+    // dflashDecode path) with a DFlash2 block of 8 (7 drafts) and 16 (15 drafts): every row's logits
+    // bits must equal the solo decode row, in every numerics mode (fast: 4-bit KV)
+    for (const u32 nd : {7u, 15u}) {
+        if (nd + 1 > n_gen || nd + 1 > q::max_small_batch) continue;
+        m.selectSeq(0);
+        m.reset();
+        m.prefill(pa, 0);
+        const u32 first = m.argmax();
+        m.verifyEnqueueEx(first, nd, std::span<const u32>(ref[0]).subspan(1, nd), static_cast<u32>(pa.size()));
+        std::array<u32, q::max_small_batch> vo{};
+        (void)m.readCycle(std::span<u32>(vo.data(), nd + 1), std::span<u32>(vo.data(), 0));
+        u32 vbad = 0, tbad = 0;
+        for (u32 r = 0; r <= nd; ++r) {
+            vbad += rowHash(m, r) != lh[0][r + 1] ? 1 : 0;
+            tbad += vo[r] != ref[0][r + 1] ? 1 : 0;
+        }
+        lh_total += nd + 1;
+        lh_bad += vbad;
+        ok = ok && tbad == 0 && first == ref[0][0];
+        out(fmt("  literal-draft verify (verifyEnqueueEx, %u drafts = %u rows): %u/%u logits hashes and %u tokens differ from the solo rows\n",
+                nd, nd + 1, vbad, nd + 1, tbad));
     }
     // P3-4 (informational, not part of ok): the prompt's last logits when the prefill is split in two
     // forwards at row a (a multiple of 64 = a CLI / server chunk start, or not) with t rows after it.
