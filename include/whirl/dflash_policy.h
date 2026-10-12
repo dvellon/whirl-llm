@@ -4,8 +4,8 @@
 // forward (src/model/dflash.cpp). Header-only and GPU-free so tests/unit covers it.
 //
 // Design (DFLASH-1, owner-approved 2026-10-05, v0.2.0):
-//   * `--draft mtp|dflash` picks the draft source; default mtp. dflash needs the drafter GGUF in
-//     WHIRL_DRAFT_MODEL that fits the target (DFlashConfig::validate, headers only) and the dflash_*
+//   * `--draft mtp|dflash` picks the draft source; default mtp. dflash needs the drafter GGUF
+//     (--draft-model FILE, else WHIRL_DRAFT_MODEL) that fits the target (DFlashConfig::validate, headers only) and the dflash_*
 //     kernels in the GPU's code object; otherwise a warning and the MTP drafts (choose()).
 //   * dflash mode does not load the MTP block (no weights, no MTP KV layer): the KV pool is sized
 //     after the drafter's weights, capture and rings, and the startup log prints its capacity.
@@ -37,12 +37,20 @@ inline std::optional<Source> parseSource(std::string_view s) {
 
 inline const char* sourceName(Source s) { return s == Source::dflash ? "dflash" : "mtp"; }
 
-// The drafter GGUF: the WHIRL_DRAFT_MODEL environment variable (a debug override) wins over
-// --draft-model; an empty value counts as not set.
+// The drafter GGUF: --draft-model FILE wins; the WHIRL_DRAFT_MODEL environment variable is the
+// fallback (a debug override when no --draft-model is given), so a stale variable never overrides the
+// command line. An empty value counts as not set.
 inline std::optional<std::string> resolveDraftModel(const std::optional<std::string>& cli, const std::optional<std::string>& env) {
-    if (env && !env->empty()) return env;
     if (cli && !cli->empty()) return cli;
+    if (env && !env->empty()) return env;
     return std::nullopt;
+}
+// Log line about where the drafter came from ("" = nothing to report: none set, or only --draft-model).
+inline std::string draftModelNote(const std::optional<std::string>& cli, const std::optional<std::string>& env) {
+    const bool c = cli && !cli->empty(), e = env && !env->empty();
+    if (c && e && *cli != *env) return "WHIRL_DRAFT_MODEL=" + *env + " ignored: --draft-model " + *cli + " given";
+    if (!c && e) return "DFlash2 drafter from WHIRL_DRAFT_MODEL=" + *env;
+    return "";
 }
 
 // The draft source actually used, and the warning to print when a dflash request falls back.

@@ -139,7 +139,7 @@ const char* kHelpBody =
     "                           come out of the KV pool (about 2 GiB net of the MTP block).\n"
     "                           A model without a matching drafter (e.g. a MoE model) keeps mtp.\n"
     "                           n-gram drafts stay on in both modes; outputs equal plain greedy decoding\n"
-    "  --draft-model FILE       DFlash2 drafter GGUF for --draft dflash (env WHIRL_DRAFT_MODEL overrides)\n"
+    "  --draft-model FILE       DFlash2 drafter GGUF for --draft dflash (wins over env WHIRL_DRAFT_MODEL)\n"
     "  --decode-min-tps N       while other requests prefill, keep every streaming (decoding) request\n"
     "                           at >= N tok/s by limiting prefill forwards (default 20; 0 = off:\n"
     "                           prefill forwards are not limited)\n"
@@ -181,7 +181,7 @@ struct Options {
     std::optional<std::uint32_t> ctx_per_slot;
     std::optional<std::uint32_t> mtp_drafts;
     std::string draft = "mtp";
-    std::string draft_model;  // --draft-model FILE (WHIRL_DRAFT_MODEL overrides)
+    std::string draft_model;  // --draft-model FILE (wins over WHIRL_DRAFT_MODEL)
     std::optional<std::uint32_t> decode_min_tps;
     std::optional<std::string> log_file;
     std::optional<std::string> alias;
@@ -610,8 +610,11 @@ int serveMain(int argc, char** argv, const char* program) {
         std::optional<std::string> dm_resolved;
         std::optional<gguf::File> dfile;
         {
-            const auto dm = dm_resolved = whirl::dflash::resolveDraftModel(opt.draft_model.empty() ? std::nullopt : std::optional<std::string>(opt.draft_model), env("DRAFT_MODEL"));
+            const std::optional<std::string> dm_cli = opt.draft_model.empty() ? std::nullopt : std::optional<std::string>(opt.draft_model);
+            const auto dm = dm_resolved = whirl::dflash::resolveDraftModel(dm_cli, env("DRAFT_MODEL"));
             const auto src = *whirl::dflash::parseSource(opt.draft);
+            if (src == whirl::dflash::Source::dflash)
+                if (const std::string note = whirl::dflash::draftModelNote(dm_cli, env("DRAFT_MODEL")); !note.empty()) logI("{}", note);
             std::string why;
             if (src == whirl::dflash::Source::dflash && dm) {
                 dfile.emplace(gguf::File::open(*dm));
