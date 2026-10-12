@@ -422,25 +422,26 @@ __device__ __forceinline__ void attn_ws4g_impl(const float *q, const KvArgs &kv,
     const ws4::Range rg = ws4::block_range(n_pos, split, ws4::kNs, kv.win);
     const int b0 = rg.b0, b1 = rg.b1;
     const size_t ml_q = (size_t)n_split * n_head * 2, acc_q = (size_t)n_split * n_head * AW_D;
+    // per tile c: this lane's column, its row (crow_), position (mp); output row / head
+    // recomputed where written (fewer registers live through the chunk loop: f16 CG 3 spilled)
     bool cvalid[CG];
-    int crow_[CG], ct[CG], ch[CG], mp[CG];
+    int crow_[CG], mp[CG];
+    auto colc = [&](int c) { return 16 * c + lane % 16 < ncol ? 16 * c + lane % 16 : 0; };
 #pragma unroll
     for (int c = 0; c < CG; ++c) {
-        const int col = 16 * c + lane % 16;
-        cvalid[c] = col < ncol;
-        const int colc = cvalid[c] ? col : 0;
-        crow_[c] = colc / grp;
-        ct[c] = first + crow_[c];
-        ch[c] = g * grp + colc % grp;
-        mp[c] = cvalid[c] ? pos[ct[c]] : -1;
+        cvalid[c] = 16 * c + lane % 16 < ncol;
+        crow_[c] = colc(c) / grp;
+        mp[c] = cvalid[c] ? pos[first + crow_[c]] : -1;
     }
+    auto ct = [&](int c) { return first + colc(c) / grp; };
+    auto ch = [&](int c) { return g * grp + colc(c) % grp; };
     if (b0 >= n_pos) {
         if (wid == 0 && lane < 16) {
 #pragma unroll
             for (int c = 0; c < CG; ++c)
                 if (cvalid[c]) {
-                    part_ml[ct[c] * ml_q + ((size_t)split * n_head + ch[c]) * 2 + 0] = -INFINITY;
-                    part_ml[ct[c] * ml_q + ((size_t)split * n_head + ch[c]) * 2 + 1] = 0.f;
+                    part_ml[ct(c) * ml_q + ((size_t)split * n_head + ch(c)) * 2 + 0] = -INFINITY;
+                    part_ml[ct(c) * ml_q + ((size_t)split * n_head + ch(c)) * 2 + 1] = 0.f;
                 }
         }
         return;
@@ -590,11 +591,11 @@ __device__ __forceinline__ void attn_ws4g_impl(const float *q, const KvArgs &kv,
     for (int c = 0; c < CG; ++c) {
         if (!cvalid[c]) continue;
         if (wid == c && lane < 16) {  // the tile's softmax wave
-            part_ml[ct[c] * ml_q + ((size_t)split * n_head + ch[c]) * 2 + 0] = mw;
-            part_ml[ct[c] * ml_q + ((size_t)split * n_head + ch[c]) * 2 + 1] = lw;
+            part_ml[ct(c) * ml_q + ((size_t)split * n_head + ch(c)) * 2 + 0] = mw;
+            part_ml[ct(c) * ml_q + ((size_t)split * n_head + ch(c)) * 2 + 1] = lw;
         }
         if (mp[c] < b0) continue;  // split past the row: (-inf, 0), no acc (as the solo run)
-        float *pa = part_acc + ct[c] * acc_q + ((size_t)split * n_head + ch[c]) * AW_D;
+        float *pa = part_acc + ct(c) * acc_q + ((size_t)split * n_head + ch(c)) * AW_D;
 #pragma unroll
         for (int j = 0; j < NDT; ++j)
 #pragma unroll
