@@ -110,10 +110,11 @@ int main(int argc, char** argv) {
                         {"attn", kt::testAttn},   {"gdn", kt::testGdn},   {"moe", kt::testMoe},
                         {"moemx", kt::testMoeMx}, {"misc", kt::testMisc},   {"attnbench", kt::benchAttn},
                         {"gemvh", kt::testGemvh}, {"gemvhbench", kt::benchGemvh}, {"dflash", kt::testDflash},
-                        {"ws4", kt::testAttnWs4}, {"ws4bench", kt::benchAttnWs4}};
+                        {"ws4", kt::testAttnWs4}, {"ws4bench", kt::benchAttnWs4},
+                        {"ws4g", kt::testAttnWs4g}, {"ws4gbench", kt::benchAttnWs4g}};
     for (const Fam& f : fams) {
         if (!only.empty() && !only.count(f.name)) continue;
-        if (only.empty() && (std::string(f.name) == "attnbench" || std::string(f.name) == "gemvhbench" || std::string(f.name) == "ws4bench")) continue;  // timing only, on request
+        if (only.empty() && (std::string(f.name) == "attnbench" || std::string(f.name) == "gemvhbench" || std::string(f.name) == "ws4bench" || std::string(f.name) == "ws4gbench")) continue;  // timing only, on request
         const auto t0 = std::chrono::steady_clock::now();
         std::printf("== %s\n", f.name);
         std::fflush(stdout);

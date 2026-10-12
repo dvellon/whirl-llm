@@ -60,6 +60,11 @@ WS4_HD constexpr int crow(int lane, int v) { return 2 * v + lane / 16; }
 // even rows at tb, odd rows at tb + 8, tb = (kb / 2) * 16 + (kb % 2) * 4)
 WS4_HD constexpr int vt_tb(int kb) { return (kb / 2) * 16 + (kb % 2) * 4; }
 WS4_HD constexpr int vt_col(int kb, int r) { return vt_tb(kb) + r / 2 + (r % 2 ? 8 : 0); }
+// inverse: key (0..31 in the chunk) held by Vt column col (vt_key(vt_col(kb, r)) == 8 kb + r);
+// the multi-row kernel masks V^T fragment element e of tile kt (column 16 kt + e) by this key
+WS4_HD constexpr int vt_key(int col) { return 8 * (2 * (col / 16) + (col % 8) / 4) + 2 * (col % 4) + (col % 16) / 8; }
+// multi-row (verify) blocks: query rows per block of CG 16-column tiles for grp GQA heads
+WS4_HD constexpr int rows_per_block(int cg, int grp) { return 16 * cg / grp; }
 // f16 offset of Vt[d][col] (row pitch 40, +8 halfs every 8 rows: 16-row reads and the
 // staging writes are bank-conflict free, F4)
 WS4_HD constexpr int vt_addr(int d, int col) { return d * kVtPitch + (d / 8) * 8 + col; }
