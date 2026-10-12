@@ -16,6 +16,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <limits>
 #include <numeric>
 #include <set>
 
@@ -414,6 +415,69 @@ void testMisc(Ctx& c) {
             rk.pass = bad == 0;
             c.rep.add(rk);
             c.rep.add(cmpTolRel("draft_sample_rows q probabilities vs CPU", gp, rp, 1e-4, 1e-7));
+            // FIX-K97 (FR-K97 P3-2): NaN logits (the row's argmax and two more set to NaN) are never candidates and do
+            // not poison the normalizer: q == the CPU distribution with those logits at -inf, finite, drawn token not NaN
+            {
+                std::vector<float> xn(x.begin(), x.begin() + n);
+                const int amax = firstMax(xn.data(), n);
+                const int nan_at[3] = {amax, (amax + 17) % n, (amax + 1001) % n};
+                for (int i : nan_at) xn[static_cast<std::size_t>(i)] = std::numeric_limits<float>::quiet_NaN();
+                std::vector<float> xc = xn;
+                for (int i : nan_at) xc[static_cast<std::size_t>(i)] = -INFINITY;
+                Buf dxn(xn), ctl1(64 * 4), qb1(sp::q_words * 4);
+                ctl1.zero();
+                wk::RowIdx a1;
+                wk::DSampArgs d1;
+                a1.v[0] = 0;
+                d1.on[0] = 1;
+                d1.top_k[0] = 20;
+                d1.qoff[0] = 0;
+                d1.inv_t[0] = 1.f / 0.7f;
+                d1.top_p[0] = 0.95f;
+                d1.min_p[0] = 0.f;
+                const std::uint64_t key = sp::raceBase(77, 3);
+                d1.key_lo[0] = static_cast<std::uint32_t>(key);
+                d1.key_hi[0] = static_cast<std::uint32_t>(key >> 32);
+                hip::launch(c.k.draft_sample_rows, {1, 1, 1}, {1024, 1, 1}, 0, c.s, dxn.p(), n, ctl1.p(), a1, r, DevPtr{0}, d1, qb1.p());
+                c.sync();
+                const auto hc1 = ctl1.down<int>(64);
+                const auto hq1 = qb1.down<std::int32_t>(sp::q_words);
+                const int K = static_cast<int>(sp::draftCands(20));
+                std::vector<int> idx(static_cast<std::size_t>(n));
+                std::iota(idx.begin(), idx.end(), 0);
+                std::partial_sort(idx.begin(), idx.begin() + K, idx.end(), [&](int a, int bb) { return xc[a] != xc[bb] ? xc[a] > xc[bb] : a < bb; });
+                const float m = xc[firstMax(xc.data(), n)];
+                double s = 0;
+                for (int i = 0; i < n; ++i) s += std::exp((static_cast<double>(xc[i]) - m) / 0.7);
+                std::vector<std::uint32_t> ci(static_cast<std::size_t>(K));
+                std::vector<float> cl(static_cast<std::size_t>(K));
+                for (int k = 0; k < K; ++k) {
+                    ci[static_cast<std::size_t>(k)] = static_cast<std::uint32_t>(idx[static_cast<std::size_t>(k)]);
+                    cl[static_cast<std::size_t>(k)] = xc[idx[static_cast<std::size_t>(k)]];
+                }
+                const sp::QDist want = sp::draftDist(ci, cl, m, static_cast<float>(s), 1.f / 0.7f, 20, 0.95f, 0.f);
+                const sp::QDist got = sp::qFromWords(hq1.data());
+                std::size_t nb = got.n != want.n;
+                std::vector<float> gp1;
+                std::vector<double> rp1;
+                for (std::uint32_t i = 0; i < std::min(got.n, want.n); ++i) {
+                    nb += got.id[i] != want.id[i];
+                    nb += !std::isfinite(got.p[i]);
+                    for (int j : nan_at) nb += got.id[i] == static_cast<std::uint32_t>(j);
+                    gp1.push_back(got.p[i]);
+                    rp1.push_back(want.p[i]);
+                }
+                const int drawn = hc1[16 + r];
+                for (int j : nan_at) nb += drawn == j;
+                nb += static_cast<std::uint32_t>(drawn) != sp::sampleRace(got, key);
+                Result rn;
+                rn.name = "draft_sample_rows NaN logits: never candidates, q == CPU with NaN as -inf, drawn token valid";
+                rn.n = got.n + 1;
+                rn.mismatches = nb;
+                rn.pass = nb == 0;
+                c.rep.add(rn);
+                c.rep.add(cmpTolRel("draft_sample_rows NaN logits: q probabilities vs CPU", gp1, rp1, 1e-4, 1e-7));
+            }
         }
     }
 

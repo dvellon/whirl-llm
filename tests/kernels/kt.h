@@ -194,12 +194,16 @@ void testQuant(Ctx& c);
 void testGemv(Ctx& c);
 void testGemm(Ctx& c);
 void testAttn(Ctx& c);
+void testAttnDq4(Ctx& c);  // "attndq4": attn_dq4 at 256 splits / contexts up to 256k / random draft windows
 void testGemvh(Ctx& c);   // "gemvh": bitwise sweep of precise-decode gemvh/gemvh2
 void benchGemvh(Ctx& c);  // "gemvhbench": timing only
 void benchAttn(Ctx& c);  // "attnbench": timing only, run with --only attnbench
 void testGdn(Ctx& c);
 void testMoe(Ctx& c);
 void testMoeMx(Ctx& c);
+void testMoeF(Ctx& c);  // "moef": precise MoE decode experts moe_gu_f_* / moe_down_f_*
+// gfx1201 precise MoE prefill gemmr_moe* == gemm_moe + moe_act_f16 (test_moe_gu.cpp), called by testMoeMx
+void gemmrChecks(Ctx& c, const HostMat& gate, const HostMat& up, const HostMat& down, int R, int K);
 // 8060S grouped expert GEMMs (test_moe_gu.cpp), called by testMoe / testMoeMx
 void moeGuChecks(Ctx& c, const HostMat& gate, const HostMat& up, const HostMat& down, int R, int K);
 void testMisc(Ctx& c);

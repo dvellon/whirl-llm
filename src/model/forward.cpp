@@ -1167,11 +1167,12 @@ bool Model::moeGuFused(const MoeW& mo) const {
 }
 
 // Prefill experts on the f16-activation MXFP4 grouped GEMMs gemmr_moe* (gfx1201; WHIRL_MOE_RBF=0
-// -> gemm_moe + moe_act_f16): all three expert tensors MXFP4, gate and up of one row size.
+// -> gemm_moe + moe_act_f16): all three expert tensors MXFP4, gate and up of one row size, E and F
+// multiples of the kernels' k step (no tail handling).
 bool Model::moeGuR(const MoeW& mo) const {
     return moe_rbf && mo.gate.ty == GgmlType::mxfp4 && mo.up.ty == GgmlType::mxfp4 && mo.down.ty == GgmlType::mxfp4 &&
            mo.gate.row_bytes == mo.up.row_bytes && k.gemmr_moegu != nullptr && k.gemmr_moegu32 != nullptr && k.gemmr_moedn != nullptr &&
-           k.gemmr_moedn32 != nullptr;
+           k.gemmr_moedn32 != nullptr && kernels::gemmrMoeShapeOk(mo.gate.ncols, mo.down.ncols);
 }
 
 // Prefill experts on the MXFP4 x fp8 grouped GEMM: all three expert tensors MXFP4 with
