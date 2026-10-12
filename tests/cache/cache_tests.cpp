@@ -322,9 +322,6 @@ static void testFingerprint() {
         CHECK(tierFingerprint(a) != tierFingerprint(b));
         CHECK(tierFingerprint(a) != base && tierFingerprint(b) != base);
         CHECK(tierFingerprint(a) == tierFingerprint(a));
-        FingerprintInputs c = a;
-        c.split_ctx = 8192;  // q4 KV: the decode split count follows the context
-        CHECK(tierFingerprint(c) != tierFingerprint(a));
         // device name and kernel set (FR-CACHE P1-1)
         FingerprintInputs e = a;
         e.gpu_name = "AMD Radeon(TM) 8060S Graphics";
@@ -332,10 +329,6 @@ static void testFingerprint() {
         e = a;
         e.kernel_set = "gfx1151 co 123";
         CHECK(tierFingerprint(e) != tierFingerprint(a));
-        c.split_ctx = 16384;
-        FingerprintInputs d = a;
-        d.split_ctx = 8192;
-        CHECK(tierFingerprint(c) != tierFingerprint(d));
     }
     p.env = {{"Whirl_Relax", "1"}};  // prefix check is case-insensitive, the key is hashed as written
     CHECK(tierFingerprint(p) != base);

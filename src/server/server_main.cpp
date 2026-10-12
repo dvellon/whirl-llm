@@ -325,7 +325,6 @@ std::uint64_t tierFingerprint(const qwen35::Model& m, const std::string& path, c
     in.gpu_name = dev.name;
     const hip::EmbeddedObject* co = hip::embeddedObjectFor(m.arch);
     in.kernel_set = std::format("{} co {}", hip::archName(m.arch), co != nullptr ? *co->size : 0ull);
-    in.split_ctx = m.kv_q4 ? m.max_ctx : 0;
     in.env = cache::fingerprintEnv();
     return cache::tierFingerprint(in);
 }

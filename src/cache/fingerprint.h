@@ -26,8 +26,6 @@ struct FingerprintInputs {
     std::string gpu_arch;
     std::string gpu_name;    // device name (DeviceInfo::name), e.g. "AMD Radeon AI PRO R9700"
     std::string kernel_set;  // code object family the model loaded (hip::archName + its size)
-    // decode attention split count input (q4 KV only: its split count follows the context size, P3-6)
-    std::uint64_t split_ctx = 0;
     // numerics mode and its items (numerics::logLine): a --balance run's KV /
     // DeltaNet state must never be restored by a --precise process
     std::string numerics;

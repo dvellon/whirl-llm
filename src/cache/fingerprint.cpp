@@ -24,8 +24,8 @@ std::uint64_t tierFingerprint(const FingerprintInputs& in) {
                                      in.page_bytes, in.max_batch));
     h = tier::hashStr(h, "numerics " + in.numerics);
     // empty / 0 hash as before R-1's format (tests compare with it); the server always sets gpu_arch
-    if (!in.gpu_arch.empty() || !in.gpu_name.empty() || !in.kernel_set.empty() || in.split_ctx != 0)
-        h = tier::hashStr(h, std::format("gpu {} name {} kernels {} splitctx {}", in.gpu_arch, in.gpu_name, in.kernel_set, in.split_ctx));
+    if (!in.gpu_arch.empty() || !in.gpu_name.empty() || !in.kernel_set.empty())
+        h = tier::hashStr(h, std::format("gpu {} name {} kernels {}", in.gpu_arch, in.gpu_name, in.kernel_set));
     std::vector<std::pair<std::string, std::string>> kv;
     for (const auto& p : in.env)
         if (fingerprintEnvKept(p.first)) kv.push_back(p);
