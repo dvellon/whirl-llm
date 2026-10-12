@@ -240,7 +240,7 @@ __device__ __forceinline__ void attn_ws4_impl(const float *q, const KvArgs &kv, 
                          [&](int j, int kt) { return ld_frag16(&Vt[ws4::vt_addr((4 * wid + j) * 16 + lane % 16, kt * 16)]); });
 #endif
                 if (c + 1 < nch) {
-                    ws4_lds_barrier();  // LB2: Vt, Sc read
+                    ws4_lds_barrier();  // LB2: Vt, Ps read
                     ws4_stage<F>(raw[(s + 1) % PD], Ks, Vt, k0 + AW_K, b1, tv);
                     // BF: unconditional (see ws4_load); past the last chunk it reloads the last
                     // one (L2), never used
@@ -286,7 +286,7 @@ WS4_ENTRY(attn_ws4_q4, 2, 1, false)
 // 8 waves (not 4 as attn_ws4): the 48 columns' accumulators are 96 VGPRs per lane with 128
 // threads, plus a 64-VGPR f16 prefetch, which spilled; with 256 threads waves 0-3 prefetch /
 // stage K and waves 4-7 V (32 VGPRs each, one register set: the role only selects addresses),
-// QK unit (tile w / 2, kt w % 2) per wave, P.V dims [32 w, 32 w + 32) of every tile per wave.
+// QK + softmax of tile c in wave c (p / alpha to LDS), P.V dims [32 w, 32 w + 32) of every tile in wave w.
 // Bitwise row-count invariance: every row's partials equal its single-row (attn_ws4 /
 // attn_wsplit1) partials whenever the rows of a group share the split rule (host: same awPer and
 // draft-window parameters). Per column:
@@ -302,6 +302,9 @@ WS4_ENTRY(attn_ws4_q4, 2, 1, false)
 // The block's range uses its own rows' largest position (n_pos); the tail logic runs only in
 // chunks with a key past the smallest position (block-uniform branch).
 // ---------------------------------------------------------------------------
+#ifndef WS4G_QK_UNROLL  // QK st loop unroll (full unrolling hoists fragment loads: CG 3 spilled)
+#define WS4G_QK_UNROLL 4
+#endif
 #ifndef WS4G_NOTAIL  // kernel development: 1 = no tail path (wrong bits for groups)
 #define WS4G_NOTAIL 0
 #endif
@@ -324,8 +327,10 @@ __device__ __forceinline__ void ws4g_load(Ws4gRaw<F> &r, const KvArgs &kv, int t
     const int dl = kv_delta(kv, tb, k0);
     const int kb = ws4::v_kb(tq);
     const int d = isv ? ws4::v_d8(tq) : ws4::k_d0(0, tq);
-    const void *base = isv ? kv.v : kv.k;
-    const _Float16 *sb = isv ? kv.vs : kv.ks;
+    // pointer arithmetic, not a select of the two pointers (a select became a private array
+    // indexed per chunk: scratch loads queued behind the K / V loads)
+    const char *base = (const char *)kv.k + (isv ? (const char *)kv.v - (const char *)kv.k : 0);
+    const _Float16 *sb = kv.ks + (isv ? kv.vs - kv.ks : 0);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const int kk = isv ? kb * 8 + i : ws4::k_key(0, tq, i);
@@ -384,21 +389,19 @@ __device__ __forceinline__ void attn_ws4g_impl(const float *q, const KvArgs &kv,
                                                int q_stride, const int *pos, float scale, const int *skip, const AwGroups &groups) {
 #pragma clang fp contract(off)
     if (skip != nullptr && *skip) return;
-    // CG 3: Qs 25.3 KB + Ks 16.9 + Vt 21 = 63.2 KB, so the scores live in the Ks space (one
-    // more LDS barrier per chunk: every wave's QK reads of Ks done before Sc is written)
+    // CG 3: Qs 25.3 KB + Ks 16.9 + Vt 21 = 63.2 KB, so p / alpha live in the Ks space (one
+    // more LDS barrier per chunk: every wave's QK reads of Ks done before they are written)
     constexpr bool kAlias = CG == 3;
     constexpr int NDT = AW_D / 16 / 8;  // P.V 16-dim tiles per wave
     __shared__ __align__(16) _Float16 Qs[16 * CG][ws4::kQs];
     __shared__ __align__(16) _Float16 Ks[AW_K][ws4::kQs];
     __shared__ __align__(16) _Float16 Vt[ws4::kVtSize];
-    // Sc: scores [tile][kSc]; Ps: p (f16) [tile][kt][lane][8]; As: alpha [tile][16 columns]
+    // Ps: p (f16) [tile][kt][lane][8]; As: alpha [tile][16 columns] (CG 3: in the Ks space)
     constexpr int kPs = CG * 2 * 32 * 8, kAs = CG * 16;
-    static_assert(CG * ws4::kScSize * 4 + kPs * 2 + kAs * 4 <= AW_K * ws4::kQs * 2, "Sc / Ps / As fit in Ks");
-    __shared__ __align__(16) float ScOwn[kAlias ? 4 : CG * ws4::kScSize];
+    static_assert(kPs * 2 + kAs * 4 <= AW_K * ws4::kQs * 2, "Ps / As fit in Ks");
     __shared__ __align__(16) _Float16 PsOwn[kAlias ? 8 : kPs];
     __shared__ __align__(16) float AsOwn[kAlias ? 4 : kAs];
-    float *Sc = kAlias ? reinterpret_cast<float *>(&Ks[0][0]) : ScOwn;
-    _Float16 *Ps = kAlias ? reinterpret_cast<_Float16 *>(Sc + CG * ws4::kScSize) : PsOwn;
+    _Float16 *Ps = kAlias ? reinterpret_cast<_Float16 *>(&Ks[0][0]) : PsOwn;
     float *As = kAlias ? reinterpret_cast<float *>(Ps + kPs) : AsOwn;
     const int tv = threadIdx.x, lane = tv % WARP, wid = tv / WARP;
     const bool isv = wid >= 4;
@@ -462,66 +465,82 @@ __device__ __forceinline__ void attn_ws4g_impl(const float *q, const KvArgs &kv,
     ws4g_stage<F>(raw, Ks, Vt, b0, b1, isv, tq);
     ws4g_load<F>(raw, kv, tb, b0 + min(1, nch - 1) * AW_K, b1, g, n_kv, isv, tq);
     float8 o[CG][NDT];
-    float m[CG], l[CG];
 #pragma unroll
-    for (int c = 0; c < CG; ++c) {
+    for (int c = 0; c < CG; ++c)
 #pragma unroll
         for (int j = 0; j < NDT; ++j) o[c][j] = (float8){0, 0, 0, 0, 0, 0, 0, 0};
-        m[c] = -INFINITY;
-        l[c] = 0.f;
-    }
-    // QK unit of wave w: tile w / 2, kt w % 2 (waves >= 2 CG idle)
-    const int qc = wid / 2, qkt = wid % 2;
+    // softmax state of tile wid (waves < CG): m, l and the column's position
+    float mw = -INFINITY, lw = 0.f;
+    int mpw = mp[0];
+#pragma unroll
+    for (int c = 1; c < CG; ++c) mpw = wid == c ? mp[c] : mpw;
     auto vfrag = [&](int j, int kt) { return ld_frag16(&Vt[ws4::vt_addr((NDT * wid + j) * 16 + lane % 16, kt * 16)]); };
     for (int cidx = 0; cidx < nch; ++cidx) {
         const int k0 = b0 + cidx * AW_K;
         const int kend = min(k0 + AW_K, b1) - 1;  // last key of the chunk
         const bool tail = pmin < kend;            // some row has keys of this chunk past its position
         ws4_lds_barrier();                        // LB0: Ks / Vt (and Qs) of the chunk written
-        float8 scr = (float8){0, 0, 0, 0, 0, 0, 0, 0};
-        if (qc < CG)
-            scr = aw_qk_chain(scr, &Qs[qc * 16 + lane % 16][0], [&](int st) { return ld_frag16(&Ks[qkt * 16 + lane % 16][16 * st]); });
-        if constexpr (kAlias) ws4_lds_barrier();  // Ks reads done (Sc overwrites Ks)
-        if (qc < CG) {
-            float *sp = Sc + qc * ws4::kScSize;
-            *(float4 *)&sp[ws4::sc_addr(qkt, lane, 0)] = (float4){scr[0], scr[1], scr[2], scr[3]};
-            *(float4 *)&sp[ws4::sc_addr(qkt, lane, 4)] = (float4){scr[4], scr[5], scr[6], scr[7]};
-        }
-        ws4_lds_barrier();  // LB1: Sc written
-        // softmax of tile c once, in wave c (its m, l live there); p (f16) and alpha go to LDS
-#pragma unroll
-        for (int c = 0; c < CG; ++c) {
-            if (wid != c) continue;
+        // QK + softmax of tile c in wave c (its m, l live there): the two kt chains of aw_qk_chain
+        // interleaved (one Q fragment load per st for both; each chain's order unchanged)
+        half8 ptw[AW_K / 16];
+        float alphaw = 0.f;
+        if (wid < CG) {  // one code copy: the tile is wid (wave-uniform)
             float8 sc[AW_K / 16];
-            const float *sp = Sc + c * ws4::kScSize;
 #pragma unroll
-            for (int kt = 0; kt < AW_K / 16; ++kt) {
-                const float4 a = *(const float4 *)&sp[ws4::sc_addr(kt, lane, 0)];
-                const float4 b = *(const float4 *)&sp[ws4::sc_addr(kt, lane, 4)];
-                sc[kt] = (float8){a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+            for (int kt = 0; kt < AW_K / 16; ++kt) sc[kt] = (float8){0, 0, 0, 0, 0, 0, 0, 0};
+            const _Float16 *qrow = &Qs[wid * 16 + lane % 16][0];
+#pragma unroll WS4G_QK_UNROLL
+            for (int st = 0; st < AW_D / 16; ++st) {
+                const half16 qb = ld_frag16(qrow + 16 * st);
+#pragma unroll
+                for (int kt = 0; kt < AW_K / 16; ++kt) sc[kt] = WMMA16(ld_frag16(&Ks[kt * 16 + lane % 16][16 * st]), qb, sc[kt]);
             }
-            half8 pt[AW_K / 16];
             // tail chunk: rows before the chunk keep m, l (select)
-            float m2 = m[c], l2 = l[c];
-            const float alpha = aw_softmax_step(sc, pt, k0, lane, mp[c], b1, scale, m2, l2);
-            if (WS4G_NOTAIL || !tail || k0 <= mp[c]) {
-                m[c] = m2;
-                l[c] = l2;
+            float m2 = mw, l2 = lw;
+            alphaw = aw_softmax_step(sc, ptw, k0, lane, mpw, b1, scale, m2, l2);
+            if (WS4G_NOTAIL || !tail || k0 <= mpw) {
+                mw = m2;
+                lw = l2;
             }
+        }
+        if constexpr (kAlias) ws4_lds_barrier();  // every wave's Ks reads done (Ps / As overwrite Ks)
+        if (wid < CG) {
 #pragma unroll
-            for (int kt = 0; kt < AW_K / 16; ++kt) *(half8 *)&Ps[(c * 2 + kt) * 32 * 8 + lane * 8] = pt[kt];
-            if (lane < 16) As[c * 16 + lane] = alpha;  // same in both half-waves (m, mx reduced over lane ^ 16)
+            for (int kt = 0; kt < AW_K / 16; ++kt) *(half8 *)&Ps[(wid * 2 + kt) * 32 * 8 + lane * 8] = ptw[kt];
+            if (lane < 16) As[wid * 16 + lane] = alphaw;  // same in both half-waves (m, mx reduced over lane ^ 16)
         }
         ws4_lds_barrier();  // LBP: p, alpha written
+        if (WS4G_NOTAIL || !tail) {
+            // P.V: each V^T fragment loaded once for every tile; per column (and 16-dim tile) the
+            // operations of aw_pv in its order: o * alpha, then WMMA kt 0, then kt 1
+#pragma unroll
+            for (int c = 0; c < CG; ++c) {
+                const float alpha = As[c * 16 + lane % 16];
+#pragma unroll
+                for (int j = 0; j < NDT; ++j)
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) o[c][j][v] *= alpha;
+            }
+#pragma unroll
+            for (int kt = 0; kt < AW_K / 16; ++kt) {
+                half16 pb[CG];
+#pragma unroll
+                for (int c = 0; c < CG; ++c) pb[c] = join_halves(*(const half8 *)&Ps[(c * 2 + kt) * 32 * 8 + lane * 8], lane);
+#pragma unroll
+                for (int j = 0; j < NDT; ++j) {
+                    const half16 a = vfrag(j, kt);
+#pragma unroll
+                    for (int c = 0; c < CG; ++c) o[c][j] = WMMA16(a, pb[c], o[c][j]);
+                }
+            }
+        } else {
 #pragma unroll
         for (int c = 0; c < CG; ++c) {
             half8 pt[AW_K / 16];
 #pragma unroll
             for (int kt = 0; kt < AW_K / 16; ++kt) pt[kt] = *(const half8 *)&Ps[(c * 2 + kt) * 32 * 8 + lane * 8];
             const float alpha = As[c * 16 + lane % 16];
-            if (WS4G_NOTAIL || !tail) {
-                aw_pv<NDT>(o[c], alpha, pt, lane, vfrag);
-            } else {
+            {
                 // tail chunk: rows before the chunk are skipped (kept by select), rows ending
                 // inside it take the variant P.V (keys past the row's position zeroed in V^T)
                 const bool act = k0 <= mp[c];
@@ -558,8 +577,9 @@ __device__ __forceinline__ void attn_ws4g_impl(const float *q, const KvArgs &kv,
                 }
             }
         }
+        }
         if (cidx + 1 < nch) {
-            ws4_lds_barrier();  // LB2: Vt, Sc read
+            ws4_lds_barrier();  // LB2: Vt, Ps read
             ws4g_stage<F>(raw, Ks, Vt, k0 + AW_K, b1, isv, tq);
             // unconditional (a load under a branch is waited for at the join); past the last
             // chunk it reloads the last one (L2), never used
@@ -570,8 +590,8 @@ __device__ __forceinline__ void attn_ws4g_impl(const float *q, const KvArgs &kv,
     for (int c = 0; c < CG; ++c) {
         if (!cvalid[c]) continue;
         if (wid == c && lane < 16) {  // the tile's softmax wave
-            part_ml[ct[c] * ml_q + ((size_t)split * n_head + ch[c]) * 2 + 0] = m[c];
-            part_ml[ct[c] * ml_q + ((size_t)split * n_head + ch[c]) * 2 + 1] = l[c];
+            part_ml[ct[c] * ml_q + ((size_t)split * n_head + ch[c]) * 2 + 0] = mw;
+            part_ml[ct[c] * ml_q + ((size_t)split * n_head + ch[c]) * 2 + 1] = lw;
         }
         if (mp[c] < b0) continue;  // split past the row: (-inf, 0), no acc (as the solo run)
         float *pa = part_acc + ct[c] * acc_q + ((size_t)split * n_head + ch[c]) * AW_D;
