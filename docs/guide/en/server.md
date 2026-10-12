@@ -28,7 +28,7 @@ model and GPU on disk).
 | `--ctx-per-slot N` | per-request context limit | 131,072 (max 262,144) |
 | `--mtp-drafts N` | MTP draft cap 1–10 | dense: automatic, cap 8; MoE: 1 |
 | `--decode-min-tps N` | decode floor per streaming request while others prefill ([§6](#batching)); 0 = off | 20 |
-| `--kv-ram-mb N` | pinned RAM KV tier size; 0 disables RAM and SSD tiers | 1/4 of physical RAM within [max(8 GiB, one full f16 session + checkpoints), 32 GiB], at most half of the RAM available at startup; 16 GiB on a 64 GB PC; off on integrated GPUs |
+| `--kv-ram-mb N` | pinned RAM KV tier size; 0 disables RAM and SSD tiers | 1/4 of physical RAM within [max(8 GiB, one full f16 session + checkpoints), 32 GiB], at most half of the RAM available at startup; 16 GiB on a 64 GB PC; integrated GPU (Radeon 8060S): OS-visible RAM / 8 within [one max-context entry (about 6 GiB for the 27B model at 262k), 16 GiB], at most 1/4 of the RAM available at startup, off under 32 GB of OS-visible RAM (the BIOS VRAM carve-out does not count; 8 GiB on a 64 GB machine) |
 | `--kv-ssd-dir` / `--kv-ssd-gb N` | SSD tier directory / size cap; 0 GB disables SSD | per-user local app-data directory / 64 |
 | `--kv-ssd-mode always\|shutdown\|off` | when the SSD tier writes (shutdown = only on a graceful stop; off = no SSD files) | always |
 | `--log-file` | log file (also printed to the console) | per-user local app-data directory |

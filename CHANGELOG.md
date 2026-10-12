@@ -5,6 +5,11 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## Unreleased (0.2.0)
 
+### RAM and SSD tier on by default on the Radeon 8060S (TIER-8S-DEF)
+
+- On integrated GPUs the host RAM tier of the prefix cache (and with it the SSD tier, mode `shutdown`) is **on by default**; it used to be off because the KV pool "already lives in system memory". On Windows the BIOS splits the VRAM carve-out (the KV pool) from the OS RAM, so the tier is separate pinned OS memory and a restore is a real copy. Measured on the 8060S (Qwen3.8-27B Q4_K_M, balance): a 128k session restores in 0.34 s from the RAM tier and 2 s from the SSD tier after a restart, against 537 s of prefill; decode speed unchanged (`audit/TIER-8S.md`).
+- Size rule (OS-visible RAM only, the carve-out does not count): `clamp(OS-visible RAM / 8, one max-context entry (about 6 GiB for 27B at 262k), 16 GiB)`, at most 1/4 of the RAM available at startup; off under 32 GB of OS-visible RAM. 8 GiB on a 64 GB machine. The startup log shows the size and the reason. `--kv-ram-mb` / `WHIRL_KV_RAM_MB` still override, `--kv-ram-mb 0` turns both host tiers off, `--kv-ssd-gb 0` / `--kv-ssd-mode off` only the SSD tier. Discrete GPUs are unchanged.
+
 ### Fast-mode concurrency (conc8s)
 
 - GPUs without replay kernels (Radeon 8060S) now use the same relaxacc draft caps as the R9700 ({8, 7, 4, 3} for 1-4 slots, 14 snapshot sets, +0.9 GiB), so concurrent fast requests match solo ones in the gate; fast concurrent == solo is best effort, not guaranteed (documented). The server gate's concurrency check runs fast mode with `WHIRL_RELAX=0` and only reports the relax-on result.

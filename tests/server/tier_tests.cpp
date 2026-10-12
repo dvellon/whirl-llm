@@ -835,14 +835,65 @@ static void testRamTierSize() {
         in.integrated = true;
         CHECK(ramTierSize(in).mb == 512);  // explicit wins on an integrated GPU too
     }
-    // integrated GPU (UMA): off by default
+    // integrated GPU (UMA): OS-visible RAM / 8, in [one entry, 16 GiB], <= 1/4 of available, off < 32 GB
     {
+        const auto ig = [](std::uint64_t total, std::uint64_t avail, std::uint64_t entry_mb = 6144) {
+            RamTierInput in;
+            in.total_phys = total;
+            in.avail_phys = avail;
+            in.entry_mb = entry_mb;
+            in.floor_mb = std::max<std::uint64_t>(8192, entry_mb);  // the discrete floor must not leak in
+            in.integrated = true;
+            return ramTierSize(in);
+        };
+        CHECK(ig(68341796864ull, 45 * G).mb == 8192);  // the 8060S box: 63.65 GiB visible -> 8 GiB
+        CHECK(!ig(68341796864ull, 45 * G).avail_limited);
+        CHECK(ig(68341796864ull, 45 * G).reason.find("1/8") != std::string::npos);
+        CHECK(ig(96 * G, 80 * G).mb == 12288);
+        CHECK(ig(128 * G, 120 * G).mb == 16384);
+        CHECK(ig(256 * G, 250 * G).mb == 16384);  // cap
+        CHECK(ig(256 * G, 250 * G).reason.find("capped") != std::string::npos);
+        // floor: one max-context entry
+        CHECK(ig(34 * G, 30 * G).mb == 6144);  // 34/8 = 4.25 -> 4 GiB, raised to 6
+        CHECK(ig(34 * G, 30 * G).reason.find("max-context entry") != std::string::npos);
+        CHECK(ig(34 * G, 30 * G, 7168).mb == 7168);
+        CHECK(ig(256 * G, 250 * G, 20480).mb == 20480);  // floor beats the cap
+        // availability: at most 1/4 of the RAM available at startup (whole GiB)
+        CHECK(ig(64 * G, 24 * G).mb == 6144 && ig(64 * G, 24 * G).avail_limited);
+        CHECK(ig(64 * G, 32 * G).mb == 8192 && !ig(64 * G, 32 * G).avail_limited);
+        CHECK(ig(64 * G, 30 * G).mb == 7168 && ig(64 * G, 30 * G).avail_limited);
+        CHECK(ig(64 * G, 20 * G).mb == 5120);  // also below the entry floor: paging is worse
+        CHECK(ig(64 * G, 20 * G).reason.find("1/4 of the") != std::string::npos);
+        CHECK(ig(64 * G, 3 * G).mb == 0 && ig(64 * G, 3 * G).avail_limited);  // 1/4 under 1 GiB: off
+        CHECK(ig(64 * G, 0).mb == 8192);  // availability unknown: no cap
+        // under 32 GB of OS-visible RAM: off, with the reason
+        CHECK(ig(16 * G, 12 * G).mb == 0);
+        CHECK(ig(24 * G, 20 * G).mb == 0);
+        CHECK(ig(24 * G, 20 * G).reason.find("under 32 GB") != std::string::npos);
+        CHECK(ig(31999999999ull, 30 * G).mb == 0);
+        CHECK(ig(32 * G, 28 * G).mb == 6144);          // a "32 GB" machine (32 GiB visible): 4 GiB -> entry floor 6
+        CHECK(ig(32000000000ull, 28 * G).mb == 6144);  // exactly 32 GB: on
+        CHECK(ig(0, 0).mb == 0);                       // unknown RAM: off
+        // explicit wins on an integrated GPU, also under 32 GB; 0 turns it off
         RamTierInput in;
         in.total_phys = 128 * G;
         in.avail_phys = 100 * G;
         in.integrated = true;
-        CHECK(ramTierSize(in).mb == 0);
-        CHECK(ramTierSize(in).reason.find("integrated") != std::string::npos);
+        in.entry_mb = 6144;
+        in.explicit_mb = 0;
+        CHECK(ramTierSize(in).mb == 0 && ramTierSize(in).reason.find("--kv-ram-mb") != std::string::npos);
+        in.explicit_mb = 4096;
+        in.total_phys = 16 * G;
+        CHECK(ramTierSize(in).mb == 4096);
+        in.explicit_mb = 30000;
+        in.avail_phys = 8 * G;
+        CHECK(ramTierSize(in).mb == 30000);
+        // the discrete rule is unchanged by entry_mb
+        RamTierInput d;
+        d.total_phys = 64 * G;
+        d.avail_phys = 60 * G;
+        d.entry_mb = 6144;
+        CHECK(ramTierSize(d).mb == 16384);
     }
 }
 
