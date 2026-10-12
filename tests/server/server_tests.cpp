@@ -2753,6 +2753,10 @@ void testFrCrossOrigin() {
 
 // P2-5: --draft dflash without DeltaNet replay (gfx1151 / 8060S): drafts are produced, output unchanged
 void testFrDFlashNoReplay() {
+    CHECK_EQ(literalSnapSets(15, std::nullopt), 15u);
+    CHECK_EQ(literalSnapSets(7, 10u), 10u);
+    CHECK_EQ(literalSnapSets(7, 99u), qwen35::gdn_max_snap);
+    CHECK_EQ(literalSnapSets(0, std::nullopt), 1u);
     for (bool ngram : {false, true}) {
         ServerSetup su = dflashSetup(ngram);
         su.mc.replay = false;

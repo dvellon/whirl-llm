@@ -849,6 +849,25 @@ int serveMain(int argc, char** argv, const char* program) {
             for (std::uint32_t k = 1; k <= opt.parallel; ++k) tbl += (k > 1 ? ", " : "") + std::to_string(std::min(batch_drafts[k], drafts));
             logI("MTP under load, DeltaNet snapshot sets: max drafts per cycle with 1..{} decoding slots: {{ {} }}; {} snapshot sets ({} for n-gram drafts)",
                  opt.parallel, tbl, model.snap_sets, lit_snap_sets > 0 ? std::to_string(lit_snap_sets) : std::string("all"));
+        } else if (use_dflash && !model.gdn_replay) {
+            // FR-SRV P2-5: without replay the literal drafts need snapshot sets (before the KV pool is sized)
+            std::optional<std::uint32_t> snap_env;
+            if (auto v = env("SNAP_SETS")) {
+                try {
+                    snap_env = static_cast<std::uint32_t>(std::stoul(*v));
+                } catch (const std::exception&) {
+                    logW("WHIRL_SNAP_SETS={} is not a number (ignored)", *v);
+                }
+            }
+            const std::uint32_t max_lit = std::max(model.dfr->block - 1, envOn("NGRAM", true) ? qwen35::max_ng_drafts : 0u);
+            model.ensureSnapshots(literalSnapSets(std::min(max_lit, qwen35::gdn_max_snap), snap_env));
+            std::uint64_t gdn_layers = 0;
+            for (std::uint32_t li = 0; li < cfg.n_layer; ++li)
+                if (model.ssm_state[li] != 0) ++gdn_layers;
+            logI("DeltaNet verify: no replay kernels: {} snapshot sets of {:.1f} MiB for DFlash2 / n-gram drafts (up to {} drafts "
+                 "per cycle over all decoding slots)",
+                 model.snap_sets,
+                 static_cast<double>(gdn_layers * (model.convBytes() + model.ssmBytes())) / (1024.0 * 1024.0), model.snap_sets);
         }
 
         // engine (checkpoint buffers, shared checkpoints, sampling buffers)

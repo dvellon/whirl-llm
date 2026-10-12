@@ -128,6 +128,13 @@ Engine::Engine(ServerModel& model, tier::DeviceOps& ops, const Tokenizer& tok, c
     ssm_bytes_ = m_.ssmBytes();
     vrows_ = std::clamp(m_.verifyRows(), max_small_batch, qwen35::max_verify_rows);
     if (opt_.ngram && opt_.use_mtp) crlf_norm_ = ChatTokens::crlfToLf(tok_);
+    // FR-SRV P2-5: --draft dflash without DeltaNet replay: literal drafts are capped by the snapshot
+    // sets that exist, so none allocated = no draft ever (server_main allocates them before sizing
+    // the KV pool; this covers every other caller)
+    if (opt_.use_dflash && !m_.gdnReplay() && m_.snapSets() == 0) {
+        m_.ensureSnapshots(std::max<std::uint32_t>(m_.dflashMaxDrafts(), 1));
+        logI("DFlash2 without DeltaNet replay: {} snapshot sets for literal drafts", m_.snapSets());
+    }
     floor_.configure(opt_.decode_min_tps);
     floor_epoch_ = Clock::now();
 }
