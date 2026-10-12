@@ -50,4 +50,15 @@ inline SnapDraftCaps snapshotDraftCaps(const std::array<std::uint32_t, qwen35::g
     return r;
 }
 
+// FR-SRV P2-5: snapshot sets for the literal drafts (DFlash2 blocks, n-gram) with --draft dflash
+// when the DeltaNet verify keeps snapshots (no replay: gfx1151 / Radeon 8060S, WHIRL_GDN_REPLAY=0).
+// The engine caps literal drafts by the sets that exist, and the model only allocates sets for the
+// drafts of the verify at hand: with none allocated up front no draft was ever made. Enough for one
+// full block (max_literal = block - 1), WHIRL_SNAP_SETS raises it, at most gdn_max_snap.
+inline std::uint32_t literalSnapSets(std::uint32_t max_literal, std::optional<std::uint32_t> snap_env) {
+    std::uint32_t n = std::max<std::uint32_t>(max_literal, 1);
+    if (snap_env) n = std::max(n, *snap_env);
+    return std::min(qwen35::gdn_max_snap, n);
+}
+
 }  // namespace whirl::server

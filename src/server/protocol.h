@@ -30,6 +30,9 @@ std::size_t partialHold(std::string_view text, std::string_view pat);
 std::size_t validUtf8Prefix(std::string_view s);
 // Invalid UTF-8 replaced by U+FFFD.
 std::string sanitizeUtf8(std::string_view s);
+// Streaming: s grew since the complete-text end `from` (a value this function returned before, or 0).
+// Returns the new end of the complete text: s up to it is what may be sent.
+std::size_t sanitizeUtf8Prefix(std::string& s, std::size_t from);
 // "..." with Python json.dumps(ensure_ascii=False) escaping.
 void appendJsonStr(std::string& out, std::string_view s);
 // Shortest round-trip decimal (no exponent); NaN / inf -> null.
@@ -54,6 +57,10 @@ struct Params {
     bool cache_prompt = true;   // llama.cpp extension
 };
 
+// Stop strings per request and bytes per stop string (more -> HTTP 400)
+constexpr std::size_t max_stop_strings = 16;
+constexpr std::size_t max_stop_bytes = 256;
+
 // Throws RequestError. `think` / `chat` select the model-card defaults for
 // non-thinking chat (temperature 0.7, top_p 0.8).
 Params parseParams(const json::Object& obj, bool think, bool chat);
@@ -75,6 +82,7 @@ struct Out {
         std::string_view content;
         std::optional<std::string_view> tool;
         bool stopped = false;
+        std::size_t stop_end = 0;  // stopped: byte offset in text just past the matched stop string
     };
     View view(bool final) const;
 };
@@ -87,6 +95,15 @@ struct ToolCall {
 // <tool_call> blocks in the Qwen3.x XML function format or as JSON objects
 // {"name", "arguments"}. nullopt when nothing parses.
 std::optional<std::vector<ToolCall>> parseToolCalls(std::string_view region, const json::Array& tools);
+
+// The final message of a generation: tool calls (finish_reason tool_calls) or the tool region kept
+// as text. reason_in: why the generation ended (stop / length; a matched stop string is "stop").
+struct ToolResolution {
+    std::optional<std::vector<ToolCall>> calls;
+    std::string content;
+    std::string reason;
+};
+ToolResolution resolveTools(const Out::View& v, std::string_view reason_in, const json::Array& tools);
 
 // ---- timings / usage / HTTP
 
@@ -105,7 +122,8 @@ void writeUsage(std::string& out, std::uint32_t n_prompt, const Timings& t);
 const char* statusText(int status);
 // Complete HTTP/1.1 response with Content-Length and Connection: close.
 std::string httpResponse(int status, std::string_view ctype, std::string_view body);
-std::string errorResponse(int status, std::string_view msg);
+// extra_headers: complete header lines (each ending in CRLF), e.g. "Retry-After: 5\r\n"
+std::string errorResponse(int status, std::string_view msg, std::string_view extra_headers = {});
 
 // Random id: prefix + n chars of [a-zA-Z0-9].
 std::string randomId(std::string_view prefix, std::size_t n, std::uint64_t (*next)(void*), void* ctx);

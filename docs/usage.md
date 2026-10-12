@@ -220,7 +220,8 @@ request slots, a prefix cache in VRAM and host RAM / SSD tiers for idle sessions
 | `--vis-mode M` | `auto` (default), `resident` (encoder weights in VRAM), `stream` (layer by layer) |
 | `--vis-cache-mb N` | host cache of image embeddings, keyed by content hash, MiB (default 1024) |
 | `--allow-local-images` | also accept local file paths / `file://` URLs as image sources (off by default; `http(s)` image URLs are never fetched) |
-| `--cors-origin ORIGIN` | let web pages from `ORIGIN` (e.g. `https://app.example.com`) call the server from a browser; repeatable. By default only pages served from `http(s)://localhost`, `127.0.0.1` or `[::1]` (any port) get CORS headers (their `Origin` is echoed back, never `*`); other web pages, including `file://` pages, cannot read responses. `*` restores the behaviour before v0.1.4 (`Access-Control-Allow-Origin: *` for every page). Non-browser clients (SDKs, curl, IDE agents) are not affected |
+| `--cors-origin ORIGIN` | let web pages from `ORIGIN` (e.g. `https://app.example.com`) call the server from a browser; repeatable. By default only pages served from `http(s)://localhost`, `127.0.0.1` or `[::1]` (any port) get CORS headers (their `Origin` is echoed back, never `*`); other web pages, including `file://` pages, cannot read responses. `*` restores the behaviour before v0.1.4 (`Access-Control-Allow-Origin: *` for every page). A `POST` from a page whose `Origin` is not allowed is refused with 403 (it is not run), including "simple" `text/plain` requests that need no preflight. Non-browser clients (SDKs, curl, IDE agents) send no `Origin` and are not affected. Local image files (`--allow-local-images`) are never read for a request from a web page other than a localhost page, whatever `--cors-origin` allows |
+| `--allow-host NAME` | also answer requests whose `Host` header is `NAME` (repeatable; `*` = any). By default the server answers `localhost`, `127.0.0.1`, `[::1]` and the `--host` address (any IP address with `--host 0.0.0.0`); other names get 403. This blocks DNS rebinding (a web page whose own domain is made to resolve to 127.0.0.1). Use it when clients reach the server by a host name, e.g. `--host 0.0.0.0 --allow-host mypc.lan` |
 | `--log-file PATH` | log file (default `%LOCALAPPDATA%\whirl\server.log`); the log also goes to the console |
 | `-h`, `--help` / `-V`, `--version` | help / version |
 
@@ -266,8 +267,9 @@ Request parameters: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `max_token
 `preserve_thinking`. Without sampling parameters the model card's recommended values apply. With
 `temperature` 0 the output equals `whirl chat` token for token. `presence_penalty` /
 `frequency_penalty` are accepted but ignored; `n` must be 1; `logprobs`, `response_format` and
-enforced `tool_choice: "required"` are not supported. Responses add `usage.cached_tokens` and a
-llama.cpp-style `timings` object. Details: [server.md](guide/en/server.md#sampling).
+enforced `tool_choice: "required"` are not supported. `stop` takes at most 16 strings of at most
+256 bytes each (more: HTTP 400); a `temperature` below 0.001 is greedy. Responses add
+`usage.cached_tokens` and a llama.cpp-style `timings` object. Details: [server.md](guide/en/server.md#sampling).
 
 Thinking and reasoning effort can be given in any of these forms (applied in this order; a later one
 overrides an earlier one): `chat_template_kwargs.{enable_thinking, reasoning_effort}`, the

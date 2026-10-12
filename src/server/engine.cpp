@@ -127,7 +127,15 @@ Engine::Engine(ServerModel& model, tier::DeviceOps& ops, const Tokenizer& tok, c
     conv_bytes_ = m_.convBytes();
     ssm_bytes_ = m_.ssmBytes();
     vrows_ = std::clamp(m_.verifyRows(), max_small_batch, qwen35::max_verify_rows);
-    if (opt_.ngram && opt_.use_mtp) crlf_norm_ = ChatTokens::crlfToLf(tok_);
+    // FR-SRV P3-9: n-gram drafts run with MTP and with DFlash2
+    if (opt_.ngram && (opt_.use_mtp || opt_.use_dflash)) crlf_norm_ = ChatTokens::crlfToLf(tok_);
+    // FR-SRV P2-5: --draft dflash without DeltaNet replay: literal drafts are capped by the snapshot
+    // sets that exist, so none allocated = no draft ever (server_main allocates them before sizing
+    // the KV pool; this covers every other caller)
+    if (opt_.use_dflash && !m_.gdnReplay() && m_.snapSets() == 0) {
+        m_.ensureSnapshots(std::max<std::uint32_t>(m_.dflashMaxDrafts(), 1));
+        logI("DFlash2 without DeltaNet replay: {} snapshot sets for literal drafts", m_.snapSets());
+    }
     floor_.configure(opt_.decode_min_tps);
     floor_epoch_ = Clock::now();
 }
@@ -313,6 +321,16 @@ Engine::Stats Engine::stats() const {
     s.dfl_accepted = stat_dfl_accepted_;
     s.dfl_cold = stat_dfl_cold_;
     s.dfl_gap = stat_dfl_gap_;
+    return s;
+}
+
+Engine::Stats Engine::statsShared() const {
+    Stats s;
+    s.ssd_written = stat_ssd_written_.load(std::memory_order_relaxed);
+    s.ssd_dedup = stat_ssd_dedup_.load(std::memory_order_relaxed);
+    s.ssd_used = stat_ssd_used_.load(std::memory_order_relaxed);
+    s.ssd_entries = stat_ssd_entries_.load(std::memory_order_relaxed);
+    s.superseded = stat_superseded_.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -1155,9 +1173,11 @@ bool Engine::emit(Slot& sl, std::uint32_t t) {
 }
 
 void Engine::flushOut(Slot& sl) {
-    if (sl.st.push(sl.out, std::span<const std::uint32_t>(sl.batch.data(), sl.n_batch))) {
+    std::uint32_t n_after = 0;
+    if (sl.st.push(sl.out, std::span<const std::uint32_t>(sl.batch.data(), sl.n_batch), &n_after)) {
         sl.done = true;
         sl.stopped_str = true;
+        sl.n_after_stop = n_after;
     }
     sl.n_batch = 0;
 }
@@ -1176,7 +1196,7 @@ bool Engine::startJob(Slot& sl, Job& job) {
     }
     const std::uint32_t room = ctx_ - N - nd_max - 2;
     sl.max_tokens = std::min(p.max_tokens.value_or(room), room);
-    sl.greedy = p.temperature <= 0;
+    sl.greedy = p.temperature <= 0 || !std::isfinite(1.0f / p.temperature);
     sl.ignore_eos = p.ignore_eos;
     sl.n_prompt = N;
     std::uint64_t seed = p.seed;
@@ -1341,6 +1361,8 @@ bool Engine::startJob(Slot& sl, Job& job) {
     sl.finish = "length";
     sl.done = false;
     sl.stopped_str = false;
+    sl.pool_cut = false;
+    sl.n_after_stop = 0;
     sl.cycles = 0;
     sl.drafted = 0;
     sl.accepted = 0;
@@ -1741,8 +1763,12 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
         const bool room_ok = sl->pos + nd_room + 1 < ctx_ && ensurePages(*sl, sl->pos + nd_room + 2);
         if (!room_ok) {
             if (sl->pos + nd_room + 1 < ctx_)
-                logW("req {} | slot {} | kv pool exhausted at {} tokens (every page belongs to a running request)",
+            {
+                logW("req {} | slot {} | kv pool exhausted at {} tokens (every page belongs to a running request); "
+                     "finish_reason length, finish_cause kv_pool_exhausted",
                      sl->reqId(), sl->id, sl->pos);
+                sl->pool_cut = true;
+            }
             sl->finish = "length";
             sl->logits_ok = false;  // other work ran since its last cycle
             finishJob(*sl);
@@ -2076,6 +2102,7 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
     stat_rows_ += rows;
     stat_slots_ += A;
     stat_drafts_ += nd;
+    for (std::size_t k = 0; k < A; ++k) stat_lit_drafts_ += ng_n[k];
 
     for (std::size_t k = 0; k < A; ++k) {
         Slot& sl = *act[k];
@@ -2338,27 +2365,30 @@ void Engine::finishJob(Slot& sl) {
     ops_.streamSync(m_.stream());
 
     // ---- final output
-    const Final fin = sl.st.finish(sl.out, sl.finish);
+    Final fin = sl.st.finish(sl.out, sl.finish);
+    if (sl.pool_cut && fin.reason == "length") fin.cause = "kv_pool_exhausted";
     const double tot_ms = msSince(sl.tp0);
     const std::uint32_t n_new = N - sl.reuse;
     Timings tim;
     tim.cache_n = sl.reuse;
     tim.prompt_n = n_new;
     tim.prompt_ms = sl.prompt_ms;
-    tim.predicted_n = sl.n_gen;
+    // FR-SRV P3-7: tokens generated after the stop string in the same cycle are not completion tokens
+    const std::uint32_t n_out = sl.n_gen - std::min(sl.n_gen, sl.n_after_stop);
+    tim.predicted_n = n_out;
     tim.predicted_ms = gen_ms;
     tim.draft_n = sl.drafted;
     tim.draft_n_accepted = sl.accepted;
     sl.st.end(sl.out, fin, tim, N);
 
     // ---- summary (llama.cpp style)
-    const double pn = n_new, gn = sl.n_gen;
+    const double pn = n_new, gn = n_out;
     logI("req {} | slot {} | prompt eval time = {:>10.2f} ms / {:>5} tokens ({:>8.2f} ms per token, {:>8.2f} tokens per second)",
          job.id, sl.id, sl.prompt_ms, n_new, n_new > 0 ? sl.prompt_ms / pn : 0.0,
          sl.prompt_ms > 0 ? pn * 1000.0 / sl.prompt_ms : 0.0);
     logI("req {} | slot {} |        eval time = {:>10.2f} ms / {:>5} tokens ({:>8.2f} ms per token, {:>8.2f} tokens per second)",
-         job.id, sl.id, gen_ms, sl.n_gen, sl.n_gen > 0 ? gen_ms / gn : 0.0, gen_ms > 0 ? gn * 1000.0 / gen_ms : 0.0);
-    logI("req {} | slot {} |       total time = {:>10.2f} ms / {:>5} tokens", job.id, sl.id, tot_ms, n_new + sl.n_gen);
+         job.id, sl.id, gen_ms, n_out, n_out > 0 ? gen_ms / gn : 0.0, gen_ms > 0 ? gn * 1000.0 / gen_ms : 0.0);
+    logI("req {} | slot {} |       total time = {:>10.2f} ms / {:>5} tokens", job.id, sl.id, tot_ms, n_new + n_out);
     if (opt_.use_mtp) {
         logI("req {} | slot {} | MTP: drafted {}, accepted {}, acceptance rate {:.1f}%, {:.2f} tokens per cycle ({} verify "
              "cycles)",
@@ -2374,7 +2404,7 @@ void Engine::finishJob(Slot& sl) {
              sl.sm.full_used);
     logI("req {} | slot {} | finish_reason {}{}, completion {} tok, reasoning {} B, content {} B, tool_calls {}, cache now {} "
          "tok",
-         job.id, sl.id, fin.reason, sl.st.gone ? " (client disconnected)" : "", sl.n_gen, fin.reason_len, fin.content_len,
+         job.id, sl.id, fin.reason, sl.st.gone ? " (client disconnected)" : "", n_out, fin.reason_len, fin.content_len,
          fin.n_tools, sl.cache_tokens.size());
     releaseSlot(sl);
     // item G: copy the idle slot's new content to the host tier (async)
@@ -3004,11 +3034,17 @@ void Engine::failSlot(Slot& sl, const std::string& err) {
     Job* job = sl.job;
     if (!job) return;
     if (sl.restore != nullptr && sl.phase != Phase::restore) finishTail(sl, true);
-    logE("req {} | slot {} | failed: {} ({})", job->id, sl.id, err, ops_.lastErrorString());
+    // FR-SRV P2-3: the KV pool ran out while prefilling (decoding requests grew into the pages the
+    // admission counted on): a retryable 503, never a 500
+    const bool pool_full = err == "KvPoolFull" && sl.phase != Phase::decode;
+    if (pool_full) logW("req {} | slot {} | KV pool full during prefill: answered 503 (retry later)", job->id, sl.id);
+    else logE("req {} | slot {} | failed: {} ({})", job->id, sl.id, err, ops_.lastErrorString());
     if (sl.phase == Phase::decode && job->params.stream) {
         sl.st.fail();
     } else {
-        const std::string r = errorResponse(500, err);
+        const std::string r = pool_full ? errorResponse(503, "the KV cache pool is full (other requests hold every page); retry later",
+                                                        "Retry-After: 5\r\n")
+                                        : errorResponse(500, err);
         if (job->w) {
             job->w->write(r);
             job->w->flush();
@@ -3016,6 +3052,63 @@ void Engine::failSlot(Slot& sl, const std::string& err) {
     }
     dropCache(sl);
     releaseSlot(sl);
+}
+
+std::size_t Engine::pagesFor(std::uint64_t n_tok) const {
+    return static_cast<std::size_t>((n_tok + draftRoom() + 2 + kv_page - 1) / kv_page);
+}
+
+std::size_t Engine::poolAvailable() const {
+    std::size_t n = free_pages_.size(), owed = 0;
+    for (const QBatch& q : quarantine_) n += q.pages.size();
+    auto own = [&](const std::vector<std::int32_t>& pages) {
+        for (std::int32_t pg : pages)
+            if (page_ref_[static_cast<std::size_t>(pg)] == 1) ++n;
+    };
+    for (const Slot& sl : slots_) {
+        if (sl.phase == Phase::idle) {
+            own(sl.pages);  // evictable (its prefix cache is dropped)
+        } else if (sl.phase == Phase::prefill && sl.job) {
+            const std::size_t want = pagesFor(sl.n_prompt);
+            if (want > sl.pages.size()) owed += want - sl.pages.size();
+        }
+    }
+    for (const Spe& s : spes_) own(s.pages);
+    return n > owed ? n - owed : 0;
+}
+
+void Engine::reapDisconnected() {
+    if (msSince(last_reap_) < 50) return;
+    last_reap_ = Clock::now();
+    {
+        // queued: dropped without a response (nobody reads it)
+        std::lock_guard<std::mutex> lk(q_mutex_);
+        for (std::size_t i = 0; i < queue_.size();) {
+            Job* job = queue_[i];
+            if (job->w == nullptr || job->w->alive()) {
+                ++i;
+                continue;
+            }
+            logW("req {} | client disconnected while queued; request dropped", job->id);
+            queue_.erase(queue_.begin() + static_cast<std::ptrdiff_t>(i));
+            job->done = true;
+            q_cond_.notify_all();
+        }
+    }
+    for (Slot& sl : slots_) {
+        if (sl.job == nullptr || sl.job->w == nullptr || sl.st.gone) continue;
+        if (sl.phase != Phase::prefill && sl.phase != Phase::decode) continue;
+        if (sl.job->w->alive()) continue;
+        if (sl.phase == Phase::decode) {
+            sl.st.fail();  // the decode cycle finishes it ("client disconnected")
+            continue;
+        }
+        // prefilling: nothing was sent yet; the partial prefill is dropped
+        logW("req {} | slot {} | client disconnected during prefill ({} of {} prompt tokens); slot freed", sl.job->id, sl.id,
+             sl.reuse + sl.pf_off, sl.n_prompt);
+        dropCache(sl);
+        releaseSlot(sl);
+    }
 }
 
 void Engine::failJobNoSlot(Job& job) {
@@ -3049,14 +3142,19 @@ void Engine::logBatchStats(bool force) {
             else if (sl.phase == Phase::prefill || sl.phase == Phase::restore) ++n_pf;
         }
         const double cyc = static_cast<double>(std::max<std::uint64_t>(stat_cycles_, 1));
+        // FR-SRV P2-5: "drafts/cycle" is the MTP draft count; literal drafts (DFlash2 / n-gram) are
+        // reported next to it (with --draft dflash the MTP figure is always 0)
+        const std::string lit = stat_lit_drafts_ > 0
+                                    ? std::format(", {:.2f} literal drafts/cycle (DFlash2 / n-gram)", static_cast<double>(stat_lit_drafts_) / cyc)
+                                    : std::string();
         logI("batch | slots busy {}/{} (decode {}, prefill {}) | {} cycles, {:.2f} slots/cycle, {:.2f} rows/cycle, {:.2f} "
-             "drafts/cycle | aggregate tg {:.1f} tok/s, prefill {:.0f} tok/s over {:.1f} s",
+             "drafts/cycle{} | aggregate tg {:.1f} tok/s, prefill {:.0f} tok/s over {:.1f} s",
              n_dec + n_pf, slots_.size(), n_dec, n_pf, stat_cycles_, static_cast<double>(stat_slots_) / cyc,
-             static_cast<double>(stat_rows_) / cyc, static_cast<double>(stat_drafts_) / cyc,
+             static_cast<double>(stat_rows_) / cyc, static_cast<double>(stat_drafts_) / cyc, lit,
              static_cast<double>(stat_tokens_) * 1000.0 / el, static_cast<double>(stat_prefill_tok_) * 1000.0 / el, el / 1000.0);
     }
     stat_t0_ = Clock::now();
-    stat_tokens_ = stat_cycles_ = stat_rows_ = stat_slots_ = stat_drafts_ = 0;
+    stat_tokens_ = stat_cycles_ = stat_rows_ = stat_slots_ = stat_drafts_ = stat_lit_drafts_ = 0;
     if (stat_seg_batches_ > 0)
         logI("batch | segmented prefill: {} forwards, {} chunks ({:.2f} chunks/forward)", stat_seg_batches_, stat_seg_chunks_,
              static_cast<double>(stat_seg_chunks_) / static_cast<double>(stat_seg_batches_));
@@ -3069,6 +3167,19 @@ void Engine::logBatchStats(bool force) {
 
 void Engine::submitAndWait(Job& job) {
     std::unique_lock<std::mutex> lk(q_mutex_);
+    if (stop_) {
+        // FR-SRV P3-1: shutting down (the loop may be flushing the tier, or gone): nobody would run
+        // this job; answered here instead of waiting forever on a finished engine
+        n_building_.fetch_sub(1);
+        ++wake_seq_;
+        q_cond_.notify_all();
+        lk.unlock();
+        if (job.w) {
+            job.w->write(errorResponse(503, "server is shutting down"));
+            job.w->flush();
+        }
+        return;
+    }
     const std::size_t free = slots_.size() - std::min<std::size_t>(slots_.size(), n_active_);
     const std::size_t waiting = queue_.size();
     queue_.push_back(&job);
@@ -3216,12 +3327,31 @@ void Engine::runLoop() {
         const std::uint64_t wake_seq0 = wake_seq_;  // a later arrival ends this iteration's wait (below)
         std::vector<Job*> admit;
         std::size_t qi = 0;
+        std::optional<std::size_t> pool_avail;  // FR-SRV P2-3 (computed when a request is about to start)
         while (qi < queue_.size() && n_busy + admit.size() < slots_.size()) {
             // item S: a new session whose system message another request is
             // prefilling right now waits for that checkpoint
             if (waitsForSys(*queue_[qi]) || waitsForTier(*queue_[qi])) {
                 ++qi;
                 continue;
+            }
+            // FR-SRV P2-3: a prompt the KV pool cannot hold next to the running requests waits in the
+            // queue (in order: later requests wait behind it) instead of failing mid-prefill. Alone it
+            // always starts (startJob rejects a prompt larger than the whole pool).
+            {
+                if (!pool_avail) pool_avail = poolAvailable();
+                Job& qj = *queue_[qi];
+                const std::size_t need = pagesFor(qj.tokens.size());
+                if (n_busy + admit.size() > 0 && need <= pool_pages_ && need > *pool_avail) {
+                    if (!qj.pool_wait_logged) {
+                        qj.pool_wait_logged = true;
+                        logI("req {} | queued: the KV pool cannot hold this prompt next to the running requests ({} pages needed, "
+                             "{} free or evictable); it starts when they finish",
+                             qj.id, need, *pool_avail);
+                    }
+                    break;
+                }
+                *pool_avail -= std::min(*pool_avail, need);
             }
             admit.push_back(queue_[qi]);
             queue_.erase(queue_.begin() + static_cast<std::ptrdiff_t>(qi));
@@ -3277,6 +3407,7 @@ void Engine::runLoop() {
                 last_tick_ = Clock::now();
             }
         }
+        reapDisconnected();
         // ---- one prefill chunk (oldest request first), batched with other
         // prefilling requests' chunks when that is bit-identical
         const TimePoint tl2 = Clock::now();
@@ -3326,6 +3457,19 @@ void Engine::runLoop() {
                 }
                 pf_rows = prefillGroup(*pf, budget);
                 if (prof_) prof_->last_end.reset();
+                // FR-SRV P3-12: chunks of <= max_small_batch rows cannot join a segmented forward;
+                // they ran only once their request was the oldest, so a short follow-up (a few new
+                // tokens on a cached prefix) waited for a whole 128k prefill. They run now, alone
+                // (the same forward they would get later: outputs unchanged).
+                for (Slot& o : slots_) {
+                    if (&o == pf || o.phase != Phase::prefill || o.job == nullptr) continue;
+                    if (chunkLen(o) > max_small_batch) continue;
+                    try {
+                        prefillStep(o);
+                    } catch (const std::exception& ex) {
+                        failSlot(o, ex.what());
+                    }
+                }
             }
         }
         // ---- one decode cycle over every decoding slot
@@ -3375,6 +3519,14 @@ void Engine::runLoop() {
 // ---------------------------------------------------------------------------
 // response writing (stream: SSE chunks as tokens arrive; else one JSON body)
 
+// FR-SRV P3-8: a "length" that came from the KV pool, not max_tokens: an extra choice field
+// (absent otherwise; OpenAI clients ignore unknown fields)
+static void appendCause(std::string& b, const Final& f) {
+    if (f.cause.empty()) return;
+    b += ",\"finish_cause\":";
+    appendJsonStr(b, f.cause);
+}
+
 void StreamState::send(const std::string& b) {
     if (gone) return;
     if (!job->w || !job->w->write(b)) fail();
@@ -3423,10 +3575,20 @@ void StreamState::chunkEnd(std::string& b, const char* fin_reason) {
     b += "}]}\n\n";
 }
 
-bool StreamState::push(Out& out, std::span<const std::uint32_t> toks) {
-    for (std::uint32_t t : toks) out.text += e->tok_.piece(static_cast<TokenId>(t), true);
-    out.valid = validUtf8Prefix(out.text);
+bool StreamState::push(Out& out, std::span<const std::uint32_t> toks, std::uint32_t* n_after) {
+    std::array<std::size_t, 64> starts{};  // text offset where each token's piece starts
+    for (std::size_t k = 0; k < toks.size(); ++k) {
+        if (k < starts.size()) starts[k] = out.text.size();
+        out.text += e->tok_.piece(static_cast<TokenId>(toks[k]), true);
+    }
+    out.valid = sanitizeUtf8Prefix(out.text, out.valid);
     const Out::View v = out.view(false);
+    if (v.stopped && n_after) {
+        std::uint32_t n = 0;
+        for (std::size_t k = 0; k < toks.size() && k < starts.size(); ++k)
+            if (starts[k] >= v.stop_end) ++n;
+        *n_after = n;
+    }
     if (job->params.stream && !gone) {
         sendDelta(out, v);
         if (!gone && !job->w->flush()) fail();
@@ -3467,21 +3629,12 @@ Final StreamState::finish(Out& out, const std::string& reason_in) {
     out.valid = out.text.size();
     Out::View v = out.view(true);
     Final f;
-    f.reason = reason_in;
-    if (v.stopped) f.reason = "stop";
-    std::string content(v.content);
-    if (v.tool) {
-        if (auto calls = parseToolCalls(*v.tool, job->tools)) {
-            f.n_tools = calls->size();
-            f.calls = std::move(calls);
-            f.reason = "tool_calls";
-        } else {
-            // not a parsable call: keep it as text
-            std::string joined(v.content);
-            if (!v.content.empty()) joined += "\n\n";
-            joined += *v.tool;
-            content = std::string(trimRightWs(joined));
-        }
+    ToolResolution tr = resolveTools(v, reason_in, job->tools);
+    f.reason = std::move(tr.reason);
+    const std::string content = std::move(tr.content);
+    if (tr.calls) {
+        f.n_tools = tr.calls->size();
+        f.calls = std::move(tr.calls);
     }
     f.content = content;
     f.reasoning = std::string(v.reason);
@@ -3528,6 +3681,7 @@ void StreamState::end(Out& out, const Final& f, const Timings& tim, std::uint32_
         b += job->kind == JobKind::chat ? "{}" : "\"\"";
         b += ",\"logprobs\":null,\"finish_reason\":";
         appendJsonStr(b, f.reason);
+        appendCause(b, f);
         b += "}],\"usage\":";
         writeUsage(b, n_prompt, tim);
         b += ",\"timings\":";
@@ -3585,6 +3739,7 @@ void StreamState::end(Out& out, const Final& f, const Timings& tim, std::uint32_
         b += ",\"logprobs\":null,\"finish_reason\":";
     }
     appendJsonStr(b, f.reason);
+    appendCause(b, f);
     b += "}],\"usage\":";
     writeUsage(b, n_prompt, tim);
     b += ",\"timings\":";

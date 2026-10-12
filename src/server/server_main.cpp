@@ -170,7 +170,11 @@ const char* kHelpBody =
     "  --allow-local-images     also accept local file paths / file:// URLs as image sources\n"
     "  --cors-origin ORIGIN     web pages from ORIGIN (e.g. https://app.example.com) may call the server\n"
     "                           from a browser (CORS); repeatable; * = any page (the behaviour before\n"
-    "                           v0.1.4). Default: only pages on http(s)://localhost, 127.0.0.1, [::1]\n"
+    "                           v0.1.4). Default: only pages on http(s)://localhost, 127.0.0.1, [::1].\n"
+    "                           A POST from any other page is refused (403)\n"
+    "  --allow-host NAME        also answer requests whose Host header is NAME (repeatable; * = any).\n"
+    "                           Default: localhost, 127.0.0.1, [::1] and the --host address (any IP\n"
+    "                           address with --host 0.0.0.0); other names get 403 (DNS rebinding guard)\n"
     "  --log-file PATH          log file (default %LOCALAPPDATA%\\whirl\\server.log; the log also goes to\n"
     "                           the console)\n"
     "  -h, --help               this text\n"
@@ -205,6 +209,7 @@ struct Options {
     std::uint64_t vis_cache_mb = 1024;
     bool allow_local_images = false;
     std::vector<std::string> cors_origins;  // --cors-origin (repeatable)
+    std::vector<std::string> allowed_hosts;  // --allow-host (repeatable)
     std::optional<std::string> mode_spec;   // --precise / --balance[=items] / --fast[=items] / --mode M
 };
 
@@ -243,9 +248,13 @@ std::optional<std::string> env(std::string_view name) { return envGet(name); }
 std::uint32_t envU32(std::string_view name, std::uint32_t def) {
     if (auto v = env(name)) {
         try {
-            return static_cast<std::uint32_t>(std::stoul(*v));
+            std::size_t used = 0;
+            const unsigned long x = std::stoul(*v, &used);
+            if (used == v->size() && x <= 0xffffffffull) return static_cast<std::uint32_t>(x);
         } catch (const std::exception&) {
         }
+        // FR-SRV P3-10: a bad value is a warning and the default, never a startup failure
+        logW("WHIRL_{}={} is not a number; using {}", name, *v, def);
     }
     return def;
 }
@@ -406,7 +415,7 @@ int serveMain(int argc, char** argv, const char* program) {
         else if (auto vd = argValue(args, i, "--kv-ssd-delay")) opt.kv_ssd_delay = parseNum<std::uint64_t>(*vd, "--kv-ssd-delay");
         else if (auto vm = argValue(args, i, "--kv-ssd-mode")) {
             if (*vm != "always" && *vm != "shutdown" && *vm != "off")
-                throw std::runtime_error("--kv-ssd-mode: expected always, shutdown or off");
+                die("invalid --kv-ssd-mode " + *vm + " (expected always, shutdown or off)");
             opt.kv_ssd_mode = *vm;
         }
         else if (auto v12 = argValue(args, i, "--device")) opt.device = *v12;
@@ -421,6 +430,10 @@ int serveMain(int argc, char** argv, const char* program) {
             if (*v17 != "*" && v17->find("://") == std::string::npos)
                 die("invalid --cors-origin " + *v17 + " (give an origin such as https://app.example.com, or *)");
             opt.cors_origins.push_back(*v17);
+        }
+        else if (auto v18 = argValue(args, i, "--allow-host")) {
+            if (v18->empty() || v18->find_first_of(" /\\") != std::string::npos) die("invalid --allow-host " + *v18 + " (give a host name such as myhost.lan, or *)");
+            opt.allowed_hosts.push_back(*v18);
         }
         else if (!arg.empty() && arg[0] == '-') die("unknown option " + arg);
         else if (opt.path.empty()) opt.path = arg;
@@ -458,7 +471,7 @@ int serveMain(int argc, char** argv, const char* program) {
         const gguf::File f = gguf::File::open(opt.path);
         const qwen35::Config cfg = qwen35::Config::fromGguf(f);
         int dev = 0;
-        if (auto v = env("HIP_DEVICE")) dev = std::stoi(*v);
+        if (env("HIP_DEVICE")) dev = static_cast<int>(envU32("HIP_DEVICE", 0));
         else dev = qwen35::pickDevice(opt.device);
         const hip::DeviceInfo info = hip::describeDevice(dev);
         hip::setDevice(dev);
@@ -709,14 +722,14 @@ int serveMain(int argc, char** argv, const char* program) {
         if (env("NAIVE_ATTN")) model.naive_attn = true;
         if (env("GDN_SEQ")) model.gdn_chunked = false;
         if (auto v = env("MOE_BN")) model.moe_bn_force = static_cast<std::uint32_t>(std::strtoul(v->c_str(), nullptr, 10));
-        if (auto v = env("PREFILL_BATCH"))  // (same floor as above: never below vram::min_prefill_batch)
-            model.max_batch = std::min(model.max_batch, vram::prefillBatchFloor(static_cast<std::uint32_t>(std::stoul(*v))));
+        if (env("PREFILL_BATCH"))  // (same floor as above: never below vram::min_prefill_batch)
+            model.max_batch = std::min(model.max_batch, vram::prefillBatchFloor(envU32("PREFILL_BATCH", model.max_batch)));
         // WHIRL_DRAFT_VOCAB: unset = embedded 64k subset (dense qwen35, 248320 vocab), 64k = embedded,
         // 48k / <file> = frequency subset file, N = the first N rows (old experiment), off = full head
         const qwen35::DraftVocabChoice draft_vocab = qwen35::draftVocabChoice(env("DRAFT_VOCAB"), qwen35::exeDirectory());
         if (draft_vocab.kind == qwen35::DraftVocabChoice::Kind::first_n) model.draft_vocab = draft_vocab.n;
-        if (auto v = env("DRAFT_WINDOW")) model.draft_window = static_cast<std::uint32_t>(std::stoul(*v));
-        if (auto v = env("DRAFT_WINDOW_MIN")) model.draft_window_min = static_cast<std::uint32_t>(std::stoul(*v));
+        model.draft_window = envU32("DRAFT_WINDOW", model.draft_window);
+        model.draft_window_min = envU32("DRAFT_WINDOW_MIN", model.draft_window_min);
         if (env("GEMV_R") || env("GEMV_W") || env("GEMV_WH"))
             logW("WHIRL_GEMV_R / WHIRL_GEMV_W / WHIRL_GEMV_WH are not supported by whirl-server (ignored)");
         model.use_graph = false;
@@ -753,7 +766,7 @@ int serveMain(int argc, char** argv, const char* program) {
         // an explicit draft count is used as is (fixed) unless WHIRL_MTP_ADAPT asks otherwise
         const bool auto_mode = adapt_env ? (*adapt_env == "auto") : (def.automatic && !drafts_user);
         if (!envOn("WIDE_VERIFY", true)) model.wide_verify = false;
-        if (auto hc = env("HEAD_CHUNK")) model.head_chunk = std::max<std::uint32_t>(32, static_cast<std::uint32_t>(std::stoul(*hc)) / 32 * 32);
+        if (env("HEAD_CHUNK")) model.head_chunk = std::max<std::uint32_t>(32, envU32("HEAD_CHUNK", model.head_chunk) / 32 * 32);
         auto batch_drafts = defaultBatchDrafts(model.cfg.moe, model.wideCapable());
         batch_drafts[1] = drafts;
         const auto bd_env = env("MTP_BATCH_DRAFTS");
@@ -840,6 +853,25 @@ int serveMain(int argc, char** argv, const char* program) {
             for (std::uint32_t k = 1; k <= opt.parallel; ++k) tbl += (k > 1 ? ", " : "") + std::to_string(std::min(batch_drafts[k], drafts));
             logI("MTP under load, DeltaNet snapshot sets: max drafts per cycle with 1..{} decoding slots: {{ {} }}; {} snapshot sets ({} for n-gram drafts)",
                  opt.parallel, tbl, model.snap_sets, lit_snap_sets > 0 ? std::to_string(lit_snap_sets) : std::string("all"));
+        } else if (use_dflash && !model.gdn_replay) {
+            // FR-SRV P2-5: without replay the literal drafts need snapshot sets (before the KV pool is sized)
+            std::optional<std::uint32_t> snap_env;
+            if (auto v = env("SNAP_SETS")) {
+                try {
+                    snap_env = static_cast<std::uint32_t>(std::stoul(*v));
+                } catch (const std::exception&) {
+                    logW("WHIRL_SNAP_SETS={} is not a number (ignored)", *v);
+                }
+            }
+            const std::uint32_t max_lit = std::max(model.dfr->block - 1, envOn("NGRAM", true) ? qwen35::max_ng_drafts : 0u);
+            model.ensureSnapshots(literalSnapSets(std::min(max_lit, qwen35::gdn_max_snap), snap_env));
+            std::uint64_t gdn_layers = 0;
+            for (std::uint32_t li = 0; li < cfg.n_layer; ++li)
+                if (model.ssm_state[li] != 0) ++gdn_layers;
+            logI("DeltaNet verify: no replay kernels: {} snapshot sets of {:.1f} MiB for DFlash2 / n-gram drafts (up to {} drafts "
+                 "per cycle over all decoding slots)",
+                 model.snap_sets,
+                 static_cast<double>(gdn_layers * (model.convBytes() + model.ssmBytes())) / (1024.0 * 1024.0), model.snap_sets);
         }
 
         // engine (checkpoint buffers, shared checkpoints, sampling buffers)
@@ -1069,8 +1101,8 @@ int serveMain(int argc, char** argv, const char* program) {
         {
             const std::uint64_t floor = static_cast<std::uint64_t>(slot_ctx_eff) + (opt.parallel > 1 ? std::min(floor_second_ctx, slot_ctx_eff) : 0);
             if (pool_tokens < floor)
-                logW("kv pool {} tokens < {} (one {}-token request + a second one reaching {}): concurrent long requests may end "
-                     "early (finish_reason length){}",
+                logW("kv pool {} tokens < {} (one {}-token request + a second one reaching {}): concurrent long requests wait in "
+                     "the queue, or end early while generating (finish_reason length, finish_cause kv_pool_exhausted){}",
                      pool_tokens, floor, slot_ctx_eff, opt.parallel > 1 ? std::min(floor_second_ctx, slot_ctx_eff) : 0,
                      model.kv_choice.kv == numerics::KvKind::f16 && !cfg.moe && nreq.mode == numerics::Mode::precise
                          ? "; --balance allows int8 KV (a longer pool)"
@@ -1313,6 +1345,7 @@ int serveMain(int argc, char** argv, const char* program) {
                  probe_1ms, sleepMs(std::chrono::milliseconds(1), 50), probe_200us, sleepMs(std::chrono::microseconds(200), 50));
         HttpOptions ho;
         ho.cors_origins = opt.cors_origins;
+        ho.allowed_hosts = opt.allowed_hosts;
         HttpServer http(engine, ho);
         http.start(opt.host, opt.port);
         logI("server listening on http://{}:{} (model id \"{}\", {} slots); endpoints: GET /health, GET /v1/models, POST "

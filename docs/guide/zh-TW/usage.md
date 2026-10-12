@@ -190,7 +190,8 @@ whirl serve  MODEL.gguf [選項]      （同一支程式）
 | `--vis-mode M` | `auto`（預設）、`resident`（編碼器權重常駐 VRAM）、`stream`（逐層串流） |
 | `--vis-cache-mb N` | 依內容雜湊快取圖片 embedding 的主記憶體容量，MiB（預設 1024） |
 | `--allow-local-images` | 也接受本機檔案路徑 / `file://` URL 當圖片來源（預設關閉；`http(s)` 圖片網址一律不抓） |
-| `--cors-origin ORIGIN` | 允許來自 `ORIGIN`（例如 `https://app.example.com`）的網頁從瀏覽器呼叫伺服器；可重複指定。預設只有 `http(s)://localhost`、`127.0.0.1`、`[::1]`（任何 port）上的網頁會拿到 CORS 標頭（回傳原本的 `Origin`，不回 `*`）；其他網頁（包括 `file://` 開啟的頁面）讀不到回應。`*` 恢復 v0.1.4 之前的行為（對所有網頁回 `Access-Control-Allow-Origin: *`）。非瀏覽器的用戶端（SDK、curl、IDE 代理）不受影響 |
+| `--cors-origin ORIGIN` | 允許來自 `ORIGIN`（例如 `https://app.example.com`）的網頁從瀏覽器呼叫伺服器；可重複指定。預設只有 `http(s)://localhost`、`127.0.0.1`、`[::1]`（任何 port）上的網頁會拿到 CORS 標頭（回傳原本的 `Origin`，不回 `*`）；其他網頁（包括 `file://` 開啟的頁面）讀不到回應。`*` 恢復 v0.1.4 之前的行為（對所有網頁回 `Access-Control-Allow-Origin: *`）。`Origin` 不被允許的網頁送來的 `POST` 直接回 403、不執行，包括不需要 preflight 的 `text/plain`「簡單請求」。非瀏覽器的用戶端（SDK、curl、IDE 代理）不送 `Origin`，不受影響。本機圖片檔（`--allow-local-images`）對 localhost 以外網頁送來的請求一律不讀，不管 `--cors-origin` 怎麼設 |
+| `--allow-host NAME` | 也回應 `Host` 標頭是 `NAME` 的請求（可重複；`*` = 任何名稱）。預設只回應 `localhost`、`127.0.0.1`、`[::1]` 和 `--host` 的位址（`--host 0.0.0.0` 時是任何 IP 位址）；其他名稱回 403。這是擋 DNS rebinding（網頁把自己的網域改解析到 127.0.0.1）。用戶端用主機名稱連線時才需要，例如 `--host 0.0.0.0 --allow-host mypc.lan` |
 | `--log-file PATH` | log 檔（預設 `%LOCALAPPDATA%\whirl\server.log`）；log 也會印在主控台 |
 | `-h`、`--help` / `-V`、`--version` | 說明 / 版本 |
 
@@ -232,7 +233,8 @@ LM Studio（`/api/v1/models`）與 Ollama（`/api/tags`、`/api/show`、`/api/ve
 `stream`、`tools`、`tool_choice`、`chat_template_kwargs.enable_thinking`（或最上層的 `enable_thinking`）、
 `reasoning_effort`、`preserve_thinking`。沒有給取樣參數時套用模型卡建議值。`temperature` 為 0 時，輸出與
 `whirl chat` 逐 token 相同。`presence_penalty` / `frequency_penalty` 會接受但忽略；`n` 必須為 1；不支援
-`logprobs`、`response_format`，`tool_choice: "required"` 也不會強制。回應另含 `usage.cached_tokens` 與
+`logprobs`、`response_format`，`tool_choice: "required"` 也不會強制。`stop` 最多 16 個字串、每個最多
+256 位元組（超過回 HTTP 400）；`temperature` 小於 0.001 視為 greedy。回應另含 `usage.cached_tokens` 與
 llama.cpp 形式的 `timings` 物件。細節見 [server.md](server.md#sampling)。
 
 思考與 reasoning effort 可用下列任一種寫法（依此順序套用，後者覆蓋前者）：

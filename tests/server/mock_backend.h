@@ -101,6 +101,11 @@ struct MockConfig {
     std::uint32_t dfl_block = 8;
     std::uint32_t dfl_cap_rows = 2048;
     double dfl_miss = 0.3;
+    // FR-SRV P2-5: false = the DeltaNet verify keeps snapshot sets instead of replaying kept rows
+    // (gfx1151 / Radeon 8060S, WHIRL_GDN_REPLAY=0): the state after a verify holds every row, and
+    // restoreSeqSnapshot(s, j) rolls it back to snapshot set j. Sets are allocated lazily by a verify
+    // that needs them (like Model::verifyBatchEnqueue) or up front by ensureSnapshots.
+    bool replay = true;
 };
 
 class MockModel final : public server::ServerModel {
@@ -123,8 +128,9 @@ public:
     std::uint32_t poolPages() const override { return pool_pages_; }
     std::uint32_t seqPages() const override { return seq_pages_; }
     std::uint32_t maxBatch() const override { return mc_.max_batch; }
-    std::uint32_t snapSets() const override { return 0; }
-    bool gdnReplay() const override { return true; }
+    std::uint32_t snapSets() const override { return mc_.replay ? 0 : snap_sets_; }
+    void ensureSnapshots(std::uint32_t n) override;
+    bool gdnReplay() const override { return mc_.replay; }
     bool fusedDecode() const override { return true; }
     bool canSegment() const override { return true; }
     std::vector<server::KvArr> kvArrays() const override;
@@ -244,6 +250,13 @@ private:
     mutable std::atomic<std::uint64_t> hid_mismatch_{0};
     std::uint64_t rows_run_ = 0;
     std::vector<std::uint32_t> seg_logits_rows_;
+    // replay off: snapshot sets (sequence, recurrent hash after that verify row)
+    struct Snap {
+        std::uint32_t seq = ~0u;
+        std::uint64_t h = 0;
+    };
+    std::vector<Snap> snaps_;
+    std::uint32_t snap_sets_ = 0;
 };
 
 }  // namespace whirl::test

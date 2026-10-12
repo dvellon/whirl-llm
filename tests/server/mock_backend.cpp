@@ -388,7 +388,20 @@ void MockModel::commitSeq(std::uint32_t si) {
     s.npend = 0;
 }
 
-void MockModel::restoreSeqSnapshot(std::uint32_t, std::uint32_t) { poison_ += 1; }
+void MockModel::ensureSnapshots(std::uint32_t n) {
+    snap_sets_ = std::max(snap_sets_, std::min(n, qwen35::gdn_max_snap));
+    if (snaps_.size() < snap_sets_) snaps_.resize(snap_sets_);
+}
+
+void MockModel::restoreSeqSnapshot(std::uint32_t s, std::uint32_t set) {
+    // replay keeps no snapshots: a restore there is a bookkeeping error
+    if (mc_.replay || set >= snaps_.size() || snaps_[set].seq != s) {
+        poison_ += 1;
+        return;
+    }
+    writeH(seqs_[s], snaps_[set].h);
+    seqs_[s].npend = 0;
+}
 
 void MockModel::mapPages(std::uint32_t s, std::uint32_t first, std::span<const std::int32_t> phys) {
     Seq& q = seqs_[s];
@@ -493,6 +506,15 @@ std::uint32_t MockModel::verifyBatchEnqueue(std::span<const server::VSeg> segs) 
     std::uint32_t row = 0;
     cap_.clear();
     spinUs(mc_.cycle_us);
+    if (!mc_.replay) {
+        // snapshot sets for every draft row of the batch (lazily allocated, like the model)
+        std::uint32_t need = 0;
+        for (const server::VSeg& sg : segs) need += sg.nd;
+        if (need > qwen35::gdn_max_snap) throw std::runtime_error("BatchTooLarge");
+        ensureSnapshots(need);
+        for (Snap& x : snaps_) x = Snap{};
+    }
+    std::uint32_t snap = 0;
     for (const server::VSeg& sg : segs) {
         Seq& s = seqs_[sg.seq];
         commitSeq(sg.seq);  // the kept rows of the previous verify reach the state
@@ -518,8 +540,16 @@ std::uint32_t MockModel::verifyBatchEnqueue(std::span<const server::VSeg> segs) 
             s.ctl[qwen35::ctl_rows + i] = static_cast<std::int32_t>(nextToken(st.h, st.kv));
             s.pend.push_back({toks[i], p});
             rows_run_ += 1;
+            // replay off: set snap + i holds the state after row i (next + i drafts kept)
+            if (!mc_.replay && i < sg.nd) snaps_[snap + i] = Snap{sg.seq, st.h};
         }
         s.npend = 0;
+        if (!mc_.replay) {
+            // the state advances over every row; the engine restores a snapshot when drafts are rejected
+            writeH(s, st.h);
+            s.pend.clear();
+        }
+        snap += sg.nd;
         row += static_cast<std::uint32_t>(toks.size());
     }
     return row;

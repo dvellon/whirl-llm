@@ -72,6 +72,9 @@ public:
     virtual ~Conn() = default;
     virtual bool write(std::string_view data) = 0;
     virtual bool flush() = 0;
+    // false once the client has closed the connection (FR-SRV P2-2: polled by the engine for
+    // requests that write nothing for a long time: queued, prefilling, non-streaming)
+    virtual bool alive() { return true; }
 };
 
 enum class JobKind { chat, completion };
@@ -89,6 +92,7 @@ struct Job {
     TimePoint t_arrive{};
     bool sys_wait_logged = false;
     bool tier_wait_logged = false;
+    bool pool_wait_logged = false;  // FR-SRV P2-3
     bool pf_checked = false;
     // vision: the request's images (preprocessed), their spans and embeddings
     std::shared_ptr<JobVis> vis;
@@ -155,6 +159,8 @@ struct Final {
     std::optional<std::vector<ToolCall>> calls;
     std::string content;
     std::string reasoning;
+    // FR-SRV P3-8: why a "length" ended early ("" = max_tokens / context; "kv_pool_exhausted")
+    std::string cause;
 };
 
 struct StreamState {
@@ -166,7 +172,8 @@ struct StreamState {
 
     void begin();
     void fail();
-    bool push(Out& out, std::span<const std::uint32_t> toks);
+    // *n_after: tokens of toks that come after a matched stop string (not counted as completion)
+    bool push(Out& out, std::span<const std::uint32_t> toks, std::uint32_t* n_after = nullptr);
     Final finish(Out& out, const std::string& reason);
     void end(Out& out, const Final& f, const Timings& tim, std::uint32_t n_prompt);
 
@@ -212,6 +219,8 @@ struct Slot : cache::SlotCache {
     std::string finish = "length";
     bool done = false;
     bool stopped_str = false;
+    bool pool_cut = false;  // FR-SRV P3-8: ended because the KV pool had no page left (decode)
+    std::uint32_t n_after_stop = 0;  // FR-SRV P3-7: generated tokens after the stop string (same cycle)
     std::uint32_t cycles = 0;
     std::uint32_t drafted = 0;
     std::uint32_t accepted = 0;
@@ -431,6 +440,8 @@ public:
         std::uint64_t dfl_cycles = 0, dfl_drafted = 0, dfl_accepted = 0, dfl_cold = 0, dfl_gap = 0;
     };
     Stats stats() const;
+    // FR-SRV P3-5: the counters other threads may read (HTTP /props): atomics only
+    Stats statsShared() const;
 
 private:
     friend struct StreamState;
@@ -523,6 +534,12 @@ private:
     void flushTierOnStop();
     void releaseSlot(Slot& sl);
     void failSlot(Slot& sl, const std::string& err);
+    // FR-SRV P2-2: queued / running requests whose client disconnected end (slot freed)
+    void reapDisconnected();
+    // FR-SRV P2-3: pool pages a prompt of n_tok tokens needs; pages free or evictable now minus
+    // what the running prefills still need
+    std::size_t pagesFor(std::uint64_t n_tok) const;
+    std::size_t poolAvailable() const;
     void failJobNoSlot(Job& job);
     void writeError(Job& job, int status, const std::string& msg);
     void logBatchStats(bool force);
@@ -592,6 +609,7 @@ private:
     // batch statistics
     TimePoint stat_t0_{};
     std::uint64_t stat_tokens_ = 0, stat_cycles_ = 0, stat_rows_ = 0, stat_slots_ = 0, stat_drafts_ = 0,
+                  stat_lit_drafts_ = 0,  // FR-SRV P2-5: DFlash2 / n-gram drafts verified (all slots)
                   stat_prefill_tok_ = 0, stat_seg_batches_ = 0, stat_seg_chunks_ = 0;
     std::uint64_t stat_dfl_cycles_ = 0, stat_dfl_drafted_ = 0, stat_dfl_accepted_ = 0, stat_dfl_cold_ = 0, stat_dfl_gap_ = 0;
     std::vector<std::uint32_t> crlf_norm_;
@@ -606,6 +624,7 @@ private:
     std::uint64_t stat_cow_pages_ = 0;
     std::uint64_t stat_q_waits_ = 0;
     TimePoint last_tick_{};
+    TimePoint last_reap_{};
     std::vector<std::uint16_t> page_ref_;
     std::vector<Spe> spes_;
     std::uint64_t stat_spe_new_ = 0, stat_spe_hits_ = 0, stat_spe_tok_ = 0, stat_spe_evict_ = 0, stat_unshare_ = 0;
