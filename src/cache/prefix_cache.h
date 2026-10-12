@@ -23,6 +23,11 @@ bool prefixEq(Tokens a, Tokens b);
 
 // Index metadata of a state checkpoint (the engine's Ckpt derives from it and
 // adds the device buffers).
+// TAIL-CK: with at least this many per-slot checkpoints, a full set never overwrites the newest
+// 'prefix' checkpoint (the tail checkpoint before a question: the next question about the same
+// document resumes there); fewer keep plain oldest-first replacement.
+inline constexpr std::size_t ckpt_keep_prefix_min = 3;
+
 struct CkptKey {
     bool valid = false;
     std::uint32_t pos = 0;
@@ -146,6 +151,8 @@ public:
                                     std::uint32_t reuse, std::uint32_t sys, const FloorFn& floor) const = 0;
 
     // insertion / eviction
+    // slot to write a checkpoint at pos: the one already at pos, else a free one, else the oldest
+    // (lowest seq) -- skipping the newest 'prefix' checkpoint when cks.size() >= ckpt_keep_prefix_min
     virtual std::size_t ckptSlotFor(View<const CkptKey> cks, std::uint32_t pos) const = 0;
     virtual int sharedVictim(View<const SpeKey> spes) const = 0;
     virtual Victim evictVictim(View<const SlotCache> slots, const SlotPred& evictable, View<const SpeKey> spes) const = 0;
@@ -166,10 +173,21 @@ struct SupersedeRule {
 struct Supersede {
     bool yes = false;
     std::size_t keep = 0;  // shared prefix (the old entry keeps tokens [0, keep))
+    // the same task lineage: cut the old entry to keep. false: it shares only the system prompt (and maybe
+    // part of the first message) -- a compact, or just another conversation with the same system prompt (a
+    // subagent while the main agent waits): never cut, only demoted (evicted first under pressure)
+    bool cut = true;
 };
+// A conversation that keeps tokens [0, keep) of an old_n-token entry and continues differently diverges
+// near the end (retry / regenerate / edit-last: the abandoned tail is short) -- not another branch worth
+// keeping. The same threshold as supersedes().
+bool nearEndDivergence(std::size_t old_n, std::size_t keep, const SupersedeRule& r = {});
 // old_t / new_t: token ids of the old entry and of the new conversation;
 // sys: end of the new conversation's system message (0: none / unknown -> no).
-Supersede supersedes(Tokens old_t, Tokens new_t, std::size_t sys, const SupersedeRule& r = {});
+// task_end: end of the new conversation's first message after the system message (the start of the turn
+// after it); the old entry is cut only when the shared prefix reaches it (an agent's compress keeps the
+// system prompt and the first task message). 0: not given (cut whenever it supersedes, the CACHE-1 rule).
+Supersede supersedes(Tokens old_t, Tokens new_t, std::size_t sys, const SupersedeRule& r = {}, std::size_t task_end = 0);
 
 // Deferred supersede: the new conversation's first turn marks the old
 // entries it would supersede; its second turn cuts those that were not used
@@ -182,8 +200,9 @@ public:
         std::uint64_t old_id = 0;
         std::size_t keep = 0;
         std::uint64_t stamp = 0;
+        bool cut = true;  // Supersede::cut
     };
-    void mark(std::uint64_t new_id, std::uint64_t old_id, std::size_t keep, std::uint64_t stamp);
+    void mark(std::uint64_t new_id, std::uint64_t old_id, std::size_t keep, std::uint64_t stamp, bool cut = true);
     // pending marks of new_id (removed from the tracker)
     std::vector<Pending> take(std::uint64_t new_id);
     void forget(std::uint64_t id);  // an entry removed: drop its marks either way

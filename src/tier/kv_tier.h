@@ -29,8 +29,11 @@
 // chained). Dropping an owner's SSD copy (LRU, rewrite of a referenced block,
 // removal) first drops every entry referencing it; at startup a reference
 // whose owner is missing or hashes differently drops the referencing file.
-// A file is never restored unless all its blocks verify, so the worst case of
-// any cache fault is a miss (re-prefill), never wrong KV bytes.
+// Startup checks a file's header, size, token checksum and block references
+// (owner present, same hash); with the crash-safe write protocol below, a crash,
+// power loss, truncation or stale file is a miss (re-prefill), never wrong KV
+// bytes. The KV / checkpoint data is not checksummed on read: silent corruption
+// inside a file (bit rot, a failing disk) is not detected.
 //
 // Threading: the main (engine) thread owns all entry bookkeeping and calls
 // every Tier method; the IO thread only moves file bytes and reports progress
@@ -211,6 +214,11 @@ struct Entry {
     bool ssd_stale = false;
     // restored at least once, or resumed in place (a multi-turn session); see Config::ssd_seen_filter
     bool reused = false;
+    // its SSD write was skipped: a file of nofit_fb bytes did not fit the cap (Tier::startWrite). Not
+    // retried until its size changes or SSD room was freed since (Tier::ssd_gen_ moved past nofit_gen).
+    std::uint64_t nofit_fb = 0, nofit_gen = 0;
+    // Tier::demote: the first RAM / SSD eviction victim, dropped (not written) on RAM eviction; any use clears it
+    bool demoted = false;
 
     std::uint64_t kvOff(const Layout& l) const;
     std::uint64_t extent(const Layout& l) const;
@@ -265,7 +273,7 @@ struct Restore {
 struct Stats {
     std::uint64_t spills = 0, spill_bytes = 0, restores_ram = 0, restores_ssd = 0, restore_bytes = 0,
                   ssd_writes = 0, ssd_write_bytes = 0, ram_evictions = 0, ssd_evictions = 0, dropped = 0,
-                  ssd_dedup_bytes = 0, superseded = 0, superseded_bytes = 0;
+                  ssd_dedup_bytes = 0, superseded = 0, superseded_bytes = 0, demoted = 0;
 };
 
 class Tier {
@@ -300,6 +308,10 @@ public:
     // (rounded up to what referencing files need, down to its checkpoints),
     // in RAM and on SSD. Returns the bytes freed (0: nothing / not now).
     std::uint64_t trimTo(Entry* e, std::uint32_t keep);
+    // Probably superseded but not provably dead (another conversation shares only its system prompt):
+    // kept whole, evicted first (RAM: dropped to its SSD copy or gone, never written; SSD: first LRU
+    // victim). Any later use (restore, in-place update) undoes it.
+    void demote(Entry* e);
     // Entries whose SSD block table references blocks e owns.
     std::vector<Entry*> dependentsOf(const Entry* e) const;
     // Ids of every entry that depends on e directly or through other entries (e itself only if
@@ -374,6 +386,8 @@ public:
         std::uint64_t cap_files = 0, cap_bytes = 0;          // evicted (LRU) to fit the cap
         // could not be opened (locked by another program): kept, counted against the cap, evicted first
         std::uint64_t unreadable_files = 0, unreadable_bytes = 0;
+        // written with another per-slot context (tok_cap: other file layout): kept, counted, evicted first
+        std::uint64_t layout_files = 0, layout_bytes = 0;
     };
     const Cleanup& cleanup() const { return cleanup_; }
     // the SSD directory is used by another process (SSD tier disabled)
@@ -421,7 +435,12 @@ private:
     void keepForeign(const std::wstring& path, std::uint64_t counted);
     void forgetForeign(const std::wstring& path);
     std::uint64_t fileBytes(const Entry* e) const;
-    bool ssdRoom(std::uint64_t need, Entry* keep);
+    // ram_copies: SSD copies of entries also in RAM may go too (only enforceCap: a write never drops
+    // them, the RAM entry would just be written again -- an endless rewrite loop under a tight cap)
+    bool ssdRoom(std::uint64_t need, Entry* keep, bool ram_copies = false);
+    void noFit(Entry* e, std::uint64_t fb);
+    // bumped whenever SSD room is freed (a file deleted or cut, an entry dropped to SSD-only)
+    std::uint64_t ssd_gen_ = 0;
     void submit(Job* j);
     void freeJob(Job* j);
     void makeHeader(const Entry* e, bool valid, std::uint8_t* buf) const;

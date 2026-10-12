@@ -185,6 +185,11 @@ public:
         loop_ = std::thread([this] { engine_->runLoop(); });
     }
     ~TestServer() { shutdown(); }
+    // the engine loop stops (as after Ctrl+C) while the HTTP front end still accepts
+    void stopEngine() {
+        engine_->stop();
+        if (loop_.joinable()) loop_.join();
+    }
     void shutdown() {
         if (!engine_) return;
         engine_->stop();
@@ -192,8 +197,10 @@ public:
         http_->stop();
         http_.reset();
         engine_->attachTier(nullptr);
-        engine_.reset();
+        // FR-CACHE P3-5: the tier first (its destructor joins the IO thread, whose wake callback calls into
+        // the engine), then the engine -- the product's order (server_main declares the tier after the engine)
         tier_.reset();
+        engine_.reset();
         model_.reset();
     }
     HttpResult post(const std::string& path, const std::string& body) {
@@ -901,8 +908,9 @@ void testCors() {
         CHECK(hasHeader(st, "Content-Type: text/event-stream"));
         CHECK(hasHeader(st, "Access-Control-Allow-Origin: http://localhost:8000"));
         CHECK(test::sseEvents(st.body).size() >= 2);
+        // FR-SRV P2-4: a POST from a disallowed Origin is refused (403), not run
         const auto st_evil = req(p, "POST", "/v1/chat/completions", chat + R"(,"stream":true})", "https://evil.example");
-        CHECK_EQ(st_evil.status, 200);
+        CHECK_EQ(st_evil.status, 403);
         CHECK(!hasHeader(st_evil, "Access-Control-"));
         const auto bad = req(p, "POST", "/v1/chat/completions", "{not json", lo);
         CHECK_EQ(bad.status, 400);
@@ -1027,6 +1035,211 @@ void testPrefixCacheMultiTurn() {
     CHECK_EQ(srv.model().poison(), 0u);
     CHECK_EQ(cold.model().poison(), 0u);
     CHECK_EQ(srv.model().hidMismatch(), 0u);
+}
+
+// TAIL-CK: the start of the last cold-schedule chunk of an n-token text prompt (no system / think /
+// image splits), computed here independently of the engine: 1024-token chunks, the rest (<= 1024 +
+// 256) merged into the last one
+std::uint64_t coldTail(std::size_t n) {
+    std::size_t pos = 0;
+    while (n - pos > 1024 + 256) pos += 1024;
+    return pos;
+}
+
+ServerSetup tailSetup(std::uint32_t np, std::size_t n_ck, bool tail = true) {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = np;
+    su.mc.slot_ctx = 32768;
+    su.mc.pool_tokens = 98304;
+    su.eo.n_ck = n_ck;
+    su.eo.tail_ck = tail;
+    return su;
+}
+
+// TAIL-CK (PREFIX-QA, REL3): the same long document with a different question, one message each.
+// Before, the 2nd question re-prefilled the whole document (no checkpoint at or before the
+// divergence on first sight; the LCP 'prefix' checkpoint only helped the 3rd). Now the tail
+// checkpoint of the 1st request (start of its last schedule chunk) is reused. Server defaults:
+// -np 1 -> 4 checkpoints per slot, -np 2..4 -> 3. With 2 (or WHIRL_TAIL_CK=0) no tail is taken
+// and the behaviour is the old one. Every answer equals the greedy reference (= a cold run).
+void testDocQa() {
+    struct Case {
+        std::uint32_t np;
+        std::size_t n_ck;
+        bool tail;
+    };
+    for (const Case c : {Case{1, 4, true}, Case{2, 3, true}, Case{4, 3, true}, Case{2, 2, true}, Case{1, 4, false}}) {
+        TestServer srv(tailSetup(c.np, c.n_ck, c.tail));
+        const auto doc = makePrompt(12000, 91);
+        std::vector<std::uint64_t> cached;
+        std::vector<std::size_t> lens;
+        for (std::uint64_t q = 0; q < 3; ++q) {
+            const auto p = makePrompt(static_cast<std::uint32_t>(doc.size() + 90 + 10 * q), 500 + q, doc);
+            auto r = srv.post("/v1/completions", completionBody(p, 24));
+            CHECK_EQ(r.status, 200);
+            CHECK_EQ(completionText(r), decode(srv.model().greedyReference(p, 24, true)));
+            cached.push_back(cachedTokens(r));
+            lens.push_back(p.size());
+        }
+        if (g_verbose)
+            std::printf("  doc_qa np %u n_ck %zu tail %d: doc %zu tok, cached q1 %llu, q2 %llu, q3 %llu\n", c.np, c.n_ck, c.tail ? 1 : 0,
+                        doc.size(), (unsigned long long)cached[0], (unsigned long long)cached[1], (unsigned long long)cached[2]);
+        CHECK_EQ(cached[0], 0u);
+        CHECK(cached[2] + 1280 >= doc.size());  // 3rd question: LCP checkpoint or tail, as before
+        const bool on = c.tail && c.n_ck >= 3;
+        if (on) CHECK_EQ(cached[1], coldTail(lens[0]));  // 2nd question: the 1st one's tail checkpoint
+        else CHECK_EQ(cached[1], 0u);                    // old behaviour (tail off): full prefill
+        CHECK_EQ(srv.model().poison(), 0u);
+        CHECK_EQ(srv.model().hidMismatch(), 0u);
+    }
+    // a follow-up turn first (its prompt-end / gen-end fill the set), then a new conversation with
+    // another question about the same document: the slot policy kept the first request's tail
+    for (const Case c : {Case{1, 4, true}, Case{2, 3, true}}) {
+        TestServer srv(tailSetup(c.np, c.n_ck, c.tail));
+        const auto doc = makePrompt(12000, 95);
+        const auto q1 = makePrompt(12100, 530, doc);
+        auto r1 = srv.post("/v1/completions", completionBody(q1, 24));
+        auto out1 = srv.model().greedyReference(q1, 24, true);
+        CHECK_EQ(completionText(r1), decode(out1));
+        std::vector<std::uint32_t> t2 = q1;
+        t2.insert(t2.end(), out1.begin(), out1.end());
+        t2 = makePrompt(static_cast<std::uint32_t>(t2.size() + 150), 531, t2);
+        auto r2 = srv.post("/v1/completions", completionBody(t2, 24));
+        CHECK_EQ(completionText(r2), decode(srv.model().greedyReference(t2, 24, true)));
+        CHECK(cachedTokens(r2) >= q1.size());  // gen-end of turn 1
+        const auto q2 = makePrompt(12090, 532, doc);
+        auto r3 = srv.post("/v1/completions", completionBody(q2, 24));
+        CHECK_EQ(completionText(r3), decode(srv.model().greedyReference(q2, 24, true)));
+        CHECK_EQ(cachedTokens(r3), coldTail(q1.size()));  // turn 1's tail, kept over its prompt-end
+        if (g_verbose)
+            std::printf("  doc_qa follow-up np %u: turn 2 cached %llu, new question cached %llu\n", c.np,
+                        (unsigned long long)cachedTokens(r2), (unsigned long long)cachedTokens(r3));
+        CHECK_EQ(srv.model().poison(), 0u);
+    }
+}
+
+// TAIL-CK bitwise guard: the tail checkpoint must sit on the cold chunk schedule. The mock's
+// sched_grid makes a prefill forward that starts off the 1024 grid change the state (as a GPU
+// forward split elsewhere rounds differently), so a tail placed anywhere else (splitting the 1st
+// request's forward there, and resuming the 2nd there) changes the text vs. the greedy reference.
+void testTailCkOnSchedule() {
+    for (std::uint32_t np : {1u, 2u}) {
+        ServerSetup su = tailSetup(np, np == 1 ? 4 : 3);
+        su.mc.sched_grid = 1024;
+        TestServer srv(su);
+        const auto doc = makePrompt(9000, 93);
+        for (std::uint64_t q = 0; q < 2; ++q) {
+            const auto p = makePrompt(static_cast<std::uint32_t>(doc.size() + 100 + 37 * q), 520 + q, doc);
+            auto r = srv.post("/v1/completions", completionBody(p, 32));
+            CHECK_EQ(r.status, 200);
+            CHECK_EQ(completionText(r), decode(srv.model().greedyReference(p, 32, true)));
+            if (q == 1) CHECK_EQ(cachedTokens(r), coldTail(doc.size() + 100));
+        }
+        CHECK_EQ(srv.model().poison(), 0u);
+    }
+}
+
+// TAIL-CK regression: run a request sequence with the tail checkpoint on and off (same server
+// settings otherwise); every answer equals the greedy reference.
+struct TailRun {
+    std::vector<std::string> text;
+    std::vector<std::uint64_t> cached;
+};
+
+// chain: each entry is new content appended to the history (last prompt + its answer), an empty
+// entry regenerates the last prompt (chat / agent sessions); else each entry is a whole prompt
+TailRun tailSeq(const ServerSetup& su, const std::vector<std::vector<std::uint32_t>>& reqs, bool chain, std::uint32_t gen) {
+    TestServer srv(su);
+    TailRun out;
+    std::vector<std::uint32_t> hist, last;
+    for (std::size_t i = 0; i < reqs.size(); ++i) {
+        std::vector<std::uint32_t> p = reqs[i];
+        if (chain) {
+            if (p.empty()) {
+                p = last;
+            } else {
+                std::vector<std::uint32_t> h = hist;
+                h.insert(h.end(), p.begin(), p.end());
+                p = std::move(h);
+            }
+        }
+        auto r = srv.post("/v1/completions", completionBody(p, gen));
+        CHECK_EQ(r.status, 200);
+        const auto ref = srv.model().greedyReference(p, gen, true);
+        CHECK_EQ(completionText(r), decode(ref));
+        out.text.push_back(completionText(r));
+        out.cached.push_back(cachedTokens(r));
+        last = p;
+        hist = p;
+        hist.insert(hist.end(), ref.begin(), ref.end());
+    }
+    CHECK_EQ(srv.model().poison(), 0u);
+    CHECK_EQ(srv.model().hidMismatch(), 0u);
+    return out;
+}
+
+void checkNoRegression(const char* name, const TailRun& on, const TailRun& off) {
+    CHECK_EQ(on.text.size(), off.text.size());
+    std::string a, b;
+    for (std::size_t i = 0; i < on.text.size() && i < off.text.size(); ++i) {
+        CHECK_EQ(on.text[i], off.text[i]);
+        CHECK(on.cached[i] >= off.cached[i]);
+        a += std::format(" {}", on.cached[i]);
+        b += std::format(" {}", off.cached[i]);
+    }
+    if (g_verbose) std::printf("  %s cached: tail on%s | off%s\n", name, a.c_str(), b.c_str());
+}
+
+void testTailCkRegression() {
+    for (std::uint32_t np : {1u, 2u}) {
+        const std::size_t nck = np == 1 ? 4 : 3;
+        // multi-turn chat with a long first message: history + answer + a new message each turn,
+        // regenerates of the last turn in between (prompt-end), next turns resume from gen-end
+        {
+            const std::vector<std::vector<std::uint32_t>> turns = {makePrompt(6000, 601), makePrompt(300, 602), makePrompt(1800, 603),
+                                                                   {},                    makePrompt(250, 604), {}};
+            const TailRun on = tailSeq(tailSetup(np, nck, true), turns, true, 40);
+            const TailRun off = tailSeq(tailSetup(np, nck, false), turns, true, 40);
+            checkNoRegression("chat", on, off);
+            for (std::size_t i = 1; i < turns.size(); ++i) CHECK_EQ(on.cached[i], off.cached[i]);
+            CHECK(on.cached[3] > 0 && on.cached[5] > 0);  // regenerate: prompt-end, nothing to prefill
+        }
+        // agent session: a long system/tool preamble, then tool outputs of 1.5k..2.5k tokens each turn
+        // (every turn takes a tail checkpoint), with a regenerate in the middle
+        {
+            std::vector<std::vector<std::uint32_t>> turns = {makePrompt(5000, 611)};
+            for (std::uint64_t k = 0; k < 6; ++k) turns.push_back(makePrompt(static_cast<std::uint32_t>(1500 + 200 * k), 612 + k));
+            turns.insert(turns.begin() + 4, std::vector<std::uint32_t>{});
+            const TailRun on = tailSeq(tailSetup(np, nck, true), turns, true, 48);
+            const TailRun off = tailSeq(tailSetup(np, nck, false), turns, true, 48);
+            checkNoRegression("agent", on, off);
+            for (std::size_t i = 1; i < turns.size(); ++i) CHECK_EQ(on.cached[i], off.cached[i]);
+        }
+        // regenerate of one long prompt (prompt-end each time), then another question about the same
+        // document, then the first again: prompt-end reuse unchanged, the new question resumes at the tail
+        {
+            const auto doc = makePrompt(8000, 621);
+            const auto q1 = makePrompt(8120, 622, doc), q2 = makePrompt(8200, 623, doc);
+            const std::vector<std::vector<std::uint32_t>> reqs = {q1, q1, q1, q2, q1};
+            const TailRun on = tailSeq(tailSetup(np, nck, true), reqs, false, 40);
+            const TailRun off = tailSeq(tailSetup(np, nck, false), reqs, false, 40);
+            // (q1 again after q2: with -np >= 2 and the tail off, q2 went to a free slot and q1's slot
+            // kept its prompt-end; with the tail on, q2 resumes in q1's slot and q1 again resumes at
+            // the tail: up to 1280 tokens to prefill there, against q2's whole document saved)
+            const TailRun on_c{{on.text.begin(), on.text.begin() + 4}, {on.cached.begin(), on.cached.begin() + 4}};
+            const TailRun off_c{{off.text.begin(), off.text.begin() + 4}, {off.cached.begin(), off.cached.begin() + 4}};
+            checkNoRegression("regenerate", on_c, off_c);
+            CHECK_EQ(on.text[4], off.text[4]);
+            CHECK_EQ(on.cached[1], q1.size());
+            CHECK_EQ(on.cached[2], q1.size());
+            CHECK_EQ(on.cached[3], coldTail(q1.size()));  // tail off: 0
+            CHECK(on.cached[4] >= coldTail(q1.size()));
+            if (np == 1) CHECK_EQ(on.cached[4], off.cached[4]);
+            CHECK(on.cached[3] + on.cached[4] >= off.cached[3] + off.cached[4]);
+            if (g_verbose) std::printf("  regenerate q1 after q2: cached tail on %llu | off %llu\n", (unsigned long long)on.cached[4],
+                                       (unsigned long long)off.cached[4]);
+        }
+    }
 }
 
 // --draft dflash: no MTP block, DFlash2 drafts (mock drafter: the true continuation from the
@@ -1692,6 +1905,235 @@ void testTiers() {
     std::filesystem::remove_all(dir, ec);
 }
 
+
+// FR-CACHE revert-check (engine.cpp spillSlot's tier_pages clamp): in-place spill after a same-slot
+// regenerate (reuse < the entry's length), then eviction and a restore of the regenerated branch: the
+// entry's pages past the divergence must have been re-copied (without the clamp the restore returns the
+// old branch's KV and the output differs; the rest of this suite passed with the clamp removed).
+void testTierInPlaceRegen() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 8192;
+    su.mc.pool_tokens = 4096;
+    su.tier = true;
+    su.tier_min = 512;
+    su.eo.n_ck = 4;
+    const auto pa = makePrompt(3000, 801);
+    const auto pb = makePrompt(3200, 802);
+    TestServer srv(su);
+    g_log.clear();
+    const auto outa = srv.model().greedyReference(pa, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pa, 40))), decode(outa));
+    std::vector<std::uint32_t> base = pa;
+    base.insert(base.end(), outa.begin(), outa.end());
+    const auto p2 = makePrompt(static_cast<std::uint32_t>(base.size() + 300), 803, base);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(p2, 40))), decode(srv.model().greedyReference(p2, 40, true)));
+    // regenerate turn 2 with another user message: resumes at the gen-end checkpoint of turn 1
+    const auto p3 = makePrompt(static_cast<std::uint32_t>(base.size() + 300), 804, base);
+    const auto out3 = srv.model().greedyReference(p3, 40, true);
+    auto r3 = srv.post("/v1/completions", completionBody(p3, 40));
+    CHECK_EQ(completionText(r3), decode(out3));
+    const std::size_t inplace = g_log.count("in place");
+    CHECK(inplace >= 1);
+    // B evicts the slot
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pb, 40))), decode(srv.model().greedyReference(pb, 40, true)));
+    std::vector<std::uint32_t> p4 = p3;
+    p4.insert(p4.end(), out3.begin(), out3.end());
+    p4 = makePrompt(static_cast<std::uint32_t>(p4.size() + 200), 805, p4);
+    auto r4 = srv.post("/v1/completions", completionBody(p4, 40));
+    CHECK_EQ(completionText(r4), decode(srv.model().greedyReference(p4, 40, true)));
+    CHECK(srv.tierp()->stats.restores_ram >= 1);
+    CHECK(cachedTokens(r4) > base.size());
+    CHECK_EQ(srv.model().poison(), 0u);
+    std::fprintf(stderr, "  (tier_inplace: in-place spills %zu, restores_ram %llu, cached %u)\n", inplace,
+                 static_cast<unsigned long long>(srv.tierp()->stats.restores_ram), static_cast<unsigned>(cachedTokens(r4)));
+}
+
+// FIX-CACHE P2-3 (FR-CACHE): more prefix checkpoints per slot than a tier entry holds (WHIRL_SERVE_CKPTS=12).
+// Before: tier::Entry::ck, Slot::rs_map / rs_tail and beginRestore's `chosen` (max_ck = 8) were read and
+// written out of bounds. Now the count is clamped to max_ck (warning); spill / restore stay exact.
+void testServeCkptsClamp() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 8192;
+    su.mc.pool_tokens = 4096;
+    su.tier = true;
+    su.tier_min = 512;
+    su.eo.n_ck = 12;
+    const auto pa = makePrompt(3000, 811);
+    const auto pb = makePrompt(3200, 812);
+    g_log.clear();
+    TestServer srv(su);
+    CHECK(g_log.count("above the maximum") >= 1);
+    const auto outa = srv.model().greedyReference(pa, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pa, 40))), decode(outa));
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(pb, 40))), decode(srv.model().greedyReference(pb, 40, true)));
+    std::vector<std::uint32_t> pa2 = pa;
+    pa2.insert(pa2.end(), outa.begin(), outa.end());
+    pa2 = makePrompt(static_cast<std::uint32_t>(pa2.size() + 300), 813, pa2);
+    auto r = srv.post("/v1/completions", completionBody(pa2, 40));
+    CHECK_EQ(completionText(r), decode(srv.model().greedyReference(pa2, 40, true)));
+    CHECK(srv.tierp()->stats.restores_ram >= 1);
+    CHECK(cachedTokens(r) >= pa.size());
+    std::size_t over = 0;
+    for (const tier::Entry* e : srv.tierp()->entries) over += e->nck > tier::max_ck ? 1 : 0;
+    CHECK_EQ(over, 0u);
+    CHECK(!srv.tierp()->entries.empty());
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+
+// Chat-shaped token prompts (ChatML special tokens + random body ids) for the supersede / branch tests.
+struct ChatBuild {
+    ChatTokens ct;
+    std::uint32_t user = 0, assistant = 0;
+    ChatBuild() : ct(tok()) {
+        user = static_cast<std::uint32_t>(tok().encode("user", false).at(0));
+        assistant = static_cast<std::uint32_t>(tok().encode("assistant", false).at(0));
+    }
+    // "<|im_start|>" role "\n" body "<|im_end|>" "\n"
+    void turn(std::vector<std::uint32_t>& v, std::uint32_t role, std::uint32_t n, std::uint64_t seed) const {
+        v.push_back(ct.im_start);
+        v.push_back(role);
+        v.push_back(ct.nl);
+        const auto b = makePrompt(n, seed);
+        v.insert(v.end(), b.begin(), b.end());
+        v.push_back(ct.im_end);
+        v.push_back(ct.nl);
+    }
+    void genPrompt(std::vector<std::uint32_t>& v) const {
+        v.push_back(ct.im_start);
+        v.push_back(assistant);
+        v.push_back(ct.nl);
+    }
+    // system + user turns (bodies n_i) + generation prompt
+    std::vector<std::uint32_t> conv(std::uint32_t sys_n, std::uint64_t sys_seed, std::initializer_list<std::pair<std::uint32_t, std::uint64_t>> users) const {
+        std::vector<std::uint32_t> v;
+        turn(v, ct.system, sys_n, sys_seed);
+        for (const auto& u : users) turn(v, user, u.first, u.second);
+        genPrompt(v);
+        return v;
+    }
+    // previous prompt + its completion + "<|im_end|>" + newline + a new user turn + generation prompt
+    std::vector<std::uint32_t> next(const std::vector<std::uint32_t>& prev, const std::vector<std::uint32_t>& out, std::uint32_t n,
+                                    std::uint64_t seed) const {
+        std::vector<std::uint32_t> v = prev;
+        v.insert(v.end(), out.begin(), out.end());
+        v.push_back(ct.im_end);
+        v.push_back(ct.nl);
+        turn(v, user, n, seed);
+        genPrompt(v);
+        return v;
+    }
+};
+
+// FIX-CACHE P2-4 (FR-CACHE), the agent pattern on one slot: the main agent's long session goes idle while a
+// subagent with the same system prompt (another task) runs two turns; then the main agent resumes.
+// supersede 1: before, the subagent's second turn cut the idle main entry to the system prompt (verified:
+// resumed with 2505 cached of 8513); now it is only demoted and restored whole (exact output).
+// supersede 0 (WHIRL_KV_SUPERSEDE=0): the baseline the demotion must match.
+void testAgentIdleMain(bool supersede) {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 16384;
+    su.mc.pool_tokens = 16384;
+    su.tier = true;
+    su.tier_min = 512;
+    su.eo.kv_supersede = supersede;
+    const ChatBuild cb;
+    const auto main1 = cb.conv(2500, 901, {{6000, 902}});
+    const auto sub1 = cb.conv(2500, 901, {{500, 903}});
+    TestServer srv(su);
+    g_log.clear();
+    const auto out_m1 = srv.model().greedyReference(main1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(main1, 40))), decode(out_m1));
+    const auto out_s1 = srv.model().greedyReference(sub1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(sub1, 40))), decode(out_s1));
+    const auto sub2 = cb.next(sub1, out_s1, 200, 904);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(sub2, 40))), decode(srv.model().greedyReference(sub2, 40, true)));
+    if (supersede) CHECK(g_log.count("looks superseded") >= 1);  // the rule still marks it (system prompt shared)
+    const auto main2 = cb.next(main1, out_m1, 200, 905);
+    auto r = srv.post("/v1/completions", completionBody(main2, 40));
+    CHECK_EQ(completionText(r), decode(srv.model().greedyReference(main2, 40, true)));
+    std::fprintf(stderr, "  (agent supersede=%d: main resumed with %llu cached of %zu, restores_ram %llu, superseded %llu, demoted %llu)" "\n",
+                 supersede ? 1 : 0, static_cast<unsigned long long>(cachedTokens(r)), main1.size(),
+                 static_cast<unsigned long long>(srv.tierp()->stats.restores_ram), static_cast<unsigned long long>(srv.tierp()->stats.superseded),
+                 static_cast<unsigned long long>(srv.tierp()->stats.demoted));
+    CHECK(cachedTokens(r) >= main1.size());
+    CHECK(srv.tierp()->stats.restores_ram >= 1);
+    CHECK_EQ(srv.tierp()->stats.superseded, 0u);
+    if (supersede) CHECK(srv.tierp()->stats.demoted >= 1);
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+void testAgentIdleMainNoSupersede() { testAgentIdleMain(false); }
+void testAgentIdleMainSupersede() { testAgentIdleMain(true); }
+
+// FIX-CACHE P3-3 (FR-CACHE): a branch from an earlier turn (edit an earlier message) restores a long
+// session's inner checkpoint and takes the entry over (owner). Before: its spill updated the entry in place
+// from the branch point, so the original later turns were gone from the tiers. Now the branch gets a new
+// entry and the original session is restored whole when it resumes.
+void testBranchFromEarlierTurn() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 16384;
+    su.mc.pool_tokens = 16384;
+    su.tier = true;
+    su.tier_min = 512;
+    su.eo.n_ck = 4;
+    const ChatBuild cb;
+    const auto t1 = cb.conv(2500, 921, {{3000, 922}});
+    TestServer srv(su);
+    g_log.clear();
+    const auto o1 = srv.model().greedyReference(t1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(t1, 40))), decode(o1));
+    const auto t2 = cb.next(t1, o1, 6000, 923);
+    const auto o2 = srv.model().greedyReference(t2, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(t2, 40))), decode(o2));
+    // another conversation takes the slot (the session goes to the RAM tier)
+    const auto u = makePrompt(3000, 924);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(u, 40))), decode(srv.model().greedyReference(u, 40, true)));
+    // the branch: turn 2 edited (shares turn 1 only)
+    const auto b2 = cb.next(t1, o1, 300, 925);
+    auto rb = srv.post("/v1/completions", completionBody(b2, 40));
+    CHECK_EQ(completionText(rb), decode(srv.model().greedyReference(b2, 40, true)));
+    const std::uint64_t restores_b = srv.tierp()->stats.restores_ram;
+    // the original session resumes
+    const auto t3 = cb.next(t2, o2, 200, 926);
+    auto r = srv.post("/v1/completions", completionBody(t3, 40));
+    CHECK_EQ(completionText(r), decode(srv.model().greedyReference(t3, 40, true)));
+    std::fprintf(stderr, "  (branch: branch cached %llu, restores after branch %llu; original resumed with %llu cached of %zu)\n",
+                 static_cast<unsigned long long>(cachedTokens(rb)), static_cast<unsigned long long>(restores_b),
+                 static_cast<unsigned long long>(cachedTokens(r)), t2.size());
+    CHECK(restores_b >= 1);                 // the branch did restore turn 1 from the tier
+    CHECK(cachedTokens(rb) >= t1.size());
+    CHECK(cachedTokens(r) >= t2.size());    // the original later turn survived
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+
+// FIX-CACHE P2-4: an agent's compress (same system prompt and first task message, the middle history
+// dropped, a short summary) still cuts the old session to the shared part (same task lineage).
+void testSupersedeCompressCuts() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 16384;
+    su.mc.pool_tokens = 16384;
+    su.tier = true;
+    su.tier_min = 512;
+    const ChatBuild cb;
+    const auto old1 = cb.conv(2500, 911, {{500, 912}, {8000, 913}});
+    auto c1 = cb.conv(2500, 911, {{500, 912}, {300, 914}});
+    TestServer srv(su);
+    g_log.clear();
+    const auto out_o = srv.model().greedyReference(old1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(old1, 40))), decode(out_o));
+    const auto out_c1 = srv.model().greedyReference(c1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(c1, 40))), decode(out_c1));
+    const auto c2 = cb.next(c1, out_c1, 200, 915);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(c2, 40))), decode(srv.model().greedyReference(c2, 40, true)));
+    CHECK(g_log.count("superseded (compact / compress): cut") >= 1);
+    CHECK(srv.tierp()->stats.superseded >= 1);
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+
 // FIX-RC4-A P2-1 (RESTORE-EXC): a device copy throwing while a restore is under way -- in the first pump
 // inside Tier::beginRestore (RAM restore: every piece is copied there) or in a later pump (SSD restore) --
 // fails the restore cleanly through the engine: the request is prefilled cold (same output), no entry
@@ -2045,6 +2487,435 @@ void testVision() {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// FIX-SRV: regression tests for the FR-SRV review findings (each failed before its fix)
+
+std::uint64_t usageCompletion(const HttpResult& r) {
+    const json::Value v = parseBody(r);
+    const json::Value* u = v.get("usage");
+    const json::Value* c = u ? u->get("completion_tokens") : nullptr;
+    return c ? static_cast<std::uint64_t>(c->asInt()) : ~0ull;
+}
+
+std::string finishReason(const HttpResult& r) {
+    const json::Value v = parseBody(r);
+    const json::Value* ch = v.get("choices");
+    if (!ch || !ch->isArray() || ch->asArray().empty()) return "<none>";
+    const json::Value* f = ch->asArray()[0].get("finish_reason");
+    return f && f->isString() ? f->asString() : "<none>";
+}
+
+bool waitIdle(TestServer& srv, double max_s) {
+    const double t0 = nowSeconds();
+    while (nowSeconds() - t0 < max_s) {
+        const auto h = srv.get("/health");
+        if (h.body.find("\"slots_busy\":0") != std::string::npos && h.body.find("\"queued\":0") != std::string::npos) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
+std::string rawPost(std::uint16_t port, const std::string& body) {
+    return std::format("POST /v1/completions HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                       port, body.size(), body);
+}
+
+// P2-1: a tool call cut by max_tokens / a stop string is never returned as a complete call
+void testFrToolTruncated() {
+    json::Array tools;
+    tools.push_back(json::parse(
+        R"({"type":"function","function":{"name":"write_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}}}}})"));
+    // parser: a parameter without </parameter>, a call without </tool_call> / </function>
+    CHECK(!parseToolCalls("<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhello wor", tools));
+    CHECK(!parseToolCalls("<tool_call>\n<function=run>\n<parameter=cmd>\nrm -rf build", tools));
+    CHECK(!parseToolCalls("<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n", tools));
+    CHECK(!parseToolCalls("<tool_call>\n<function=write_file", tools));
+    CHECK(!parseToolCalls("<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": 1}}", tools));  // JSON without </tool_call>
+    // complete calls still parse (closed by </function> without </tool_call>: e.g. a stop string there)
+    CHECK(parseToolCalls("<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>", tools));
+    CHECK(parseToolCalls("<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n</function>", tools));
+    // the finish decision (StreamState::finish): finish_reason length keeps the text, no tool_calls
+    Out o;
+    o.chat = true;
+    o.tools_on = true;
+    o.text = "Writing.\n<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhello wor";
+    o.valid = o.text.size();
+    const ToolResolution a = resolveTools(o.view(true), "length", tools);
+    CHECK(!a.calls);
+    CHECK_EQ(a.reason, std::string("length"));
+    CHECK(a.content.find("hello wor") != std::string::npos);
+    // even a complete first call: the generation was cut (a later call is missing) -> text + length
+    Out o2 = o;
+    o2.text = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<fun";
+    o2.valid = o2.text.size();
+    const ToolResolution b = resolveTools(o2.view(true), "length", tools);
+    CHECK(!b.calls);
+    CHECK_EQ(b.reason, std::string("length"));
+    // a generation that ended normally with a complete call: tool_calls as before
+    Out o3 = o;
+    o3.text = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>";
+    o3.valid = o3.text.size();
+    const ToolResolution c = resolveTools(o3.view(true), "stop", tools);
+    CHECK(c.calls.has_value());
+    CHECK_EQ(c.reason, std::string("tool_calls"));
+}
+
+// P2-2: a non-streaming request whose client disconnects frees its slot (decoding, prefilling, queued)
+void testFrNonStreamDisconnect() {
+    {  // decoding
+        ServerSetup su = baseSetup();
+        su.mc.cycle_us = 1000;
+        TestServer srv(su);
+        g_log.clear();
+        const auto a = test::rawConnect("127.0.0.1", srv.port());
+        test::rawSend(a, rawPost(srv.port(), completionBody(makePrompt(64, 81), 6000, false)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        test::rawClose(a);
+        const double t0 = nowSeconds();
+        CHECK(waitIdle(srv, 5.0));
+        CHECK(nowSeconds() - t0 < 1.0);
+        CHECK(g_log.count("client disconnected") >= 1);
+    }
+    {  // prefilling (2.4 s of prefill)
+        ServerSetup su = baseSetup();
+        su.mc.prefill_us_per_row = 300;
+        TestServer srv(su);
+        const auto a = test::rawConnect("127.0.0.1", srv.port());
+        test::rawSend(a, rawPost(srv.port(), completionBody(makePrompt(8000, 82), 64, false)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        test::rawClose(a);
+        const double t0 = nowSeconds();
+        CHECK(waitIdle(srv, 10.0));
+        CHECK(nowSeconds() - t0 < 1.0);
+    }
+    {  // queued behind a busy slot: never started
+        ServerSetup su = baseSetup();
+        su.mc.parallel = 1;
+        su.mc.cycle_us = 1000;
+        TestServer srv(su);
+        g_log.clear();
+        auto send = [&](std::uint64_t seed) {
+            const auto s = test::rawConnect("127.0.0.1", srv.port());
+            test::rawSend(s, rawPost(srv.port(), completionBody(makePrompt(64, seed), 4000, false)));
+            return s;
+        };
+        const auto a = send(83);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const auto b = send(84);
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        test::rawClose(b);
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        test::rawClose(a);
+        const double t0 = nowSeconds();
+        CHECK(waitIdle(srv, 10.0));
+        CHECK(nowSeconds() - t0 < 1.0);
+        CHECK_EQ(g_log.count("starting after"), std::size_t(0));  // b never took the slot
+    }
+}
+
+// P2-3: KV pool too small for concurrent long prompts: they queue (all 200), never 500
+void testFrPoolPrefill() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 2;
+    su.mc.slot_ctx = 8192;
+    su.mc.pool_tokens = 8192;
+    TestServer srv(su);
+    std::vector<std::thread> th;
+    std::vector<HttpResult> rs(3);
+    for (int i = 0; i < 3; ++i)
+        th.emplace_back([&, i] { rs[i] = srv.post("/v1/completions", completionBody(makePrompt(6000 - 500 * i, 90 + i), 16)); });
+    for (auto& t : th) t.join();
+    for (int i = 0; i < 3; ++i) {
+        CHECK_EQ(rs[i].status, 200);
+        CHECK_EQ(completionText(rs[i]), decode(srv.model().greedyReference(makePrompt(6000 - 500 * i, 90 + i), 16, true)));
+    }
+    CHECK_EQ(srv.model().poison(), 0u);
+    // the residual path (a prefill that still runs out of pages) answers 503 + Retry-After
+    const std::string e503 = errorResponse(503, "full", "Retry-After: 5\r\n");
+    CHECK(e503.starts_with("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Type: application/json"));
+}
+
+// P3-8 (with P2-3): decode-time pool exhaustion is not a silent "length"
+void testFrPoolDecode() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 2;
+    su.mc.slot_ctx = 8192;
+    su.mc.pool_tokens = 8192;
+    TestServer srv(su);
+    std::vector<std::thread> th;
+    std::vector<HttpResult> rs(2);
+    const std::uint32_t pn[2] = {500, 3000}, mt[2] = {7000, 4500};
+    for (int i = 0; i < 2; ++i)
+        th.emplace_back([&, i] { rs[i] = srv.post("/v1/completions", completionBody(makePrompt(pn[i], 95 + i), mt[i])); });
+    for (auto& t : th) t.join();
+    int cut = 0;
+    for (int i = 0; i < 2; ++i) {
+        CHECK_EQ(rs[i].status, 200);
+        if (usageCompletion(rs[i]) < mt[i]) {
+            ++cut;
+            CHECK_EQ(finishReason(rs[i]), std::string("length"));
+            CHECK(rs[i].body.find("\"finish_cause\":\"kv_pool_exhausted\"") != std::string::npos);
+        } else {
+            CHECK(rs[i].body.find("finish_cause") == std::string::npos);
+        }
+    }
+    CHECK(cut >= 1);
+}
+
+// P2-4: disallowed Origin -> 403 for POST (also text/plain simple requests); Host allow-list (DNS rebinding)
+void testFrCrossOrigin() {
+    const std::string chat = R"({"messages":[{"role":"user","content":"q"}],"max_tokens":4,"temperature":0})";
+    CHECK(hostAllowed("192.168.1.5:8080", {}, "0.0.0.0"));
+    CHECK(hostAllowed("[fe80::1]:80", {}, "::"));
+    CHECK(!hostAllowed("evil.example", {}, "0.0.0.0"));
+    CHECK(hostAllowed("192.168.1.5", {}, "192.168.1.5"));
+    CHECK(!hostAllowed("192.168.1.6", {}, "192.168.1.5"));
+    CHECK(hostAllowed("[fe80::1]:8080", {}, "fe80::1"));
+    CHECK(hostAllowed("localhost.:8080", {}, "127.0.0.1"));
+    CHECK(!hostAllowed("localhost:80x", {}, "127.0.0.1"));
+    CHECK(!hostAllowed("127.0.0.1.nip.io", {}, "127.0.0.1"));
+    CHECK(hostAllowed("anything.example", {"*"}, "127.0.0.1"));
+    CHECK(hostAllowed("", {}, "127.0.0.1"));  // no Host header (HTTP/1.0 tools)
+    {
+        ServerSetup su = baseSetup();
+        TestServer srv(su);
+        const std::uint16_t p = srv.port();
+        g_log.clear();
+        const auto r = test::httpRequest("127.0.0.1", p, "POST", "/v1/completions", completionBody(makePrompt(32, 82), 8), 30,
+                                         "Origin: http://evil.example\r\nContent-Type: text/plain\r\n");
+        CHECK_EQ(r.status, 403);
+        CHECK_EQ(g_log.count("POST /v1/completions | stream"), std::size_t(0));  // never built / run
+        CHECK_EQ(test::httpRequest("127.0.0.1", p, "POST", "/v1/chat/completions", chat, 30, "Origin: null\r\n").status, 403);
+        CHECK_EQ(test::httpRequest("127.0.0.1", p, "POST", "/v1/chat/completions", chat, 30, "Origin: http://localhost:3000\r\n").status, 200);
+        CHECK_EQ(test::httpRequest("127.0.0.1", p, "POST", "/v1/chat/completions", chat, 30).status, 200);  // no Origin (SDK, curl)
+        // GET endpoints stay answerable (without CORS headers) for other origins: no state change
+        CHECK_EQ(test::httpRequest("127.0.0.1", p, "GET", "/health", "", 30, "Origin: http://evil.example\r\n").status, 200);
+        // DNS rebinding: Host must be loopback (or the bound address / --allow-host)
+        auto rawReq = [&](const std::string& req) {
+            const auto s = test::rawConnect("127.0.0.1", p);
+            test::rawSend(s, req);
+            const std::string resp = test::rawRecvAll(s, 10);
+            test::rawClose(s);
+            return resp;
+        };
+        const std::string b = completionBody(makePrompt(16, 83), 4);
+        auto post = [&](const std::string& host) {
+            return rawReq(std::format("POST /v1/completions HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                      host, b.size(), b));
+        };
+        CHECK(post("evil.example").starts_with("HTTP/1.1 403"));
+        CHECK(post(std::format("evil.example:{}", p)).starts_with("HTTP/1.1 403"));
+        CHECK(rawReq("GET /props HTTP/1.1\r\nHost: rebind.evil.example\r\n\r\n").starts_with("HTTP/1.1 403"));
+        CHECK(post(std::format("localhost:{}", p)).starts_with("HTTP/1.1 200"));
+        CHECK(post(std::format("127.0.0.1:{}", p)).starts_with("HTTP/1.1 200"));
+        CHECK(post(std::format("[::1]:{}", p)).starts_with("HTTP/1.1 200"));
+        CHECK(post("LOCALHOST").starts_with("HTTP/1.1 200"));
+    }
+    {  // --allow-host extends the Host list; --cors-origin extends the Origin list
+        ServerSetup su = baseSetup();
+        su.http.allowed_hosts = {"myhost.lan"};
+        su.http.cors_origins = {"https://app.example.com"};
+        TestServer srv(su);
+        const std::uint16_t p = srv.port();
+        const auto s = test::rawConnect("127.0.0.1", p);
+        test::rawSend(s, std::format("GET /health HTTP/1.1\r\nHost: myhost.lan:{}\r\n\r\n", p));
+        CHECK(test::rawRecvAll(s, 10).starts_with("HTTP/1.1 200"));
+        test::rawClose(s);
+        CHECK_EQ(test::httpRequest("127.0.0.1", p, "POST", "/v1/chat/completions", chat, 30, "Origin: https://app.example.com\r\n").status, 200);
+        CHECK_EQ(test::httpRequest("127.0.0.1", p, "POST", "/v1/chat/completions", chat, 30, "Origin: https://evil.example\r\n").status, 403);
+    }
+    {  // --allow-local-images: never for a web page (an Origin that is not a loopback page), even with --cors-origin *
+        ServerSetup su = baseSetup();
+        su.vision = true;
+        su.allow_files = true;
+        su.http.cors_origins = {"*"};
+        TestServer srv(su);
+        const std::string img = (std::filesystem::temp_directory_path() / "whirl_fr_srv_img.bmp").string();
+        {
+            FILE* f = std::fopen(img.c_str(), "wb");
+            const std::string bmp = makeBmp(64, 64, 7);
+            if (f) {
+                std::fwrite(bmp.data(), 1, bmp.size(), f);
+                std::fclose(f);
+            }
+        }
+        std::string esc;
+        appendJsonStr(esc, img);
+        const std::string body = R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":)" + esc +
+                                 R"(}},{"type":"text","text":"what"}]}],"max_tokens":4,"temperature":0})";
+        const auto web = test::httpRequest("127.0.0.1", srv.port(), "POST", "/v1/chat/completions", body, 30, "Origin: https://evil.example\r\n");
+        CHECK_EQ(web.status, 400);
+        CHECK(web.body.find("local image") != std::string::npos);
+        CHECK_EQ(test::httpRequest("127.0.0.1", srv.port(), "POST", "/v1/chat/completions", body, 30).status, 200);  // no Origin: allowed
+        std::filesystem::remove(img);
+    }
+}
+
+// P2-5: --draft dflash without DeltaNet replay (gfx1151 / 8060S): drafts are produced, output unchanged
+void testFrDFlashNoReplay() {
+    CHECK_EQ(literalSnapSets(15, std::nullopt), 15u);
+    CHECK_EQ(literalSnapSets(7, 10u), 10u);
+    CHECK_EQ(literalSnapSets(7, 99u), qwen35::gdn_max_snap);
+    CHECK_EQ(literalSnapSets(0, std::nullopt), 1u);
+    for (bool ngram : {false, true}) {
+        ServerSetup su = dflashSetup(ngram);
+        su.mc.replay = false;
+        su.mc.dfl_miss = 0.3;
+        if (ngram) su.mc.markov = 40;
+        TestServer srv(su);
+        g_log.clear();
+        for (std::uint32_t n : {5u, 300u, 1500u}) {
+            const auto p = makePrompt(n, 140 + n);
+            const auto ref = srv.model().greedyReference(p, 120, true);
+            auto r = srv.post("/v1/completions", completionBody(p, 120, n == 300));
+            CHECK_EQ(r.status, 200);
+            CHECK_EQ(n == 300 ? streamText(r, false) : completionText(r), decode(ref));
+        }
+        const Engine::Stats st = srv.engine().stats();
+        CHECK(st.dfl_drafted > 0);
+        CHECK(st.dfl_accepted > 0);
+        CHECK(srv.model().snapSets() > 0);
+        CHECK_EQ(srv.model().poison(), 0u);
+        CHECK(waitIdle(srv, 5.0));
+        CHECK(g_log.count("literal drafts/cycle (DFlash2 / n-gram)") >= 1);  // the batch log shows them
+    }
+    {  // MTP without replay still matches the reference (snapshot rollback path of the mock)
+        ServerSetup su = baseSetup();
+        su.mc.replay = false;
+        TestServer srv(su);
+        const auto p = makePrompt(700, 150);
+        CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(p, 100))), decode(srv.model().greedyReference(p, 100, true)));
+        CHECK_EQ(srv.model().poison(), 0u);
+    }
+}
+
+// P3-1: a request arriving after the engine loop has stopped gets 503 at once (no hang)
+void testFrShutdown503() {
+    ServerSetup su = baseSetup();
+    TestServer srv(su);
+    srv.stopEngine();
+    const double t0 = nowSeconds();
+    const auto r = test::httpRequest("127.0.0.1", srv.port(), "POST", "/v1/completions", completionBody(makePrompt(16, 160), 4), 5);
+    CHECK_EQ(r.status, 503);
+    CHECK(nowSeconds() - t0 < 2.0);
+}
+
+// P3-3, P3-4, P3-6: protocol details
+void testFrProtocol() {
+    // P3-3: what is streamed is always a prefix of the final (sanitized) text
+    const std::vector<std::string> cases = {std::string("ab\xE0" "bc\xF0\x9F\x98\x80" "d\xC3"),
+                                            std::string("\xED\xA0\x80x\xC3\xA9\xF4\x90\x80\x80y"), std::string("\x80\xBFq\xE2\x82"),
+                                            std::string("ok \xE4\xBD\xA0\xE5\xA5\xBD"), std::string("\xC0\xAF" "a\xF0\x9F" "b")};
+    for (const std::string& bytes : cases) {
+        Out o;
+        std::vector<std::string> streamed;
+        for (char c : bytes) {
+            o.text.push_back(c);
+            o.valid = sanitizeUtf8Prefix(o.text, o.valid);
+            streamed.emplace_back(o.text.substr(0, o.valid));
+        }
+        const std::string fin = sanitizeUtf8(o.text);
+        CHECK(isValidUtf8(fin));
+        for (const std::string& s : streamed) CHECK(fin.starts_with(s));
+    }
+    CHECK_EQ(sanitizeUtf8("ab\xE0" "bc"), std::string("ab\xEF\xBF\xBD" "bc"));
+    // P3-4: a tiny positive temperature is greedy; > 100 has a correct message
+    {
+        const Params p = parseParams(json::parse(R"({"temperature":1e-40})").asObject(), true, true);
+        CHECK(p.temperature == 0.0f);
+        const Params q = parseParams(json::parse(R"({"temperature":0.0005})").asObject(), true, true);
+        CHECK(q.temperature == 0.0f);
+        const Params r = parseParams(json::parse(R"({"temperature":0.01})").asObject(), true, true);
+        CHECK(r.temperature > 0.0f);
+        std::string msg;
+        try {
+            parseParams(json::parse(R"({"temperature":150})").asObject(), true, true);
+        } catch (const RequestError& e) {
+            msg = e.what();
+        }
+        CHECK_EQ(msg, std::string("temperature must be in [0, 100]"));
+    }
+    // P3-6: stop strings: at most 16, each at most 256 bytes
+    {
+        auto threw = [](const std::string& js) {
+            try {
+                parseParams(json::parse(js).asObject(), true, true);
+            } catch (const RequestError&) {
+                return true;
+            }
+            return false;
+        };
+        auto list = [](int n) {
+            std::string s = R"({"stop":[)";
+            for (int i = 0; i < n; ++i) s += std::format("{}\"s{}\"", i ? "," : "", i);
+            return s + "]}";
+        };
+        CHECK(threw(list(17)));
+        CHECK(!threw(list(16)));
+        CHECK(threw("{\"stop\":\"" + std::string(257, 'x') + "\"}"));
+        CHECK(!threw("{\"stop\":\"" + std::string(256, 'x') + "\"}"));
+    }
+}
+
+// P3-7: completion_tokens counts the tokens up to the one that completes the stop string
+void testFrStopTokens() {
+    ServerSetup su = baseSetup();  // MTP: several tokens per cycle
+    TestServer srv(su);
+    const auto p = makePrompt(500, 170);
+    const auto ref = srv.model().greedyReference(p, 300, true);
+    const std::string full = decode(ref);
+    for (std::size_t at : {std::size_t(40), full.size() / 2}) {
+        const std::string stop = full.substr(at, 5);
+        const std::size_t end = full.find(stop) + stop.size();
+        std::uint64_t want = 0;
+        while (want < ref.size() && decode(std::span<const std::uint32_t>(ref.data(), want)).size() < end) ++want;
+        std::string js;
+        appendJsonStr(js, stop);
+        auto r = srv.post("/v1/completions",
+                          std::format("{{\"prompt\":{},\"max_tokens\":300,\"temperature\":0,\"ignore_eos\":true,\"stop\":[{}]}}", idsJson(p), js));
+        CHECK_EQ(finishReason(r), std::string("stop"));
+        CHECK_EQ(usageCompletion(r), want);
+    }
+}
+
+// P3-12: a follow-up with a few new tokens on a cached prefix is not held behind a long prefill
+void testFrShortFollowUp() {
+    ServerSetup su = baseSetup();
+    su.mc.prefill_us_per_row = 250;  // 12000 rows: 3 s of prefill
+    TestServer srv(su);
+    const auto p1 = makePrompt(400, 180);
+    const auto o1 = srv.model().greedyReference(p1, 16, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(p1, 16))), decode(o1));
+    std::vector<std::uint32_t> p2 = p1;
+    p2.insert(p2.end(), o1.begin(), o1.end());
+    for (std::uint32_t t : makePrompt(6, 181)) p2.push_back(t);
+    HttpResult rl;
+    std::thread longer([&] { rl = srv.post("/v1/completions", completionBody(makePrompt(12000, 182), 4)); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));  // the long prefill is running
+    const double t0 = nowSeconds();
+    const auto r2 = srv.post("/v1/completions", completionBody(p2, 1));  // done when its prefill is
+    const double dt = nowSeconds() - t0;
+    longer.join();
+    CHECK_EQ(r2.status, 200);
+    CHECK_EQ(completionText(r2), decode(srv.model().greedyReference(p2, 1, true)));
+    CHECK(cachedTokens(r2) >= p1.size());  // the follow-up reused its prefix (a short chunk)
+    CHECK(dt < 1.5);                       // one 2048-row chunk of the long prefill (~0.5 s), not all of it (3 s)
+    CHECK_EQ(rl.status, 200);
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+
+// P3-11: control characters in a request path are escaped in the log
+void testFrLogInjection() {
+    TestServer srv(baseSetup());
+    g_log.clear();
+    const auto s = test::rawConnect("127.0.0.1", srv.port());
+    test::rawSend(s, "GET /x\x1b[2Jy\x07 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    CHECK(test::rawRecvAll(s, 10).starts_with("HTTP/1.1 404"));
+    test::rawClose(s);
+    CHECK_EQ(g_log.count("/x\\x1b[2Jy\\x07 -> 404"), std::size_t(1));
+    CHECK_EQ(g_log.count("\x1b"), std::size_t(0));
+}
+
 int main(int argc, char** argv) {
     std::set<std::string> only;
     for (int i = 1; i < argc; ++i) {
@@ -2098,6 +2969,9 @@ int main(int argc, char** argv) {
         {"greedy_reference", testGreedyMatchesReference},
         {"stream", testStreamEqualsNonStream},
         {"prefix_cache", testPrefixCacheMultiTurn},
+        {"doc_qa", testDocQa},
+        {"tail_ck_sched", testTailCkOnSchedule},
+        {"tail_ck_regress", testTailCkRegression},
         {"concurrency", [] { testConcurrency(4, 12, true); }},
         {"concurrency16", [] { testConcurrency(16, 24, true); }},
         {"concurrency_nomtp", [] { testConcurrency(4, 8, false); }},
@@ -2120,8 +2994,25 @@ int main(int argc, char** argv) {
         {"tiers", testTiers},
         {"restore_conc", testRestoreConcurrent},
         {"restore_throws", testRestoreThrows},
+        {"tier_inplace", testTierInPlaceRegen},
+        {"ckpts_clamp", testServeCkptsClamp},
+        {"branch_turn", testBranchFromEarlierTurn},
+        {"agent_idle_main", testAgentIdleMainNoSupersede},
+        {"agent_idle_main_sup", testAgentIdleMainSupersede},
+        {"supersede_compress", testSupersedeCompressCuts},
         {"sampling", testSampling},
         {"stop_eos", testStopAndEos},
+        {"fr_tool_truncated", testFrToolTruncated},
+        {"fr_nonstream_disconnect", testFrNonStreamDisconnect},
+        {"fr_pool_prefill", testFrPoolPrefill},
+        {"fr_pool_decode", testFrPoolDecode},
+        {"fr_cross_origin", testFrCrossOrigin},
+        {"fr_dflash_noreplay", testFrDFlashNoReplay},
+        {"fr_shutdown_503", testFrShutdown503},
+        {"fr_protocol", testFrProtocol},
+        {"fr_stop_tokens", testFrStopTokens},
+        {"fr_log_injection", testFrLogInjection},
+        {"fr_short_followup", testFrShortFollowUp},
     };
     for (const T& t : tests) {
         if (!only.empty() && !only.count(t.name)) continue;

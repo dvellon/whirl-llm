@@ -220,7 +220,8 @@ request slots, a prefix cache in VRAM and host RAM / SSD tiers for idle sessions
 | `--vis-mode M` | `auto` (default), `resident` (encoder weights in VRAM), `stream` (layer by layer) |
 | `--vis-cache-mb N` | host cache of image embeddings, keyed by content hash, MiB (default 1024) |
 | `--allow-local-images` | also accept local file paths / `file://` URLs as image sources (off by default; `http(s)` image URLs are never fetched) |
-| `--cors-origin ORIGIN` | let web pages from `ORIGIN` (e.g. `https://app.example.com`) call the server from a browser; repeatable. By default only pages served from `http(s)://localhost`, `127.0.0.1` or `[::1]` (any port) get CORS headers (their `Origin` is echoed back, never `*`); other web pages, including `file://` pages, cannot read responses. `*` restores the behaviour before v0.1.4 (`Access-Control-Allow-Origin: *` for every page). Non-browser clients (SDKs, curl, IDE agents) are not affected |
+| `--cors-origin ORIGIN` | let web pages from `ORIGIN` (e.g. `https://app.example.com`) call the server from a browser; repeatable. By default only pages served from `http(s)://localhost`, `127.0.0.1` or `[::1]` (any port) get CORS headers (their `Origin` is echoed back, never `*`); other web pages, including `file://` pages, cannot read responses. `*` restores the behaviour before v0.1.4 (`Access-Control-Allow-Origin: *` for every page). A `POST` from a page whose `Origin` is not allowed is refused with 403 (it is not run), including "simple" `text/plain` requests that need no preflight. Non-browser clients (SDKs, curl, IDE agents) send no `Origin` and are not affected. Local image files (`--allow-local-images`) are never read for a request from a web page other than a localhost page, whatever `--cors-origin` allows |
+| `--allow-host NAME` | also answer requests whose `Host` header is `NAME` (repeatable; `*` = any). By default the server answers `localhost`, `127.0.0.1`, `[::1]` and the `--host` address (any IP address with `--host 0.0.0.0`); other names get 403. This blocks DNS rebinding (a web page whose own domain is made to resolve to 127.0.0.1). Use it when clients reach the server by a host name, e.g. `--host 0.0.0.0 --allow-host mypc.lan` |
 | `--log-file PATH` | log file (default `%LOCALAPPDATA%\whirl\server.log`); the log also goes to the console |
 | `-h`, `--help` / `-V`, `--version` | help / version |
 
@@ -266,8 +267,9 @@ Request parameters: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `max_token
 `preserve_thinking`. Without sampling parameters the model card's recommended values apply. With
 `temperature` 0 the output equals `whirl chat` token for token. `presence_penalty` /
 `frequency_penalty` are accepted but ignored; `n` must be 1; `logprobs`, `response_format` and
-enforced `tool_choice: "required"` are not supported. Responses add `usage.cached_tokens` and a
-llama.cpp-style `timings` object. Details: [server.md](guide/en/server.md#sampling).
+enforced `tool_choice: "required"` are not supported. `stop` takes at most 16 strings of at most
+256 bytes each (more: HTTP 400); a `temperature` below 0.001 is greedy. Responses add
+`usage.cached_tokens` and a llama.cpp-style `timings` object. Details: [server.md](guide/en/server.md#sampling).
 
 Thinking and reasoning effort can be given in any of these forms (applied in this order; a later one
 overrides an earlier one): `chat_template_kwargs.{enable_thinking, reasoning_effort}`, the
@@ -290,6 +292,29 @@ $body = '{"messages":[{"role":"user","content":"What is 2+3?"}],"temperature":0,
 Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -ContentType 'application/json' -Body $body
 ```
 
+### <a id="prefix-cache"></a>Prefix cache: what a new request reuses
+
+DeltaNet layers can only resume where the server saved a **checkpoint** of their state (details:
+[kv-and-caching.md](guide/en/kv-and-caching.md#checkpoints)). Per slot: the end of the prompt
+(`prompt-end`: the same prompt again, e.g. regenerate), the end of the answer (`gen-end`: the next
+chat or agent turn) and, since 0.2.0, a **tail checkpoint** near the end of every prompt of 4096
+tokens or more. Shared between sessions: long system messages and prefixes common to earlier
+sessions.
+
+**Long-document Q&A.** Ask several questions about the same long document, each as its own request
+(`document + question` in one user message, no system message): the second question resumes from
+the first one's tail checkpoint (the start of its last 1024-token chunk, 257 to 1280 tokens before
+the prompt end) and prefills only the rest, instead of the whole document. On a 128k document that
+is about 1.1k tokens instead of 131k (R9700: an estimated 1-2 s instead of the 107 s measured before). Conditions: the questions
+differ only after that point (a question up to about 256 tokens always qualifies; put a long
+question, or the document, in a system message of 2048+ tokens otherwise), and the slot keeps 3 or
+more checkpoints (default: 4 with one slot, 3 with 2 to 4 slots). The output is the same as without
+the cache: the tail checkpoint lies on the cold-run chunk schedule (precise and balance stay bit
+identical to a cold run). Each per-slot checkpoint takes 150.6 MiB of VRAM for Qwen3.8-27B and
+63.8 MiB for Ornith-1.5-35B-A3B; the startup log lists the count and size, and the VRAM fit lowers
+the count to 2 (tail checkpoint off) when the KV pool would otherwise be small. `WHIRL_TAIL_CK=0`
+turns it off (debugging).
+
 ### <a id="ssd-tier"></a>How the SSD tier stores sessions
 
 - **When it writes.** `--kv-ssd-mode shutdown` (default): no SSD writes while the server runs.
@@ -307,28 +332,38 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -Conten
 - **Size cap, expiry.** The directory never holds more than `--kv-ssd-gb` (default 64 GiB) on
   disk, counted as real allocated bytes (shared blocks are holes in the sparse files and are not
   counted twice). When it is full, the least recently used session is deleted (together with the
-  files that borrow its blocks); files of other models, builds or KV formats are deleted first.
-  Files not used for 7 days are deleted automatically (at start and hourly); files that cannot be
-  used (half-written by a crash, corrupt, not a WHIRL cache file) are deleted at start. The start-up
-  log has one line with the files and GiB on disk, the cap and what was removed and why.
+  files that borrow its blocks); files of other models, builds or KV formats are deleted first, and
+  so are files written with another per-slot context (`--ctx` / `--parallel`, or a smaller context
+  chosen for the free VRAM): those are kept, counted against the cap and used again by a server with
+  that context. A session in RAM whose file does not fit the cap is not written (it stays in RAM only;
+  logged once). Files not used for 7 days are deleted automatically (at start and hourly); files that
+  cannot be used (half-written by a crash, corrupt, not a WHIRL cache file) are deleted at start. The
+  start-up log has one line with the files and GiB on disk, the cap and what was removed and why.
 - **Only what changed is written.** A continued conversation writes its new KV pages and the
   changed checkpoint, not the whole session again. KV blocks that another file on the SSD already
   holds for the same token prefix (a shared system prompt and tool definitions, the part before a
   retry or a compact) are not written again: the new file refers to them (the file is sparse, the
   block is read from the other file). A block is shared only when its token prefix matches and
   its 128-bit content hash is equal.
-- **Superseded sessions.** When an agent compacts or trims its history (same system prompt, the new
-  conversation shares only an early part with an older session and is clearly shorter), the older
-  session is cut down to the shared part once the new conversation has finished its second turn
-  and the old one has not been used since. Retries, regenerations, edits of the last message and
-  other system prompts never trigger this. `WHIRL_KV_SUPERSEDE=0` turns it off.
+- **Superseded sessions.** When an agent trims its history (same system prompt and first task
+  message, the middle dropped, the new conversation clearly shorter), the older session is cut down
+  to the shared part once the new conversation has finished its second turn and the old one has not
+  been used since. A new conversation that shares only the system prompt (a compact that replaces
+  the history with a summary, or simply another conversation with the same system prompt, such as a
+  subagent running while the main agent waits) never cuts the older session: it is kept whole and only
+  evicted first when the RAM or SSD tier needs room (and not written to the SSD on a RAM eviction);
+  any use of it undoes that. Retries, regenerations, edits of the last message and other system
+  prompts never trigger this. `WHIRL_KV_SUPERSEDE=0` turns it off.
 - **Short sessions** (under 2048 tokens, `WHIRL_KV_TIER_MIN`) are not kept: prefilling them again
   is about as fast as restoring them.
 - **Safety.** The cache matches token prefixes exactly; a restored entry is the very bytes that were
-  saved. Every file has a checksummed token list and a header written last; a file cut short by a
-  crash, a file whose shared block is gone or no longer matches, or a file from another build,
+  saved. Every file has a checksummed token list and a header written last (behind flush barriers,
+  so a crash or power loss never leaves a valid header over other bytes); a file cut short, a file
+  whose shared block is gone or no longer matches its recorded hash, or a file from another build,
   model, mode or KV format is never restored (other builds' files are counted against the cap and
-  deleted first). The worst case of any fault is a cache miss, never different output.
+  deleted first). The KV and checkpoint data itself is not checksummed on read: these checks catch
+  crashes, power loss, truncation and stale files, not bit rot or a failing disk silently changing
+  bytes inside a file. Against those faults the tier relies on the drive and file system.
 - **One server per directory.** A second server pointed at a directory in use (`whirl.lock`) runs
   without an SSD tier and says so in the log; give each server its own `--kv-ssd-dir`.
 - **Write volume.** The log's `kv tier |` line and `GET /props` (`kv_ssd.bytes_written`,
@@ -452,7 +487,7 @@ The output always equals plain greedy decoding (with sampling: the same distribu
 |---|---|
 | `WHIRL_NO_PREFIX_CACHE=1` | disable the prefix cache |
 | `WHIRL_PREFIX_CACHE_VERIFY=1` | re-prefill after every cache hit and compare *(diagnostic)* |
-| `WHIRL_SERVE_CKPTS=N` | prefix checkpoints per slot (default 4 with one slot, 2 up to 4 slots, else 1) |
+| `WHIRL_SERVE_CKPTS=N` | prefix checkpoints per slot (default 4 with one slot, 3 up to 4 slots, else 1; at most 8; 3 or more keep a [tail checkpoint](#prefix-cache)) |
 | `WHIRL_SYS_MIN=N` | system messages of at least N tokens get their own checkpoint (default 2048, 0 = off) |
 | `WHIRL_SYS_CKPTS=N` | shared prefix checkpoints kept in VRAM (default 2) |
 | `WHIRL_SYS_LCP=0` | no checkpoints at prefixes common to sessions |
@@ -475,7 +510,7 @@ The output always equals plain greedy decoding (with sampling: the same distribu
 | `WHIRL_KV_SSD_EXPIRE_S=S` | delete SSD cache files unused for S seconds (default 604800 = 7 days; for tests) |
 | `WHIRL_KV_SSD_MODE=always\|shutdown\|off` | = `--kv-ssd-mode` |
 | `WHIRL_KV_SSD_DEDUP=0` | write every block even when another SSD file holds it (default: shared) |
-| `WHIRL_KV_SUPERSEDE=0` | keep sessions superseded by an agent's compact / trim (default: cut to the shared part) |
+| `WHIRL_KV_SUPERSEDE=0` | keep sessions superseded by an agent's trim (default: cut to the shared part when the first task message is shared too; evicted first when only the system prompt is) |
 | `WHIRL_MMPROJ=FILE` | vision encoder (= `--mmproj`) |
 | `WHIRL_VIS_IDLE_S=N` | release the vision encoder after N s without images (= `--vis-idle-s`) |
 | `WHIRL_VIS_CACHE_MB=N` | image embedding cache in MiB (= `--vis-cache-mb`) |
@@ -537,6 +572,8 @@ Alternatives kept for A/B tests and numerics comparisons. The lossy ones are the
 | Variable | Meaning |
 |---|---|
 | `WHIRL_KV=f16\|q8\|q8h\|q8v\|q4` | *(debug)* force a KV cache format instead of the mode's ([numerics modes](#modes)); `auto` or unset = the mode decides. A forced format skips the fit check (the pool is sized from what is free) and in precise mode a quantized value is logged as a user-requested lossy override. A format the GPU has no kernels for is refused. See [kv-and-caching.md](guide/en/kv-and-caching.md#formats) |
+| `WHIRL_FD_SPLITS=64\|128\|192\|256` | *(debug)* split count of the decode / verify attention (default 64, q4 KV 256). Another value changes the attention's partial sums, so output bits differ from the default |
+| `WHIRL_FD_SPLITS`, `WHIRL_GEMV_MAX`, `WHIRL_GV_NMAX`, `WHIRL_GV_GROUP`, `WHIRL_NO_FUSE`, `WHIRL_FLOAT_GEMV`, `WHIRL_GDN_SEQ`, `WHIRL_NAIVE_ATTN`, `WHIRL_DBG`, `WHIRL_ATTN_WIDE`, `WHIRL_ATTN_DQ4`, `WHIRL_MOE_BN` | A/B switches that pick other kernel paths. Any of them set is logged at start-up as an override and the mode label becomes `MODE+overrides` (also in `GET /props`): the run is not the mode's tested path, and e.g. `WHIRL_GEMV_MAX=8` in balance makes 9–16-row verifies take another GEMM than 1-token decode, so MTP is no longer equal to plain decode |
 | `WHIRL_TOKENIZE_ONLY=1` | print the prompt token ids and stop |
 | `WHIRL_PRINT_IDS=1` | print the generated token ids and their FNV-1a hash |
 | `WHIRL_PROFILE=1` | per-op-class GPU time; distorts speed numbers (`whirl bench`: per prefill size; server: 1 or 2) |
@@ -547,6 +584,7 @@ Alternatives kept for A/B tests and numerics comparisons. The lossy ones are the
 | `WHIRL_TRACE_ND=1` | log the draft count of every decode cycle |
 | `WHIRL_LOOP_LOG=1` | log per-loop phase timing (server) |
 | `WHIRL_TIER_VERIFY=1` | byte-verify every host-tier spill / restore (server) |
+| `WHIRL_TAIL_CK=0` | *(debug)* no [tail checkpoint](#prefix-cache) near the end of long prompts (logged as an override); a second question about the same document then re-prefills it |
 | `WHIRL_TIER_MIN_GAIN=N` | restore from a host tier only when it saves at least N tokens (default 512) |
 
 ## <a id="files"></a>8. Files WHIRL writes

@@ -30,7 +30,7 @@ DeltaNet 狀態本身每個序列是固定大小，與上下文長度無關。se
 - f16 分頁版本與舊的連續快取**逐位元相同**（兩個模型 × 4 種提示詞類型：prefill logits、MTP 文字、純文字）。
 - 查表成本佔 decode 時間的 **0.3–0.5%**（例如 64k 純 decode 35.8 vs 35.7 ms/token）。
 
-**server 的池管理。** 一個空閒頁堆疊；每個 slot 擁有一份頁清單（閒置時保留，供前綴重用）。在每個 prefill chunk 與每個 decode 週期之前，slot 會確保頁數涵蓋到 `pos + drafts + 2`。池用盡時，會逐出最久未使用的*閒置* slot（丟棄其前綴快取並收回其頁——若啟用分層，則先寫出，見 §8）。若所有頁都被執行中的請求佔用，該請求以 `finish_reason: length`（decode）或 HTTP 500（prefill）結束。頁帶有參考計數，讓共享前綴（§5）能以唯讀方式映射到多個 slot；仍被背景複製讀取中的頁會進入隔離清單，等該複製的 fence 通過後才回到空閒清單。
+**server 的池管理。** 一個空閒頁堆疊；每個 slot 擁有一份頁清單（閒置時保留，供前綴重用）。在每個 prefill chunk 與每個 decode 週期之前，slot 會確保頁數涵蓋到 `pos + drafts + 2`。池用盡時，會逐出最久未使用的*閒置* slot（丟棄其前綴快取並收回其頁——若啟用分層，則先寫出，見 §8）。若所有頁都被執行中的請求佔用：即將開始的請求會留在佇列，等池放得下它的 prompt 才開始（只剩它自己時一定開始）；decode 中的請求以 `finish_reason: "length"` 結束，choice 裡另加 `"finish_cause": "kv_pool_exhausted"`（max_tokens 或 context 用完時沒有這個欄位）；prefill 途中仍然不夠（decode 中的請求用掉了它預估的頁）時回 HTTP 503 加 `Retry-After: 5`，不會是 500。頁帶有參考計數，讓共享前綴（§5）能以唯讀方式映射到多個 slot；仍被背景複製讀取中的頁會進入隔離清單，等該複製的 fence 通過後才回到空閒清單。
 
 - `--ctx N` = 池大小（以 token 計）；`--ctx-per-slot N` = 每個請求的上限。
 - 預設池 = 扣除權重、緩衝區、slot 狀態與檢查點後剩下的全部 VRAM，再減去保留量：**dense 模型 768 MiB，MoE 1.5 GiB**（MoE 模型會較晚配置約 0.5 GiB，保留量較小時會溢入共享記憶體）。
@@ -153,15 +153,16 @@ transformer 可以重用任何 KV 區塊已被快取的前綴。DeltaNet 層做�
 | `think-open` | 思考提示詞結尾 `<think>\n` 的正後方（無 logits） | 客戶端丟掉思考內容時的下一回合 |
 | `system` | system 訊息結尾（≥ 2048 token） | 使用相同系統提示詞的新 session |
 | `prefix` | 長共同前綴內的某個 chunk 起點 | 結尾帶有各 session 專屬文字的系統提示詞 |
+| `prefix`（尾端，每 slot） | 4096 token 以上提示詞最後一個排程 chunk 的起點（距結尾 257..1280） | 對同一份長文件的另一個問題 |
 
-當 `--parallel` > 1 時每個 slot 保存 2 個檢查點，否則 4 個。新請求會被放到可重用前綴最長的 slot；KV 以截斷方式重用，slot 的狀態則從該點或之前最佳的檢查點載入。
+每個 slot 保存的檢查點數：1 個 slot 時 4 個、2 到 4 個 slot 時 3 個、更多時 1 個。3 個以上時，存滿後不會覆寫最新的 `prefix`（尾端）檢查點，因此上一個請求的尾端、`prompt-end` 與 `gen-end` 都保留；少於 3 個則不建立尾端檢查點（`WHIRL_TAIL_CK=0` 可關閉）。新請求會被放到可重用前綴最長的 slot；KV 以截斷方式重用，slot 的狀態則從該點或之前最佳的檢查點載入。
 
 ### <a id="think-open"></a>5.1 多回合快取為何沒命中，以及修正
 
 server 日誌顯示有兩個根本原因，而不是一開始懷疑的單一原因：
 
 1. **MTP 在 EOS 之後仍接受草稿**（[speculative-decoding.md](speculative-decoding.md#eos)）：狀態跑過 `<|im_end|>` 1–3 個 token，所以 `gen-end` 落在下一回合的共同前綴之外（例如：`cache now 42`，下一回合的共同前綴是 41）。
-2. **思考提示詞以 `<think>\n` 結尾。** 當客戶端不回傳 `reasoning_content`（多數 agent 客戶端都不回傳）時，歷史會被重新渲染成 `<think>\n\n</think>\n\n…`，而 `\n\n` 是單一個 token，和提示詞最後的 `\n` 不同。`prompt-end` 檢查點差一個 token 沒命中，因此**每一回合都重新 prefill 整段對話**（命中率 0.000）。修正：將這類提示詞的 prefill 在 N−1 處切開，並在 `<think>` 之後存一個 `think-open` 檢查點。CLI 以相同方式切分，因此 server == CLI 仍維持逐位元相同；成本：思考提示詞多一個 1-token 步驟（27B 上約 28 ms）。
+2. **思考提示詞以 `<think>\n` 結尾。** 當客戶端不回傳 `reasoning_content`（多數 agent 客戶端都不回傳）時，歷史會被重新渲染成 `<think>\n\n</think>\n\n…`，而 `\n\n` 是單一個 token，和提示詞最後的 `\n` 不同。`prompt-end` 檢查點差一個 token 沒命中，因此**每一回合都重新 prefill 整段對話**（命中率 0.000）。修正：將這類提示詞的 prefill 在 N−1 處切開，並在 `<think>` 之後存一個 `think-open` 檢查點。CLI 以相同方式切分（切點在兩邊一致）；成本：思考提示詞多一個 1-token 步驟（27B 上約 28 ms）。
 
 | 多回合命中率（後續回合：已快取 / 提示詞） | 27B 修正前 → 後 | MoE 修正前 → 後 |
 |---|---|---|

@@ -122,6 +122,24 @@ static void testCkptSlotFor() {
     cks[0].valid = false;
     CHECK(pc->ckptSlotFor(cks, 400) == 0);  // first free one
     CHECK(pc->ckptSlotFor(cks, 300) == 2);  // the same position wins over a free one
+    // TAIL-CK: a full set of >= ckpt_keep_prefix_min keeps its newest 'prefix' checkpoint
+    std::vector<Ck> t = {ck(100, 5), ck(200, 3), ck(300, 7)};
+    t[1].kind = "prefix";
+    t[0].kind = "prompt-end";
+    t[2].kind = "gen-end";
+    CHECK(pc->ckptSlotFor(t, 400) == 0);  // oldest is the tail: the next oldest goes
+    CHECK(pc->ckptSlotFor(t, 200) == 1);  // the same position: in place, also a 'prefix' one
+    t[0].kind = "prefix";                 // two 'prefix' ones: the older (seq 3) goes, the newest stays
+    CHECK(pc->ckptSlotFor(t, 400) == 1);
+    t.push_back(Ck{});
+    CHECK(pc->ckptSlotFor(t, 400) == 3);  // a free one first
+    // fewer than ckpt_keep_prefix_min: plain oldest first (2 per slot keeps prompt-end + gen-end)
+    std::vector<Ck> two = {ck(100, 3), ck(200, 4)};
+    two[0].kind = "prefix";
+    CHECK(pc->ckptSlotFor(two, 400) == 0);
+    std::vector<Ck> one = {ck(100, 3)};
+    one[0].kind = "prefix";
+    CHECK(pc->ckptSlotFor(one, 400) == 0);
 }
 
 static void testShared() {
@@ -283,6 +301,18 @@ static void testFingerprint() {
     p.numerics = "precise (items)";
     CHECK(tierFingerprint(p) != base);
     CHECK(tierFingerprint(p) == oldFingerprint(p, {}));
+    // KV format is part of the key (FR-CACHE: corrupting kv_name went unnoticed)
+    for (const char* kv : {"q8h", "q8", "q8v", "q4", ""}) {
+        p = in;
+        p.kv_name = kv;
+        CHECK(tierFingerprint(p) != base);
+    }
+    p = in;
+    p.max_batch = 2048;
+    CHECK(tierFingerprint(p) != base);
+    p = in;
+    p.exe_id += 1;
+    CHECK(tierFingerprint(p) != base);
     // model identity / layout / mtp
     p = in;
     p.use_mtp = false;
@@ -302,6 +332,22 @@ static void testFingerprint() {
     CHECK(e1 == oldFingerprint(in, {{"WHIRL_A", "1"}, {"WHIRL_B", "2"}}));
     p.env = {{"WHIRL_A", "1"}, {"WHIRL_B", "3"}};
     CHECK(tierFingerprint(p) != e1);
+    // FIX-NUM P2-2: the GPU code object is part of the key (one exe, R9700 + 8060S kernels)
+    {
+        FingerprintInputs a = in, b = in;
+        a.gpu_arch = "gfx1201";
+        b.gpu_arch = "gfx1151";
+        CHECK(tierFingerprint(a) != tierFingerprint(b));
+        CHECK(tierFingerprint(a) != base && tierFingerprint(b) != base);
+        CHECK(tierFingerprint(a) == tierFingerprint(a));
+        // device name and kernel set (FR-CACHE P1-1)
+        FingerprintInputs e = a;
+        e.gpu_name = "AMD Radeon(TM) 8060S Graphics";
+        CHECK(tierFingerprint(e) != tierFingerprint(a));
+        e = a;
+        e.kernel_set = "gfx1151 co 123";
+        CHECK(tierFingerprint(e) != tierFingerprint(a));
+    }
     p.env = {{"Whirl_Relax", "1"}};  // prefix check is case-insensitive, the key is hashed as written
     CHECK(tierFingerprint(p) != base);
     CHECK(fingerprintEnvKept("WHIRL_NUMERICS"));
@@ -372,6 +418,37 @@ static void testSupersede() {
         const auto small_old = cat(sys, seq(3000, 750000));
         CHECK(!supersedes(small_old, cat(sys, seq(200, 760000)), sys.size()).yes);
     }
+    // FIX-CACHE P2-4 task lineage (task_end: end of the new conversation's first message after the system one)
+    {
+        // compact / another conversation with the same system prompt (a subagent): shares only the system
+        // prompt -> supersedes but is not cut
+        const auto n = cat(sys, seq(1500, 500000));
+        const Supersede s = supersedes(old_t, n, sys.size(), {}, 3600);
+        CHECK(s.yes && s.keep == 3000 && !s.cut);
+        // the first message shared too (compress): cut
+        auto m = old_t;
+        m.resize(9000);
+        m = cat(m, seq(4000, 600000));
+        const Supersede c = supersedes(old_t, m, sys.size(), {}, 3600);
+        CHECK(c.yes && c.keep == 9000 && c.cut);
+        // the first message only partly shared: not cut; task_end unknown (max): not cut; 0: the old rule
+        auto q = old_t;
+        q.resize(3400);
+        q = cat(q, seq(1500, 610000));
+        CHECK(supersedes(old_t, q, sys.size(), {}, 3600).yes && !supersedes(old_t, q, sys.size(), {}, 3600).cut);
+        CHECK(!supersedes(old_t, m, sys.size(), {}, static_cast<std::size_t>(-1)).cut);
+        CHECK(supersedes(old_t, n, sys.size()).cut);
+        // marks carry it
+        SupersedeTracker t2;
+        t2.mark(5, 6, 3000, 1, false);
+        const auto pp = t2.take(5);
+        CHECK(pp.size() == 1 && !pp[0].cut);
+    }
+    // FIX-CACHE P3-3: near-end divergence (in-place spill allowed) uses the same threshold
+    CHECK(nearEndDivergence(23000, 23000 - 600) && nearEndDivergence(23000, 23000 - 5000));  // 25 % of 23000 = 5750
+    CHECK(!nearEndDivergence(23000, 3000) && !nearEndDivergence(23000, 23000 - 5750));
+    CHECK(nearEndDivergence(6000, 3000) && !nearEndDivergence(9000, 3000));  // min_tail 4096
+    CHECK(nearEndDivergence(5000, 6000));  // continues past the end
     // too short for the host tiers
     CHECK(tooShortForTier(2047, 2048) && !tooShortForTier(2048, 2048));
     // deferred marks: taken once per new entry, re-marking updates, forget drops

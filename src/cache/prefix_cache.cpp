@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <string_view>
 
 namespace whirl::cache {
 
@@ -17,30 +18,35 @@ std::size_t lcpLen(Tokens a, Tokens b) {
 
 bool prefixEq(Tokens a, Tokens b) { return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin()); }
 
-Supersede supersedes(Tokens old_t, Tokens new_t, std::size_t sys, const SupersedeRule& r) {
+bool nearEndDivergence(std::size_t old_n, std::size_t keep, const SupersedeRule& r) {
+    const std::size_t tail = old_n > keep ? old_n - keep : 0;
+    const double need = std::max(static_cast<double>(r.min_tail), r.tail_frac * static_cast<double>(old_n));
+    return static_cast<double>(tail) < need;
+}
+
+Supersede supersedes(Tokens old_t, Tokens new_t, std::size_t sys, const SupersedeRule& r, std::size_t task_end) {
     Supersede s;
     const std::size_t lo = old_t.size(), ln = new_t.size();
     if (sys == 0 || lo == 0 || ln == 0) return s;
     const std::size_t l = lcpLen(old_t, new_t);
     if (l < sys) return s;  // not the same system prompt
     if (static_cast<double>(ln) > r.shorter * static_cast<double>(lo)) return s;
-    const std::size_t tail = lo - l;
-    const double need = std::max(static_cast<double>(r.min_tail), r.tail_frac * static_cast<double>(lo));
-    if (static_cast<double>(tail) < need) return s;  // near-end divergence: retry / regenerate / edit
+    if (nearEndDivergence(lo, l, r)) return s;  // retry / regenerate / edit
     s.yes = true;
     s.keep = l;
+    s.cut = task_end == 0 || (task_end > sys && l >= task_end);
     return s;
 }
 
-void SupersedeTracker::mark(std::uint64_t new_id, std::uint64_t old_id, std::size_t keep, std::uint64_t stamp) {
+void SupersedeTracker::mark(std::uint64_t new_id, std::uint64_t old_id, std::size_t keep, std::uint64_t stamp, bool cut) {
     for (Item& it : items_) {
         if (it.new_id == new_id && it.p.old_id == old_id) {
-            it.p = {old_id, keep, stamp};
+            it.p = {old_id, keep, stamp, cut};
             return;
         }
     }
     if (items_.size() >= 256) items_.erase(items_.begin());
-    items_.push_back({new_id, {old_id, keep, stamp}});
+    items_.push_back({new_id, {old_id, keep, stamp, cut}});
 }
 
 std::vector<SupersedeTracker::Pending> SupersedeTracker::take(std::uint64_t new_id) {
@@ -156,20 +162,33 @@ public:
     }
 
     std::size_t ckptSlotFor(View<const CkptKey> cks, std::uint32_t pos) const override {
-        std::size_t slot = 0;
+        // TAIL-CK: the newest 'prefix' checkpoint is kept while the set is large enough (it is the
+        // tail checkpoint of the last long prompt; older ones go first, prompt-end / gen-end of the
+        // same request outlive it as before because the set has room for all three)
+        int keep = -1;
+        if (cks.size() >= ckpt_keep_prefix_min)
+            for (std::size_t i = 0; i < cks.size(); ++i) {
+                const CkptKey& c = cks[i];
+                if (c.valid && std::string_view(c.kind) == "prefix" && (keep < 0 || c.seq > cks[static_cast<std::size_t>(keep)].seq))
+                    keep = static_cast<int>(i);
+            }
+        int slot = -1;
         for (std::size_t i = 0; i < cks.size(); ++i) {
             const CkptKey& c = cks[i];
-            if (c.valid && c.pos == pos) {
-                slot = i;
-                break;
+            if (c.valid && c.pos == pos) return i;
+            if (static_cast<int>(i) == keep) continue;
+            if (slot < 0) {
+                slot = static_cast<int>(i);
+                continue;
             }
+            const CkptKey& b = cks[static_cast<std::size_t>(slot)];
             if (!c.valid) {
-                if (cks[slot].valid) slot = i;
-            } else if (cks[slot].valid && c.seq < cks[slot].seq) {
-                slot = i;
+                if (b.valid) slot = static_cast<int>(i);
+            } else if (b.valid && c.seq < b.seq) {
+                slot = static_cast<int>(i);
             }
         }
-        return slot;
+        return slot < 0 ? 0 : static_cast<std::size_t>(slot);
     }
 
     int sharedVictim(View<const SpeKey> spes) const override {

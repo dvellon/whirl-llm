@@ -121,6 +121,23 @@ public:
         stalled_ = false;
     }
     bool bad() const { return bad_; }
+    // FIN / reset from the client: readable with nothing to read (or an error). Bytes waiting
+    // (a pipelined request) count as alive. Non-blocking; the engine calls it while the
+    // connection thread waits for the job.
+    bool alive() override {
+        if (bad_) return false;
+        fd_set rs;
+        FD_ZERO(&rs);
+        FD_SET(s_, &rs);
+        timeval tv{0, 0};
+        const int n = ::select(0, &rs, nullptr, nullptr, &tv);
+        if (n <= 0) return true;  // nothing to read (or select failed: assume alive)
+        char c;
+        const int r = ::recv(s_, &c, 1, MSG_PEEK);
+        if (r > 0) return true;
+        if (r == 0) return false;
+        return WSAGetLastError() == WSAEWOULDBLOCK;
+    }
 
 private:
     bool setBad() {
@@ -238,6 +255,21 @@ bool ieq(std::string_view a, std::string_view b) {
     return true;
 }
 
+// Client-supplied text for a log line (FR-SRV P3-11): control bytes (ESC sequences, CR/LF that
+// would forge log lines) as \xNN, at most 256 bytes.
+std::string logSafe(std::string_view s) {
+    std::string out;
+    const std::size_t n = std::min<std::size_t>(s.size(), 256);
+    out.reserve(n + 8);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        if (c < 0x20 || c == 0x7f) out += std::format("\\x{:02x}", c);
+        else out.push_back(static_cast<char>(c));
+    }
+    if (s.size() > n) out += "...";
+    return out;
+}
+
 bool icontains(std::string_view h, std::string_view n) {
     if (n.size() > h.size()) return false;
     for (std::size_t i = 0; i + n.size() <= h.size(); ++i)
@@ -306,7 +338,7 @@ std::vector<std::string> collectImages(const json::Array& msgs) {
 
 // Bytes of an image source: a data: URL (base64), or with --allow-local-images a
 // local path / file:// URL. No network fetches.
-std::vector<std::uint8_t> imageBytes(const std::string& src, bool allow_files) {
+std::vector<std::uint8_t> imageBytes(const std::string& src, bool allow_files, bool web) {
     std::vector<std::uint8_t> out;
     if (src.starts_with("data:")) {
         const std::size_t comma = src.find(',');
@@ -321,6 +353,9 @@ std::vector<std::uint8_t> imageBytes(const std::string& src, bool allow_files) {
         throw RequestError("remote image URLs are not fetched; send the image as a data: URL (base64)");
     if (!allow_files)
         throw RequestError("image sources must be data: URLs (start the server with --allow-local-images to accept local file paths)");
+    // FR-SRV P2-4: a web page (a request with an Origin other than a localhost page) never reads
+    // local files, whatever --cors-origin allows
+    if (web) throw RequestError("local image files are not accepted from web pages (send the image as a data: URL)");
     const std::string p = src.starts_with("file:///") ? src.substr(8) : src.starts_with("file://") ? src.substr(7) : src;
     try {
         const std::string s = readFile(p);
@@ -333,11 +368,12 @@ std::vector<std::uint8_t> imageBytes(const std::string& src, bool allow_files) {
 }
 
 // Decode + preprocess the request's images, expand their placeholders.
-std::shared_ptr<JobVis> buildVis(const VisionConfig& vc, const std::vector<std::string>& srcs, std::vector<std::uint32_t>& tokens) {
+std::shared_ptr<JobVis> buildVis(const VisionConfig& vc, const std::vector<std::string>& srcs, std::vector<std::uint32_t>& tokens,
+                                 bool web) {
     auto jv = std::make_shared<JobVis>();
     jv->preps.reserve(srcs.size());
     for (const std::string& src : srcs) {
-        const std::vector<std::uint8_t> bytes = imageBytes(src, vc.allow_files);
+        const std::vector<std::uint8_t> bytes = imageBytes(src, vc.allow_files, web);
         try {
             jv->preps.push_back(vc.vis->prepare(bytes));
         } catch (const vision::VisionError& ex) {
@@ -362,7 +398,7 @@ std::shared_ptr<JobVis> buildVis(const VisionConfig& vc, const std::vector<std::
 }
 
 // Builds a job from the request body (throws RequestError for HTTP 400).
-void buildJob(Engine& e, Job& job, std::string_view path, std::string_view body) {
+void buildJob(Engine& e, Job& job, std::string_view path, std::string_view body, bool web) {
     json::Value root;
     try {
         root = json::parse(body);
@@ -384,7 +420,7 @@ void buildJob(Engine& e, Job& job, std::string_view path, std::string_view body)
         // vision: image parts -> per-image content ids (decoding here, on the connection thread)
         if (vc.vis != nullptr) {
             const std::vector<std::string> srcs = collectImages(req.messages);
-            if (!srcs.empty()) job.vis = buildVis(vc, srcs, job.tokens);
+            if (!srcs.empty()) job.vis = buildVis(vc, srcs, job.tokens, web);
         }
         job.think = req.options.think;
         job.tools_on = !req.tools.empty();
@@ -455,7 +491,7 @@ std::string propsJson(Engine& e) {
     b += std::format(",\"modalities\":{{\"vision\":{},\"audio\":false}},\"build_info\":\"whirl {}\"",
                      e.visionConfig().vis ? "true" : "false", WHIRL_VERSION_STRING);
     if (!o.numerics_json.empty()) b += ",\"numerics\":" + o.numerics_json;
-    const Engine::Stats st = e.stats();
+    const Engine::Stats st = e.statsShared();
     b += ",\"kv_ssd\":{\"mode\":";
     appendJsonStr(b, o.kv_ssd_mode);
     b += std::format(",\"bytes_written\":{},\"bytes_shared\":{},\"bytes_used\":{},\"entries\":{},\"superseded\":{}}}",
@@ -484,6 +520,7 @@ bool firstProbe(std::string_view path) {
 struct ConnCtx {
     Engine& e;
     const HttpOptions& o;
+    std::string_view bound;  // the listening address
     std::function<void()> on_read;  // the request has been read (stop() no longer cuts it)
 };
 
@@ -527,6 +564,8 @@ void handleConn(const ConnCtx& cx, SOCKET s) {
     bool have_len = false;
     bool chunked = false;
     std::string origin;
+    std::string host;
+    bool have_origin = false;
     std::size_t header_bytes = line0.size();
     std::uint32_t header_lines = 0;
     std::string hl;
@@ -567,9 +606,18 @@ void handleConn(const ConnCtx& cx, SOCKET s) {
             if (icontains(val, "chunked")) chunked = true;
         } else if (ieq(name, "origin")) {
             origin.assign(val);
+            have_origin = true;
+        } else if (ieq(name, "host")) {
+            host.assign(val);
         }
     }
     r.setDeadline(std::nullopt);
+    // FR-SRV P2-4: DNS rebinding (a page on evil.example whose name now resolves to 127.0.0.1 is
+    // same-origin to itself): only the Host names this server answers to
+    if (!hostAllowed(host, cx.o.allowed_hosts, cx.bound)) {
+        logW("{} {} -> 403 (Host header not allowed: {})", method, logSafe(path), logSafe(host));
+        return sendAll(w, errorResponse(403, "Host header not allowed (start the server with --allow-host NAME to answer this name)"));
+    }
     const std::string cors = corsHeaders(origin, cx.o.cors_origins);
     w.setCors(cors);
     if (method == "OPTIONS") {
@@ -581,6 +629,13 @@ void handleConn(const ConnCtx& cx, SOCKET s) {
                     "Access-Control-Max-Age: 86400\r\n";
         resp += "Content-Length: 0\r\nConnection: close\r\n\r\n";
         return sendAll(w, resp);
+    }
+    // FR-SRV P2-4: a state-changing request from a web page whose Origin is not allowed is refused,
+    // not just left without CORS headers (a "simple" text/plain POST needs no preflight and would
+    // still run on the GPU). Requests without Origin (SDKs, curl, IDE agents) are not affected.
+    if (method != "GET" && method != "HEAD" && have_origin && cors.empty()) {
+        logW("{} {} -> 403 (cross-origin request from {} refused; see --cors-origin)", method, logSafe(path), logSafe(origin));
+        return sendAll(w, errorResponse(403, "cross-origin request refused: this web page's Origin is not allowed (see --cors-origin)"));
     }
     if (chunked) return sendAll(w, errorResponse(411, "chunked request bodies are not supported; send Content-Length"));
     if (content_len > kMaxBody) return sendAll(w, errorResponse(413, "request body too large"));
@@ -627,7 +682,7 @@ void handleConn(const ConnCtx& cx, SOCKET s) {
                      path);
             return sendAll(w, errorResponse(404, "not found"));
         }
-        logW("{} {} -> 404", method, path);
+        logW("{} {} -> 404", logSafe(method), logSafe(path));
         return sendAll(w, errorResponse(404, "not found"));
     }
     if (!is_post) return sendAll(w, errorResponse(405, "use POST"));
@@ -639,7 +694,7 @@ void handleConn(const ConnCtx& cx, SOCKET s) {
     job.endpoint = path;
     job.w = &w;
     try {
-        buildJob(e, job, path, body);
+        buildJob(e, job, path, body, have_origin && !isLoopbackOrigin(origin));
     } catch (const RequestError& ex) {
         logW("req {} | POST {} -> 400: {}", job.id, path, ex.what());
         return sendAll(w, errorResponse(400, ex.what()));
@@ -688,6 +743,51 @@ bool isLoopbackOrigin(std::string_view origin) {
     return true;
 }
 
+bool hostAllowed(std::string_view host_in, const std::vector<std::string>& extra, std::string_view bound_in) {
+    if (host_in.empty()) return true;
+    for (const std::string& x : extra)
+        if (x == "*") return true;
+    const std::string h = lower(host_in);
+    std::string_view name = h, port;
+    if (name.starts_with("[")) {
+        const std::size_t e = name.find(']');
+        if (e == std::string_view::npos) return false;
+        port = name.substr(e + 1);
+        name = name.substr(0, e + 1);
+    } else if (const std::size_t c = name.rfind(':'); c != std::string_view::npos) {
+        port = name.substr(c);
+        name = name.substr(0, c);
+    }
+    if (!port.empty()) {
+        if (port.front() != ':' || port.size() < 2 || port.size() > 6) return false;
+        for (char ch : port.substr(1))
+            if (ch < '0' || ch > '9') return false;
+    }
+    if (name.ends_with(".")) name.remove_suffix(1);  // "localhost." is the same name
+    if (name.empty()) return false;
+    if (name == "localhost" || name == "127.0.0.1" || name == "[::1]") return true;
+    std::string bound = lower(bound_in);
+    if (bound.find(':') != std::string::npos && !bound.starts_with("[")) bound = "[" + bound + "]";
+    if (name == bound) return true;
+    if (bound == "0.0.0.0" || bound == "[::]") {
+        // every interface: any IP literal (a DNS name is what rebinding needs)
+        if (name.starts_with("[")) return true;
+        int dots = 0;
+        bool digits = true;
+        for (char ch : name) {
+            if (ch == '.') ++dots;
+            else if (ch < '0' || ch > '9') digits = false;
+        }
+        if (digits && dots == 3) return true;
+    }
+    for (const std::string& x : extra) {
+        std::string_view xv = x;
+        while (!xv.empty() && xv.back() == '.') xv.remove_suffix(1);
+        if (lower(xv) == name) return true;
+    }
+    return false;
+}
+
 std::string corsHeaders(std::string_view origin, const std::vector<std::string>& extra) {
     for (const std::string& x : extra)
         if (x == "*") return "Access-Control-Allow-Origin: *\r\n";
@@ -726,6 +826,7 @@ HttpServer::HttpServer(Engine& e, HttpOptions o) : e_(e), o_(std::move(o)) { net
 HttpServer::~HttpServer() { stop(); }
 
 void HttpServer::start(const std::string& host, std::uint16_t port) {
+    bound_ = host;
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -788,6 +889,13 @@ void HttpServer::stop() {
         shutAll(false);
         waitConns(5000);
     }
+    // FR-SRV P3-1: connection threads use the Engine (submitAndWait answers 503 once it stopped):
+    // the owner destroys it after stop() returns, so wait for them (shut down sockets end soon)
+    if (n_conn_.load() > 0) {
+        shutAll(false);
+        waitConns(20000);
+        if (n_conn_.load() > 0) logW("http: {} connection thread(s) still running at shutdown", n_conn_.load());
+    }
 }
 
 void HttpServer::setReading(std::uintptr_t sock, bool on) {
@@ -843,7 +951,7 @@ void HttpServer::acceptLoop() {
 void HttpServer::connThread(std::uintptr_t sock) {
     const SOCKET s = static_cast<SOCKET>(sock);
     try {
-        const ConnCtx cx{e_, o_, [this, sock] { setReading(sock, false); }};
+        const ConnCtx cx{e_, o_, bound_, [this, sock] { setReading(sock, false); }};
         handleConn(cx, s);
     } catch (const std::exception& ex) {
         logE("connection error: {}", ex.what());

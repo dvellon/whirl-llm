@@ -35,7 +35,8 @@ model and GPU on disk).
 | `--log-file` | log file (also printed to the console) | per-user local app-data directory |
 | `--alias` | model id reported by `/v1/models` | GGUF file name |
 | `--mmproj FILE`, `--vis-idle-s`, `--vis-mode`, `--vis-cache-mb` | image input ([vision.md](vision.md)) | off / 60 / auto / 1024 |
-| `--cors-origin ORIGIN` | extra web-page origin allowed to call the server from a browser (repeatable; `*` = any page, the pre-v0.1.4 behaviour) | only `http(s)://localhost`, `127.0.0.1`, `[::1]` pages |
+| `--cors-origin ORIGIN` | extra web-page origin allowed to call the server from a browser (repeatable; `*` = any page, the pre-v0.1.4 behaviour); a `POST` from any other page is refused (403) | only `http(s)://localhost`, `127.0.0.1`, `[::1]` pages |
+| `--allow-host NAME` | extra `Host` header name the server answers (repeatable; `*` = any); other names get 403 (DNS rebinding guard) | `localhost`, `127.0.0.1`, `[::1]`, the `--host` address |
 
 Useful environment variables (all of them: [usage.md](../../usage.md#env)):
 
@@ -45,7 +46,8 @@ Useful environment variables (all of them: [usage.md](../../usage.md#env)):
 | `WHIRL_POOL_RESERVE_MB` | VRAM reserve after the pool (default 768 dense / 1536 MoE) |
 | `WHIRL_NO_PREFIX_CACHE=1` | disable prefix caching |
 | `WHIRL_PREFIX_CACHE_VERIFY=1` | after every cache hit, re-prefill and compare logits (diagnostic) |
-| `WHIRL_SERVE_CKPTS` | checkpoints per slot (default 2 when `--parallel` > 1, else 4) |
+| `WHIRL_SERVE_CKPTS` | checkpoints per slot (default 4 with one slot, 3 up to 4 slots, else 1; at most 8) |
+| `WHIRL_TAIL_CK=0` | debug: no tail checkpoint near the end of prompts >= 4096 tokens |
 | `WHIRL_MTP=0`, `WHIRL_NGRAM=0` | disable MTP / n-gram co-drafting |
 | `WHIRL_MTP_BATCH_DRAFTS=d1,d2,…` | draft caps by number of decoding slots |
 | `WHIRL_GATHER_MS` | burst-gather window for new requests (default 30, 0 = off) |
@@ -81,6 +83,13 @@ about 5 s whatever is left. Killing the process (Task Manager, `taskkill /F`) sk
 Responses are standard OpenAI JSON: `finish_reason` `stop` / `length` / `tool_calls`; `usage`
 includes `cached_tokens`; a llama.cpp-style `timings` object is added (prompt and predicted tokens
 per second, draft counts), which lets existing llama.cpp benchmark clients read WHIRL's numbers.
+`completion_tokens` counts the tokens up to the one that completes a stop string (drafts accepted
+after it in the same cycle are not counted). A generation cut by `max_tokens` while it writes a tool
+call ends with `finish_reason: "length"` and the call as text, never as a half `tool_calls` entry.
+A `"finish_cause": "kv_pool_exhausted"` next to `finish_reason: "length"` means the KV pool, not
+`max_tokens`, ended it. A non-streaming request whose client disconnects stops (queued, prefilling
+or generating) and frees its slot; a client that half-closes its socket after sending counts as
+disconnected. During shutdown new requests get 503.
 
 ```
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \

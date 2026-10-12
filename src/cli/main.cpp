@@ -162,7 +162,7 @@ const char* k_help_dflash_check =
     "  -h, --help                 this text\n";
 
 const char* k_help_seqtest =
-    "usage: whirl seqtest MODEL.gguf [--decode N] [--device SPEC]\n"
+    "usage: whirl seqtest MODEL.gguf [--decode N] [--slot-ctx N] [--device SPEC]\n"
     "\n"
     "Runs the multi-sequence (server) paths against the single-sequence reference on two\n"
     "prompts: segmented prefill, batched decode rows, batched verify with literal drafts.\n"
@@ -233,7 +233,7 @@ struct Args {
 
 bool takesValue(const std::string& o) {
     static const char* v[] = {"--max-tokens", "--ctx", "--tokens", "--out", "--device", "--prefill", "--decode", "--prompt", "--modes", "--mmproj", "--suite",
-                              "--draft", "--draft-model"};
+                              "--draft", "--draft-model", "--slot-ctx"};
     for (const char* s : v)
         if (o == s) return true;
     return false;
@@ -1001,7 +1001,7 @@ int selectDevice(const Args& a, std::string* info_line) {
     return dev;
 }
 
-// numerics mode: --precise / --balance[=items] / --fast[=items] / --mode M, else WHIRL_MODE, else precise
+// numerics mode: --precise / --balance[=items] / --fast[=items] / --mode M, else WHIRL_MODE, else balance
 whirl::numerics::Request modeRequest(const Args& a) {
     return whirl::numerics::resolve(a.get("--mode") ? std::optional<std::string>(*a.get("--mode")) : std::nullopt, envGet("MODE"));
 }
@@ -1636,12 +1636,23 @@ int cmdBench(const Args& a) {
 //    (verifyBatchEnqueue, no drafts), then a batched verify with literal
 //    drafts taken from the reference continuation (all must be accepted).
 // Every token must match the solo run.
+u64 fnvF32(std::span<const float> v);
+
+// logits hash of row r of the last forward
+u64 rowHash(q::Model& m, u32 r) {
+    std::vector<float> lg(m.cfg.n_vocab);
+    hip::download(lg.data(), m.logits + static_cast<u64>(r) * m.cfg.n_vocab * 4, lg.size() * 4);
+    return fnvF32(lg);
+}
+
 int cmdSeqtest(const Args& a) {
     if (a.pos.empty()) throw std::runtime_error("seqtest: missing MODEL.gguf");
     gguf::File f = gguf::File::open(a.pos[0]);
     selectDevice(a, nullptr);
     Tok tok(f);
-    const u32 slot_ctx = 4096, n_gen = a.get("--decode") ? static_cast<u32>(std::stoul(*a.get("--decode"))) : 24;
+    // --slot-ctx N: the context per sequence (P3-6: the solo digest must not depend on it)
+    const u32 slot_ctx = a.get("--slot-ctx") ? static_cast<u32>(std::stoul(*a.get("--slot-ctx"))) : 4096,
+              n_gen = a.get("--decode") ? static_cast<u32>(std::stoul(*a.get("--decode"))) : 24;
     const std::vector<u32> pa = tok.encode(chatWrap(std::string("Write a C function that reverses a singly linked list, and explain it.") + k_bench_text, false));
     const std::vector<u32> pb = tok.encode(chatWrap("請用繁體中文說明 TCP 三向交握的過程，並用 Python 寫一個簡單的 socket 伺服器。", false));
     q::LoadOptions lo;
@@ -1664,20 +1675,33 @@ int cmdSeqtest(const Args& a) {
     }
     const std::vector<u32>* prompts[2] = {&pa, &pb};
     // 1. solo reference
+    // lh[s][i]: logits hash of the solo row that produced ref[s][i] (the CLI plain decode head)
     std::vector<u32> ref[2];
+    std::vector<u64> lh[2];
     for (u32 s = 0; s < 2; ++s) {
         m.selectSeq(s);
         m.reset();
         m.prefill(*prompts[s], 0);
         u32 t = m.argmax();
+        lh[s].push_back(rowHash(m, 0));
         u32 pos = static_cast<u32>(prompts[s]->size());
         for (u32 i = 0; i < n_gen; ++i) {
             ref[s].push_back(t);
             m.step(t, pos++);
             t = m.argmax();
+            lh[s].push_back(rowHash(m, 0));
         }
         ref[s].push_back(t);
     }
+    {
+        u64 dg = 0xcbf29ce484222325ull;
+        for (u32 s = 0; s < 2; ++s)
+            for (u64 v : lh[s]) dg = (dg ^ v) * 0x100000001b3ull;
+        out(fmt("  solo logits digest (slot ctx %u, max_ctx %u): %016llx\n", slot_ctx, m.max_ctx, static_cast<unsigned long long>(dg)));
+    }
+    // P2-1: every head input (plain decode, CLI verify rows, server batched rows) must give the
+    // same logits bits as the solo row; lh_bad counts rows whose logits hash differs
+    u32 lh_bad = 0, lh_total = 0;
     bool ok = true;
     // 2. segmented prefill + batched rows
     for (u32 s = 0; s < 2; ++s) {
@@ -1715,6 +1739,8 @@ int cmdSeqtest(const Args& a) {
         m.verifyBatchEnqueue(vs);
         m.readCtl(ctl);
         for (const q::VSeg& v : vs) {
+            lh_total += 1;
+            lh_bad += rowHash(m, v.seq) != lh[v.seq][i + 1] ? 1 : 0;
             next[v.seq] = static_cast<u32>(ctl[v.seq * q::ctl_words + q::ctl_rows]);
             pos[v.seq] += 1;
             total += 1;
@@ -1736,10 +1762,50 @@ int cmdSeqtest(const Args& a) {
         m.readCtl(ctl);
         u32 good = 0;
         for (u32 s = 0; s < 2; ++s)
-            for (u32 r = 0; r <= nd; ++r) good += static_cast<u32>(ctl[s * q::ctl_words + q::ctl_rows + r]) == ref[s][half + 1 + r] ? 1 : 0;
+            for (u32 r = 0; r <= nd; ++r) {
+                good += static_cast<u32>(ctl[s * q::ctl_words + q::ctl_rows + r]) == ref[s][half + 1 + r] ? 1 : 0;
+                lh_total += 1;
+                lh_bad += rowHash(m, s * (nd + 1) + r) != lh[s][half + 1 + r] ? 1 : 0;
+            }
         out(fmt("  batched verify with %u literal drafts per sequence: %u/%u rows match the solo run\n", nd, good, 2 * (nd + 1)));
         ok = ok && good == 2 * (nd + 1);
     }
+    // the CLI's MTP / n-gram verify (Model::verify) over the reference continuation of sequence 0
+    {
+        m.selectSeq(0);
+        m.reset();
+        m.prefill(pa, 0);
+        const u32 nv = std::min<u32>(8, n_gen);
+        std::vector<u32> vo(nv);
+        m.verify(std::span<const u32>(ref[0]).subspan(0, nv), static_cast<u32>(pa.size()), vo);
+        u32 vbad = 0;
+        for (u32 r = 0; r < nv; ++r) vbad += rowHash(m, r) != lh[0][r + 1] ? 1 : 0;
+        lh_total += nv;
+        lh_bad += vbad;
+        out(fmt("  CLI verify rows (%u): %u/%u logits hashes differ from the solo rows\n", nv, vbad, nv));
+    }
+    // P3-4 (informational, not part of ok): the prompt's last logits when the prefill is split in two
+    // forwards at row a (a multiple of 64 = a CLI / server chunk start, or not) with t rows after it.
+    // t <= 16 runs the second forward on the decode kernels (gemv / flash-decoding / fused GDN).
+    {
+        m.selectSeq(0);
+        const std::span<const u32> ps(pa);
+        const u32 cases[][2] = {{128, 5}, {128, 16}, {128, 17}, {64, 40}, {122, 40}, {64, 1}};
+        for (const auto& c : cases) {
+            const u32 aa = c[0], t = c[1];
+            if (aa + t > ps.size()) continue;
+            m.reset();
+            m.forward(ps.subspan(0, aa + t), 0);
+            const u64 single = rowHash(m, 0);
+            m.reset();
+            m.forward(ps.subspan(0, aa), 0);
+            m.forward(ps.subspan(aa, t), aa);
+            out(fmt("  prefill split %u + %u rows: last logits %s the single forward of %u rows\n", aa, t,
+                    rowHash(m, 0) == single ? "==" : "DIFFER from", aa + t));
+        }
+    }
+    out(fmt("  head logits bits: %u/%u verify / batched rows differ from the solo decode row\n", lh_bad, lh_total));
+    ok = ok && lh_bad == 0;
     out(ok ? "seqtest: ok\n" : "seqtest: FAIL\n");
     return ok ? 0 : 1;
 }

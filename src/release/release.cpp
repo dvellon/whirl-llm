@@ -360,7 +360,8 @@ constexpr EnvDoc k_env[] = {
 
     {"Server", "NO_PREFIX_CACHE=1", "disable the prefix cache", S},
     {"Server", "PREFIX_CACHE_VERIFY=1", "diagnostic: re-prefill after every cache hit and compare", S},
-    {"Server", "SERVE_CKPTS=N", "prefix checkpoints per slot (default 4 with one slot, 2 up to 4 slots, else 1)", S},
+    {"Server", "SERVE_CKPTS=N", "prefix checkpoints per slot (default 4 with one slot, 3 up to 4 slots, else 1; at most 8)", S},
+    {"Server", "TAIL_CK=0", "debug: no tail checkpoint before the question of a long prompt (needs 3+ checkpoints per slot)", S},
     {"Server", "SYS_MIN=N", "system messages of at least N tokens get their own checkpoint (default 2048, 0 = off)", S},
     {"Server", "SYS_CKPTS=N", "shared prefix checkpoints kept in VRAM (default 2)", S},
     {"Server", "SYS_LCP=0", "no checkpoints at prefixes common to sessions", S},

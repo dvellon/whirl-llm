@@ -190,7 +190,8 @@ whirl serve  MODEL.gguf [選項]      （同一支程式）
 | `--vis-mode M` | `auto`（預設）、`resident`（編碼器權重常駐 VRAM）、`stream`（逐層串流） |
 | `--vis-cache-mb N` | 依內容雜湊快取圖片 embedding 的主記憶體容量，MiB（預設 1024） |
 | `--allow-local-images` | 也接受本機檔案路徑 / `file://` URL 當圖片來源（預設關閉；`http(s)` 圖片網址一律不抓） |
-| `--cors-origin ORIGIN` | 允許來自 `ORIGIN`（例如 `https://app.example.com`）的網頁從瀏覽器呼叫伺服器；可重複指定。預設只有 `http(s)://localhost`、`127.0.0.1`、`[::1]`（任何 port）上的網頁會拿到 CORS 標頭（回傳原本的 `Origin`，不回 `*`）；其他網頁（包括 `file://` 開啟的頁面）讀不到回應。`*` 恢復 v0.1.4 之前的行為（對所有網頁回 `Access-Control-Allow-Origin: *`）。非瀏覽器的用戶端（SDK、curl、IDE 代理）不受影響 |
+| `--cors-origin ORIGIN` | 允許來自 `ORIGIN`（例如 `https://app.example.com`）的網頁從瀏覽器呼叫伺服器；可重複指定。預設只有 `http(s)://localhost`、`127.0.0.1`、`[::1]`（任何 port）上的網頁會拿到 CORS 標頭（回傳原本的 `Origin`，不回 `*`）；其他網頁（包括 `file://` 開啟的頁面）讀不到回應。`*` 恢復 v0.1.4 之前的行為（對所有網頁回 `Access-Control-Allow-Origin: *`）。`Origin` 不被允許的網頁送來的 `POST` 直接回 403、不執行，包括不需要 preflight 的 `text/plain`「簡單請求」。非瀏覽器的用戶端（SDK、curl、IDE 代理）不送 `Origin`，不受影響。本機圖片檔（`--allow-local-images`）對 localhost 以外網頁送來的請求一律不讀，不管 `--cors-origin` 怎麼設 |
+| `--allow-host NAME` | 也回應 `Host` 標頭是 `NAME` 的請求（可重複；`*` = 任何名稱）。預設只回應 `localhost`、`127.0.0.1`、`[::1]` 和 `--host` 的位址（`--host 0.0.0.0` 時是任何 IP 位址）；其他名稱回 403。這是擋 DNS rebinding（網頁把自己的網域改解析到 127.0.0.1）。用戶端用主機名稱連線時才需要，例如 `--host 0.0.0.0 --allow-host mypc.lan` |
 | `--log-file PATH` | log 檔（預設 `%LOCALAPPDATA%\whirl\server.log`）；log 也會印在主控台 |
 | `-h`、`--help` / `-V`、`--version` | 說明 / 版本 |
 
@@ -232,7 +233,8 @@ LM Studio（`/api/v1/models`）與 Ollama（`/api/tags`、`/api/show`、`/api/ve
 `stream`、`tools`、`tool_choice`、`chat_template_kwargs.enable_thinking`（或最上層的 `enable_thinking`）、
 `reasoning_effort`、`preserve_thinking`。沒有給取樣參數時套用模型卡建議值。`temperature` 為 0 時，輸出與
 `whirl chat` 逐 token 相同。`presence_penalty` / `frequency_penalty` 會接受但忽略；`n` 必須為 1；不支援
-`logprobs`、`response_format`，`tool_choice: "required"` 也不會強制。回應另含 `usage.cached_tokens` 與
+`logprobs`、`response_format`，`tool_choice: "required"` 也不會強制。`stop` 最多 16 個字串、每個最多
+256 位元組（超過回 HTTP 400）；`temperature` 小於 0.001 視為 greedy。回應另含 `usage.cached_tokens` 與
 llama.cpp 形式的 `timings` 物件。細節見 [server.md](server.md#sampling)。
 
 思考與 reasoning effort 可用下列任一種寫法（依此順序套用，後者覆蓋前者）：
@@ -255,6 +257,12 @@ $body = '{"messages":[{"role":"user","content":"2+3 等於多少？"}],"temperat
 Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
 ```
 
+### <a id="prefix-cache"></a>前綴快取：新請求會重用什麼
+
+DeltaNet 層只能從伺服器存過**檢查點**的位置接著跑（細節：[kv-and-caching.md](kv-and-caching.md#checkpoints)）。每個 slot 保存：提示詞結尾（`prompt-end`：同一個提示詞再來一次，例如重新生成）、回答結尾（`gen-end`：聊天或代理的下一回合），以及 0.2.0 起每個 4096 token 以上提示詞結尾附近的**尾端檢查點**。跨 session 共用的有：長 system 訊息，以及與先前 session 共同的前綴。
+
+**長文件問答。** 對同一份長文件問好幾個問題、每題一個請求（同一則 user 訊息裡放「文件＋問題」、沒有 system 訊息）：第二題會從第一題的尾端檢查點（最後一個 1024-token chunk 的起點，距提示詞結尾 257 到 1280 個 token）接著跑，只 prefill 剩下的部分，而不是整份文件。128k 文件約為 1.1k token 取代 131k（R9700：估計 1–2 秒，先前實測 107 秒）。條件：問題只在該點之後不同（約 256 token 以內的問題一定符合；更長的問題，或把文件放進 2048 token 以上的 system 訊息），且每個 slot 保留 3 個以上檢查點（預設：1 個 slot 時 4、2 到 4 個 slot 時 3）。輸出與不用快取時相同：尾端檢查點落在冷啟動的 chunk 排程上（precise 與 balance 與冷啟動逐位元一致）。每個 slot 檢查點佔 VRAM：Qwen3.8-27B 150.6 MiB、Ornith-1.5-35B-A3B 63.8 MiB；啟動日誌會列出數量與大小，VRAM 估算在 KV pool 會太小時把數量降到 2（尾端檢查點關閉）。`WHIRL_TAIL_CK=0` 可關閉（除錯用）。
+
 ### <a id="ssd-tier"></a>SSD 層如何儲存 session
 
 - **何時寫入。** `--kv-ssd-mode shutdown`（預設）：執行中完全不寫 SSD。session 留在主記憶體層，正常關閉（Ctrl+C，最多 60 秒）時寫入，
@@ -263,19 +271,24 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -Conten
   就先寫入，否則直接丟棄。`always` 只寫值得保留的 session：前綴至少被重用（還原）過一次，或已被後續回合接續過；沒有人再回來用的一次性 prompt 不會寫入（benchmark 連續送不同 prompt 幾乎不寫）。正常關閉時由最近使用的 session 開始寫。`off`：完全不寫 SSD 檔案（主記憶體層照常運作）。原因：benchmark 或 agent 連續送出大量不同的長 prompt 時，
   每個請求會寫數 GB，幾分鐘就是數百 GB，會損耗 SSD。
 - **容量上限與過期。** 資料夾實際佔用的磁碟空間（以真正配置的位元組計，稀疏檔中共用的區塊是洞，不重複計算）不會超過
-  `--kv-ssd-gb`（預設 64 GiB）。滿了就刪最久沒用的 session（連同借用其區塊的檔案）；其他模型、版本或 KV 格式的檔案最先刪。
+  `--kv-ssd-gb`（預設 64 GiB）。滿了就刪最久沒用的 session（連同借用其區塊的檔案）；其他模型、版本或 KV 格式的檔案最先刪，
+  用另一個 per-slot context（`--ctx`／`--parallel`，或依空閒 VRAM 自動縮小）寫的檔也一樣：這些檔會保留、計入容量，
+  換回那個 context 的 server 會再用到。主記憶體裡的 session 若檔案放不進容量上限就不寫入（只留在主記憶體，log 記一次）。
   超過 7 天沒被使用的檔案會自動刪除（啟動時與每小時一次）；無法使用的檔案（當機寫一半、損毀、不是 WHIRL 快取檔）在啟動時刪除。
   啟動 log 有一行：檔案數、佔用 GiB、容量上限，以及刪了什麼、為什麼。
 - **只寫有變動的部分。** 續接的對話只寫新的 KV page 與變動的 checkpoint，不會整段重寫。SSD 上其他檔案已存有、
   且 token 前綴相同的 KV 區塊（共用的系統提示與工具定義、retry 或 compact 之前的部分）不再重寫：新檔案只記錄引用
   （稀疏檔，該區塊從另一個檔案讀取）。只有 token 前綴相同且 128-bit 內容雜湊相同的區塊才會共用。
-- **被取代的 session。** agent 做 compact 或刪減歷史時（同一個系統提示、新對話只和舊 session 共用前面一段、且明顯較短），
-  在新對話完成第二輪、且舊 session 期間沒有再被使用時，把舊 session 截到共用的部分。retry、regenerate、修改最後一則訊息、
-  不同系統提示都不會觸發。`WHIRL_KV_SUPERSEDE=0` 可關閉。
+- **被取代的 session。** agent 刪減歷史時（同一個系統提示和第一則任務訊息、中間被刪掉、新對話明顯較短），
+  在新對話完成第二輪、且舊 session 期間沒有再被使用時，把舊 session 截到共用的部分。新對話只和舊 session 共用系統提示時
+  （用摘要取代歷史的 compact，或只是同一個系統提示的另一段對話，例如主 agent 等待時在跑的 subagent），舊 session 不會被截斷：
+  整段保留，只在主記憶體層或 SSD 層需要空間時最先被逐出（主記憶體逐出時也不寫入 SSD）；之後再被使用就恢復正常。
+  retry、regenerate、修改最後一則訊息、不同系統提示都不會觸發。`WHIRL_KV_SUPERSEDE=0` 可關閉。
 - **太短的 session**（少於 2048 token，`WHIRL_KV_TIER_MIN`）不保留：重新 prefill 和還原差不多快。
-- **安全性。** 快取以 token 前綴精確比對；還原的就是當初存下的位元組。每個檔案有含校驗的 token 清單、header 最後才寫；
-  當機寫一半的檔、引用的共用區塊已不存在或不相符的檔、其他版本／模型／模式／KV 格式的檔，一律不會還原
-  （其他版本的檔計入容量並優先刪除）。任何故障最壞只是少命中，不會讓輸出不同。
+- **安全性。** 快取以 token 前綴精確比對；還原的就是當初存下的位元組。每個檔案有含校驗的 token 清單、header 最後才寫
+  （前後有 flush 屏障，當機或斷電不會留下有效 header 蓋在其他位元組上）；被截短的檔、引用的共用區塊已不存在或與記錄的雜湊不符的檔、
+  其他版本／模型／模式／KV 格式的檔，一律不會還原（其他版本的檔計入容量並優先刪除）。KV 與 checkpoint 資料本身讀取時不做校驗：
+  這些檢查擋得住當機、斷電、截斷與過期的檔，擋不住檔案內容被 bit rot 或壞軌悄悄改掉；這類故障仰賴磁碟與檔案系統本身。
 - **一個資料夾一個 server。** 第二個 server 指到使用中的資料夾（`whirl.lock`）時會不使用 SSD 層並在 log 說明；
   請給每個 server 各自的 `--kv-ssd-dir`。
 - **寫入量。** log 的 `kv tier |` 行與 `GET /props`（`kv_ssd.bytes_written`、`bytes_shared`、`bytes_used`、`entries`、
@@ -385,7 +398,7 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 |---|---|
 | `WHIRL_NO_PREFIX_CACHE=1` | 關閉前綴快取 |
 | `WHIRL_PREFIX_CACHE_VERIFY=1` | 每次快取命中後重新 prefill 並比對 *（診斷）* |
-| `WHIRL_SERVE_CKPTS=N` | 每個 slot 的前綴檢查點數（預設：1 個 slot 時 4、最多 4 個 slot 時 2、更多時 1） |
+| `WHIRL_SERVE_CKPTS=N` | 每個 slot 的前綴檢查點數（預設：1 個 slot 時 4、最多 4 個 slot 時 3、更多時 1；最多 8；3 個以上才保留[尾端檢查點](#prefix-cache)） |
 | `WHIRL_SYS_MIN=N` | 至少 N 個 token 的 system 訊息會有自己的檢查點（預設 2048，0 = 關閉） |
 | `WHIRL_SYS_CKPTS=N` | 保留在 VRAM 的共用前綴檢查點數（預設 2） |
 | `WHIRL_SYS_LCP=0` | 不在多個 session 共同的前綴處建立檢查點 |
@@ -408,7 +421,7 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 | `WHIRL_KV_SSD_MODE=always\|shutdown\|off` | = `--kv-ssd-mode`（預設 shutdown） |
 | `WHIRL_KV_SSD_EXPIRE_S=S` | 超過 S 秒沒用的 SSD 快取檔刪除（預設 604800 = 7 天；測試用） |
 | `WHIRL_KV_SSD_DEDUP=0` | 即使其他 SSD 檔案已有相同區塊也照寫（預設：共用） |
-| `WHIRL_KV_SUPERSEDE=0` | 保留被 agent compact／刪減取代的 session（預設：截到共用部分） |
+| `WHIRL_KV_SUPERSEDE=0` | 保留被 agent 刪減取代的 session（預設：連第一則任務訊息都共用時截到共用部分；只共用系統提示時只是最先逐出） |
 | `WHIRL_MMPROJ=FILE` | 視覺編碼器（= `--mmproj`） |
 | `WHIRL_VIS_IDLE_S=N` | N 秒沒有圖片就釋放視覺編碼器（= `--vis-idle-s`） |
 | `WHIRL_VIS_CACHE_MB=N` | 圖片 embedding 快取，MiB（= `--vis-cache-mb`） |
@@ -478,6 +491,7 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 | `WHIRL_TRACE_ND=1` | 記錄每個 decode 回合的草稿數 |
 | `WHIRL_LOOP_LOG=1` | 記錄每圈各階段的時間（伺服器） |
 | `WHIRL_TIER_VERIFY=1` | 每次 host 層寫出 / 還原都逐位元組驗證（伺服器） |
+| `WHIRL_TAIL_CK=0` | *（除錯）* 長提示詞結尾附近不保留[尾端檢查點](#prefix-cache)（日誌標示為覆寫）；同一份文件的第二個問題會重新 prefill 整份文件 |
 | `WHIRL_TIER_MIN_GAIN=N` | 只有能省下至少 N 個 token 時才從 host 層還原（預設 512） |
 
 ## <a id="files"></a>8. WHIRL 會寫入的檔案

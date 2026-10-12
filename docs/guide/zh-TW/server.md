@@ -33,7 +33,8 @@ Base URL 為 `http://127.0.0.1:8080/v1`；接受任何 API key。模型只載入
 | `--log-file` | 記錄檔（同時印到主控台） | 每位使用者的本機 app-data 目錄 |
 | `--alias` | `/v1/models` 回報的模型 id | GGUF 檔名 |
 | `--mmproj FILE`、`--vis-idle-s`、`--vis-mode`、`--vis-cache-mb` | 影像輸入（[vision.md](vision.md)） | off / 60 / auto / 1024 |
-| `--cors-origin ORIGIN` | 額外允許從瀏覽器呼叫伺服器的網頁來源（可重複；`*` = 任何網頁，即 v0.1.4 之前的行為） | 只允許 `http(s)://localhost`、`127.0.0.1`、`[::1]` 的網頁 |
+| `--cors-origin ORIGIN` | 額外允許從瀏覽器呼叫伺服器的網頁來源（可重複；`*` = 任何網頁，即 v0.1.4 之前的行為）；其他網頁的 `POST` 回 403 | 只允許 `http(s)://localhost`、`127.0.0.1`、`[::1]` 的網頁 |
+| `--allow-host NAME` | 額外允許的 `Host` 標頭名稱（可重複；`*` = 任何）；其他名稱回 403（擋 DNS rebinding） | `localhost`、`127.0.0.1`、`[::1]`、`--host` 的位址 |
 
 實用的環境變數（完整清單見[使用參考](usage.md#env)）：
 
@@ -43,7 +44,8 @@ Base URL 為 `http://127.0.0.1:8080/v1`；接受任何 API key。模型只載入
 | `WHIRL_POOL_RESERVE_MB` | 池之後保留的 VRAM（預設 dense 768 / MoE 1536） |
 | `WHIRL_NO_PREFIX_CACHE=1` | 停用前綴快取 |
 | `WHIRL_PREFIX_CACHE_VERIFY=1` | 每次快取命中後重新 prefill 並比對 logits（診斷用） |
-| `WHIRL_SERVE_CKPTS` | 每個 slot 的檢查點數（`--parallel` > 1 時預設 2，否則 4） |
+| `WHIRL_SERVE_CKPTS` | 每個 slot 的檢查點數（預設：1 個 slot 時 4、最多 4 個 slot 時 3、更多時 1；最多 8） |
+| `WHIRL_TAIL_CK=0` | 除錯：4096 token 以上的提示詞不保留結尾附近的尾端檢查點 |
 | `WHIRL_MTP=0`、`WHIRL_NGRAM=0` | 停用 MTP / n-gram 共同草擬 |
 | `WHIRL_MTP_BATCH_DRAFTS=d1,d2,…` | 依 decode 中 slot 數決定的草稿上限 |
 | `WHIRL_GATHER_MS` | 新請求的突發收集視窗（預設 30，0 = 關閉） |
@@ -77,6 +79,11 @@ Base URL 為 `http://127.0.0.1:8080/v1`；接受任何 API key。模型只載入
 回應為標準 OpenAI JSON：`finish_reason` 為 `stop` / `length` / `tool_calls`；`usage` 含
 `cached_tokens`；另外加上 llama.cpp 風格的 `timings` 物件（prompt 與預測 token 的每秒數、草稿
 計數），讓現有的 llama.cpp 基準測試用戶端能讀取 WHIRL 的數據。
+`completion_tokens` 算到補齊停止字串的那個 token 為止（同一個 cycle 之後接受的草稿不算）。寫工具呼叫寫到
+一半碰到 `max_tokens` 時，回 `finish_reason: "length"`，呼叫內容當文字回傳，不會變成半截的 `tool_calls`。
+`finish_reason: "length"` 旁邊有 `"finish_cause": "kv_pool_exhausted"` 表示是 KV 池用完、不是 `max_tokens`。
+非串流請求的客戶端斷線時（排隊中、prefill 中、生成中都一樣）請求會停止並釋放 slot；送完請求就半關閉
+socket 的客戶端也會被當成斷線。關機期間進來的新請求回 503。
 
 ```
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \

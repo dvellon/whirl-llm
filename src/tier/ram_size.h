@@ -7,7 +7,10 @@
 //   explicit size (--kv-ram-mb / WHIRL_KV_RAM_MB)  -> used as given (0 = off)
 //   integrated GPU (UMA, e.g. Radeon 8060S)       -> OS-visible RAM / 8, at least one
 //       max-context entry (entry_mb), at most 16 GiB, at most 1/4 of the RAM
-//       available at startup; off when the OS-visible RAM is under 32 GB.
+//       available at startup -- but never below one entry: when 1/4 of the
+//       available RAM is less than one entry, one entry if that is at most half
+//       of the available RAM (the discrete rule's bound), else off (a tier the
+//       longest session cannot use); off when the OS-visible RAM is under 32 GB.
 //       (On Windows the BIOS splits the VRAM carve-out from the OS RAM: only
 //       the OS-visible RAM counts, the tier is separate pinned OS memory.)
 //   otherwise                                      -> 1/4 of physical RAM (nearest GiB),
@@ -85,7 +88,17 @@ inline RamTierSize ramTierSize(const RamTierInput& in) {
             const std::uint64_t quarter = (in.avail_phys / 4 / mib) / gib_mb * gib_mb;
             if (quarter < mb) {
                 r.avail_limited = true;
-                if (quarter < ram_auto_off_mb) {
+                const std::uint64_t half = (in.avail_phys / 2 / mib) / gib_mb * gib_mb;
+                if (quarter < in.entry_mb && in.entry_mb <= half && in.entry_mb >= ram_auto_off_mb) {
+                    // FR-CACHE P3-4: one max-context entry always fits (within half of the available RAM)
+                    r.reason += "; 1/4 of the " + gib(in.avail_phys / mib) + " RAM available at startup is below one max-context entry: " +
+                                gib(in.entry_mb) + " (at most half of the available RAM)";
+                    mb = in.entry_mb;
+                } else if (quarter < in.entry_mb) {
+                    r.reason += "; only " + gib(in.avail_phys / mib) + " RAM available at startup: off (one max-context entry, " +
+                                gib(in.entry_mb) + ", would be more than half of it)";
+                    mb = 0;
+                } else if (quarter < ram_auto_off_mb) {
                     r.reason += "; only " + gib(in.avail_phys / mib) + " RAM available at startup: off (1/4 of it would be under 1 GiB)";
                     mb = 0;
                 } else {

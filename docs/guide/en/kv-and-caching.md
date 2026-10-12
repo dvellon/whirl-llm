@@ -50,8 +50,11 @@ layer all use the same scheme.
 prefix reuse). Before every prefill chunk and every decode cycle a slot ensures pages up to
 `pos + drafts + 2`. When the pool is empty the least recently used *idle* slot is evicted (its
 prefix cache is dropped and its pages reclaimed — or, with tiers enabled, spilled first, §8).
-If every page is held by running requests, the request ends with `finish_reason: length` (decode)
-or HTTP 500 (prefill). Pages carry reference counts so that shared prefixes (§5) can be mapped
+If every page is held by running requests: a request about to start waits in the queue until the
+pool can hold its prompt next to the running ones (it always starts when it is alone); a decoding
+request ends with `finish_reason: "length"` plus `"finish_cause": "kv_pool_exhausted"` in its
+choice (absent when max_tokens or the context ended it); a prefill that still runs out (decoding
+requests grew into the pages it counted on) is answered HTTP 503 with `Retry-After: 5`, never 500. Pages carry reference counts so that shared prefixes (§5) can be mapped
 read-only into several slots; pages still being read by a background copy go to a quarantine
 list and return to the free list only after the copy's fence.
 
@@ -242,8 +245,11 @@ needed if the new prompt ends exactly there).
 | `think-open` | just after `<think>\n` at the end of a thinking prompt (no logits) | next turn when the client drops reasoning |
 | `system` | end of the system message (≥ 2048 tokens) | new sessions with the same system prompt |
 | `prefix` | a chunk start inside a long common prefix | system prompts that end with per-session text |
+| `prefix` (tail, per slot) | start of the last schedule chunk of a prompt >= 4096 tokens (257..1280 before its end) | another question about the same long document |
 
-Each slot holds 2 checkpoints when `--parallel` > 1, 4 otherwise. A new request is placed on the
+Each slot holds 4 checkpoints with one slot, 3 with 2 to 4 slots, 1 with more. With 3 or more, a full
+set never overwrites its newest `prefix` (tail) checkpoint, so the tail, `prompt-end` and `gen-end`
+of the last request all stay; with fewer no tail checkpoint is taken (`WHIRL_TAIL_CK=0` turns it off). A new request is placed on the
 slot with the longest reusable prefix; KV is reused by truncation and the slot's state is loaded
 from the best checkpoint at or before that point.
 
@@ -259,8 +265,8 @@ Server logs showed two root causes, not the single one first suspected:
    `<think>\n\n</think>\n\n…`, and `\n\n` is a single token that differs from the prompt's final
    `\n`. The `prompt-end` checkpoint missed by one token, so **every turn re-prefilled the whole
    conversation** (hit ratio 0.000). Fix: split the prefill of such prompts at N−1 and save a
-   `think-open` checkpoint after `<think>`. The CLI splits identically, so server == CLI stays
-   bit-exact; cost: one extra 1-token step on thinking prompts (~28 ms on the 27B).
+   `think-open` checkpoint after `<think>`. The CLI splits identically (where the split is made
+   does not differ between them); cost: one extra 1-token step on thinking prompts (~28 ms on the 27B).
 
 | Multi-turn hit ratio (later turns: cached / prompt) | 27B before → after | MoE before → after |
 |---|---|---|

@@ -32,6 +32,7 @@ public:
     std::uint32_t seqPages() const override { return m_.seq_pages; }
     std::uint32_t maxBatch() const override { return m_.max_batch; }
     std::uint32_t snapSets() const override { return m_.snap_sets; }
+    void ensureSnapshots(std::uint32_t n) override { m_.ensureSnapshots(n); }
     bool gdnReplay() const override { return m_.gdn_replay; }
     bool fusedDecode() const override { return m_.fusedDecode(); }
     bool canSegment() const override { return m_.canSegment(); }

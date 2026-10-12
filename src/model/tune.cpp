@@ -940,6 +940,7 @@ void loadOrTune(Model& m, const std::string& model_path, std::string& log) {
         }
         if (const auto v = envGet("SPEC_SAMPLE"); v && !v->empty())
             nu::applyOverride(p, nu::Item::specsample, "SPEC_SAMPLE", *v, *v != "0", t.mtp && t.k_spec_sample);
+        nu::noteSwitches(p, [](const char* n) { return envGet(n); });
         m.num_plan = p;
         log += "  " + nu::logLine(p) + "\n";
         if (!m.load_note.empty()) log += "  " + m.load_note;

@@ -114,32 +114,68 @@ std::size_t validUtf8Prefix(std::string_view s) {
     return i;
 }
 
+namespace {
+
+// The UTF-8 sequence at s[i] (the rules of isValidUtf8: no overlong forms, surrogates or code
+// points above U+10FFFF): its length when complete and valid, 0 when s ends inside a sequence
+// that may still become valid, -1 when s[i] cannot start a valid sequence (one byte -> U+FFFD).
+int utf8Seq(std::string_view s, std::size_t i) {
+    const auto c = static_cast<unsigned char>(s[i]);
+    if (c < 0x80) return 1;
+    int n;
+    unsigned lo = 0x80, hi = 0xBF;  // the second byte's range
+    if (c >= 0xC2 && c <= 0xDF) n = 2;
+    else if (c == 0xE0) n = 3, lo = 0xA0;
+    else if (c == 0xED) n = 3, hi = 0x9F;
+    else if (c >= 0xE1 && c <= 0xEF) n = 3;
+    else if (c == 0xF0) n = 4, lo = 0x90;
+    else if (c == 0xF4) n = 4, hi = 0x8F;
+    else if (c >= 0xF1 && c <= 0xF3) n = 4;
+    else return -1;
+    for (int k = 1; k < n; ++k) {
+        if (i + static_cast<std::size_t>(k) >= s.size()) return 0;
+        const auto b = static_cast<unsigned char>(s[i + static_cast<std::size_t>(k)]);
+        if (b < (k == 1 ? lo : 0x80u) || b > (k == 1 ? hi : 0xBFu)) return -1;
+    }
+    return n;
+}
+
+}  // namespace
+
 std::string sanitizeUtf8(std::string_view s) {
     if (isValidUtf8(s)) return std::string(s);
     std::string out;
     out.reserve(s.size() + 8);
     std::size_t i = 0;
     while (i < s.size()) {
-        const auto c = static_cast<unsigned char>(s[i]);
-        std::size_t n;
-        if (c < 0x80) n = 1;
-        else if ((c & 0xE0) == 0xC0) n = 2;
-        else if ((c & 0xF0) == 0xE0) n = 3;
-        else if ((c & 0xF8) == 0xF0) n = 4;
-        else {
-            out += "\xEF\xBF\xBD";
-            ++i;
-            continue;
-        }
-        if (i + n <= s.size() && isValidUtf8(s.substr(i, n))) {
-            out.append(s.substr(i, n));
-            i += n;
-        } else {
+        const int r = utf8Seq(s, i);
+        if (r > 0) {
+            out.append(s.substr(i, static_cast<std::size_t>(r)));
+            i += static_cast<std::size_t>(r);
+        } else {  // invalid, or cut at the end: U+FFFD per byte
             out += "\xEF\xBF\xBD";
             ++i;
         }
     }
     return out;
+}
+
+std::size_t sanitizeUtf8Prefix(std::string& s, std::size_t from) {
+    // FR-SRV P3-3: invalid bytes become U+FFFD here, by the rule sanitizeUtf8 applies at the end,
+    // so the streamed text is always a prefix of the final one (validUtf8Prefix passed invalid
+    // bytes through and the final text, longer after sanitizing, no longer matched the offsets sent)
+    std::size_t i = std::min(from, s.size());
+    while (i < s.size()) {
+        const int r = utf8Seq(s, i);
+        if (r == 0) break;  // an incomplete sequence at the end: wait for more bytes
+        if (r > 0) {
+            i += static_cast<std::size_t>(r);
+        } else {
+            s.replace(i, 1, "\xEF\xBF\xBD");
+            i += 3;
+        }
+    }
+    return i;
 }
 
 void appendJsonStr(std::string& out, std::string_view s) {
@@ -168,8 +204,9 @@ Params parseParams(const json::Object& obj, bool think, bool chat) {
         p.top_p = 0.8f;
     }
     if (auto v = getNum(obj, "temperature", "temperature must be a number")) {
-        if (*v < 0 || *v > 100) throw RequestError("temperature must be >= 0");
-        p.temperature = static_cast<float>(*v);
+        if (*v < 0 || *v > 100) throw RequestError("temperature must be in [0, 100]");
+        // FR-SRV P3-4: below 1e-3 sampling is greedy in effect; 1 / temperature stays finite
+        p.temperature = *v < 1e-3 ? 0.0f : static_cast<float>(*v);
     }
     if (auto v = getNum(obj, "top_p", "top_p must be a number")) {
         if (*v <= 0 || *v > 1) throw RequestError("top_p must be in (0, 1]");
@@ -212,6 +249,10 @@ Params parseParams(const json::Object& obj, bool think, bool chat) {
         } else {
             throw RequestError("stop must be a string or a list of strings");
         }
+        // FR-SRV P3-6: every stop string is searched in the whole output on the engine thread
+        if (p.stop.size() > max_stop_strings) throw RequestError("at most 16 stop sequences are supported");
+        for (const std::string& s : p.stop)
+            if (s.size() > max_stop_bytes) throw RequestError("a stop sequence must be at most 256 bytes");
     }
     p.stream = getBool(obj, "stream", "stream must be a boolean").value_or(false);
     p.ignore_eos = getBool(obj, "ignore_eos", "ignore_eos must be a boolean").value_or(false);
@@ -236,11 +277,16 @@ Out::View Out::view(bool final_in) const {
     View r;
     if (!stops.empty()) {
         std::optional<std::size_t> best;
+        std::size_t best_len = 0;
         for (const std::string& s : stops) {
             const std::size_t i = t.find(s);
-            if (i != std::string_view::npos && (!best || i < *best)) best = i;
+            if (i != std::string_view::npos && (!best || i < *best)) {
+                best = i;
+                best_len = s.size();
+            }
         }
         if (best) {
+            r.stop_end = *best + best_len;
             t = t.substr(0, *best);
             final = true;
             r.stopped = true;
@@ -300,15 +346,20 @@ std::optional<std::vector<ToolCall>> parseToolCalls(std::string_view region, con
         if (s == std::string_view::npos) break;
         const std::string_view after = rest.substr(s + 11);
         const std::size_t e = after.find("</tool_call>");
-        const std::string_view inner = trimWs(e != std::string_view::npos ? after.substr(0, e) : after);
-        rest = e != std::string_view::npos ? after.substr(e + 12) : std::string_view();
+        const bool closed = e != std::string_view::npos;
+        const std::string_view inner = trimWs(closed ? after.substr(0, e) : after);
+        rest = closed ? after.substr(e + 12) : std::string_view();
         if (startsWith(inner, "<function=")) {
             const std::size_t gt = inner.find('>');
             if (gt == std::string_view::npos) return std::nullopt;
             const std::string_view name = trimWs(inner.substr(10, gt - 10));
             if (name.empty()) return std::nullopt;
             std::string_view body = inner.substr(gt + 1);
-            if (const std::size_t k = body.find("</function>"); k != std::string_view::npos) body = body.substr(0, k);
+            const std::size_t fe = body.find("</function>");
+            // FR-SRV P2-1: a call cut before its end (max_tokens, a stop string, a full KV pool) is not a
+            // call: without </tool_call> it must at least be closed by </function>
+            if (!closed && fe == std::string_view::npos) return std::nullopt;
+            if (fe != std::string_view::npos) body = body.substr(0, fe);
             json::Object obj;
             for (;;) {
                 const std::size_t ps = body.find("<parameter=");
@@ -319,8 +370,9 @@ std::optional<std::vector<ToolCall>> parseToolCalls(std::string_view region, con
                 const std::string_view pname = trimWs(b2.substr(0, pg));
                 std::string_view vtext = b2.substr(pg + 1);
                 const std::size_t pe = vtext.find("</parameter>");
-                body = pe != std::string_view::npos ? vtext.substr(pe + 12) : std::string_view();
-                if (pe != std::string_view::npos) vtext = vtext.substr(0, pe);
+                if (pe == std::string_view::npos) return std::nullopt;  // a truncated value (FR-SRV P2-1)
+                body = vtext.substr(pe + 12);
+                vtext = vtext.substr(0, pe);
                 if (startsWith(vtext, "\n")) vtext.remove_prefix(1);
                 if (endsWith(vtext, "\n")) vtext.remove_suffix(1);
                 const auto ty = toolParamType(tools, name, pname);
@@ -335,6 +387,7 @@ std::optional<std::vector<ToolCall>> parseToolCalls(std::string_view region, con
             }
             calls.push_back({std::string(name), json::dumpPython(json::Value(std::move(obj)), true)});
         } else if (startsWith(inner, "{")) {
+            if (!closed) return std::nullopt;  // FR-SRV P2-1: a JSON call needs its </tool_call>
             json::Value v;
             try {
                 v = json::parse(inner);
@@ -354,6 +407,31 @@ std::optional<std::vector<ToolCall>> parseToolCalls(std::string_view region, con
     }
     if (calls.empty()) return std::nullopt;
     return calls;
+}
+
+ToolResolution resolveTools(const Out::View& v, std::string_view reason_in, const json::Array& tools) {
+    ToolResolution r;
+    r.reason = std::string(reason_in);
+    if (v.stopped) r.reason = "stop";
+    r.content = std::string(v.content);
+    if (v.tool) {
+        // FR-SRV P2-1: a generation cut by max_tokens (or a full KV pool) is never returned as tool calls,
+        // even when the calls so far parse: a later call or argument may be missing. The tool region
+        // stays text and finish_reason stays "length" (an agent must not run half a command).
+        std::optional<std::vector<ToolCall>> calls;
+        if (r.reason != "length") calls = parseToolCalls(*v.tool, tools);
+        if (calls) {
+            r.calls = std::move(calls);
+            r.reason = "tool_calls";
+        } else {
+            // not a parsable call: keep it as text
+            std::string joined(v.content);
+            if (!v.content.empty()) joined += "\n\n";
+            joined += *v.tool;
+            r.content = std::string(trimRightWs(joined));
+        }
+    }
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +464,7 @@ const char* statusText(int status) {
         case 200: return "OK";
         case 204: return "No Content";
         case 400: return "Bad Request";
+        case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 408: return "Request Timeout";
@@ -407,7 +486,7 @@ std::string httpResponse(int status, std::string_view ctype, std::string_view bo
     return r;
 }
 
-std::string errorResponse(int status, std::string_view msg) {
+std::string errorResponse(int status, std::string_view msg, std::string_view extra_headers) {
     std::string b = "{\"error\":{\"message\":";
     std::string_view m = msg.substr(0, std::min<std::size_t>(msg.size(), 3000));
     // keep the cut on a UTF-8 boundary
@@ -416,7 +495,9 @@ std::string errorResponse(int status, std::string_view msg) {
     appendJsonStr(b, m);
     b += std::format(",\"type\":\"{}\",\"code\":{}}}}}",
                      status >= 500 ? "server_error" : (status == 404 ? "not_found_error" : "invalid_request_error"), status);
-    return httpResponse(status, "application/json; charset=utf-8", b);
+    std::string r = httpResponse(status, "application/json; charset=utf-8", b);
+    if (!extra_headers.empty()) r.insert(r.find("\r\n") + 2, extra_headers);
+    return r;
 }
 
 std::string randomId(std::string_view prefix, std::size_t n, std::uint64_t (*next)(void*), void* ctx) {

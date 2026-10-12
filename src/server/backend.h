@@ -60,6 +60,8 @@ public:
     virtual std::uint32_t seqPages() const = 0;
     virtual std::uint32_t maxBatch() const = 0;
     virtual std::uint32_t snapSets() const = 0;
+    // DeltaNet snapshot sets for the verify without replay (at least n, at most gdn_max_snap)
+    virtual void ensureSnapshots(std::uint32_t n) = 0;
     virtual bool gdnReplay() const = 0;
     virtual bool fusedDecode() const = 0;
     virtual bool canSegment() const = 0;

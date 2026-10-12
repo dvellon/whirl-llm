@@ -5,6 +5,10 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## Unreleased (0.2.0)
 
+### Long-document Q&A: the second question reuses the document (TAIL-CK)
+
+- Prompts of 4096+ tokens keep a per-slot **tail checkpoint** at the start of their last 1024-token chunk, on the cold-run chunk schedule (precise / balance output stays bit identical to a cold run). Another question about the same document (`document + question` in one message) now resumes there and prefills about 0.3k-1.3k tokens instead of the whole document; before, only the third question was served from the cache (REL3: 131k document, second question 107 s on the R9700, 589 s on the 8060S). `-np 2..4` now default to 3 checkpoints per slot (was 2; +150.6 MiB VRAM per slot for Qwen3.8-27B, +63.8 MiB for Ornith-1.5-35B-A3B, counted in the VRAM fit, which drops back to 2 when VRAM is tight); a full set keeps its newest tail checkpoint, so regenerate (prompt-end) and next-turn (gen-end) reuse are unchanged. With fewer than 3 checkpoints per slot no tail is taken. `WHIRL_TAIL_CK=0` turns it off (debug). `audit/TAIL-CK.md`.
+
 ### RAM and SSD tier on by default on the Radeon 8060S (TIER-8S-DEF)
 
 - On integrated GPUs the host RAM tier of the prefix cache (and with it the SSD tier, mode `shutdown`) is **on by default**; it used to be off because the KV pool "already lives in system memory". On Windows the BIOS splits the VRAM carve-out (the KV pool) from the OS RAM, so the tier is separate pinned OS memory and a restore is a real copy. Measured on the 8060S (Qwen3.8-27B Q4_K_M, balance): a 128k session restores in 0.34 s from the RAM tier and 2 s from the SSD tier after a restart, against 537 s of prefill; decode speed unchanged (`audit/TIER-8S.md`).
@@ -50,19 +54,29 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 - New `--precise` / `--balance` / `--fast` (or `--mode M`, env `WHIRL_MODE`) for `whirl` and
   `whirl-server`; one mode per process, reported in the start-up log and in `GET /props`
   (`"numerics"`). See [docs/usage.md](docs/usage.md#modes).
-- **balance stays the default** when no mode is given (owner decision for 0.2.0; same output as
-  0.1.x, including q8v KV on cards under 20 GiB); `--precise` and `--fast` are opt-in, `--balance`
-  is still accepted, and `GET /props` `"numerics"` reports `"source"` (`default`, `command line` or
-  `WHIRL_MODE`).
+- **balance stays the default** when no mode is given (owner decision for 0.2.0); `--precise` and
+  `--fast` are opt-in, `--balance` is still accepted, and `GET /props` `"numerics"` reports
+  `"source"` (`default`, `command line` or `WHIRL_MODE`).
+- What each mode is, in one place (the entries below give the details):
+
+  | mode | KV format | activations / kernels | output guarantee |
+  |---|---|---|---|
+  | precise | f16 (every model, every GPU) | no fp8, f32 DeltaNet, no h16; f16 decode / verify activations | bitwise reproducible: the same bits with or without drafts, solo or batched, CLI or server |
+  | balance (default) | q8h on dense models, f16 on MoE models | items `fp8`, `moefp8`, `gdnwmma`, `h16`, `kvq8`; int8 decode / verify activations | near-lossless (KL vs precise about 1e-4 to 5e-4), MTP / n-gram == plain greedy; **not** bit for bit the 0.1.x output (q8v KV gone, KG-1 kernels, specsample sampler) |
+  | fast | q4 (R9700 since FAST-1c, Radeon 8060S) | balance + `kvq4`, `relaxacc` (dense models with an MTP head) | lossy within the published KL; the text may depend on drafts |
+
 - **precise** (`--precise`) on every GPU: no fp8 MXFP4 prefill activations (and no rounding of
   folded MXFP4 exponents), no fp8 MoE expert prefill, f32 DeltaNet prefill chunks instead of
   f16-WMMA, no f16 GEMM intermediates (h16), and **f16 KV everywhere** (no automatic q8v / q8h / q8,
   also on cards under 20 GiB and on the Radeon 8060S). When f16 KV does not fit, the context is
   lowered with a warning, or the program stops with a message when `--ctx` / `--ctx-per-slot` was
   given. MXFP4 prefill is slower in precise mode than in 0.1.x.
-- **balance** is the 0.1.x / 0.2.0-rc behaviour, bit for bit (items `fp8`, `moefp8`, `gdnwmma`,
-  `h16`, `kvq8`; `--balance=ITEMS` picks a subset). **fast** lists the future gated lossy items
-  (4-bit KV, relaxed acceptance, ...); none is implemented yet, so fast runs as balance.
+- **balance** uses the items `fp8`, `moefp8`, `gdnwmma`, `h16` and `kvq8` (`--balance=ITEMS` picks
+  a subset). It is near-lossless, not bit for bit the 0.1.x output: the KV format is q8h on dense
+  models (BAL-Q8, no q8v), dense models get the KG-1 kernels, and sampling uses specsample (see
+  those entries). **fast** is balance plus the lossy items `kvq4` (4-bit KV) and `relaxacc`
+  (relaxed MTP acceptance, dense models with an MTP head); where neither applies (e.g. MoE models
+  on a GPU without q4 KV kernels) the log says "fast runs as balance".
 - `whirl selftest`: the precise decode checks turn fp8 prefill, MoE fp8 and h16 off themselves
   (FIX-PS). Since balance became the default, selftest loaded in balance and its "== prefill GEMM
   rows" (MXFP4) and precise MoE n=17..32 checks compared against the fp8 prefill paths and
@@ -216,6 +230,56 @@ selftest in every mode unchanged).
   never an old valid header over half-new data. Asynchronous GPU copy errors fail the restore
   (cold prefill) instead of counting as done. `--help` and the docs now give the real defaults
   (`shutdown`, `--kv-ssd-delay`).
+
+### Fixes from the numerics and cache reviews (FIX-NUM, FIX-CACHE)
+
+- One head-norm reduction order for every logits row: the plain decode head and the prompt-end head
+  used `rmsnormQ8` (1024-thread sum) while verify / all-logits rows used `rmsnorm`; all now use
+  `rmsnorm`, so CLI plain, CLI MTP / n-gram verify and server batched rows give the same logits
+  bits (`whirl seqtest` checks it). Tokens are unchanged in every golden case; only the logits
+  hashes (`lh=`) of the affected steps changed and the golden references were re-recorded for that
+  reason only. Server decode rows are unchanged; the first token after a prompt can change only
+  on a near tie.
+- The SSD tier fingerprint includes the GPU (arch, device name, kernel code object), so one exe
+  on the R9700 and on the Radeon 8060S never reuses the other's KV files; KV format, batch and
+  exe id are covered by tests. The 12 numerics-changing A/B variables are reported as overrides
+  (`MODE+overrides`), and `relaxacc` is reported as skipped without an MTP head or with
+  `--draft dflash`.
+- SSD tier: with a cap smaller than the RAM entries the tier no longer rewrites forever or
+  overshoots `--kv-ssd-gb` (a write that cannot fit is skipped until space is freed). Files written
+  with another per-slot context (`tok_cap`) are kept and counted instead of deleted as corrupt.
+  `WHIRL_SERVE_CKPTS` is limited to 8 (above it the server crashed). A new conversation that
+  shares only the system prompt (a compact, or a subagent) no longer cuts the idle long session
+  with the same system prompt: it is demoted (evicted first under pressure) instead. Restoring
+  part of an entry and then branching from an earlier turn makes a new entry instead of
+  overwriting the other branch in place. On integrated GPUs the RAM tier is at least one
+  max-context entry (or off, with a log line, when that is more than half the available RAM).
+
+### Fixes from the server review (FIX-SRV)
+
+- **Behaviour change:** cross-origin requests are refused. A non-GET request with an Origin that is
+  not allowed (including `null` and `text/plain` "simple" requests) gets 403 before the body is
+  read, and the `Host` header must be `localhost`, `127.0.0.1`, `[::1]`, the `--host` address
+  (any IP literal when bound to `0.0.0.0` / `::`) or a name given with `--allow-host NAME`
+  (repeatable, `*` = any); requests without a Host header are allowed. Clients that reach the
+  server by a host name (for example `mypc.lan`) need `--allow-host`. `--allow-local-images`
+  reads local files only for requests from a localhost page.
+- A tool call cut off by `max_tokens` or a stop string is no longer returned as a complete call
+  (`finish_reason` stays `length`, the text is returned as is).
+- A client that disconnects frees its slot while queued, prefilling or in a non-streaming
+  request. Pressing the KV pool with parallel prefills queues the prompt instead of failing with
+  500; the remaining pool-full case is 503 with `Retry-After`. A decode stopped by a full pool
+  keeps `finish_reason: "length"` and adds `"finish_cause": "kv_pool_exhausted"`.
+- `--draft dflash` on GPUs without DeltaNet replay kernels (Radeon 8060S) allocates snapshot sets
+  so DFlash2 / n-gram drafts are made (before: no drafts); the batch log reports literal drafts
+  per cycle.
+- Smaller fixes: requests during shutdown get 503; an invalid `--kv-ssd-mode` is a usage error;
+  streamed text is always a prefix of the final UTF-8-sanitized text; temperature below 1e-3 is
+  greedy; `/props` reads only atomic counters; at most 16 stop strings of up to 256 bytes;
+  `completion_tokens` no longer counts tokens after a stop string; CRLF n-gram normalization also
+  under `--draft dflash`; bad numeric environment variables fall back to the default with a
+  warning; control characters in logged request lines are escaped; a short follow-up prompt is
+  no longer held behind a long prefill.
 
 ## 0.1.4 — 2026-10-06
 

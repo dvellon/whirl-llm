@@ -50,6 +50,9 @@ constexpr std::uint32_t k_big = 16384;
 constexpr std::uint32_t max_rows = qwen35::max_verify_rows;
 constexpr std::size_t prefill_chunk = 1024;
 constexpr std::size_t prefill_merge = 256;
+// TAIL-CK: per-slot checkpoints needed for the tail checkpoint (tail + prompt-end + gen-end); with
+// fewer, a tail would evict what a regenerate or the next chat turn resumes from, so none is taken
+constexpr std::size_t tail_ck_slots = cache::ckpt_keep_prefix_min;
 
 inline std::size_t prefillChunkLen(std::size_t remaining) {
     return remaining <= prefill_chunk + prefill_merge ? remaining : prefill_chunk;
@@ -69,6 +72,9 @@ public:
     virtual ~Conn() = default;
     virtual bool write(std::string_view data) = 0;
     virtual bool flush() = 0;
+    // false once the client has closed the connection (FR-SRV P2-2: polled by the engine for
+    // requests that write nothing for a long time: queued, prefilling, non-streaming)
+    virtual bool alive() { return true; }
 };
 
 enum class JobKind { chat, completion };
@@ -86,6 +92,7 @@ struct Job {
     TimePoint t_arrive{};
     bool sys_wait_logged = false;
     bool tier_wait_logged = false;
+    bool pool_wait_logged = false;  // FR-SRV P2-3
     bool pf_checked = false;
     // vision: the request's images (preprocessed), their spans and embeddings
     std::shared_ptr<JobVis> vis;
@@ -152,6 +159,8 @@ struct Final {
     std::optional<std::vector<ToolCall>> calls;
     std::string content;
     std::string reasoning;
+    // FR-SRV P3-8: why a "length" ended early ("" = max_tokens / context; "kv_pool_exhausted")
+    std::string cause;
 };
 
 struct StreamState {
@@ -163,7 +172,8 @@ struct StreamState {
 
     void begin();
     void fail();
-    bool push(Out& out, std::span<const std::uint32_t> toks);
+    // *n_after: tokens of toks that come after a matched stop string (not counted as completion)
+    bool push(Out& out, std::span<const std::uint32_t> toks, std::uint32_t* n_after = nullptr);
     Final finish(Out& out, const std::string& reason);
     void end(Out& out, const Final& f, const Timings& tim, std::uint32_t n_prompt);
 
@@ -196,6 +206,8 @@ struct Slot : cache::SlotCache {
     // vision: end of the prompt's last image (after <|vision_end|>), a chunk split
     // where a shared 'prefix' checkpoint is kept (0 = none)
     std::uint32_t img_ck = 0;
+    // TAIL-CK: slot checkpoint at the start of the prompt's last schedule chunk (0 = none)
+    std::uint32_t tail_ck = 0;
     bool on_sched = false;
     bool rs_shared = false;
     TimePoint tp0{};
@@ -207,6 +219,8 @@ struct Slot : cache::SlotCache {
     std::string finish = "length";
     bool done = false;
     bool stopped_str = false;
+    bool pool_cut = false;  // FR-SRV P3-8: ended because the KV pool had no page left (decode)
+    std::uint32_t n_after_stop = 0;  // FR-SRV P3-7: generated tokens after the stop string (same cycle)
     std::uint32_t cycles = 0;
     std::uint32_t drafted = 0;
     std::uint32_t accepted = 0;
@@ -334,6 +348,13 @@ struct EngineOptions {
     std::uint32_t sys_min = 2048;
     bool lcp_on = true;
     std::size_t n_ck = 2;
+    // TAIL-CK: a prompt of >= tail_ck_min tokens keeps a slot checkpoint (kind 'prefix') at the start
+    // of its last schedule chunk, so the same long document with another question resumes there on
+    // the second request (not only the third). Needs n_ck >= tail_ck_slots, so the tail never
+    // pushes out the prompt-end / gen-end checkpoints a regenerate or the next chat turn resumes from.
+    // WHIRL_TAIL_CK=0 turns it off (debug).
+    bool tail_ck = true;
+    std::uint32_t tail_ck_min = 4096;
     std::size_t n_spe = 2;
     bool ckpt_host = false;
     std::size_t prefill_exec = 2048;
@@ -419,6 +440,8 @@ public:
         std::uint64_t dfl_cycles = 0, dfl_drafted = 0, dfl_accepted = 0, dfl_cold = 0, dfl_gap = 0;
     };
     Stats stats() const;
+    // FR-SRV P3-5: the counters other threads may read (HTTP /props): atomics only
+    Stats statsShared() const;
 
 private:
     friend struct StreamState;
@@ -511,6 +534,12 @@ private:
     void flushTierOnStop();
     void releaseSlot(Slot& sl);
     void failSlot(Slot& sl, const std::string& err);
+    // FR-SRV P2-2: queued / running requests whose client disconnected end (slot freed)
+    void reapDisconnected();
+    // FR-SRV P2-3: pool pages a prompt of n_tok tokens needs; pages free or evictable now minus
+    // what the running prefills still need
+    std::size_t pagesFor(std::uint64_t n_tok) const;
+    std::size_t poolAvailable() const;
     void failJobNoSlot(Job& job);
     void writeError(Job& job, int status, const std::string& msg);
     void logBatchStats(bool force);
@@ -580,6 +609,7 @@ private:
     // batch statistics
     TimePoint stat_t0_{};
     std::uint64_t stat_tokens_ = 0, stat_cycles_ = 0, stat_rows_ = 0, stat_slots_ = 0, stat_drafts_ = 0,
+                  stat_lit_drafts_ = 0,  // FR-SRV P2-5: DFlash2 / n-gram drafts verified (all slots)
                   stat_prefill_tok_ = 0, stat_seg_batches_ = 0, stat_seg_chunks_ = 0;
     std::uint64_t stat_dfl_cycles_ = 0, stat_dfl_drafted_ = 0, stat_dfl_accepted_ = 0, stat_dfl_cold_ = 0, stat_dfl_gap_ = 0;
     std::vector<std::uint32_t> crlf_norm_;
@@ -594,6 +624,7 @@ private:
     std::uint64_t stat_cow_pages_ = 0;
     std::uint64_t stat_q_waits_ = 0;
     TimePoint last_tick_{};
+    TimePoint last_reap_{};
     std::vector<std::uint16_t> page_ref_;
     std::vector<Spe> spes_;
     std::uint64_t stat_spe_new_ = 0, stat_spe_hits_ = 0, stat_spe_tok_ = 0, stat_spe_evict_ = 0, stat_unshare_ = 0;
