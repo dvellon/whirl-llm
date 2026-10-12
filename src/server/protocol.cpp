@@ -142,6 +142,11 @@ std::string sanitizeUtf8(std::string_view s) {
     return out;
 }
 
+std::size_t sanitizeUtf8Prefix(std::string& s, std::size_t from) {
+    (void)from;
+    return validUtf8Prefix(s);
+}
+
 void appendJsonStr(std::string& out, std::string_view s) {
     out.push_back('"');
     json::appendEscaped(out, s);
@@ -354,6 +359,26 @@ std::optional<std::vector<ToolCall>> parseToolCalls(std::string_view region, con
     }
     if (calls.empty()) return std::nullopt;
     return calls;
+}
+
+ToolResolution resolveTools(const Out::View& v, std::string_view reason_in, const json::Array& tools) {
+    ToolResolution r;
+    r.reason = std::string(reason_in);
+    if (v.stopped) r.reason = "stop";
+    r.content = std::string(v.content);
+    if (v.tool) {
+        if (auto calls = parseToolCalls(*v.tool, tools)) {
+            r.calls = std::move(calls);
+            r.reason = "tool_calls";
+        } else {
+            // not a parsable call: keep it as text
+            std::string joined(v.content);
+            if (!v.content.empty()) joined += "\n\n";
+            joined += *v.tool;
+            r.content = std::string(trimRightWs(joined));
+        }
+    }
+    return r;
 }
 
 // ---------------------------------------------------------------------------

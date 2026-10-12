@@ -33,6 +33,9 @@ struct HttpOptions {
     // CORS: browser Origins allowed besides http(s)://localhost / 127.0.0.1 / [::1]
     // (any port); "*" = every Origin (Access-Control-Allow-Origin: *)
     std::vector<std::string> cors_origins;
+    // Host header names allowed besides localhost / 127.0.0.1 / [::1] and the bound address
+    // (DNS rebinding guard; "*" = any Host)
+    std::vector<std::string> allowed_hosts;
     int sndbuf = 0;                           // test hook: SO_SNDBUF of accepted sockets (0 = system default)
 };
 

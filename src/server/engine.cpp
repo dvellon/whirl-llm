@@ -3425,7 +3425,7 @@ void StreamState::chunkEnd(std::string& b, const char* fin_reason) {
 
 bool StreamState::push(Out& out, std::span<const std::uint32_t> toks) {
     for (std::uint32_t t : toks) out.text += e->tok_.piece(static_cast<TokenId>(t), true);
-    out.valid = validUtf8Prefix(out.text);
+    out.valid = sanitizeUtf8Prefix(out.text, out.valid);
     const Out::View v = out.view(false);
     if (job->params.stream && !gone) {
         sendDelta(out, v);
@@ -3467,21 +3467,12 @@ Final StreamState::finish(Out& out, const std::string& reason_in) {
     out.valid = out.text.size();
     Out::View v = out.view(true);
     Final f;
-    f.reason = reason_in;
-    if (v.stopped) f.reason = "stop";
-    std::string content(v.content);
-    if (v.tool) {
-        if (auto calls = parseToolCalls(*v.tool, job->tools)) {
-            f.n_tools = calls->size();
-            f.calls = std::move(calls);
-            f.reason = "tool_calls";
-        } else {
-            // not a parsable call: keep it as text
-            std::string joined(v.content);
-            if (!v.content.empty()) joined += "\n\n";
-            joined += *v.tool;
-            content = std::string(trimRightWs(joined));
-        }
+    ToolResolution tr = resolveTools(v, reason_in, job->tools);
+    f.reason = std::move(tr.reason);
+    const std::string content = std::move(tr.content);
+    if (tr.calls) {
+        f.n_tools = tr.calls->size();
+        f.calls = std::move(tr.calls);
     }
     f.content = content;
     f.reasoning = std::string(v.reason);

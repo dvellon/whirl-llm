@@ -30,6 +30,9 @@ std::size_t partialHold(std::string_view text, std::string_view pat);
 std::size_t validUtf8Prefix(std::string_view s);
 // Invalid UTF-8 replaced by U+FFFD.
 std::string sanitizeUtf8(std::string_view s);
+// Streaming: s grew since the complete-text end `from` (a value this function returned before, or 0).
+// Returns the new end of the complete text: s up to it is what may be sent.
+std::size_t sanitizeUtf8Prefix(std::string& s, std::size_t from);
 // "..." with Python json.dumps(ensure_ascii=False) escaping.
 void appendJsonStr(std::string& out, std::string_view s);
 // Shortest round-trip decimal (no exponent); NaN / inf -> null.
@@ -87,6 +90,15 @@ struct ToolCall {
 // <tool_call> blocks in the Qwen3.x XML function format or as JSON objects
 // {"name", "arguments"}. nullopt when nothing parses.
 std::optional<std::vector<ToolCall>> parseToolCalls(std::string_view region, const json::Array& tools);
+
+// The final message of a generation: tool calls (finish_reason tool_calls) or the tool region kept
+// as text. reason_in: why the generation ended (stop / length; a matched stop string is "stop").
+struct ToolResolution {
+    std::optional<std::vector<ToolCall>> calls;
+    std::string content;
+    std::string reason;
+};
+ToolResolution resolveTools(const Out::View& v, std::string_view reason_in, const json::Array& tools);
 
 // ---- timings / usage / HTTP
 
