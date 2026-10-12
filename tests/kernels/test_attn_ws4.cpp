@@ -3,12 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // ws4: for f16 / q8 / q4 KV (synthetic pool, shuffled pages, two sequences with their own page
 // tables through kvbase), one query per group (the gfx1151 host's only kind): the partials
-// (m, l, acc of every split) of attn_ws4[_q8|_q4] (and the prefetch-depth variants) are bitwise
+// (m, l, acc of every split) of attn_ws4[_q8|_q4] are bitwise
 // those of attn_wsplit1[_q8|_q4] for contexts 1 .. 256k incl. chunk / page / split boundaries
 // and random positions, with the MTP draft window, for a smaller grid (split rule independent of
 // gridDim.y), and over 200 repeated launches with changing batches.
 // ws4bench: kernel time and KV GB/s at 32k / 64k / 96k / 128k (WHIRL_KT_BENCH_L) for
-// attn_wsplit1 / attn_ws4 (pd1 / pd2) / attn_dq4 per format, plus attn_combine.
+// attn_wsplit1 / attn_ws4 / attn_dq4 per format, plus attn_combine.
 
 #include <algorithm>
 #include <cmath>
@@ -277,10 +277,11 @@ void testAttnWs4(Ctx& c) {
         }
         Pool p(c, f, pages);
         std::vector<std::pair<std::string, hip::Function>> news;
-        for (const char* v : {"", "_pd2", "_pd1"}) {
-            const std::string nm = std::string("attn_ws4") + fsuf(f) + v;
+        {
+            const std::string nm = std::string("attn_ws4") + fsuf(f);
             if (auto fn = c.fnOpt(nm)) news.push_back({nm, fn});
         }
+        if (news.empty()) continue;
         if (have_base)
             if (auto fb = base_mod.getFunctionOpt((std::string("attn_wsplit1") + fsuf(f)).c_str()))
                 news.push_back({std::string("base attn_wsplit1") + fsuf(f), fb});
@@ -362,12 +363,35 @@ void benchAttnWs4(Ctx& c) {
     const std::vector<float> q = c.randn(static_cast<std::size_t>(kH) * kQStr);
     Buf dq(q);
     const int maxl = *std::max_element(lens.begin(), lens.end());
-    for (F f : {F::q8, F::f16, F::q4}) {
+    // WHIRL_KT_BENCH_HSACO: attn_ws4* from this code object instead (kernel development)
+    std::vector<char> image;
+    hip::Module xmod;
+    bool have_x = false;
+    if (const char* e = std::getenv("WHIRL_KT_BENCH_HSACO")) {
+        if (std::FILE* fp = std::fopen(e, "rb")) {
+            std::fseek(fp, 0, SEEK_END);
+            image.resize(static_cast<std::size_t>(std::ftell(fp)));
+            std::fseek(fp, 0, SEEK_SET);
+            if (std::fread(image.data(), 1, image.size(), fp) != image.size()) image.clear();
+            std::fclose(fp);
+        }
+        if (!image.empty()) {
+            xmod = hip::Module::loadData(image.data(), c.mod.arch());
+            have_x = true;
+            std::printf("   attn_ws4* from %s\n", e);
+        }
+    }
+    std::vector<F> fmts = {F::q8, F::f16, F::q4};
+    if (const char* e = std::getenv("WHIRL_KT_BENCH_FMT")) {
+        const std::string fs = e;
+        fmts = {fs == "f16" ? F::f16 : fs == "q4" ? F::q4 : F::q8};
+    }
+    for (F f : fmts) {
         Pool p(c, f, (maxl + wk::kKvPage - 1) / wk::kKvPage);
         const double row_bytes = f == F::f16 ? 2.0 * kD * 2 : f == F::q8 ? 2.0 * (kD + kD / 32 * 2) : 2.0 * (kD / 2 + kD / 32 * 2);
         std::vector<std::pair<std::string, unsigned>> names = {{std::string("attn_wsplit1") + fsuf(f), 128},
                                                                {std::string("attn_ws4") + fsuf(f), 128}};
-        names.push_back({std::string("attn_ws4") + fsuf(f) + (f == F::q4 ? "_pd1" : "_pd2"), 128});
+        if (const char* e = std::getenv("WHIRL_KT_BENCH_KERNELS")) names.push_back({e, 128});
         if (f == F::q4) names.push_back({"attn_dq4", 256});
         for (const int L : lens) {
             Buf dpos(std::vector<int>{L - 1}), dkvb(std::vector<int>{0});
@@ -376,7 +400,7 @@ void benchAttnWs4(Ctx& c) {
             g.first[0] = 0;
             g.count[0] = 1;
             for (const auto& [nm, threads] : names) {
-                const auto fn = c.fnOpt(nm);
+                const auto fn = have_x && nm.rfind("attn_ws4", 0) == 0 ? xmod.getFunctionOpt(nm.c_str()) : c.fnOpt(nm);
                 if (!fn) {
                     std::printf("   %s: not in this code object\n", nm.c_str());
                     continue;

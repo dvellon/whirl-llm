@@ -7,10 +7,10 @@
 // and the vector L0 is not invalidated) comes from asf0/strix-llama.cpp fattn-rdna35.cu
 // (MIT, Copyright (c) 2023-2026 The ggml authors); the code here is written from scratch.
 //
-// attn_ws4<F, PD> (F: 0 f16, 1 int8 (q8 / q8h), 2 int4 (q4); PD: chunks prefetched in
-// registers). Same arguments, grid (kv head, split, group), 128 threads and partial layout as
-// attn_wsplit1[_q8|_q4], and bitwise the same partials for groups of one query (the gfx1151
-// host's only kind, caps.attn_group1). Per 32-key chunk:
+// attn_ws4<F, PD, BF> (F: 0 f16, 1 int8 (q8 / q8h), 2 int4 (q4); PD: chunks prefetched in
+// registers, 1 for all (2 spills); BF: branch-free loads, see ws4_load). Same arguments, grid
+// (kv head, split, group), 128 threads and partial layout as attn_wsplit1[_q8|_q4], and bitwise
+// the same partials for groups of one query (the gfx1151 host's only kind, caps.attn_group1). Per 32-key chunk:
 //   LB0  Ks / Vt of the chunk ready
 //   QK   wave kt (0, 1): aw_qk_chain over its 16 keys from Ks -> Sc (f32, C-fragment order)
 //   LB1  every wave: aw_softmax_step on both tiles (identical bits in all waves), aw_pv on its
@@ -18,8 +18,9 @@
 //   LB2  stage the next chunk's raw K / V bytes (registers, issued PD chunks ahead) into
 //        Ks / Vt (in-register dequant: kv_dq8 / kv_dq4, the same rounding as kv_ld16 / kv_ld8),
 //        then issue the raw loads of chunk + 1 + PD into the freed registers
-// All K / V bytes are read once per block (keys >= b1 of the last chunk: K reads row b1 - 1
-// again, the clamp of attn_wsplit_impl; V is zero there), loaded by all 128 threads.
+// K / V bytes are loaded by all 128 threads, once per block, except: keys >= b1 of the last
+// chunk read row b1 - 1 again (the K clamp of attn_wsplit_impl; V is zeroed when staged), and
+// with BF the prefetch past the last chunk reloads the last chunk (L2; < 2% at 32k+).
 // The split rule uses the constant ws4::kNs (64), not gridDim.y: the splits depend on n_pos
 // only (the same ranges as attn_wsplit1 whenever n_pos <= 64 * gridDim.y, i.e. always).
 // ---------------------------------------------------------------------------
@@ -53,7 +54,11 @@ template <> struct Ws4Raw<2> {  // int4: K 4 x 16 nibbles + scale, V 8 keys x 8 
 };
 
 // issue the raw loads of chunk k0 (keys < b1) of kv head g for thread tv
-template <int F>
+// BF (branch-free): every load unconditional. Otherwise V rows >= b1 are not read (zero) and
+// the caller skips loads past the last chunk; the loads under a branch make the compiler copy
+// their results at the join, i.e. wait right away (the prefetch then only covers the staging).
+// f16 / int8 use BF (+13% for int8); int4 does not (BF needs 4 more VGPRs than 256 there).
+template <int F, bool BF>
 __device__ __forceinline__ void ws4_load(Ws4Raw<F> &r, const KvArgs &kv, int tb, int k0, int b1, int g, int n_kv, int tv) {
     const int dl = kv_delta(kv, tb, k0);  // 32-key chunks never straddle a page
 #pragma unroll
@@ -70,22 +75,13 @@ __device__ __forceinline__ void ws4_load(Ws4Raw<F> &r, const KvArgs &kv, int tb,
             r.ks[p] = kv.ks[e >> 5];
         }
     }
+    // V rows (BF: keys >= b1 read row b1 - 1 again; zeroed when staged either way)
     const int kb = ws4::v_kb(tv), d8 = ws4::v_d8(tv);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const int key = k0 + kb * 8 + i;
+        const int key = min(k0 + kb * 8 + i, b1 - 1);
         const size_t e = ((size_t)(key + dl) * n_kv + g) * AW_D + d8;
-        if (key < b1) {
-            if constexpr (F == 0) {
-                r.v[i] = *(const uint4 *)((const _Float16 *)kv.v + e);
-            } else if constexpr (F == 1) {
-                r.v[i] = *(const uint2 *)((const int8_t *)kv.v + e);
-                r.vs[i] = kv.vs[e >> 5];
-            } else {
-                r.v[i] = *(const uint32_t *)((const uint8_t *)kv.v + (e >> 1));
-                r.vs[i] = kv.vs[e >> 5];
-            }
-        } else {
+        if (!BF && k0 + kb * 8 + i >= b1) {
             if constexpr (F == 0) {
                 r.v[i] = make_uint4(0, 0, 0, 0);
             } else if constexpr (F == 1) {
@@ -95,6 +91,14 @@ __device__ __forceinline__ void ws4_load(Ws4Raw<F> &r, const KvArgs &kv, int tb,
                 r.v[i] = 0;
                 r.vs[i] = (_Float16)0.f;
             }
+        } else if constexpr (F == 0) {
+            r.v[i] = *(const uint4 *)((const _Float16 *)kv.v + e);
+        } else if constexpr (F == 1) {
+            r.v[i] = *(const uint2 *)((const int8_t *)kv.v + e);
+            r.vs[i] = kv.vs[e >> 5];
+        } else {
+            r.v[i] = *(const uint32_t *)((const uint8_t *)kv.v + (e >> 1));
+            r.vs[i] = kv.vs[e >> 5];
         }
     }
 }
@@ -116,39 +120,41 @@ __device__ __forceinline__ void ws4_stage(const Ws4Raw<F> &r, _Float16 (*Ks)[ws4
             *(half8 *)(dst + 8) = kv_dq4(r.k[p].y, r.ks[p]);
         }
     }
-    const int kb = ws4::v_kb(tv), d8 = ws4::v_d8(tv);
-    half8 rows[8];
+    // V^T: even rows (keys 8 kb + 0, 2, 4, 6) to column tb, then odd rows to tb + 8 (half the
+    // temporaries of dequantizing all 8 rows at once; same values and layout)
+    typedef _Float16 half4_t __attribute__((ext_vector_type(4)));
+    const int kb = ws4::v_kb(tv), d8 = ws4::v_d8(tv), tb = ws4::vt_tb(kb);
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        if constexpr (F == 0) {
-            rows[i] = __builtin_bit_cast(half8, r.v[i]);
-        } else {
+    for (int par = 0; par < 2; ++par) {
+        half8 rows[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = 2 * j + par;
             half8 x;
-            if constexpr (F == 1)
+            if constexpr (F == 0)
+                x = __builtin_bit_cast(half8, r.v[i]);
+            else if constexpr (F == 1)
                 x = kv_dq8(__builtin_bit_cast(kvq8_t, r.v[i]), r.vs[i]);
             else
                 x = kv_dq4(r.v[i], r.vs[i]);
             const bool valid = k0 + kb * 8 + i < b1;  // keys >= b1: +0 as attn_wsplit_impl
 #pragma unroll
-            for (int e2 = 0; e2 < 8; ++e2) rows[i][e2] = valid ? x[e2] : (_Float16)0.f;
+            for (int e2 = 0; e2 < 8; ++e2) rows[j][e2] = valid ? x[e2] : (_Float16)0.f;
         }
-    }
-    typedef _Float16 half4_t __attribute__((ext_vector_type(4)));
-    const int tb = ws4::vt_tb(kb);
 #pragma unroll
-    for (int c = 0; c < 8; ++c) {
-        half4_t ev, od;
+        for (int c = 0; c < 8; ++c) {
+            half4_t w4;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            ev[i] = rows[2 * i][c];
-            od[i] = rows[2 * i + 1][c];
+            for (int j = 0; j < 4; ++j) w4[j] = rows[j][c];
+            *(half4_t *)&Vt[ws4::vt_addr(d8 + c, tb + 8 * par)] = w4;
         }
-        *(half4_t *)&Vt[ws4::vt_addr(d8 + c, tb)] = ev;
-        *(half4_t *)&Vt[ws4::vt_addr(d8 + c, tb + 8)] = od;
     }
 }
 
-template <int F, int PD>
+#ifndef WS4_DBG  // kernel development: 1 = no QK / softmax / P.V, 2 = no global loads after the prologue
+#define WS4_DBG 0
+#endif
+template <int F, int PD, bool BF>
 __device__ __forceinline__ void attn_ws4_impl(const float *q, const KvArgs &kv, float *part_ml, float *part_acc, int n_head, int n_kv,
                                               int q_stride, const int *pos, float scale, const int *skip, const AwGroups &groups) {
 #pragma clang fp contract(off)
@@ -181,7 +187,7 @@ __device__ __forceinline__ void attn_ws4_impl(const float *q, const KvArgs &kv, 
     }
     const int nch = (b1 - b0 + AW_K - 1) / AW_K;
     Ws4Raw<F> raw[PD];
-    ws4_load<F>(raw[0], kv, tb, b0, b1, g, n_kv, tv);
+    ws4_load<F, BF>(raw[0], kv, tb, b0, b1, g, n_kv, tv);
     // Q^T (f16) of the group's columns, as attn_wsplit_impl
     for (int i = tv; i < 16 * (AW_D / 8); i += 128) {
         const int c = i / (AW_D / 8), d8 = (i % (AW_D / 8)) * 8;
@@ -200,7 +206,7 @@ __device__ __forceinline__ void attn_ws4_impl(const float *q, const KvArgs &kv, 
     ws4_stage<F>(raw[0], Ks, Vt, b0, b1, tv);
 #pragma unroll
     for (int j = 1; j <= PD; ++j)
-        if (j < nch) ws4_load<F>(raw[j % PD], kv, tb, b0 + j * AW_K, b1, g, n_kv, tv);
+        if (BF || j < nch) ws4_load<F, BF>(raw[j % PD], kv, tb, b0 + min(j, nch - 1) * AW_K, b1, g, n_kv, tv);
     float8 o[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) o[j] = (float8){0, 0, 0, 0, 0, 0, 0, 0};
@@ -212,6 +218,7 @@ __device__ __forceinline__ void attn_ws4_impl(const float *q, const KvArgs &kv, 
             if (c < nch) {
                 const int k0 = b0 + c * AW_K;
                 ws4_lds_barrier();  // LB0: Ks / Vt (and Qs) of chunk c written
+#if WS4_DBG != 1
                 if (wid < 2) {
                     const int kt = wid;
                     const float8 sc = aw_qk_chain((float8){0, 0, 0, 0, 0, 0, 0, 0}, &Qs[lane % 16][0],
@@ -231,10 +238,14 @@ __device__ __forceinline__ void attn_ws4_impl(const float *q, const KvArgs &kv, 
                 const float alpha = aw_softmax_step(sc, pt, k0, lane, my_pos, b1, scale, m, l);
                 aw_pv<4>(o, alpha, pt, lane,
                          [&](int j, int kt) { return ld_frag16(&Vt[ws4::vt_addr((4 * wid + j) * 16 + lane % 16, kt * 16)]); });
+#endif
                 if (c + 1 < nch) {
                     ws4_lds_barrier();  // LB2: Vt, Sc read
                     ws4_stage<F>(raw[(s + 1) % PD], Ks, Vt, k0 + AW_K, b1, tv);
-                    if (c + 1 + PD < nch) ws4_load<F>(raw[(s + 1) % PD], kv, tb, k0 + (1 + PD) * AW_K, b1, g, n_kv, tv);
+                    // BF: unconditional (see ws4_load); past the last chunk it reloads the last
+                    // one (L2), never used
+                    if (WS4_DBG != 2 && (BF || c + 1 + PD < nch))
+                        ws4_load<F, BF>(raw[(s + 1) % PD], kv, tb, min(k0 + (1 + PD) * AW_K, b0 + (nch - 1) * AW_K), b1, g, n_kv, tv);
                 }
             }
         }
@@ -251,16 +262,15 @@ __device__ __forceinline__ void attn_ws4_impl(const float *q, const KvArgs &kv, 
         for (int v = 0; v < 8; ++v) pa[(4 * wid + j) * 16 + CROW(lane, v)] = o[j][v];
 }
 
-#define WS4_ENTRY(name, F, PD)                                                                                                        \
+#define WS4_ENTRY(name, F, PD, BF)                                                                                                        \
     extern "C" __global__ void __launch_bounds__(128)                                                                                 \
         name(const float *q, KvArgs kv, float *part_ml, float *part_acc, int n_head, int n_kv, int q_stride, const int *pos, float scale, \
              const int *skip, AwGroups groups) {                                                                                      \
-        attn_ws4_impl<F, PD>(q, kv, part_ml, part_acc, n_head, n_kv, q_stride, pos, scale, skip, groups);                            \
+        attn_ws4_impl<F, PD, BF>(q, kv, part_ml, part_acc, n_head, n_kv, q_stride, pos, scale, skip, groups);                            \
     }
-WS4_ENTRY(attn_ws4, 0, 1)
-WS4_ENTRY(attn_ws4_q8, 1, 1)
-WS4_ENTRY(attn_ws4_q4, 2, 2)
-// prefetch depth 1 for q4 (kernel development / bench; not used by the host). Depth 2 for f16 /
-// int8 does not fit: 256 VGPRs with 76 / 94 spilled (ROCm 7.2), so they stay at depth 1.
-WS4_ENTRY(attn_ws4_q4_pd1, 2, 1)
+WS4_ENTRY(attn_ws4, 0, 1, true)
+WS4_ENTRY(attn_ws4_q8, 1, 1, true)
+WS4_ENTRY(attn_ws4_q4, 2, 1, false)
+// Prefetch depth 2 (template PD, design F7) does not fit any format with ROCm 7.2: 256 VGPRs
+// and 50-140 spilled once the prefetch really overlaps (and slower than depth 1), so all use 1.
 #undef WS4_ENTRY
