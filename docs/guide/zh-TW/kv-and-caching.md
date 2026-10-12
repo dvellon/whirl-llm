@@ -161,7 +161,7 @@ transformer 可以重用任何 KV 區塊已被快取的前綴。DeltaNet 層做�
 server 日誌顯示有兩個根本原因，而不是一開始懷疑的單一原因：
 
 1. **MTP 在 EOS 之後仍接受草稿**（[speculative-decoding.md](speculative-decoding.md#eos)）：狀態跑過 `<|im_end|>` 1–3 個 token，所以 `gen-end` 落在下一回合的共同前綴之外（例如：`cache now 42`，下一回合的共同前綴是 41）。
-2. **思考提示詞以 `<think>\n` 結尾。** 當客戶端不回傳 `reasoning_content`（多數 agent 客戶端都不回傳）時，歷史會被重新渲染成 `<think>\n\n</think>\n\n…`，而 `\n\n` 是單一個 token，和提示詞最後的 `\n` 不同。`prompt-end` 檢查點差一個 token 沒命中，因此**每一回合都重新 prefill 整段對話**（命中率 0.000）。修正：將這類提示詞的 prefill 在 N−1 處切開，並在 `<think>` 之後存一個 `think-open` 檢查點。CLI 以相同方式切分，因此 server == CLI 仍維持逐位元相同；成本：思考提示詞多一個 1-token 步驟（27B 上約 28 ms）。
+2. **思考提示詞以 `<think>\n` 結尾。** 當客戶端不回傳 `reasoning_content`（多數 agent 客戶端都不回傳）時，歷史會被重新渲染成 `<think>\n\n</think>\n\n…`，而 `\n\n` 是單一個 token，和提示詞最後的 `\n` 不同。`prompt-end` 檢查點差一個 token 沒命中，因此**每一回合都重新 prefill 整段對話**（命中率 0.000）。修正：將這類提示詞的 prefill 在 N−1 處切開，並在 `<think>` 之後存一個 `think-open` 檢查點。CLI 以相同方式切分（切點在兩邊一致）；成本：思考提示詞多一個 1-token 步驟（27B 上約 28 ms）。
 
 | 多回合命中率（後續回合：已快取 / 提示詞） | 27B 修正前 → 後 | MoE 修正前 → 後 |
 |---|---|---|

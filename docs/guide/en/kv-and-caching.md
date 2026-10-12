@@ -259,8 +259,8 @@ Server logs showed two root causes, not the single one first suspected:
    `<think>\n\n</think>\n\n…`, and `\n\n` is a single token that differs from the prompt's final
    `\n`. The `prompt-end` checkpoint missed by one token, so **every turn re-prefilled the whole
    conversation** (hit ratio 0.000). Fix: split the prefill of such prompts at N−1 and save a
-   `think-open` checkpoint after `<think>`. The CLI splits identically, so server == CLI stays
-   bit-exact; cost: one extra 1-token step on thinking prompts (~28 ms on the 27B).
+   `think-open` checkpoint after `<think>`. The CLI splits identically (where the split is made
+   does not differ between them); cost: one extra 1-token step on thinking prompts (~28 ms on the 27B).
 
 | Multi-turn hit ratio (later turns: cached / prompt) | 27B before → after | MoE before → after |
 |---|---|---|
