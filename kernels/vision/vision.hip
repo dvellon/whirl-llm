@@ -1,5 +1,5 @@
 // WHIRL vision encoder kernels: Qwen3-VL / Qwen3.5 ViT ("qwen3vl_merger"
-// mmproj, F16 weights) for RDNA 4 (gfx1201).
+// mmproj, F16 weights) for RDNA 4 (gfx1201) and RDNA 3.5 (gfx1151, VIS-8S).
 // SPDX-License-Identifier: Apache-2.0 (graph adapted from llama.cpp, MIT; see
 // THIRD_PARTY_NOTICES.md). Ported from the research prototype (item VIS).
 //
@@ -14,6 +14,14 @@
 //         LN -> up (+b) -> GELU(tanh) -> down (+b) -> +res]
 //   post LN -> view 4 patches as one row -> mm.0 (+b) -> GELU -> mm.2 (+b)
 // Activations: f32 residual stream, f16 GEMM inputs, f32 accumulation.
+//
+// One source, two code objects (cmake/vision.cmake): gfx1201 compiles exactly the
+// code in the `#else` branches (unchanged from the gfx1201-only file); gfx1151
+// (__GFX11__) takes the `#if defined(__GFX11__)` branches. The arithmetic is the same
+// (f16 inputs, f32 accumulation, 16x16x16 WMMA); only the wave32 fragment layouts
+// differ: gfx12 lanes hold 8 k values (k = 8 * (lane / 16) ..) and accumulator rows
+// v + 8 * (lane / 16); gfx11 lanes hold all 16 k values (lanes 16-31 repeat 0-15) and
+// accumulator rows 2 * v + lane / 16 (llama.cpp ggml-cuda/mma.cuh, RDNA3).
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -22,6 +30,43 @@
 #define WARP 32
 typedef _Float16 half8 __attribute__((ext_vector_type(8)));
 typedef float float8 __attribute__((ext_vector_type(8)));
+#if defined(__GFX11__)
+typedef _Float16 half16 __attribute__((ext_vector_type(16)));
+// 16 consecutive halfs (two 16-byte reads) = one gfx11 A / B fragment
+__device__ __forceinline__ half16 cat_frag(half8 lo, half8 hi) {
+    return __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+}
+__device__ __forceinline__ half16 ld_frag16(const _Float16 *p) { return cat_frag(*(const half8 *)p, *(const half8 *)(p + 8)); }
+#define VWMMA(a, b, c) __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c)
+// the other half-wave's copy of a 32-bit value (lane ^ 16)
+__device__ __forceinline__ int xhalf(int v) {
+    return __builtin_amdgcn_permlanex16(v, v, 0x76543210, 0xfedcba98, false, false);
+}
+__device__ __forceinline__ float xhalff(float v) { return __builtin_bit_cast(float, xhalf(__builtin_bit_cast(int, v))); }
+// gfx11 accumulator (this lane: rows 2v + h, h = lane / 16) -> the gfx12 order (rows
+// 8h + v), so the gfx12 epilogues apply unchanged. Every lane of the wave must call it.
+__device__ __forceinline__ float8 c_to_rows(float8 c, int lane) {
+    const bool h = lane >= 16;
+    float8 o;
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+        const float own = h ? c[4 + jj] : c[jj];
+        const float rcv = xhalff(h ? c[jj] : c[4 + jj]);
+        o[2 * jj] = h ? rcv : own;
+        o[2 * jj + 1] = h ? own : rcv;
+    }
+    return o;
+}
+// P^T values of this lane (keys 2v + h of one query, gfx11 accumulator order) -> the
+// full 16-key B fragment (both half-waves hold it). Every lane must call it.
+__device__ __forceinline__ half16 p_to_frag(half8 p, int lane) {
+    const int4 o = __builtin_bit_cast(int4, p);
+    const int4 q = make_int4(xhalf(o.x), xhalf(o.y), xhalf(o.z), xhalf(o.w));
+    const bool h = lane >= 16;
+    const half8 ev = __builtin_bit_cast(half8, h ? q : o), od = __builtin_bit_cast(half8, h ? o : q);
+    return __builtin_shufflevector(ev, od, 0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
+}
+#endif
 
 #define VD 72    // head dim
 #define VDP 80   // padded head dim (5 WMMA k-steps)
@@ -50,7 +95,11 @@ __device__ float block_sum(float v) {
 }
 
 __device__ __forceinline__ void lds_barrier() {
+#if defined(__GFX11__)
+    __syncthreads();
+#else
     asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
+#endif
 }
 
 // token index t (2x2 merge order) -> patch (px, py); pw = patches per row
@@ -214,6 +263,7 @@ extern "C" __global__ void vis_qkv_prep(const float *T, const float *bias, _Floa
 // grid = (ceil(N / 64), VH), block 128.
 #define FA_BQ 64
 #define FA_BK 64
+#if !defined(__GFX11__)  // v1 (the host uses vis_attn2): gfx1201 only
 extern "C" __global__ void __launch_bounds__(128) vis_attn(const _Float16 *Q, const _Float16 *K, const _Float16 *V,
                                                            _Float16 *O, int N, float scale_log2) {
     __shared__ __attribute__((aligned(16))) _Float16 Ks[FA_BK * VDP];
@@ -304,6 +354,7 @@ extern "C" __global__ void __launch_bounds__(128) vis_attn(const _Float16 *Q, co
         *(half8 *)(orow + d0) = hv;  // h*72 + d0: 16-byte aligned (72*2 = 144 = 9*16)
     }
 }
+#endif  // !__GFX11__
 
 // ---------------------------------------------------------------------------
 // v2 (faster): qkv prep per 64-token tile with V written transposed, and flash
@@ -369,7 +420,11 @@ extern "C" __global__ void __launch_bounds__(256) vis_qkv_prep2(const float *T, 
 #define FB_BQ 128
 #define FB_BK 64
 #define FB_KS 80  // LDS row stride of K (halfs; padding it cost occupancy, measured)
+#if defined(__GFX11__)
+#define FB_VS 72  // gfx11: 16-byte aligned rows for the 32-byte fragment reads
+#else
 #define FB_VS 68  // LDS row stride of V^T (padded: 64 gave 8-way bank conflicts; 1080p attn 170 -> 150 ms)
+#endif
 extern "C" __global__ void __launch_bounds__(128) vis_attn2(const _Float16 *__restrict__ Q, const _Float16 *__restrict__ K,
                                                             const _Float16 *__restrict__ Vt, _Float16 *__restrict__ O, int N,
                                                             int Np, float scale_log2) {
@@ -381,12 +436,20 @@ extern "C" __global__ void __launch_bounds__(128) vis_attn2(const _Float16 *__re
     const _Float16 *Qh = Q + (size_t)h * Np * VDP;
     const _Float16 *Kh = K + (size_t)h * Np * VDP;
     const _Float16 *Vh = Vt + (size_t)h * VDP * Np;
+#if defined(__GFX11__)
+    half16 qf[2][5];
+#pragma unroll
+    for (int f = 0; f < 2; ++f)
+#pragma unroll
+        for (int ks = 0; ks < 5; ++ks) qf[f][ks] = ld_frag16(Qh + (size_t)(q0 + f * 16 + lane % 16) * VDP + ks * 16);
+#else
     half8 qf[2][5];
 #pragma unroll
     for (int f = 0; f < 2; ++f)
 #pragma unroll
         for (int ks = 0; ks < 5; ++ks)
             qf[f][ks] = *(const half8 *)(Qh + (size_t)(q0 + f * 16 + lane % 16) * VDP + ks * 16 + (lane / 16) * 8);
+#endif
     float8 acc[2][5];
 #pragma unroll
     for (int f = 0; f < 2; ++f)
@@ -421,9 +484,15 @@ extern "C" __global__ void __launch_bounds__(128) vis_attn2(const _Float16 *__re
             s[1][sub] = (float8){0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
             for (int ks = 0; ks < 5; ++ks) {
+#if defined(__GFX11__)
+                const half16 a = ld_frag16(&Ks[b][(sub * 16 + lane % 16) * FB_KS + ks * 16]);
+                s[0][sub] = VWMMA(a, qf[0][ks], s[0][sub]);
+                s[1][sub] = VWMMA(a, qf[1][ks], s[1][sub]);
+#else
                 const half8 a = *(const half8 *)(&Ks[b][(sub * 16 + lane % 16) * FB_KS + ks * 16 + (lane / 16) * 8]);
                 s[0][sub] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, qf[0][ks], s[0][sub]);
                 s[1][sub] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, qf[1][ks], s[1][sub]);
+#endif
             }
         }
         const bool tail = k0 + FB_BK > N;
@@ -436,7 +505,11 @@ extern "C" __global__ void __launch_bounds__(128) vis_attn2(const _Float16 *__re
 #pragma unroll
                 for (int v = 0; v < 8; ++v) {
                     float x = s[f][sub][v] * scale_log2;
+#if defined(__GFX11__)
+                    if (tail && k0 + sub * 16 + 2 * v + lane / 16 >= N) x = -INFINITY;  // gfx11 row order
+#else
                     if (tail && k0 + sub * 16 + 8 * (lane / 16) + v >= N) x = -INFINITY;
+#endif
                     s[f][sub][v] = x;
                     mt = fmaxf(mt, x);
                 }
@@ -465,14 +538,47 @@ extern "C" __global__ void __launch_bounds__(128) vis_attn2(const _Float16 *__re
         }
 #pragma unroll
         for (int sub = 0; sub < 4; ++sub)
+#if defined(__GFX11__)
+        {
+            const half16 pb0 = p_to_frag(p[0][sub], lane), pb1 = p_to_frag(p[1][sub], lane);
+#pragma unroll
+            for (int i = 0; i < 5; ++i) {
+                const half16 a = ld_frag16(&Vs[b][(i * 16 + lane % 16) * FB_VS + sub * 16]);
+                acc[0][i] = VWMMA(a, pb0, acc[0][i]);
+                acc[1][i] = VWMMA(a, pb1, acc[1][i]);
+            }
+        }
+#else
 #pragma unroll
             for (int i = 0; i < 5; ++i) {
                 const half8 a = *(const half8 *)(&Vs[b][(i * 16 + lane % 16) * FB_VS + sub * 16 + (lane / 16) * 8]);
                 acc[0][i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, p[0][sub], acc[0][i]);
                 acc[1][i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, p[1][sub], acc[1][i]);
             }
+#endif
         lds_barrier();
     }
+#if defined(__GFX11__)
+    // gfx11: element v of this lane is dim i * 16 + 2v + lane / 16; per-element stores
+    // (no cross-lane exchange in the epilogue: the compiler may place it after the
+    // divergent q / d checks, where permlanex16 reads inactive lanes as 0)
+#pragma unroll
+    for (int f = 0; f < 2; ++f) {
+        const float L = l[f] + __shfl_xor(l[f], 16, WARP);
+        const float inv = 1.0f / L;
+        const int q = q0 + f * 16 + lane % 16;
+        if (q >= N) continue;
+        _Float16 *orow = O + (size_t)q * VE + h * VD;
+#pragma unroll
+        for (int i = 0; i < 5; ++i)
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                const int d = i * 16 + 2 * v + lane / 16;
+                if (d < VD) orow[d] = (_Float16)(acc[f][i][v] * inv);
+            }
+    }
+    return;
+#endif
 #pragma unroll
     for (int f = 0; f < 2; ++f) {
         const float L = l[f] + __shfl_xor(l[f], 16, WARP);
@@ -584,6 +690,27 @@ extern "C" __global__ void __launch_bounds__(256) vis_gemm(const _Float16 *__res
     };
     auto compute = [&]() {
         const _Float16 *sb = S + ABUF;
+#if defined(__GFX11__)
+        // the slab holds k 0..7 of row r at slot r and k 8..15 at slot r + 16: a gfx11
+        // fragment (all 16 k of row lane % 16) joins the two slots
+        const int r16 = lane % 16;
+#pragma unroll
+        for (int st = 0; st < KSPS; ++st) {
+            half16 a[TM];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                const _Float16 *pa = S + (((wm * TM + i) * KSPS + st) * 32) * 8;
+                a[i] = cat_frag(*(const half8 *)(pa + r16 * 8), *(const half8 *)(pa + (r16 + 16) * 8));
+            }
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                const _Float16 *pb = sb + (((wn * TN + j) * KSPS + st) * 32) * 8;
+                const half16 bj = cat_frag(*(const half8 *)(pb + r16 * 8), *(const half8 *)(pb + (r16 + 16) * 8));
+#pragma unroll
+                for (int i = 0; i < TM; ++i) acc[i][j] = VWMMA(a[i], bj, acc[i][j]);
+            }
+        }
+#else
 #pragma unroll
         for (int st = 0; st < KSPS; ++st) {
             half8 a[TM], b[TN];
@@ -596,6 +723,7 @@ extern "C" __global__ void __launch_bounds__(256) vis_gemm(const _Float16 *__res
 #pragma unroll
                 for (int j = 0; j < TN; ++j) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a[i], b[j], acc[i][j]);
         }
+#endif
     };
     const int nslabs = ncols / BK;
     fetch(0);
@@ -606,6 +734,12 @@ extern "C" __global__ void __launch_bounds__(256) vis_gemm(const _Float16 *__res
         if (s + 1 < nslabs) fetch((s + 1) * BK);
         compute();
     }
+#if defined(__GFX11__)
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = c_to_rows(acc[i][j], lane);
+#endif
 #pragma unroll
     for (int j = 0; j < TN; ++j) {
         const int t = t0 + (wn * TN + j) * 16 + lane % 16;

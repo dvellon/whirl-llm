@@ -719,7 +719,8 @@ void testAttn(Ctx& c) {
     const MV mvs[] = {{"attn_prep", "attn_prep_m", Fmt::f16, false},
                       {"attn_prep_q8", "attn_prep_m_q8", Fmt::q8, false},
                       {"attn_prep_q8h", "attn_prep_m_q8h", Fmt::q8, true},
-                      {"attn_prep_q8v", "attn_prep_m_q8v", Fmt::q8v, false}};
+                      {"attn_prep_q8v", "attn_prep_m_q8v", Fmt::q8v, false},
+                      {"attn_prep_q4", "attn_prep_m_q4", Fmt::q4, true}};
     for (const MV& mv : mvs) {
         auto fm = c.fnOpt(mv.m);
         auto fp = c.fnOpt(mv.plain);

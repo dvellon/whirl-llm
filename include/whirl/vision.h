@@ -235,7 +235,8 @@ std::vector<std::uint32_t> expand(std::span<const std::uint32_t> tokens, std::ui
 // name): standalone encoder test; prints the prototype-style report. Returns the exit code.
 int cliVisEncode(std::span<const std::string> args);
 
-// The vision code object embedded for gfx1201 (empty span if not built).
-std::span<const std::uint8_t> kernelImage();
+// The vision code object embedded for `arch` (gfx1201, gfx1151; empty span if that
+// architecture was not built).
+std::span<const std::uint8_t> kernelImage(hip::Arch arch);
 
 }  // namespace whirl::vision

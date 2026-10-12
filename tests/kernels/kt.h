@@ -198,6 +198,7 @@ void testGemvh(Ctx& c);   // "gemvh": bitwise sweep of precise-decode gemvh/gemv
 void benchGemvh(Ctx& c);  // "gemvhbench": timing only
 void benchAttn(Ctx& c);  // "attnbench": timing only, run with --only attnbench
 void testGdn(Ctx& c);
+void testVision(Ctx& c);  // "vision": encoder kernels (own code object) vs CPU
 void testMoe(Ctx& c);
 void testMoeMx(Ctx& c);
 // 8060S grouped expert GEMMs (test_moe_gu.cpp), called by testMoe / testMoeMx

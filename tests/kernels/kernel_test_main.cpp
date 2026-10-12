@@ -4,7 +4,7 @@
 //
 // usage: whirl-kernel-test [--device SPEC] [--only fam,fam] [--quick] [-v]
 //                          [--q4 GGUF] [--mx GGUF] [--moe GGUF] [--moemx GGUF]
-// families: quant gemv gemm attn gdn moe moemx misc
+// families: quant gemv gemm attn gdn moe moemx misc gemvh dflash vision
 
 #include <chrono>
 #include <cstdlib>
@@ -24,7 +24,7 @@ std::string envOr(const char* name) {
 
 int usage() {
     std::printf(
-        "usage: whirl-kernel-test [--device SPEC] [--only quant,gemv,gemm,attn,gdn,moe,moemx,misc] [--quick] [-v]\n"
+        "usage: whirl-kernel-test [--device SPEC] [--only quant,gemv,gemm,attn,gdn,moe,moemx,misc,vision] [--quick] [-v]\n"
         "                         [--q4 GGUF] [--mx GGUF] [--moe GGUF] [--moemx GGUF]\n"
         "  --device  index, gfx arch, name substring, r9700 or 8060s (default: WHIRL_DEVICE, else the\n"
         "            first R9700, else the first GPU this build has kernels for)\n"
@@ -109,7 +109,8 @@ int main(int argc, char** argv) {
     const Fam fams[] = {{"quant", kt::testQuant}, {"gemv", kt::testGemv}, {"gemm", kt::testGemm},
                         {"attn", kt::testAttn},   {"gdn", kt::testGdn},   {"moe", kt::testMoe},
                         {"moemx", kt::testMoeMx}, {"misc", kt::testMisc},   {"attnbench", kt::benchAttn},
-                        {"gemvh", kt::testGemvh}, {"gemvhbench", kt::benchGemvh}, {"dflash", kt::testDflash}};
+                        {"gemvh", kt::testGemvh}, {"gemvhbench", kt::benchGemvh}, {"dflash", kt::testDflash},
+                        {"vision", kt::testVision}};
     for (const Fam& f : fams) {
         if (!only.empty() && !only.count(f.name)) continue;
         if (only.empty() && (std::string(f.name) == "attnbench" || std::string(f.name) == "gemvhbench")) continue;  // timing only, on request
