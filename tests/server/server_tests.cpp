@@ -192,8 +192,10 @@ public:
         http_->stop();
         http_.reset();
         engine_->attachTier(nullptr);
-        engine_.reset();
+        // FR-CACHE P3-5: the tier first (its destructor joins the IO thread, whose wake callback calls into
+        // the engine), then the engine -- the product's order (server_main declares the tier after the engine)
         tier_.reset();
+        engine_.reset();
         model_.reset();
     }
     HttpResult post(const std::string& path, const std::string& body) {
