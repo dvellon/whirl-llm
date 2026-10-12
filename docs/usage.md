@@ -267,8 +267,9 @@ Request parameters: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `max_token
 `preserve_thinking`. Without sampling parameters the model card's recommended values apply. With
 `temperature` 0 the output equals `whirl chat` token for token. `presence_penalty` /
 `frequency_penalty` are accepted but ignored; `n` must be 1; `logprobs`, `response_format` and
-enforced `tool_choice: "required"` are not supported. Responses add `usage.cached_tokens` and a
-llama.cpp-style `timings` object. Details: [server.md](guide/en/server.md#sampling).
+enforced `tool_choice: "required"` are not supported. `stop` takes at most 16 strings of at most
+256 bytes each (more: HTTP 400); a `temperature` below 0.001 is greedy. Responses add
+`usage.cached_tokens` and a llama.cpp-style `timings` object. Details: [server.md](guide/en/server.md#sampling).
 
 Thinking and reasoning effort can be given in any of these forms (applied in this order; a later one
 overrides an earlier one): `chat_template_kwargs.{enable_thinking, reasoning_effort}`, the

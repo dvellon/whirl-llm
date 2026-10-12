@@ -57,6 +57,10 @@ struct Params {
     bool cache_prompt = true;   // llama.cpp extension
 };
 
+// Stop strings per request and bytes per stop string (more -> HTTP 400)
+constexpr std::size_t max_stop_strings = 16;
+constexpr std::size_t max_stop_bytes = 256;
+
 // Throws RequestError. `think` / `chat` select the model-card defaults for
 // non-thinking chat (temperature 0.7, top_p 0.8).
 Params parseParams(const json::Object& obj, bool think, bool chat);
@@ -78,6 +82,7 @@ struct Out {
         std::string_view content;
         std::optional<std::string_view> tool;
         bool stopped = false;
+        std::size_t stop_end = 0;  // stopped: byte offset in text just past the matched stop string
     };
     View view(bool final) const;
 };

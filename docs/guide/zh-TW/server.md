@@ -79,6 +79,11 @@ Base URL 為 `http://127.0.0.1:8080/v1`；接受任何 API key。模型只載入
 回應為標準 OpenAI JSON：`finish_reason` 為 `stop` / `length` / `tool_calls`；`usage` 含
 `cached_tokens`；另外加上 llama.cpp 風格的 `timings` 物件（prompt 與預測 token 的每秒數、草稿
 計數），讓現有的 llama.cpp 基準測試用戶端能讀取 WHIRL 的數據。
+`completion_tokens` 算到補齊停止字串的那個 token 為止（同一個 cycle 之後接受的草稿不算）。寫工具呼叫寫到
+一半碰到 `max_tokens` 時，回 `finish_reason: "length"`，呼叫內容當文字回傳，不會變成半截的 `tool_calls`。
+`finish_reason: "length"` 旁邊有 `"finish_cause": "kv_pool_exhausted"` 表示是 KV 池用完、不是 `max_tokens`。
+非串流請求的客戶端斷線時（排隊中、prefill 中、生成中都一樣）請求會停止並釋放 slot；送完請求就半關閉
+socket 的客戶端也會被當成斷線。關機期間進來的新請求回 503。
 
 ```
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \

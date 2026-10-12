@@ -233,7 +233,8 @@ LM Studio（`/api/v1/models`）與 Ollama（`/api/tags`、`/api/show`、`/api/ve
 `stream`、`tools`、`tool_choice`、`chat_template_kwargs.enable_thinking`（或最上層的 `enable_thinking`）、
 `reasoning_effort`、`preserve_thinking`。沒有給取樣參數時套用模型卡建議值。`temperature` 為 0 時，輸出與
 `whirl chat` 逐 token 相同。`presence_penalty` / `frequency_penalty` 會接受但忽略；`n` 必須為 1；不支援
-`logprobs`、`response_format`，`tool_choice: "required"` 也不會強制。回應另含 `usage.cached_tokens` 與
+`logprobs`、`response_format`，`tool_choice: "required"` 也不會強制。`stop` 最多 16 個字串、每個最多
+256 位元組（超過回 HTTP 400）；`temperature` 小於 0.001 視為 greedy。回應另含 `usage.cached_tokens` 與
 llama.cpp 形式的 `timings` 物件。細節見 [server.md](server.md#sampling)。
 
 思考與 reasoning effort 可用下列任一種寫法（依此順序套用，後者覆蓋前者）：

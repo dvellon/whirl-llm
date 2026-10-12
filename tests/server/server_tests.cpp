@@ -2875,6 +2875,32 @@ void testFrStopTokens() {
     }
 }
 
+// P3-12: a follow-up with a few new tokens on a cached prefix is not held behind a long prefill
+void testFrShortFollowUp() {
+    ServerSetup su = baseSetup();
+    su.mc.prefill_us_per_row = 250;  // 12000 rows: 3 s of prefill
+    TestServer srv(su);
+    const auto p1 = makePrompt(400, 180);
+    const auto o1 = srv.model().greedyReference(p1, 16, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(p1, 16))), decode(o1));
+    std::vector<std::uint32_t> p2 = p1;
+    p2.insert(p2.end(), o1.begin(), o1.end());
+    for (std::uint32_t t : makePrompt(6, 181)) p2.push_back(t);
+    HttpResult rl;
+    std::thread longer([&] { rl = srv.post("/v1/completions", completionBody(makePrompt(12000, 182), 4)); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));  // the long prefill is running
+    const double t0 = nowSeconds();
+    const auto r2 = srv.post("/v1/completions", completionBody(p2, 1));  // done when its prefill is
+    const double dt = nowSeconds() - t0;
+    longer.join();
+    CHECK_EQ(r2.status, 200);
+    CHECK_EQ(completionText(r2), decode(srv.model().greedyReference(p2, 1, true)));
+    CHECK(cachedTokens(r2) >= p1.size());  // the follow-up reused its prefix (a short chunk)
+    CHECK(dt < 1.5);                       // one 2048-row chunk of the long prefill (~0.5 s), not all of it (3 s)
+    CHECK_EQ(rl.status, 200);
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+
 // P3-11: control characters in a request path are escaped in the log
 void testFrLogInjection() {
     TestServer srv(baseSetup());
@@ -2983,6 +3009,7 @@ int main(int argc, char** argv) {
         {"fr_protocol", testFrProtocol},
         {"fr_stop_tokens", testFrStopTokens},
         {"fr_log_injection", testFrLogInjection},
+        {"fr_short_followup", testFrShortFollowUp},
     };
     for (const T& t : tests) {
         if (!only.empty() && !only.count(t.name)) continue;

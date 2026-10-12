@@ -491,7 +491,7 @@ std::string propsJson(Engine& e) {
     b += std::format(",\"modalities\":{{\"vision\":{},\"audio\":false}},\"build_info\":\"whirl {}\"",
                      e.visionConfig().vis ? "true" : "false", WHIRL_VERSION_STRING);
     if (!o.numerics_json.empty()) b += ",\"numerics\":" + o.numerics_json;
-    const Engine::Stats st = e.stats();
+    const Engine::Stats st = e.statsShared();
     b += ",\"kv_ssd\":{\"mode\":";
     appendJsonStr(b, o.kv_ssd_mode);
     b += std::format(",\"bytes_written\":{},\"bytes_shared\":{},\"bytes_used\":{},\"entries\":{},\"superseded\":{}}}",
@@ -682,7 +682,7 @@ void handleConn(const ConnCtx& cx, SOCKET s) {
                      path);
             return sendAll(w, errorResponse(404, "not found"));
         }
-        logW("{} {} -> 404", method, path);
+        logW("{} {} -> 404", logSafe(method), logSafe(path));
         return sendAll(w, errorResponse(404, "not found"));
     }
     if (!is_post) return sendAll(w, errorResponse(405, "use POST"));
@@ -888,6 +888,13 @@ void HttpServer::stop() {
     if (n_conn_.load() > 0) {
         shutAll(false);
         waitConns(5000);
+    }
+    // FR-SRV P3-1: connection threads use the Engine (submitAndWait answers 503 once it stopped):
+    // the owner destroys it after stop() returns, so wait for them (shut down sockets end soon)
+    if (n_conn_.load() > 0) {
+        shutAll(false);
+        waitConns(20000);
+        if (n_conn_.load() > 0) logW("http: {} connection thread(s) still running at shutdown", n_conn_.load());
     }
 }
 

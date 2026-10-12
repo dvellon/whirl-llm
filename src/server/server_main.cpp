@@ -248,9 +248,13 @@ std::optional<std::string> env(std::string_view name) { return envGet(name); }
 std::uint32_t envU32(std::string_view name, std::uint32_t def) {
     if (auto v = env(name)) {
         try {
-            return static_cast<std::uint32_t>(std::stoul(*v));
+            std::size_t used = 0;
+            const unsigned long x = std::stoul(*v, &used);
+            if (used == v->size() && x <= 0xffffffffull) return static_cast<std::uint32_t>(x);
         } catch (const std::exception&) {
         }
+        // FR-SRV P3-10: a bad value is a warning and the default, never a startup failure
+        logW("WHIRL_{}={} is not a number; using {}", name, *v, def);
     }
     return def;
 }
@@ -411,7 +415,7 @@ int serveMain(int argc, char** argv, const char* program) {
         else if (auto vd = argValue(args, i, "--kv-ssd-delay")) opt.kv_ssd_delay = parseNum<std::uint64_t>(*vd, "--kv-ssd-delay");
         else if (auto vm = argValue(args, i, "--kv-ssd-mode")) {
             if (*vm != "always" && *vm != "shutdown" && *vm != "off")
-                throw std::runtime_error("--kv-ssd-mode: expected always, shutdown or off");
+                die("invalid --kv-ssd-mode " + *vm + " (expected always, shutdown or off)");
             opt.kv_ssd_mode = *vm;
         }
         else if (auto v12 = argValue(args, i, "--device")) opt.device = *v12;
@@ -467,7 +471,7 @@ int serveMain(int argc, char** argv, const char* program) {
         const gguf::File f = gguf::File::open(opt.path);
         const qwen35::Config cfg = qwen35::Config::fromGguf(f);
         int dev = 0;
-        if (auto v = env("HIP_DEVICE")) dev = std::stoi(*v);
+        if (env("HIP_DEVICE")) dev = static_cast<int>(envU32("HIP_DEVICE", 0));
         else dev = qwen35::pickDevice(opt.device);
         const hip::DeviceInfo info = hip::describeDevice(dev);
         hip::setDevice(dev);
@@ -718,14 +722,14 @@ int serveMain(int argc, char** argv, const char* program) {
         if (env("NAIVE_ATTN")) model.naive_attn = true;
         if (env("GDN_SEQ")) model.gdn_chunked = false;
         if (auto v = env("MOE_BN")) model.moe_bn_force = static_cast<std::uint32_t>(std::strtoul(v->c_str(), nullptr, 10));
-        if (auto v = env("PREFILL_BATCH"))  // (same floor as above: never below vram::min_prefill_batch)
-            model.max_batch = std::min(model.max_batch, vram::prefillBatchFloor(static_cast<std::uint32_t>(std::stoul(*v))));
+        if (env("PREFILL_BATCH"))  // (same floor as above: never below vram::min_prefill_batch)
+            model.max_batch = std::min(model.max_batch, vram::prefillBatchFloor(envU32("PREFILL_BATCH", model.max_batch)));
         // WHIRL_DRAFT_VOCAB: unset = embedded 64k subset (dense qwen35, 248320 vocab), 64k = embedded,
         // 48k / <file> = frequency subset file, N = the first N rows (old experiment), off = full head
         const qwen35::DraftVocabChoice draft_vocab = qwen35::draftVocabChoice(env("DRAFT_VOCAB"), qwen35::exeDirectory());
         if (draft_vocab.kind == qwen35::DraftVocabChoice::Kind::first_n) model.draft_vocab = draft_vocab.n;
-        if (auto v = env("DRAFT_WINDOW")) model.draft_window = static_cast<std::uint32_t>(std::stoul(*v));
-        if (auto v = env("DRAFT_WINDOW_MIN")) model.draft_window_min = static_cast<std::uint32_t>(std::stoul(*v));
+        model.draft_window = envU32("DRAFT_WINDOW", model.draft_window);
+        model.draft_window_min = envU32("DRAFT_WINDOW_MIN", model.draft_window_min);
         if (env("GEMV_R") || env("GEMV_W") || env("GEMV_WH"))
             logW("WHIRL_GEMV_R / WHIRL_GEMV_W / WHIRL_GEMV_WH are not supported by whirl-server (ignored)");
         model.use_graph = false;
@@ -762,7 +766,7 @@ int serveMain(int argc, char** argv, const char* program) {
         // an explicit draft count is used as is (fixed) unless WHIRL_MTP_ADAPT asks otherwise
         const bool auto_mode = adapt_env ? (*adapt_env == "auto") : (def.automatic && !drafts_user);
         if (!envOn("WIDE_VERIFY", true)) model.wide_verify = false;
-        if (auto hc = env("HEAD_CHUNK")) model.head_chunk = std::max<std::uint32_t>(32, static_cast<std::uint32_t>(std::stoul(*hc)) / 32 * 32);
+        if (env("HEAD_CHUNK")) model.head_chunk = std::max<std::uint32_t>(32, envU32("HEAD_CHUNK", model.head_chunk) / 32 * 32);
         auto batch_drafts = defaultBatchDrafts(model.cfg.moe, model.wideCapable());
         batch_drafts[1] = drafts;
         const auto bd_env = env("MTP_BATCH_DRAFTS");

@@ -114,27 +114,45 @@ std::size_t validUtf8Prefix(std::string_view s) {
     return i;
 }
 
+namespace {
+
+// The UTF-8 sequence at s[i] (the rules of isValidUtf8: no overlong forms, surrogates or code
+// points above U+10FFFF): its length when complete and valid, 0 when s ends inside a sequence
+// that may still become valid, -1 when s[i] cannot start a valid sequence (one byte -> U+FFFD).
+int utf8Seq(std::string_view s, std::size_t i) {
+    const auto c = static_cast<unsigned char>(s[i]);
+    if (c < 0x80) return 1;
+    int n;
+    unsigned lo = 0x80, hi = 0xBF;  // the second byte's range
+    if (c >= 0xC2 && c <= 0xDF) n = 2;
+    else if (c == 0xE0) n = 3, lo = 0xA0;
+    else if (c == 0xED) n = 3, hi = 0x9F;
+    else if (c >= 0xE1 && c <= 0xEF) n = 3;
+    else if (c == 0xF0) n = 4, lo = 0x90;
+    else if (c == 0xF4) n = 4, hi = 0x8F;
+    else if (c >= 0xF1 && c <= 0xF3) n = 4;
+    else return -1;
+    for (int k = 1; k < n; ++k) {
+        if (i + static_cast<std::size_t>(k) >= s.size()) return 0;
+        const auto b = static_cast<unsigned char>(s[i + static_cast<std::size_t>(k)]);
+        if (b < (k == 1 ? lo : 0x80u) || b > (k == 1 ? hi : 0xBFu)) return -1;
+    }
+    return n;
+}
+
+}  // namespace
+
 std::string sanitizeUtf8(std::string_view s) {
     if (isValidUtf8(s)) return std::string(s);
     std::string out;
     out.reserve(s.size() + 8);
     std::size_t i = 0;
     while (i < s.size()) {
-        const auto c = static_cast<unsigned char>(s[i]);
-        std::size_t n;
-        if (c < 0x80) n = 1;
-        else if ((c & 0xE0) == 0xC0) n = 2;
-        else if ((c & 0xF0) == 0xE0) n = 3;
-        else if ((c & 0xF8) == 0xF0) n = 4;
-        else {
-            out += "\xEF\xBF\xBD";
-            ++i;
-            continue;
-        }
-        if (i + n <= s.size() && isValidUtf8(s.substr(i, n))) {
-            out.append(s.substr(i, n));
-            i += n;
-        } else {
+        const int r = utf8Seq(s, i);
+        if (r > 0) {
+            out.append(s.substr(i, static_cast<std::size_t>(r)));
+            i += static_cast<std::size_t>(r);
+        } else {  // invalid, or cut at the end: U+FFFD per byte
             out += "\xEF\xBF\xBD";
             ++i;
         }
@@ -143,8 +161,21 @@ std::string sanitizeUtf8(std::string_view s) {
 }
 
 std::size_t sanitizeUtf8Prefix(std::string& s, std::size_t from) {
-    (void)from;
-    return validUtf8Prefix(s);
+    // FR-SRV P3-3: invalid bytes become U+FFFD here, by the rule sanitizeUtf8 applies at the end,
+    // so the streamed text is always a prefix of the final one (validUtf8Prefix passed invalid
+    // bytes through and the final text, longer after sanitizing, no longer matched the offsets sent)
+    std::size_t i = std::min(from, s.size());
+    while (i < s.size()) {
+        const int r = utf8Seq(s, i);
+        if (r == 0) break;  // an incomplete sequence at the end: wait for more bytes
+        if (r > 0) {
+            i += static_cast<std::size_t>(r);
+        } else {
+            s.replace(i, 1, "\xEF\xBF\xBD");
+            i += 3;
+        }
+    }
+    return i;
 }
 
 void appendJsonStr(std::string& out, std::string_view s) {
@@ -173,8 +204,9 @@ Params parseParams(const json::Object& obj, bool think, bool chat) {
         p.top_p = 0.8f;
     }
     if (auto v = getNum(obj, "temperature", "temperature must be a number")) {
-        if (*v < 0 || *v > 100) throw RequestError("temperature must be >= 0");
-        p.temperature = static_cast<float>(*v);
+        if (*v < 0 || *v > 100) throw RequestError("temperature must be in [0, 100]");
+        // FR-SRV P3-4: below 1e-3 sampling is greedy in effect; 1 / temperature stays finite
+        p.temperature = *v < 1e-3 ? 0.0f : static_cast<float>(*v);
     }
     if (auto v = getNum(obj, "top_p", "top_p must be a number")) {
         if (*v <= 0 || *v > 1) throw RequestError("top_p must be in (0, 1]");
@@ -217,6 +249,10 @@ Params parseParams(const json::Object& obj, bool think, bool chat) {
         } else {
             throw RequestError("stop must be a string or a list of strings");
         }
+        // FR-SRV P3-6: every stop string is searched in the whole output on the engine thread
+        if (p.stop.size() > max_stop_strings) throw RequestError("at most 16 stop sequences are supported");
+        for (const std::string& s : p.stop)
+            if (s.size() > max_stop_bytes) throw RequestError("a stop sequence must be at most 256 bytes");
     }
     p.stream = getBool(obj, "stream", "stream must be a boolean").value_or(false);
     p.ignore_eos = getBool(obj, "ignore_eos", "ignore_eos must be a boolean").value_or(false);
@@ -241,11 +277,16 @@ Out::View Out::view(bool final_in) const {
     View r;
     if (!stops.empty()) {
         std::optional<std::size_t> best;
+        std::size_t best_len = 0;
         for (const std::string& s : stops) {
             const std::size_t i = t.find(s);
-            if (i != std::string_view::npos && (!best || i < *best)) best = i;
+            if (i != std::string_view::npos && (!best || i < *best)) {
+                best = i;
+                best_len = s.size();
+            }
         }
         if (best) {
+            r.stop_end = *best + best_len;
             t = t.substr(0, *best);
             final = true;
             r.stopped = true;

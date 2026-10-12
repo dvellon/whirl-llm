@@ -83,6 +83,13 @@ about 5 s whatever is left. Killing the process (Task Manager, `taskkill /F`) sk
 Responses are standard OpenAI JSON: `finish_reason` `stop` / `length` / `tool_calls`; `usage`
 includes `cached_tokens`; a llama.cpp-style `timings` object is added (prompt and predicted tokens
 per second, draft counts), which lets existing llama.cpp benchmark clients read WHIRL's numbers.
+`completion_tokens` counts the tokens up to the one that completes a stop string (drafts accepted
+after it in the same cycle are not counted). A generation cut by `max_tokens` while it writes a tool
+call ends with `finish_reason: "length"` and the call as text, never as a half `tool_calls` entry.
+A `"finish_cause": "kv_pool_exhausted"` next to `finish_reason: "length"` means the KV pool, not
+`max_tokens`, ended it. A non-streaming request whose client disconnects stops (queued, prefilling
+or generating) and frees its slot; a client that half-closes its socket after sending counts as
+disconnected. During shutdown new requests get 503.
 
 ```
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \

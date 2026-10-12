@@ -172,7 +172,8 @@ struct StreamState {
 
     void begin();
     void fail();
-    bool push(Out& out, std::span<const std::uint32_t> toks);
+    // *n_after: tokens of toks that come after a matched stop string (not counted as completion)
+    bool push(Out& out, std::span<const std::uint32_t> toks, std::uint32_t* n_after = nullptr);
     Final finish(Out& out, const std::string& reason);
     void end(Out& out, const Final& f, const Timings& tim, std::uint32_t n_prompt);
 
@@ -219,6 +220,7 @@ struct Slot : cache::SlotCache {
     bool done = false;
     bool stopped_str = false;
     bool pool_cut = false;  // FR-SRV P3-8: ended because the KV pool had no page left (decode)
+    std::uint32_t n_after_stop = 0;  // FR-SRV P3-7: generated tokens after the stop string (same cycle)
     std::uint32_t cycles = 0;
     std::uint32_t drafted = 0;
     std::uint32_t accepted = 0;
@@ -438,6 +440,8 @@ public:
         std::uint64_t dfl_cycles = 0, dfl_drafted = 0, dfl_accepted = 0, dfl_cold = 0, dfl_gap = 0;
     };
     Stats stats() const;
+    // FR-SRV P3-5: the counters other threads may read (HTTP /props): atomics only
+    Stats statsShared() const;
 
 private:
     friend struct StreamState;
