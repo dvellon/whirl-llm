@@ -100,6 +100,19 @@ bool writeAt(HANDLE fh, const std::uint8_t* buf, std::uint64_t len, std::uint64_
     return true;
 }
 
+// Delete a cache file. false: it is still there (locked by another program, access denied); the caller
+// keeps counting its bytes against the cap (a file that stays on disk must not leave the accounting).
+bool removeFile(const std::wstring& p) {
+    if (DeleteFileW(p.c_str()) != 0) return true;
+    const DWORD err = GetLastError();
+    return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND;
+}
+
+std::int64_t fileTimeUnix(const FILETIME& ft) {
+    const std::uint64_t t100 = (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    return static_cast<std::int64_t>(t100 / 10000000ull) - 11644473600ll;
+}
+
 bool readAt(HANDLE fh, std::uint8_t* buf, std::uint64_t len, std::uint64_t off) {
     std::uint64_t done = 0;
     while (done < len) {
@@ -345,6 +358,11 @@ void Tier::start(const Config& cfg_in, const Layout& lay_in, std::uint64_t finge
                            static_cast<double>(cleanup_.expired_bytes) / 1073741824.0, static_cast<unsigned long long>(cleanup_.bad_files),
                            static_cast<double>(cleanup_.bad_bytes) / 1073741824.0, static_cast<unsigned long long>(cleanup_.cap_files),
                            static_cast<double>(cleanup_.cap_bytes) / 1073741824.0));
+            if (log_fn && cleanup_.unreadable_files > 0)
+                log_fn(fmt("kv tier: %llu SSD cache files (%.2f GiB) could not be opened (in use by another program?); "
+                           "kept and counted against the cap",
+                           static_cast<unsigned long long>(cleanup_.unreadable_files),
+                           static_cast<double>(cleanup_.unreadable_bytes) / 1073741824.0));
             next_expiry_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg.expire_check_ms);
         }
         io_thread_ = std::thread([this] { ioThread(); });
@@ -1288,9 +1306,41 @@ void Tier::deleteFile(std::uint64_t id, std::uint64_t size) {
     } catch (...) {
         return;
     }
-    DeleteFileW(p.c_str());
+    if (!removeFile(p)) {
+        keepForeign(p, size);  // still on disk: stays counted (as a foreign file, retried first by ssdRoom)
+        return;
+    }
     ssd_bytes = satSub(ssd_bytes, size);
     stats.ssd_evictions += 1;
+}
+
+// A file that could not be deleted stays counted against the cap as a foreign file (`counted`: its bytes
+// already in ssd_bytes). One path is listed once (repeated failures must not count it twice).
+void Tier::keepForeign(const std::wstring& path, std::uint64_t counted) {
+    for (Foreign& f : foreign_) {
+        if (f.path != path) continue;
+        ssd_bytes = satSub(ssd_bytes, counted);
+        if (counted > f.size) {
+            ssd_bytes += counted - f.size;
+            f.size = counted;
+        }
+        return;
+    }
+    try {
+        foreign_.push_back(Foreign{path, counted, nowUnix()});
+    } catch (...) {
+    }
+}
+
+// A write is about to (re)create this path: a foreign record of an older undeletable file there goes (the
+// write's reservation counts the file from now on; deleting the record's path later would hit the new file).
+void Tier::forgetForeign(const std::wstring& path) {
+    for (std::size_t i = 0; i < foreign_.size(); ++i) {
+        if (foreign_[i].path != path) continue;
+        ssd_bytes = satSub(ssd_bytes, foreign_[i].size);
+        foreign_.erase(foreign_.begin() + static_cast<std::ptrdiff_t>(i));
+        return;
+    }
 }
 
 std::uint64_t Tier::fileBytes(const Entry* e) const { return alignUp(lay.dataOff() + e->extent(lay), sector); }
@@ -1298,16 +1348,19 @@ std::uint64_t Tier::fileBytes(const Entry* e) const { return alignUp(lay.dataOff
 // Make room on SSD for `need` more bytes (LRU: foreign files, SSD-only
 // entries, SSD copies of RAM entries). false: cannot.
 bool Tier::ssdRoom(std::uint64_t need, Entry* keep) {
+    for (Foreign& f : foreign_) f.tried = false;
     while (ssd_bytes + need > cfg.ssd_cap) {
-        // oldest foreign file first
-        if (!foreign_.empty()) {
-            std::size_t oi = 0;
-            for (std::size_t i = 0; i < foreign_.size(); ++i)
-                if (foreign_[i].last_used < foreign_[oi].last_used) oi = i;
-            Foreign f = std::move(foreign_[oi]);
+        // oldest foreign file first (one that cannot be deleted now stays counted; tried once per pass)
+        std::size_t oi = foreign_.size();
+        for (std::size_t i = 0; i < foreign_.size(); ++i)
+            if (!foreign_[i].tried && (oi == foreign_.size() || foreign_[i].last_used < foreign_[oi].last_used)) oi = i;
+        if (oi < foreign_.size()) {
+            if (!removeFile(foreign_[oi].path)) {
+                foreign_[oi].tried = true;
+                continue;
+            }
+            ssd_bytes = satSub(ssd_bytes, foreign_[oi].size);
             foreign_.erase(foreign_.begin() + static_cast<std::ptrdiff_t>(oi));
-            DeleteFileW(f.path.c_str());
-            ssd_bytes = satSub(ssd_bytes, f.size);
             stats.ssd_evictions += 1;
             continue;
         }
@@ -1402,6 +1455,10 @@ void Tier::startWrite(Entry* e) {
             }
         }
         for (Entry* d : hit) dropSsdCopy(d);
+    }
+    try {
+        forgetForeign(filePath(e->id));
+    } catch (...) {
     }
     const std::uint64_t old0 = e->ssd ? e->ssd->alloc_bytes : 0;
     if (!ssdRoom(satSub(fb, old0), e)) return;
@@ -1560,14 +1617,14 @@ bool Tier::tick() {
                         o->ssd->tbl[ok_].h1 != r.h1)
                         refs_ok = false;
                 }
-                if (!failed && !refs_ok) {
-                    DeleteFileW(j->path.c_str());
-                    failed = true;
-                }
+                if (!failed && !refs_ok) failed = true;
                 e->ssd_stale = false;
                 if (failed) {
                     if (log_fn) log_fn("kv tier: SSD write failed or superseded; the entry stays in RAM only");
-                    ssd_bytes = satSub(ssd_bytes, j->reserved);
+                    // the IO thread deleted the file of a failed write; a superseded one is deleted here.
+                    // One that cannot be deleted stays counted as a foreign file.
+                    if (removeFile(j->path)) ssd_bytes = satSub(ssd_bytes, j->reserved);
+                    else keepForeign(j->path, j->reserved);
                     if (e->ssd)
                         for (Entry* d : dependentsOf(e)) dropSsdCopy(d);
                     e->ssd.reset();
@@ -1670,15 +1727,25 @@ bool Tier::tick() {
 // ---- startup index ----------------------------------------------------------------
 
 void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<IndexItem>& order) {
-    const std::uint64_t logical_size = size;  // the directory entry's size (sparse files: includes the holes)
+    // the directory entry's size can be stale (NTFS updates it lazily): the open handle's size below is used
+    std::uint64_t logical_size = size;  // sparse files: includes the holes
     bool del = false, expired = false;
     std::uint64_t alloc_sz = size;  // bytes on disk (sparse files: without the holes)
+    std::int64_t mtime = 0;
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExW(pw.c_str(), GetFileExInfoStandard, &fa) != 0) mtime = fileTimeUnix(fa.ftLastWriteTime);
+    }
     ScopeExit del_guard{[&] {
-        if (del) {
-            DeleteFileW(pw.c_str());
+        if (!del) return;
+        if (removeFile(pw)) {
             (expired ? cleanup_.expired_files : cleanup_.bad_files) += 1;
             (expired ? cleanup_.expired_bytes : cleanup_.bad_bytes) += alloc_sz;
+            return;
         }
+        // cannot be deleted now: stays counted against the cap, retried first
+        ssd_bytes += alloc_sz;
+        keepForeign(pw, alloc_sz);
     }};
     {
         DWORD hi = 0;
@@ -1687,19 +1754,21 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
     }
     HANDLE fh = CreateFileW(pw.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (fh == INVALID_HANDLE_VALUE) {
-        // cannot be read: still counted against the cap (and evicted first)
-        foreign_.push_back(Foreign{pw, alloc_sz, 0});
+        // cannot be read now (another program holds it): counted against the cap and evicted first, aged
+        // by its last-write time (not "never used": that expired it at once, and the delete of a locked
+        // file fails anyway)
+        foreign_.push_back(Foreign{pw, alloc_sz, mtime});
         ssd_bytes += alloc_sz;
+        cleanup_.unreadable_files += 1;
+        cleanup_.unreadable_bytes += alloc_sz;
         return;
     }
     ScopeExit close_guard{[&] { CloseHandle(fh); }};
-    std::int64_t mtime = 0;
     {
         FILETIME ft;
-        if (GetFileTime(fh, nullptr, nullptr, &ft)) {
-            const std::uint64_t t100 = (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-            mtime = static_cast<std::int64_t>(t100 / 10000000ull) - 11644473600ll;
-        }
+        if (GetFileTime(fh, nullptr, nullptr, &ft)) mtime = fileTimeUnix(ft);
+        LARGE_INTEGER fs_sz;
+        if (GetFileSizeEx(fh, &fs_sz) != 0 && fs_sz.QuadPart >= 0) logical_size = static_cast<std::uint64_t>(fs_sz.QuadPart);
     }
     try {
         alignas(16) std::uint8_t hdr_buf[header_bytes];
@@ -1837,7 +1906,10 @@ void Tier::expireSweep() {
     const std::int64_t cutoff = nowUnix() - static_cast<std::int64_t>(cfg.expire_s);
     for (std::size_t i = 0; i < foreign_.size();) {
         if (foreign_[i].last_used < cutoff) {
-            DeleteFileW(foreign_[i].path.c_str());
+            if (!removeFile(foreign_[i].path)) {  // locked: stays counted, tried again later
+                i += 1;
+                continue;
+            }
             ssd_bytes = satSub(ssd_bytes, foreign_[i].size);
             cleanup_.expired_files += 1;
             cleanup_.expired_bytes += foreign_[i].size;

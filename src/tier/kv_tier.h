@@ -363,6 +363,8 @@ public:
         std::uint64_t expired_files = 0, expired_bytes = 0;
         std::uint64_t bad_files = 0, bad_bytes = 0;          // corrupt, half-written, old format, unreadable
         std::uint64_t cap_files = 0, cap_bytes = 0;          // evicted (LRU) to fit the cap
+        // could not be opened (locked by another program): kept, counted against the cap, evicted first
+        std::uint64_t unreadable_files = 0, unreadable_bytes = 0;
     };
     const Cleanup& cleanup() const { return cleanup_; }
     // the SSD directory is used by another process (SSD tier disabled)
@@ -385,6 +387,7 @@ private:
         std::wstring path;
         std::uint64_t size = 0;
         std::int64_t last_used = 0;
+        bool tried = false;  // ssdRoom: deleting it failed in this pass (locked)
     };
     struct IndexItem {
         Entry* e;
@@ -406,6 +409,8 @@ private:
 
     std::wstring filePath(std::uint64_t id) const;
     void deleteFile(std::uint64_t id, std::uint64_t size);
+    void keepForeign(const std::wstring& path, std::uint64_t counted);
+    void forgetForeign(const std::wstring& path);
     std::uint64_t fileBytes(const Entry* e) const;
     bool ssdRoom(std::uint64_t need, Entry* keep);
     void submit(Job* j);

@@ -2482,6 +2482,70 @@ static void testShutdownNoWrites(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+// FIX-RC4-A P3-3: a cache file that cannot be deleted (another program holds it) stays counted against the
+// cap -- at an LRU eviction, for a corrupt file at startup -- and a file that cannot be opened at startup is
+// kept and counted (aged by its last-write time), not reported as expired and dropped from the accounting.
+static void testDeleteFails(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 9400;
+    const std::uint64_t fp = 79;
+    Sess a(ops, 24), b(ops, 24), c(ops, 24);
+    a.toks = freshToks(3000, seed);
+    b.toks = freshToks(3000, seed);
+    c.toks = freshToks(3000, seed);
+    const auto holdOpen = [](const fs::path& p, DWORD share) {
+        return CreateFileW(p.c_str(), GENERIC_READ, share, nullptr, OPEN_EXISTING, 0, nullptr);
+    };
+    std::uint64_t cap = 0;
+    {
+        auto t = Tier::create(ops, 256ull << 20, 97, 0);
+        t->start(env.cfg(4ull << 30), kLay, fp);
+        spillSess(*t, a, 0);
+        CHECK(tickIdle(*t));
+        sleepMs(5);
+        spillSess(*t, b, 0);
+        CHECK(tickIdle(*t));
+        cap = t->ssd_bytes + t->ssd_bytes / 4;  // 2.5 files
+    }
+    {
+        // restart: a and b are SSD-only
+        auto t = Tier::create(ops, 256ull << 20, 102, 0);
+        t->start(env.cfg(cap), kLay, fp);
+        CHECK(t->ssdEntries() == 2);
+        // a (LRU) must go for c; its file is held by another program
+        HANDLE h = holdOpen(entryFile(dir, fp, a.id), FILE_SHARE_READ);
+        CHECK(h != INVALID_HANDLE_VALUE);
+        sleepMs(5);
+        spillSess(*t, c, 0);
+        CHECK(tickIdle(*t));
+        CHECK(fs::exists(entryFile(dir, fp, a.id)));
+        CHECK(t->ssd_bytes >= diskBytes(dir));  // the file still on disk is still counted
+        CHECK(diskBytes(dir) <= cap);           // so the cap holds (b went instead)
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    }
+    {
+        // startup: a file nobody can open, and a corrupt file that cannot be deleted
+        const fs::path fc = entryFile(dir, fp, c.id);
+        CHECK(fs::exists(fc));
+        HANDLE h = holdOpen(fc, 0);
+        CHECK(h != INVALID_HANDLE_VALUE);
+        const fs::path junk = dir / L"junk.wkv";
+        writeJunk(junk, 100000, 7);
+        HANDLE hj = holdOpen(junk, FILE_SHARE_READ);
+        auto t = Tier::create(ops, 256ull << 20, 98, 0);
+        t->start(env.cfg(cap), kLay, fp);
+        CHECK(t->cleanup().expired_files == 0);  // it was used minutes ago (was: last_used 0 -> "expired")
+        CHECK(t->cleanup().unreadable_files == 1);
+        CHECK(fs::exists(fc) && fs::exists(junk));
+        CHECK(t->ssd_bytes >= diskBytes(dir));
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        if (hj != INVALID_HANDLE_VALUE) CloseHandle(hj);
+    }
+    fs::remove_all(dir, ec);
+}
+
 // ---- SSD-QUIET: write amplification of a benchmark-like request stream -------------------
 // Ornith-35B-A3B layout from the server log ("entry: 51.2 MiB per checkpoint, 9.0 MiB per 256-token
 // page", f16 KV), scaled by 1/amp_div so the default run stays small (WHIRL_TIER_AMP=full: real sizes).
@@ -2754,6 +2818,10 @@ int main(int argc, char** argv) {
     if (want("testShutdownNoWrites")) {
         std::printf("-- %s\n", "testShutdownNoWrites");
         testShutdownNoWrites(ops, dir);
+    }
+    if (want("testDeleteFails")) {
+        std::printf("-- %s\n", "testDeleteFails");
+        testDeleteFails(ops, dir);
     }
     if (want("testWriteAmplification")) {
         std::printf("-- %s\n", "testWriteAmplification");
