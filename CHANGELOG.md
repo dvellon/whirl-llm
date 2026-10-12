@@ -227,6 +227,30 @@ selftest in every mode unchanged).
   (cold prefill) instead of counting as done. `--help` and the docs now give the real defaults
   (`shutdown`, `--kv-ssd-delay`).
 
+### Fixes from the numerics and cache reviews (FIX-NUM, FIX-CACHE)
+
+- One head-norm reduction order for every logits row: the plain decode head and the prompt-end head
+  used `rmsnormQ8` (1024-thread sum) while verify / all-logits rows used `rmsnorm`; all now use
+  `rmsnorm`, so CLI plain, CLI MTP / n-gram verify and server batched rows give the same logits
+  bits (`whirl seqtest` checks it). Tokens are unchanged in every golden case; only the logits
+  hashes (`lh=`) of the affected steps changed and the golden references were re-recorded for that
+  reason only. Server decode rows are unchanged; the first token after a prompt can change only
+  on a near tie.
+- The SSD tier fingerprint includes the GPU (arch, device name, kernel code object), so one exe
+  on the R9700 and on the Radeon 8060S never reuses the other's KV files; KV format, batch and
+  exe id are covered by tests. The 12 numerics-changing A/B variables are reported as overrides
+  (`MODE+overrides`), and `relaxacc` is reported as skipped without an MTP head or with
+  `--draft dflash`.
+- SSD tier: with a cap smaller than the RAM entries the tier no longer rewrites forever or
+  overshoots `--kv-ssd-gb` (a write that cannot fit is skipped until space is freed). Files written
+  with another per-slot context (`tok_cap`) are kept and counted instead of deleted as corrupt.
+  `WHIRL_SERVE_CKPTS` is limited to 8 (above it the server crashed). A new conversation that
+  shares only the system prompt (a compact, or a subagent) no longer cuts the idle long session
+  with the same system prompt: it is demoted (evicted first under pressure) instead. Restoring
+  part of an entry and then branching from an earlier turn makes a new entry instead of
+  overwriting the other branch in place. On integrated GPUs the RAM tier is at least one
+  max-context entry (or off, with a log line, when that is more than half the available RAM).
+
 ## 0.1.4 — 2026-10-06
 
 Routine bug-fix release: no new features, no speed changes. The changes harden input handling (GGUF
