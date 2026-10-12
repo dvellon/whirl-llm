@@ -21,6 +21,13 @@ struct FingerprintInputs {
     std::uint64_t n_gdn = 0;
     std::uint64_t ck_bytes = 0, page_bytes = 0;
     std::uint64_t max_batch = 0;
+    // GPU code object (hip DeviceInfo::gcn_arch, e.g. "gfx1201"): one exe carries kernels for several
+    // GPUs whose bits differ, so an entry written on one GPU is never restored on another (FIX-NUM P2-2)
+    std::string gpu_arch;
+    std::string gpu_name;    // device name (DeviceInfo::name), e.g. "AMD Radeon AI PRO R9700"
+    std::string kernel_set;  // code object family the model loaded (hip::archName + its size)
+    // decode attention split count input (q4 KV only: its split count follows the context size, P3-6)
+    std::uint64_t split_ctx = 0;
     // numerics mode and its items (numerics::logLine): a --balance run's KV /
     // DeltaNet state must never be restored by a --precise process
     std::string numerics;
