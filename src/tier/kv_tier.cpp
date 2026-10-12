@@ -726,8 +726,10 @@ Restore* Tier::beginRestore(Entry* e, std::span<const Span> spans, std::size_t n
     e->t_mod = r->t0;
     e->reused = true;
     markUsed(e);
-    if (e->ssd && (!e->in_ram || e->prefetching)) {
-        // SSD use: the file's last-write time is the persisted "last used" (expiry, LRU after a restart)
+    if (e->ssd && (!e->in_ram || e->prefetching) && !cfg.ssd_shutdown_only) {
+        // SSD use: the file's last-write time is the persisted "last used" (expiry, LRU after a restart).
+        // Shutdown mode writes nothing while running, not even this metadata: persistUse records the
+        // use at the shutdown flush.
         stampFile(e->id, e->used);
         std::uint64_t last = 0;
         for (const BlkRef& rf : e->ssd->tbl) {
@@ -1623,7 +1625,8 @@ bool Tier::tick() {
         const bool writes_on = !cfg.ssd_shutdown_only || flushing;
         for (Entry* e : snapshot) {
             if (!contains(e)) continue;
-            if (e->meta_dirty && e->ssd && !e->io_busy && e->pin == 0) {
+            // (shutdown mode: not even the header / table rewrite of a trimmed entry while running)
+            if (writes_on && e->meta_dirty && e->ssd && !e->io_busy && e->pin == 0) {
                 // trimmed (superseded session): header / table rewrite, file cut
                 try {
                     startWrite(e);

@@ -2414,6 +2414,74 @@ static void testRamUsePersisted(MockDeviceOps& ops, const fs::path& dir) {
     }
 }
 
+// FIX-RC4-A P3-2: shutdown mode writes nothing to the SSD while running -- not the header / table rewrite
+// of a trimmed (superseded) entry, not the "last used" time of an entry restored from SSD; both are written
+// at the shutdown flush.
+static void testShutdownNoWrites(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 9300;
+    const std::uint64_t fp = 78;
+    std::int64_t offset = 0;
+    auto cfg = [&]() {
+        Config c = env.cfg(4ull << 30);
+        c.ssd_shutdown_only = true;
+        c.clock_fn = [&] { return static_cast<std::int64_t>(std::time(nullptr)) + offset; };
+        return c;
+    };
+    Sess a(ops, 24);
+    a.toks = freshToks(3000, seed);
+    std::uint64_t id_a = 0;
+    {
+        auto t = Tier::create(ops, 256ull << 20, 95, 0);
+        t->start(cfg(), kLay, fp);
+        spillSess(*t, a, 0);
+        id_a = a.id;
+        auto more = freshToks(500, seed);
+        a.toks.insert(a.toks.end(), more.begin(), more.end());
+        spillSess(*t, a, 3000);  // in place: checkpoints at 3000 and 3500
+        t->flushing = true;
+        CHECK(tickIdle(*t));
+        t->flushing = false;
+        CHECK(t->stats.ssd_writes == 1);
+        Entry* ea = t->find(id_a);
+        CHECK(ea != nullptr && ea->ssd.has_value() && !ea->hasDirty());
+        if (!ea) return;
+        const fs::path f = entryFile(dir, fp, id_a);
+        const auto sz0 = fs::file_size(f, ec);
+        const auto mt0 = fs::last_write_time(f, ec);
+        CHECK(t->trimTo(ea, 3200) > 0);  // superseded: cut to the checkpoint at 3000
+        CHECK(ea->meta_dirty);
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 1);  // nothing written while running (was a meta-only rewrite)
+        CHECK(fs::file_size(f, ec) == sz0 && fs::last_write_time(f, ec) == mt0);
+        t->flushing = true;
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 2 && !ea->meta_dirty);  // the flush does it
+        CHECK(fs::file_size(f, ec) < sz0);
+    }
+    {
+        // restart, restore from SSD while running: the file's time is not touched until the flush
+        offset = 2 * 86400;
+        auto t = Tier::create(ops, 256ull << 20, 96, 0);
+        t->start(cfg(), kLay, fp);
+        Entry* ea = t->find(id_a);
+        CHECK(ea != nullptr);
+        if (!ea) return;
+        const fs::path f = entryFile(dir, fp, id_a);
+        const auto mt0 = fs::last_write_time(f, ec);
+        a.toks.resize(3000);
+        CHECK(restoreMatches(*t, ops, ea, a));
+        CHECK(tickIdle(*t));
+        CHECK(fs::last_write_time(f, ec) == mt0);
+        t->flushing = true;
+        CHECK(tickIdle(*t));
+        CHECK(fs::last_write_time(f, ec) != mt0);  // persisted at the flush
+    }
+    fs::remove_all(dir, ec);
+}
+
 // ---- SSD-QUIET: write amplification of a benchmark-like request stream -------------------
 // Ornith-35B-A3B layout from the server log ("entry: 51.2 MiB per checkpoint, 9.0 MiB per 256-token
 // page", f16 KV), scaled by 1/amp_div so the default run stays small (WHIRL_TIER_AMP=full: real sizes).
@@ -2682,6 +2750,10 @@ int main(int argc, char** argv) {
     if (want("testRamUsePersisted")) {
         std::printf("-- %s\n", "testRamUsePersisted");
         testRamUsePersisted(ops, dir);
+    }
+    if (want("testShutdownNoWrites")) {
+        std::printf("-- %s\n", "testShutdownNoWrites");
+        testShutdownNoWrites(ops, dir);
     }
     if (want("testWriteAmplification")) {
         std::printf("-- %s\n", "testWriteAmplification");
