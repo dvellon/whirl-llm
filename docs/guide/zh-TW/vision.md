@@ -75,3 +75,46 @@
 - 確認 MTP 接受率下降的原因（§4.2）。
 - 已完成（0.2.0）：gfx1151 多段 RoPE kernel 與編碼器 kernel（§7）。
 - gfx1151：編碼器速度（§7：attention 與 GEMM 只用到 WMMA 峰值的一小部分）。
+
+## <a id="gfx1151"></a>7. Radeon 8060S（gfx1151）
+
+從 0.2.0 起圖片輸入也能在 8060S 上執行（`--device 8060s`，參數相同）。原本缺的是：gfx1151 kernel 組沒有多段
+RoPE attention prep（`attn_prep_m*`、`set_rpos`），所以 server 拒絕 `--mmproj`；編碼器 code object 也只有
+gfx1201 版。現在編碼器是同一份原始碼（`kernels/vision/vision.hip`）依架構各建一份。只有兩個 WMMA kernel 不同：
+gfx11 每個 lane 持有 A / B fragment 的全部 16 個 k（gfx12 是 8 個），累加器第 v 個元素是第 `2v + lane / 16` 列
+（gfx12 是 `v + 8 * (lane / 16)`）；attention 每個 block 用 8 個 wave、每個 wave 16 個 query（每 wave 32 個
+query 在 gfx11 會溢出暫存器）。算術不變：f16 輸入、f32 累加，沒有 fp8。R9700 的 code object 反組譯完全相同，
+embedding 與改動前逐位元相同。
+
+| 檢查（Qwen3.8-27B mmproj F16） | 結果 |
+|---|---|
+| `whirl-kernel-test --only vision`（8 個編碼器 kernel 全部對 CPU 參考）、`attn_prep_m*` / `set_rpos` 檢查 | 兩張 GPU 都通過 |
+| 8060S embedding 對 f32 numpy 參考，4 張圖 | 相對 L2 0.16–0.30%，最小 cosine ≥ 0.9995（R9700：0.16–0.31%） |
+| 8060S 對 R9700 embedding，7 張圖（220–2,040 token） | 相對 L2 0.09–0.23%，最小 cosine ≥ 0.9995 |
+| Server，`--precise`，temperature 0，8 個圖片請求（一或兩張圖、英文／中文問題、最大 1080p） | 兩張 GPU 回答文字完全相同；同一張圖再問一次兩邊都完全命中快取 |
+
+8060S 編碼時間（`whirl-vis vis-encode`，權重常駐，第三次執行）：
+
+| 圖片（token） | 8060S | R9700 |
+|---|---|---|
+| 640x352（220） | 54 ms | 17 ms |
+| 512x512（256） | 59 ms | 18 ms |
+| 1024x672（672） | 219 ms | 52 ms |
+| 1280x736（920） | 314 ms | 78 ms |
+| 1024x1024（1,024） | 332 ms | 92 ms |
+| 1920x1088（2,040） | 934 ms（attention 532、GEMM 303） | 253 ms |
+
+8060S 上的 `whirl-server-gate --suite vis`（`--kv auto`）：18 項中 16 項通過，包括圖片快取重用、圖片結尾檢查點
+（2,066 個 token 重用 2,045 個）、與文字請求並行，以及 SSD 還原。沒過的兩項是為獨立顯卡設計的 VRAM 檢查：
+統一記憶體上載入 mmproj 時 `hipMemGetInfo` 少了 1,775 MiB（887 MiB 鎖頁 mmproj 複本的兩倍），但 KV 池
+（262,144 token）不變；閒置釋放後差 4.8 / 8.8 MiB（上限 8 MiB）。
+
+8060S 上權重串流的成本差不多（1080p 949 ms）：主機記憶體與 GPU 共用同一組 DRAM。編碼器在 8060S 上約
+10–17 TFLOPS，只是 WMMA 峰值的一小部分；調校尚未進行（§6）。
+
+#### 移植時找到的 bug：跨 lane 讀到非作用中的 lane
+
+第一版 gfx11 attention 只有 head dim 71 輸出 0。它的收尾在兩個半 wave 之間交換累加值（`permlanex16`），寫在
+每個 lane 的 `d < 72` / `q < N` 判斷之前，但編譯器把交換排到判斷之後；dim 72–79 的對應 lane 已不在作用中，
+而 `permlanex16` 讀非作用中 lane 會得到 0。修正：收尾改成逐元素寫出，不做跨 lane 步驟。kernel 測試抓到了它
+（每個 head 恰好一個 dim 錯）。
