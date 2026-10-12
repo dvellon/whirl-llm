@@ -203,6 +203,7 @@ public:
     MockVision* vision() { return vis_.get(); }
     Engine& engine() { return *engine_; }
     tier::Tier* tierp() { return tier_.get(); }
+    MockDeviceOps& ops() { return ops_; }
     std::uint16_t port() const { return http_->port(); }
 
 private:
@@ -1668,6 +1669,83 @@ void testTiers() {
     std::filesystem::remove_all(dir, ec);
 }
 
+// FIX-RC4-A P2-1 (RESTORE-EXC): a device copy throwing while a restore is under way -- in the first pump
+// inside Tier::beginRestore (RAM restore: every piece is copied there) or in a later pump (SSD restore) --
+// fails the restore cleanly through the engine: the request is prefilled cold (same output), no entry
+// stays pinned, nothing stays loading / busy, and the entry restores again afterwards.
+void testRestoreThrows() {
+    std::filesystem::path base;
+    if (const char* t = std::getenv("WHIRL_TEST_TMP"); t && *t) base = std::filesystem::path(widen(t));
+    else base = std::filesystem::temp_directory_path() / L"whirl-tests";
+    const std::string dir = narrow((base / L"server_test_ssd_throw").wstring());
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 2;
+    su.mc.slot_ctx = 8192;
+    su.mc.pool_tokens = 4096;
+    su.tier = true;
+    su.ssd_dir = dir;
+    su.tier_min = 512;
+    su.eo.n_ck = 2;
+    const auto pa = makePrompt(3000, 701);
+    const auto pb = makePrompt(3200, 702);
+    const auto outa = [&] {
+        TestServer probe(baseSetup());
+        return probe.model().greedyReference(pa, 40, true);
+    }();
+    std::vector<std::uint32_t> pa2 = pa;
+    pa2.insert(pa2.end(), outa.begin(), outa.end());
+    pa2 = makePrompt(static_cast<std::uint32_t>(pa2.size() + 300), 703, pa2);
+    const auto settled = [](TestServer& srv) {
+        // the tier is touched by the engine thread only; wait until it is quiet, then look
+        for (int i = 0; i < 300; ++i) {
+            bool busy = false;
+            for (const tier::Entry* e : srv.tierp()->entries) busy = busy || e->io_busy || e->loading || e->pin > 0;
+            if (!busy) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    };
+    {
+        TestServer srv(su);
+        auto r1 = srv.post("/v1/completions", completionBody(pa, 40));
+        CHECK_EQ(completionText(r1), decode(outa));
+        auto r2 = srv.post("/v1/completions", completionBody(pb, 40));
+        CHECK_EQ(completionText(r2), decode(srv.model().greedyReference(pb, 40, true)));
+        // A's next turn would restore from RAM: its first restore copy throws (inside Tier::beginRestore)
+        g_log.clear();
+        srv.ops().failHostToDevCopy(1);
+        auto r3 = srv.post("/v1/completions", completionBody(pa2, 40));
+        CHECK(!srv.ops().hostCopyFailArmed());  // the injected failure happened
+        srv.ops().failHostToDevCopy(0);
+        CHECK_EQ(completionText(r3), decode(srv.model().greedyReference(pa2, 40, true)));
+        CHECK(settled(srv));  // the restore target is not left pinned (it could never be evicted again)
+        CHECK_EQ(srv.tierp()->stats.restores_ram, 0u);
+        for (int i = 0; i < 400 && srv.tierp()->ssdEntries() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK_EQ(srv.model().poison(), 0u);
+    }
+    {
+        // restart: A's turn restores from SSD; a later restore copy throws (first pump or pollRestores)
+        TestServer srv(su);
+        CHECK(srv.tierp()->ssdEntries() >= 1);
+        g_log.clear();
+        srv.ops().failHostToDevCopy(3);
+        auto r = srv.post("/v1/completions", completionBody(pa2, 40));
+        CHECK(!srv.ops().hostCopyFailArmed());
+        srv.ops().failHostToDevCopy(0);
+        CHECK_EQ(completionText(r), decode(srv.model().greedyReference(pa2, 40, true)));
+        CHECK(settled(srv));
+        CHECK_EQ(srv.model().poison(), 0u);
+        // nothing is stuck: the same prompt restores now (from RAM or SSD) and gives the same output
+        auto r2 = srv.post("/v1/completions", completionBody(pa2, 40));
+        CHECK_EQ(completionText(r2), decode(srv.model().greedyReference(pa2, 40, true)));
+        CHECK(settled(srv));
+    }
+    std::filesystem::remove_all(dir, ec);
+}
+
 // concurrent requests on the same evicted prefix: one restore (delay hit)
 void testRestoreConcurrent() {
     ServerSetup su = baseSetup();
@@ -2017,6 +2095,7 @@ int main(int argc, char** argv) {
         {"sys_prompt", testSharedSystemPrompt},
         {"tiers", testTiers},
         {"restore_conc", testRestoreConcurrent},
+        {"restore_throws", testRestoreThrows},
         {"sampling", testSampling},
         {"stop_eos", testStopAndEos},
     };

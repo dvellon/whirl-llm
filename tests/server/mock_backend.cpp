@@ -30,8 +30,20 @@ void spinUs(double us) {
 
 MockDeviceOps::~MockDeviceOps() = default;
 
+bool MockDeviceOps::isHost(tier::DevPtr p) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = host_.upper_bound(static_cast<std::uintptr_t>(p));
+    if (it == host_.begin()) return false;
+    --it;
+    return p >= it->first && p < it->first + it->second;
+}
+
 void MockDeviceOps::copyAsync(tier::DevPtr dst, tier::DevPtr src, std::uint64_t bytes, tier::Stream) {
     if (bytes == 0) return;
+    if (const std::uint64_t nth = fail_host_copy_.load(); nth != 0 && isHost(src) && ++host_copies_ == nth) {
+        fail_host_copy_ = 0;
+        throw std::runtime_error("injected copyAsync failure");
+    }
     std::memmove(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), bytes);
     copied_ += bytes;
 }
@@ -56,6 +68,7 @@ void* MockDeviceOps::hostMalloc(std::uint64_t bytes) {
     std::memset(p, 0, bytes);
     std::lock_guard<std::mutex> lk(mu_);
     live_.insert(p);
+    host_[reinterpret_cast<std::uintptr_t>(p)] = bytes;
     return p;
 }
 
@@ -63,6 +76,7 @@ void MockDeviceOps::hostFree(void* p) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         live_.erase(p);
+        host_.erase(reinterpret_cast<std::uintptr_t>(p));
     }
     _aligned_free(p);
 }

@@ -17,7 +17,9 @@
 // never queued behind a long transfer.
 // SSD: one sparse file per entry (4 KiB header, token ids, block table, data
 // region), written by an IO thread with unbuffered positional writes (dirty
-// blocks only; the header is invalidated first and rewritten last), read back
+// blocks only; the header is invalidated first, behind a flush barrier when the
+// file already existed, and the valid header is written last behind another, so a
+// power loss never leaves a valid header over other bytes), read back
 // the same way (read_qd overlapped reads in flight).
 // Block dedup (CACHE-1): a KV block (2 MiB of the data region) that holds the
 // same token prefix as a block already on SSD and hashes the same (128-bit
@@ -172,6 +174,7 @@ struct SsdSnap {
     std::uint64_t file_bytes = 0;   // logical file size
     std::uint64_t alloc_bytes = 0;  // bytes counted against the cap (shared blocks excluded)
     std::vector<BlkRef> tbl;        // one row per KV block
+    std::int64_t stamped = 0;       // last use the file records (header last_used / last-write time), unix s
 };
 
 struct Entry {
@@ -352,6 +355,13 @@ public:
     bool waitOnly() const { return wait_only_; }
     // earliest time an entry becomes due for its SSD write (nullopt: none waiting)
     std::optional<std::chrono::steady_clock::time_point> nextDue() const { return next_due_; }
+    // when tick() has timed work next: a due SSD write, or the periodic SSD expiry check (an idle
+    // engine must wake for it too, or an idle server never expires files)
+    std::optional<std::chrono::steady_clock::time_point> nextWake() const {
+        std::optional<std::chrono::steady_clock::time_point> w = next_due_;
+        if (ssd_dir_w_ && cfg.expire_s > 0 && cfg.expire_check_ms > 0 && (!w || next_expiry_ < *w)) w = next_expiry_;
+        return w;
+    }
     // RAM evictions started SSD writes that will free blocks when they finish (retry the spill then)
     bool roomPending() const { return room_pending_; }
 
@@ -362,6 +372,8 @@ public:
         std::uint64_t expired_files = 0, expired_bytes = 0;
         std::uint64_t bad_files = 0, bad_bytes = 0;          // corrupt, half-written, old format, unreadable
         std::uint64_t cap_files = 0, cap_bytes = 0;          // evicted (LRU) to fit the cap
+        // could not be opened (locked by another program): kept, counted against the cap, evicted first
+        std::uint64_t unreadable_files = 0, unreadable_bytes = 0;
     };
     const Cleanup& cleanup() const { return cleanup_; }
     // the SSD directory is used by another process (SSD tier disabled)
@@ -384,6 +396,7 @@ private:
         std::wstring path;
         std::uint64_t size = 0;
         std::int64_t last_used = 0;
+        bool tried = false;  // ssdRoom: deleting it failed in this pass (locked)
     };
     struct IndexItem {
         Entry* e;
@@ -400,10 +413,13 @@ private:
     void dropRam(Entry* e);
     bool evictable(Entry* e, Entry* keep);
     bool makeRoom(std::size_t blocks, Entry* keep);
+    bool ensureBlocksHeld(Entry* e, std::size_t lb_end);
     bool contains(const Entry* e) const;
 
     std::wstring filePath(std::uint64_t id) const;
     void deleteFile(std::uint64_t id, std::uint64_t size);
+    void keepForeign(const std::wstring& path, std::uint64_t counted);
+    void forgetForeign(const std::wstring& path);
     std::uint64_t fileBytes(const Entry* e) const;
     bool ssdRoom(std::uint64_t need, Entry* keep);
     void submit(Job* j);
@@ -458,6 +474,7 @@ private:
     std::int64_t nowUnix() const;
     void markUsed(Entry* e);
     void stampFile(std::uint64_t id, std::int64_t unix_s);
+    void persistUse();
     void expireSweep();
     void enforceCap();
     std::uint64_t foreignFiles_() const { return foreign_.size(); }
@@ -475,5 +492,18 @@ std::uint64_t hashStr(std::uint64_t h, std::string_view s);
 // Identity of the running executable (size + last write time): an SSD entry
 // written by another build is not restored (its numerics may differ).
 std::uint64_t exeIdentity();
+
+// CPU-test hook (power-loss fault injection; nullptr in the product). When set, the SSD write
+// job's positional writes and flush barriers go through it, so a test can model the drive's
+// volatile write cache: writes not yet covered by a flush may reach the media in any order, or
+// not at all. While dead() (the simulated power is off) no file is deleted, truncated or
+// re-stamped. Set it only while no IO job is running.
+struct WriteSim {
+    virtual ~WriteSim() = default;
+    virtual bool write(void* fh, const std::uint8_t* buf, std::uint64_t len, std::uint64_t off) = 0;
+    virtual bool flush(void* fh) = 0;
+    virtual bool dead() const = 0;
+};
+extern std::atomic<WriteSim*> g_write_sim;
 
 }  // namespace whirl::tier

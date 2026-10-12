@@ -25,6 +25,8 @@
 
 namespace whirl::tier {
 
+std::atomic<WriteSim*> g_write_sim{nullptr};
+
 namespace {
 
 constexpr std::uint64_t alignUp(std::uint64_t x, std::uint64_t a) { return (x + a - 1) / a * a; }
@@ -88,7 +90,13 @@ OVERLAPPED ovAt(std::uint64_t off) {
     return ov;
 }
 
+bool simDead() {
+    const WriteSim* s = g_write_sim.load(std::memory_order_acquire);
+    return s != nullptr && s->dead();
+}
+
 bool writeAt(HANDLE fh, const std::uint8_t* buf, std::uint64_t len, std::uint64_t off) {
+    if (WriteSim* s = g_write_sim.load(std::memory_order_acquire)) return s->write(fh, buf, len, off);
     std::uint64_t done = 0;
     while (done < len) {
         const DWORD n = static_cast<DWORD>(std::min<std::uint64_t>(len - done, 64ull << 20));
@@ -98,6 +106,29 @@ bool writeAt(HANDLE fh, const std::uint8_t* buf, std::uint64_t len, std::uint64_
         done += w;
     }
     return true;
+}
+
+// Write barrier: everything written to fh before it is on the media before anything written after it.
+// FILE_FLAG_NO_BUFFERING only bypasses the Windows cache; the drive's own volatile cache may still
+// reorder or drop writes at a power loss. FlushFileBuffers (NTFS metadata + the device's FLUSH CACHE)
+// is what orders them.
+bool flushFile(HANDLE fh) {
+    if (WriteSim* s = g_write_sim.load(std::memory_order_acquire)) return s->flush(fh);
+    return FlushFileBuffers(fh) != 0;
+}
+
+// Delete a cache file. false: it is still there (locked by another program, access denied); the caller
+// keeps counting its bytes against the cap (a file that stays on disk must not leave the accounting).
+bool removeFile(const std::wstring& p) {
+    if (simDead()) return false;
+    if (DeleteFileW(p.c_str()) != 0) return true;
+    const DWORD err = GetLastError();
+    return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND;
+}
+
+std::int64_t fileTimeUnix(const FILETIME& ft) {
+    const std::uint64_t t100 = (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    return static_cast<std::int64_t>(t100 / 10000000ull) - 11644473600ll;
 }
 
 bool readAt(HANDLE fh, std::uint8_t* buf, std::uint64_t len, std::uint64_t off) {
@@ -345,6 +376,11 @@ void Tier::start(const Config& cfg_in, const Layout& lay_in, std::uint64_t finge
                            static_cast<double>(cleanup_.expired_bytes) / 1073741824.0, static_cast<unsigned long long>(cleanup_.bad_files),
                            static_cast<double>(cleanup_.bad_bytes) / 1073741824.0, static_cast<unsigned long long>(cleanup_.cap_files),
                            static_cast<double>(cleanup_.cap_bytes) / 1073741824.0));
+            if (log_fn && cleanup_.unreadable_files > 0)
+                log_fn(fmt("kv tier: %llu SSD cache files (%.2f GiB) could not be opened (in use by another program?); "
+                           "kept and counted against the cap",
+                           static_cast<unsigned long long>(cleanup_.unreadable_files),
+                           static_cast<double>(cleanup_.unreadable_bytes) / 1073741824.0));
             next_expiry_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg.expire_check_ms);
         }
         io_thread_ = std::thread([this] { ioThread(); });
@@ -405,12 +441,30 @@ void Tier::stampFile(std::uint64_t id, std::int64_t unix_s) {
         HANDLE h = CreateFileW(p.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                OPEN_EXISTING, 0, nullptr);
         if (h == INVALID_HANDLE_VALUE) return;
+        if (simDead()) {
+            CloseHandle(h);
+            return;
+        }
         ULARGE_INTEGER u;
         u.QuadPart = (static_cast<std::uint64_t>(unix_s) + 11644473600ull) * 10000000ull;
         FILETIME ft{u.LowPart, u.HighPart};
         SetFileTime(h, nullptr, nullptr, &ft);
         CloseHandle(h);
     } catch (...) {
+    }
+    // best effort: not retried (a file that cannot be opened now is not hammered on every tick)
+    if (Entry* x = find(id))
+        if (x->ssd) x->ssd->stamped = std::max(x->ssd->stamped, unix_s);
+}
+
+// Uses the SSD files do not record yet: an entry used from the RAM tier, unchanged, is never rewritten,
+// so its file kept the time of its last write / SSD use and expired at a restart although it was in use.
+// Metadata only (the file's last-write time), at the graceful shutdown flush (and hourly in `always` mode).
+void Tier::persistUse() {
+    if (!ssd_dir_w_) return;
+    for (Entry* e : entries) {
+        if (!e->ssd || e->io_busy || e->used <= e->ssd->stamped) continue;
+        stampFile(e->id, e->used);
     }
 }
 
@@ -564,7 +618,10 @@ bool Tier::ensureBlocks(Entry* e, std::size_t lb0, std::size_t lb1) {
         if (lb >= e->blocks.size() || e->blocks[lb] == no_block) missing += 1;
     }
     if (missing == 0) return true;
-    if (missing > n_blocks_) return false;
+    if (missing > n_blocks_) {
+        room_pending_ = false;  // never possible: no write to wait for (a stale flag kept the engine busy)
+        return false;
+    }
     if (!makeRoom(missing, e)) return false;
     while (e->blocks.size() < lb1) {
         e->blocks.push_back(no_block);
@@ -577,6 +634,44 @@ bool Tier::ensureBlocks(Entry* e, std::size_t lb0, std::size_t lb1) {
         }
     }
     return true;
+}
+
+// ensureBlocks(e, 0, lb_end) for an SSD-only entry about to be read into RAM (restore, prefetch). Making
+// room in RAM may start an eviction write, which makes room on SSD by dropping LRU SSD copies, and may drop
+// the files referencing a block that write changes: e (an SSD-only entry is removed when its SSD copy goes)
+// and the owners of the blocks it borrows are held (pin / ext_pin: ssdDroppable, startWrite, gcOwners,
+// trimTo and expiry leave them alone) while that runs, so e is never deleted under its caller.
+bool Tier::ensureBlocksHeld(Entry* e, std::size_t lb_end) {
+    const std::uint64_t id = e->id;
+    std::vector<std::uint64_t> owners;
+    if (e->ssd) {
+        for (const BlkRef& r : e->ssd->tbl) {
+            if (r.owner == 0 || std::find(owners.begin(), owners.end(), r.owner) != owners.end()) continue;
+            owners.push_back(r.owner);
+        }
+    }
+    e->pin += 1;
+    for (std::uint64_t o : owners)
+        if (Entry* oe = find(o)) oe->ext_pin += 1;
+    bool ok = false;
+    {
+        ScopeExit unhold{[&] {
+            if (Entry* x = find(id))
+                if (x->pin > 0) x->pin -= 1;
+            for (std::uint64_t o : owners)
+                if (Entry* oe = find(o))
+                    if (oe->ext_pin > 0) oe->ext_pin -= 1;
+        }};
+        ok = ensureBlocks(e, 0, lb_end);
+    }
+    if (find(id) != e) return false;
+    if (e->ssd_stale && !e->io_busy) {
+        // its SSD copy was dropped while it was held (dropSsdCopy defers that for a held SSD-only entry)
+        e->ssd_stale = false;
+        dropSsdCopy(e);
+        return false;
+    }
+    return ok;
 }
 
 std::array<std::size_t, 2> Tier::lbRange(std::uint64_t off, std::uint64_t len) {
@@ -660,14 +755,24 @@ std::optional<Match> Tier::lookup(std::span<const std::uint32_t> toks) {
 
 Restore* Tier::beginRestore(Entry* e, std::span<const Span> spans, std::size_t n_main_spans) {
     auto r = std::make_unique<Restore>();
+    // events first: nothing below may throw once an SSD read job is submitted
+    ScopeExit ev_guard{[&] {
+        if (!r) return;  // handed to the caller
+        if (r->ev != nullptr) poolEvent(r->ev);
+        if (r->ev_main != nullptr) poolEvent(r->ev_main);
+    }};
+    r->ev = newEvent();
+    r->ev_main = newEvent();
     r->entry_id = e->id;
     r->t0 = std::chrono::steady_clock::now();
     // in use: the "unchanged for" clock of its SSD write restarts
     e->t_mod = r->t0;
     e->reused = true;
     markUsed(e);
-    if (e->ssd && (!e->in_ram || e->prefetching)) {
-        // SSD use: the file's last-write time is the persisted "last used" (expiry, LRU after a restart)
+    if (e->ssd && (!e->in_ram || e->prefetching) && !cfg.ssd_shutdown_only) {
+        // SSD use: the file's last-write time is the persisted "last used" (expiry, LRU after a restart).
+        // Shutdown mode writes nothing while running, not even this metadata: persistUse records the
+        // use at the shutdown flush.
         stampFile(e->id, e->used);
         std::uint64_t last = 0;
         for (const BlkRef& rf : e->ssd->tbl) {
@@ -686,8 +791,9 @@ Restore* Tier::beginRestore(Entry* e, std::span<const Span> spans, std::size_t n
             Job* j = jobs_[i];
             if (j->kind == JobKind::read && j->entry_id == e->id) {
                 found = j;
-                jobs_[i] = jobs_.back();  // swapRemove
-                jobs_.pop_back();
+                // ordered erase (FLAKE-1): a swapRemove moved the newest job into this slot, so later
+                // jobs were reaped (and logged) out of submission order
+                jobs_.erase(jobs_.begin() + static_cast<std::ptrdiff_t>(i));
                 break;
             }
         }
@@ -699,7 +805,7 @@ Restore* Tier::beginRestore(Entry* e, std::span<const Span> spans, std::size_t n
         if (!ssd_dir_w_ || !refsOk(e)) return nullptr;
         // blocks for the whole extent (the entry becomes a RAM entry, clean)
         const std::size_t lb_end = static_cast<std::size_t>((e->extent(lay) + block_bytes - 1) / block_bytes);
-        if (!ensureBlocks(e, 0, lb_end)) return nullptr;
+        if (!ensureBlocksHeld(e, lb_end)) return nullptr;
         // blocks of invalid checkpoint slots are not needed
         for (std::uint32_t k = 0; k < e->nck; ++k)
             if (e->ck[k].valid == 0) dropCkBlocks(e, k);
@@ -755,33 +861,38 @@ Restore* Tier::beginRestore(Entry* e, std::span<const Span> spans, std::size_t n
         readSources(job.get(), e);
         job->fence = newEvent();
         ops_.eventRecord(job->fence, stream);
+        r->pos_of_lb.assign(e->blocks.size(), 0xffffffffu);
+        for (std::size_t k = 0; k < job->lbs.size(); ++k) {
+            if (job->lbs[k] < r->pos_of_lb.size()) r->pos_of_lb[job->lbs[k]] = static_cast<std::uint32_t>(k);
+        }
         e->in_ram = true;
         e->io_busy = true;
         e->loading = true;
         for (auto& d : e->dirty) d = 0;
         r->job = job.release();
         submit(r->job);
-    }
-    if (r->job != nullptr) {
+    } else if (r->job != nullptr) {
         r->pos_of_lb.assign(e->blocks.size(), 0xffffffffu);
         const auto& lbs = r->job->lbs;
         for (std::size_t k = 0; k < lbs.size(); ++k) {
             if (lbs[k] < r->pos_of_lb.size()) r->pos_of_lb[lbs[k]] = static_cast<std::uint32_t>(k);
         }
     }
-    r->ev = newEvent();
-    r->ev_main = newEvent();
     e->pin += 1;
     touch(e);
     Restore* rp = r.release();
-    pumpRestore(rp);
+    // the first pump enqueues most pieces (all of them for a RAM restore): a device exception here
+    // marks the restore failed (the caller prefills cold after ordering its stream behind what was
+    // enqueued, then ends the restore: pin released, an SSD read job reaped by tick) instead of
+    // leaking the Restore with the entry pinned and its copies unordered against the cold prefill
+    pumpRestoreNoThrow(rp);
     return rp;
 }
 
 bool Tier::prefetch(Entry* e) {
     if (e->in_ram || e->io_busy || e->loading || !e->ssd || !ssd_dir_w_ || !refsOk(e)) return false;
     const std::size_t lb_end = static_cast<std::size_t>((e->extent(lay) + block_bytes - 1) / block_bytes);
-    if (!ensureBlocks(e, 0, lb_end)) return false;
+    if (!ensureBlocksHeld(e, lb_end)) return false;
     for (std::uint32_t k = 0; k < e->nck; ++k)
         if (e->ck[k].valid == 0) dropCkBlocks(e, k);
     auto job = std::make_unique<Job>();
@@ -842,13 +953,14 @@ bool Tier::pumpRestore(Restore* r) {
         r->main_rec = true;
         return false;
     }
-    return ops_.eventDone(r->ev_main);
+    // (an asynchronous copy error throws here: pumpRestoreNoThrow marks the restore failed, cold prefill)
+    return ops_.eventDoneChecked(r->ev_main);
 }
 
 bool Tier::pumpRestoreNoThrow(Restore* r) {
     try {
         return pumpRestore(r);
-    } catch (const std::exception&) {
+    } catch (...) {
         r->failed = true;
         return true;
     }
@@ -857,7 +969,7 @@ bool Tier::pumpRestoreNoThrow(Restore* r) {
 bool Tier::pumpTailNoThrow(Restore* r) {
     try {
         return pumpTail(r);
-    } catch (const std::exception&) {
+    } catch (...) {
         r->failed = true;
         return true;
     }
@@ -923,7 +1035,7 @@ bool Tier::pumpTail(Restore* r) {
         r->enqueued = true;
         return false;
     }
-    return ops_.eventDone(r->ev);
+    return ops_.eventDoneChecked(r->ev);
 }
 
 void Tier::endRestore(Restore* r) {
@@ -1031,7 +1143,9 @@ void Tier::dropSsdCopy(Entry* e) {
     ScopeExit pop_guard{[&] { dropping_.erase(std::find(dropping_.begin(), dropping_.end(), id)); }};
     for (Entry* d : dependentsOf(e)) dropSsdCopy(d);
     if (!contains(e) || !e->ssd) return;
-    if (e->io_busy) {
+    // IO running, or an SSD-only entry held by ensureBlocksHeld (restore / prefetch about to read it):
+    // dropped once that is over
+    if (e->io_busy || (e->pin > 0 && !e->in_ram)) {
         e->ssd_stale = true;
         return;
     }
@@ -1219,9 +1333,41 @@ void Tier::deleteFile(std::uint64_t id, std::uint64_t size) {
     } catch (...) {
         return;
     }
-    DeleteFileW(p.c_str());
+    if (!removeFile(p)) {
+        keepForeign(p, size);  // still on disk: stays counted (as a foreign file, retried first by ssdRoom)
+        return;
+    }
     ssd_bytes = satSub(ssd_bytes, size);
     stats.ssd_evictions += 1;
+}
+
+// A file that could not be deleted stays counted against the cap as a foreign file (`counted`: its bytes
+// already in ssd_bytes). One path is listed once (repeated failures must not count it twice).
+void Tier::keepForeign(const std::wstring& path, std::uint64_t counted) {
+    for (Foreign& f : foreign_) {
+        if (f.path != path) continue;
+        ssd_bytes = satSub(ssd_bytes, counted);
+        if (counted > f.size) {
+            ssd_bytes += counted - f.size;
+            f.size = counted;
+        }
+        return;
+    }
+    try {
+        foreign_.push_back(Foreign{path, counted, nowUnix()});
+    } catch (...) {
+    }
+}
+
+// A write is about to (re)create this path: a foreign record of an older undeletable file there goes (the
+// write's reservation counts the file from now on; deleting the record's path later would hit the new file).
+void Tier::forgetForeign(const std::wstring& path) {
+    for (std::size_t i = 0; i < foreign_.size(); ++i) {
+        if (foreign_[i].path != path) continue;
+        ssd_bytes = satSub(ssd_bytes, foreign_[i].size);
+        foreign_.erase(foreign_.begin() + static_cast<std::ptrdiff_t>(i));
+        return;
+    }
 }
 
 std::uint64_t Tier::fileBytes(const Entry* e) const { return alignUp(lay.dataOff() + e->extent(lay), sector); }
@@ -1229,16 +1375,19 @@ std::uint64_t Tier::fileBytes(const Entry* e) const { return alignUp(lay.dataOff
 // Make room on SSD for `need` more bytes (LRU: foreign files, SSD-only
 // entries, SSD copies of RAM entries). false: cannot.
 bool Tier::ssdRoom(std::uint64_t need, Entry* keep) {
+    for (Foreign& f : foreign_) f.tried = false;
     while (ssd_bytes + need > cfg.ssd_cap) {
-        // oldest foreign file first
-        if (!foreign_.empty()) {
-            std::size_t oi = 0;
-            for (std::size_t i = 0; i < foreign_.size(); ++i)
-                if (foreign_[i].last_used < foreign_[oi].last_used) oi = i;
-            Foreign f = std::move(foreign_[oi]);
+        // oldest foreign file first (one that cannot be deleted now stays counted; tried once per pass)
+        std::size_t oi = foreign_.size();
+        for (std::size_t i = 0; i < foreign_.size(); ++i)
+            if (!foreign_[i].tried && (oi == foreign_.size() || foreign_[i].last_used < foreign_[oi].last_used)) oi = i;
+        if (oi < foreign_.size()) {
+            if (!removeFile(foreign_[oi].path)) {
+                foreign_[oi].tried = true;
+                continue;
+            }
+            ssd_bytes = satSub(ssd_bytes, foreign_[oi].size);
             foreign_.erase(foreign_.begin() + static_cast<std::ptrdiff_t>(oi));
-            DeleteFileW(f.path.c_str());
-            ssd_bytes = satSub(ssd_bytes, f.size);
             stats.ssd_evictions += 1;
             continue;
         }
@@ -1334,6 +1483,10 @@ void Tier::startWrite(Entry* e) {
         }
         for (Entry* d : hit) dropSsdCopy(d);
     }
+    try {
+        forgetForeign(filePath(e->id));
+    } catch (...) {
+    }
     const std::uint64_t old0 = e->ssd ? e->ssd->alloc_bytes : 0;
     if (!ssdRoom(satSub(fb, old0), e)) return;
     const std::uint64_t old = e->ssd ? e->ssd->alloc_bytes : 0;  // ssdRoom may have dropped it
@@ -1416,6 +1569,7 @@ void Tier::startWrite(Entry* e) {
     sn.ck = e->ck;
     sn.tokens.assign(e->tokens.begin(), e->tokens.begin() + e->n_tok);
     sn.file_bytes = fb;
+    sn.stamped = nowUnix();  // the header's last_used (makeHeader)
     j->snap = std::move(sn);
     e->io_busy = true;
     e->meta_dirty = false;
@@ -1490,14 +1644,14 @@ bool Tier::tick() {
                         o->ssd->tbl[ok_].h1 != r.h1)
                         refs_ok = false;
                 }
-                if (!failed && !refs_ok) {
-                    DeleteFileW(j->path.c_str());
-                    failed = true;
-                }
+                if (!failed && !refs_ok) failed = true;
                 e->ssd_stale = false;
                 if (failed) {
                     if (log_fn) log_fn("kv tier: SSD write failed or superseded; the entry stays in RAM only");
-                    ssd_bytes = satSub(ssd_bytes, j->reserved);
+                    // the IO thread deleted the file of a failed write; a superseded one is deleted here.
+                    // One that cannot be deleted stays counted as a foreign file.
+                    if (removeFile(j->path)) ssd_bytes = satSub(ssd_bytes, j->reserved);
+                    else keepForeign(j->path, j->reserved);
                     if (e->ssd)
                         for (Entry* d : dependentsOf(e)) dropSsdCopy(d);
                     e->ssd.reset();
@@ -1537,8 +1691,10 @@ bool Tier::tick() {
     }
     if (ssd_dir_w_ && cfg.expire_s > 0 && std::chrono::steady_clock::now() >= next_expiry_) {
         next_expiry_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg.expire_check_ms);
+        if (!cfg.ssd_shutdown_only) persistUse();  // shutdown mode: nothing is written while running
         expireSweep();
     }
+    if (ssd_dir_w_ && flushing) persistUse();
     if (ssd_dir_w_) {
         const auto now = std::chrono::steady_clock::now();
         // startWrite may evict SSD-only entries (ssdRoom): iterate over a copy
@@ -1553,7 +1709,8 @@ bool Tier::tick() {
         const bool writes_on = !cfg.ssd_shutdown_only || flushing;
         for (Entry* e : snapshot) {
             if (!contains(e)) continue;
-            if (e->meta_dirty && e->ssd && !e->io_busy && e->pin == 0) {
+            // (shutdown mode: not even the header / table rewrite of a trimmed entry while running)
+            if (writes_on && e->meta_dirty && e->ssd && !e->io_busy && e->pin == 0) {
                 // trimmed (superseded session): header / table rewrite, file cut
                 try {
                     startWrite(e);
@@ -1597,15 +1754,25 @@ bool Tier::tick() {
 // ---- startup index ----------------------------------------------------------------
 
 void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<IndexItem>& order) {
-    const std::uint64_t logical_size = size;  // the directory entry's size (sparse files: includes the holes)
+    // the directory entry's size can be stale (NTFS updates it lazily): the open handle's size below is used
+    std::uint64_t logical_size = size;  // sparse files: includes the holes
     bool del = false, expired = false;
     std::uint64_t alloc_sz = size;  // bytes on disk (sparse files: without the holes)
+    std::int64_t mtime = 0;
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExW(pw.c_str(), GetFileExInfoStandard, &fa) != 0) mtime = fileTimeUnix(fa.ftLastWriteTime);
+    }
     ScopeExit del_guard{[&] {
-        if (del) {
-            DeleteFileW(pw.c_str());
+        if (!del) return;
+        if (removeFile(pw)) {
             (expired ? cleanup_.expired_files : cleanup_.bad_files) += 1;
             (expired ? cleanup_.expired_bytes : cleanup_.bad_bytes) += alloc_sz;
+            return;
         }
+        // cannot be deleted now: stays counted against the cap, retried first
+        ssd_bytes += alloc_sz;
+        keepForeign(pw, alloc_sz);
     }};
     {
         DWORD hi = 0;
@@ -1614,19 +1781,21 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
     }
     HANDLE fh = CreateFileW(pw.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (fh == INVALID_HANDLE_VALUE) {
-        // cannot be read: still counted against the cap (and evicted first)
-        foreign_.push_back(Foreign{pw, alloc_sz, 0});
+        // cannot be read now (another program holds it): counted against the cap and evicted first, aged
+        // by its last-write time (not "never used": that expired it at once, and the delete of a locked
+        // file fails anyway)
+        foreign_.push_back(Foreign{pw, alloc_sz, mtime});
         ssd_bytes += alloc_sz;
+        cleanup_.unreadable_files += 1;
+        cleanup_.unreadable_bytes += alloc_sz;
         return;
     }
     ScopeExit close_guard{[&] { CloseHandle(fh); }};
-    std::int64_t mtime = 0;
     {
         FILETIME ft;
-        if (GetFileTime(fh, nullptr, nullptr, &ft)) {
-            const std::uint64_t t100 = (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-            mtime = static_cast<std::int64_t>(t100 / 10000000ull) - 11644473600ll;
-        }
+        if (GetFileTime(fh, nullptr, nullptr, &ft)) mtime = fileTimeUnix(ft);
+        LARGE_INTEGER fs_sz;
+        if (GetFileSizeEx(fh, &fs_sz) != 0 && fs_sz.QuadPart >= 0) logical_size = static_cast<std::uint64_t>(fs_sz.QuadPart);
     }
     try {
         alignas(16) std::uint8_t hdr_buf[header_bytes];
@@ -1715,6 +1884,7 @@ void Tier::indexFile(const std::wstring& pw, std::uint64_t size, std::vector<Ind
         sn.file_bytes = want_bytes;  // logical size (size below is the allocated part for sparse files)
         sn.alloc_bytes = size;
         sn.tbl = std::move(tbl);
+        sn.stamped = e->used;
         e->ssd = std::move(sn);
         entries.push_back(e.get());
         Entry* ep = e.release();
@@ -1763,7 +1933,10 @@ void Tier::expireSweep() {
     const std::int64_t cutoff = nowUnix() - static_cast<std::int64_t>(cfg.expire_s);
     for (std::size_t i = 0; i < foreign_.size();) {
         if (foreign_[i].last_used < cutoff) {
-            DeleteFileW(foreign_[i].path.c_str());
+            if (!removeFile(foreign_[i].path)) {  // locked: stays counted, tried again later
+                i += 1;
+                continue;
+            }
             ssd_bytes = satSub(ssd_bytes, foreign_[i].size);
             cleanup_.expired_files += 1;
             cleanup_.expired_bytes += foreign_[i].size;
@@ -2002,10 +2175,19 @@ void Tier::runJob(Job* j) {
         HANDLE fh = CreateFileW(j->path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
                                 FILE_FLAG_NO_BUFFERING, nullptr);
         bool ok = fh != INVALID_HANDLE_VALUE;
+        // crash safety (FIX-HDR0): the valid header (hdr1) goes out only after a barrier that puts
+        // everything else on the media. An existing file still holds a valid header for its old
+        // contents, so it is first invalidated (hdr0) behind a barrier of its own: otherwise the
+        // drive may land new payload before hdr0 and a power loss leaves the old valid header over
+        // half-new bytes. A new file needs no extra barrier: until hdr1 lands its header reads as
+        // hdr0 or zeros (no magic), both rejected at startup.
+        const bool existed = ok && GetLastError() == ERROR_ALREADY_EXISTS;
         if (ok) {
             DWORD br = 0;
             DeviceIoControl(fh, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &br, nullptr);
-            ok = writeAt(fh, j->hdr0.get(), header_bytes, 0) && writeAt(fh, j->toks.get(), j->toks_len, j->tok_off);
+            ok = writeAt(fh, j->hdr0.get(), header_bytes, 0);
+            if (ok && existed) ok = flushFile(fh);
+            ok = ok && writeAt(fh, j->toks.get(), j->toks_len, j->tok_off);
             j->written += header_bytes + j->toks_len;
             if (ok) {
                 for (std::size_t i = 0; i < j->lbs.size(); ++i) {
@@ -2040,20 +2222,20 @@ void Tier::runJob(Job* j) {
                 ok = writeAt(fh, j->tbl.get(), tl, j->tbl_off);
                 j->written += tl;
             }
-            ok = ok && FlushFileBuffers(fh) != 0;
+            ok = ok && flushFile(fh);
             ok = ok && writeAt(fh, j->hdr1.get(), header_bytes, 0);
             j->written += header_bytes;
             if (ok) {
                 LARGE_INTEGER dist;
                 dist.QuadPart = static_cast<LONGLONG>(j->file_bytes);
                 LARGE_INTEGER np;
-                if (SetFilePointerEx(fh, dist, &np, FILE_BEGIN) != 0) SetEndOfFile(fh);
-                ok = FlushFileBuffers(fh) != 0;
+                if (!simDead() && SetFilePointerEx(fh, dist, &np, FILE_BEGIN) != 0) SetEndOfFile(fh);
+                ok = flushFile(fh);
             }
             CloseHandle(fh);
         }
         if (!ok) {
-            DeleteFileW(j->path.c_str());
+            if (!simDead()) DeleteFileW(j->path.c_str());
             j->failed.store(true, std::memory_order_release);
         }
         j->finished.store(true, std::memory_order_release);

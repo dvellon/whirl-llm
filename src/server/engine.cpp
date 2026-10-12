@@ -3151,9 +3151,10 @@ void Engine::runLoop() {
                     continue;
                 }
                 tier_wake_ = false;
-                if (tier_ != nullptr && tier_->nextDue()) {
-                    // an SSD write is due at a known time: wake then (re-checked every minute)
-                    const auto due = std::min(*tier_->nextDue() + std::chrono::milliseconds(2), std::chrono::steady_clock::now() + std::chrono::seconds(60));
+                if (tier_ != nullptr && tier_->nextWake()) {
+                    // an SSD write is due at a known time, or the periodic SSD expiry check: wake then
+                    // (re-checked every minute)
+                    const auto due = std::min(*tier_->nextWake() + std::chrono::milliseconds(2), std::chrono::steady_clock::now() + std::chrono::seconds(60));
                     q_cond_.wait_until(lk, due, [&] { return !queue_.empty() || tier_wake_ || stop_; });
                 } else {
                     q_cond_.wait(lk, [&] { return !queue_.empty() || tier_wake_ || stop_; });

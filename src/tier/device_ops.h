@@ -39,6 +39,9 @@ public:
     virtual void eventRecord(Event e, Stream s) = 0;
     // true when complete (also for a never-recorded event and on query errors)
     virtual bool eventDone(Event e) = 0;
+    // The same, but a query error (an asynchronous failure of the work before the event, e.g. a copy)
+    // throws instead of reading as "complete": restores use it, a failed copy must not count as valid.
+    virtual bool eventDoneChecked(Event e) { return eventDone(e); }
     virtual void eventSync(Event e) = 0;
 
     // Pinned host memory (throws on failure).

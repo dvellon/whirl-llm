@@ -204,6 +204,8 @@ request slots, a prefix cache in VRAM and host RAM / SSD tiers for idle sessions
 | `--ctx-per-slot N` | longest context of one request (default min(pool, 131072); up to 262144) |
 | `--precise` / `--balance` / `--fast` / `--mode M` | numerics mode (default balance; `--precise`: f16 KV; when the f16 pool cannot hold a full request the context per request is lowered with a warning, or the server refuses to start if `--ctx` / `--ctx-per-slot` was given). See [numerics modes](#modes) |
 | `--mtp-drafts N` | fixed MTP drafts per cycle, 1–10 (default: chosen per model type by a cost model) |
+| `--draft mtp\|dflash` | draft source of the speculative decode (default `mtp`). `dflash`: the DFlash2 drafter GGUF given by `--draft-model` (block 8: up to 7 drafts per cycle); a model without a matching drafter (e.g. a MoE model) keeps `mtp`. n-gram drafts stay on in both modes; greedy outputs equal plain greedy decoding |
+| `--draft-model FILE` | DFlash2 drafter GGUF for `--draft dflash` (`WHIRL_DRAFT_MODEL` overrides) |
 | `--decode-min-tps N` | decode floor: while other requests prefill, every streaming (decoding) request keeps at least N tok/s; prefill forwards are shortened and decode cycles interleaved to hold it (default 20; `0` = off, prefill forwards are not limited). Outputs are identical for any N ([server.md](guide/en/server.md#batching)) |
 | `--kv-ram-mb N` | host RAM tier of the prefix cache, MiB of pinned memory (default: 1/4 of physical RAM, at least 8 GiB or one full-length session if that is larger — about 9 GiB for the 27B model —, at most 32 GiB, and at most half of the RAM available at startup; 16 GiB on a 64 GB PC; integrated GPUs: OS-visible RAM / 8 within [one max-context entry (about 6 GiB for the 27B model at 262k), 16 GiB], at most 1/4 of the RAM available at startup, off under 32 GB of OS-visible RAM (the BIOS VRAM carve-out does not count; 8 GiB on a 64 GB machine)). The startup log prints the chosen size and why. Idle sessions are copied there and restored instead of prefilled again. `0` disables both host tiers. **Radeon 8060S** (integrated GPU): on by default with the size above (the KV pool is the BIOS carve-out, the tier is separate pinned OS RAM; a 128k session restores in 0.3 s from RAM or 2 s from SSD instead of a 537 s prefill); `--kv-ram-mb 0` turns both host tiers off, `--kv-ssd-gb 0` / `--kv-ssd-mode off` only the SSD tier |
 | `--kv-ssd-dir PATH` | SSD tier directory (default `%LOCALAPPDATA%\whirl\kvcache`) |
@@ -342,7 +344,11 @@ Press **Ctrl+C** (or Ctrl+Break, or close the console window). The server then s
 1. new and queued requests are answered with HTTP 503;
 2. running requests finish;
 3. finished sessions are copied to the RAM tier, and every RAM-tier entry that is not on the SSD yet
-   is written now — for at most 10 seconds (the log says `shutdown: tier writes done …`).
+   is written now — for at most 60 seconds with the default `--kv-ssd-mode shutdown` (everything new
+   is written at this point), 10 seconds with `always` (the log says `shutdown: tier writes done …`).
+   The flush starts after the running requests have finished, and the Ctrl+C handler waits 120 s in
+   all: a very long prefill still running at Ctrl+C can leave no time for the flush (the cache is
+   lost, never corrupted).
 
 The next start therefore restores recent conversations from the SSD instead of prefilling them
 again. A second Ctrl+C exits immediately. When the console window is closed, Windows ends the
