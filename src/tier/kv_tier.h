@@ -214,6 +214,8 @@ struct Entry {
     // its SSD write was skipped: a file of nofit_fb bytes did not fit the cap (Tier::startWrite). Not
     // retried until its size changes or SSD room was freed since (Tier::ssd_gen_ moved past nofit_gen).
     std::uint64_t nofit_fb = 0, nofit_gen = 0;
+    // Tier::demote: the first RAM / SSD eviction victim, dropped (not written) on RAM eviction; any use clears it
+    bool demoted = false;
 
     std::uint64_t kvOff(const Layout& l) const;
     std::uint64_t extent(const Layout& l) const;
@@ -268,7 +270,7 @@ struct Restore {
 struct Stats {
     std::uint64_t spills = 0, spill_bytes = 0, restores_ram = 0, restores_ssd = 0, restore_bytes = 0,
                   ssd_writes = 0, ssd_write_bytes = 0, ram_evictions = 0, ssd_evictions = 0, dropped = 0,
-                  ssd_dedup_bytes = 0, superseded = 0, superseded_bytes = 0;
+                  ssd_dedup_bytes = 0, superseded = 0, superseded_bytes = 0, demoted = 0;
 };
 
 class Tier {
@@ -303,6 +305,10 @@ public:
     // (rounded up to what referencing files need, down to its checkpoints),
     // in RAM and on SSD. Returns the bytes freed (0: nothing / not now).
     std::uint64_t trimTo(Entry* e, std::uint32_t keep);
+    // Probably superseded but not provably dead (another conversation shares only its system prompt):
+    // kept whole, evicted first (RAM: dropped to its SSD copy or gone, never written; SSD: first LRU
+    // victim). Any later use (restore, in-place update) undoes it.
+    void demote(Entry* e);
     // Entries whose SSD block table references blocks e owns.
     std::vector<Entry*> dependentsOf(const Entry* e) const;
     // Ids of every entry that depends on e directly or through other entries (e itself only if

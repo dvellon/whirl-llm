@@ -1769,6 +1769,117 @@ void testServeCkptsClamp() {
     CHECK_EQ(srv.model().poison(), 0u);
 }
 
+// Chat-shaped token prompts (ChatML special tokens + random body ids) for the supersede / branch tests.
+struct ChatBuild {
+    ChatTokens ct;
+    std::uint32_t user = 0, assistant = 0;
+    ChatBuild() : ct(tok()) {
+        user = static_cast<std::uint32_t>(tok().encode("user", false).at(0));
+        assistant = static_cast<std::uint32_t>(tok().encode("assistant", false).at(0));
+    }
+    // "<|im_start|>" role "\n" body "<|im_end|>" "\n"
+    void turn(std::vector<std::uint32_t>& v, std::uint32_t role, std::uint32_t n, std::uint64_t seed) const {
+        v.push_back(ct.im_start);
+        v.push_back(role);
+        v.push_back(ct.nl);
+        const auto b = makePrompt(n, seed);
+        v.insert(v.end(), b.begin(), b.end());
+        v.push_back(ct.im_end);
+        v.push_back(ct.nl);
+    }
+    void genPrompt(std::vector<std::uint32_t>& v) const {
+        v.push_back(ct.im_start);
+        v.push_back(assistant);
+        v.push_back(ct.nl);
+    }
+    // system + user turns (bodies n_i) + generation prompt
+    std::vector<std::uint32_t> conv(std::uint32_t sys_n, std::uint64_t sys_seed, std::initializer_list<std::pair<std::uint32_t, std::uint64_t>> users) const {
+        std::vector<std::uint32_t> v;
+        turn(v, ct.system, sys_n, sys_seed);
+        for (const auto& u : users) turn(v, user, u.first, u.second);
+        genPrompt(v);
+        return v;
+    }
+    // previous prompt + its completion + "<|im_end|>" + newline + a new user turn + generation prompt
+    std::vector<std::uint32_t> next(const std::vector<std::uint32_t>& prev, const std::vector<std::uint32_t>& out, std::uint32_t n,
+                                    std::uint64_t seed) const {
+        std::vector<std::uint32_t> v = prev;
+        v.insert(v.end(), out.begin(), out.end());
+        v.push_back(ct.im_end);
+        v.push_back(ct.nl);
+        turn(v, user, n, seed);
+        genPrompt(v);
+        return v;
+    }
+};
+
+// FIX-CACHE P3-3 / P2-4 (FR-CACHE), the agent pattern on one slot: the main agent's long session goes idle
+// while a subagent with the same system prompt (another task) runs two turns; then the main agent resumes.
+// supersede 0: WHIRL_KV_SUPERSEDE=0 (P3-3: before, the subagent's spill overwrote the main session's entry
+// in place from the system prompt on -- the slot owned it -- so the main session was gone from the tiers);
+// supersede 1: on (P2-4: before, the subagent's second turn cut the idle main entry to the system prompt).
+// Now the main session is restored whole from the RAM tier (exact output).
+void testAgentIdleMain(bool supersede) {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 16384;
+    su.mc.pool_tokens = 16384;
+    su.tier = true;
+    su.tier_min = 512;
+    su.eo.kv_supersede = supersede;
+    const ChatBuild cb;
+    const auto main1 = cb.conv(1000, 901, {{6000, 902}});
+    const auto sub1 = cb.conv(1000, 901, {{500, 903}});
+    TestServer srv(su);
+    g_log.clear();
+    const auto out_m1 = srv.model().greedyReference(main1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(main1, 40))), decode(out_m1));
+    const auto out_s1 = srv.model().greedyReference(sub1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(sub1, 40))), decode(out_s1));
+    const auto sub2 = cb.next(sub1, out_s1, 200, 904);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(sub2, 40))), decode(srv.model().greedyReference(sub2, 40, true)));
+    if (supersede) CHECK(g_log.count("looks superseded") >= 1);  // the rule still marks it (system prompt shared)
+    const auto main2 = cb.next(main1, out_m1, 200, 905);
+    auto r = srv.post("/v1/completions", completionBody(main2, 40));
+    CHECK_EQ(completionText(r), decode(srv.model().greedyReference(main2, 40, true)));
+    std::fprintf(stderr, "  (agent supersede=%d: main resumed with %llu cached of %zu, restores_ram %llu, superseded %llu, demoted %llu)" "\n",
+                 supersede ? 1 : 0, static_cast<unsigned long long>(cachedTokens(r)), main1.size(),
+                 static_cast<unsigned long long>(srv.tierp()->stats.restores_ram), static_cast<unsigned long long>(srv.tierp()->stats.superseded),
+                 static_cast<unsigned long long>(srv.tierp()->stats.demoted));
+    CHECK(cachedTokens(r) >= main1.size());
+    CHECK(srv.tierp()->stats.restores_ram >= 1);
+    CHECK_EQ(srv.tierp()->stats.superseded, 0u);
+    if (supersede) CHECK(srv.tierp()->stats.demoted >= 1);
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+void testAgentIdleMainNoSupersede() { testAgentIdleMain(false); }
+void testAgentIdleMainSupersede() { testAgentIdleMain(true); }
+
+// FIX-CACHE P2-4: an agent's compress (same system prompt and first task message, the middle history
+// dropped, a short summary) still cuts the old session to the shared part (same task lineage).
+void testSupersedeCompressCuts() {
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 16384;
+    su.mc.pool_tokens = 16384;
+    su.tier = true;
+    su.tier_min = 512;
+    const ChatBuild cb;
+    const auto old1 = cb.conv(1000, 911, {{500, 912}, {8000, 913}});
+    auto c1 = cb.conv(1000, 911, {{500, 912}, {300, 914}});
+    TestServer srv(su);
+    g_log.clear();
+    const auto out_o = srv.model().greedyReference(old1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(old1, 40))), decode(out_o));
+    const auto out_c1 = srv.model().greedyReference(c1, 40, true);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(c1, 40))), decode(out_c1));
+    const auto c2 = cb.next(c1, out_c1, 200, 915);
+    CHECK_EQ(completionText(srv.post("/v1/completions", completionBody(c2, 40))), decode(srv.model().greedyReference(c2, 40, true)));
+    CHECK(g_log.count("superseded (compact / compress): cut") >= 1);
+    CHECK(srv.tierp()->stats.superseded >= 1);
+    CHECK_EQ(srv.model().poison(), 0u);
+}
+
 // FIX-RC4-A P2-1 (RESTORE-EXC): a device copy throwing while a restore is under way -- in the first pump
 // inside Tier::beginRestore (RAM restore: every piece is copied there) or in a later pump (SSD restore) --
 // fails the restore cleanly through the engine: the request is prefilled cold (same output), no entry
@@ -2199,6 +2310,9 @@ int main(int argc, char** argv) {
         {"restore_throws", testRestoreThrows},
         {"tier_inplace", testTierInPlaceRegen},
         {"ckpts_clamp", testServeCkptsClamp},
+        {"agent_idle_main", testAgentIdleMainNoSupersede},
+        {"agent_idle_main_sup", testAgentIdleMainSupersede},
+        {"supersede_compress", testSupersedeCompressCuts},
         {"sampling", testSampling},
         {"stop_eos", testStopAndEos},
     };

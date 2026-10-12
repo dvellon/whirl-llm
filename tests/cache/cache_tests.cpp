@@ -372,6 +372,37 @@ static void testSupersede() {
         const auto small_old = cat(sys, seq(3000, 750000));
         CHECK(!supersedes(small_old, cat(sys, seq(200, 760000)), sys.size()).yes);
     }
+    // FIX-CACHE P2-4 task lineage (task_end: end of the new conversation's first message after the system one)
+    {
+        // compact / another conversation with the same system prompt (a subagent): shares only the system
+        // prompt -> supersedes but is not cut
+        const auto n = cat(sys, seq(1500, 500000));
+        const Supersede s = supersedes(old_t, n, sys.size(), {}, 3600);
+        CHECK(s.yes && s.keep == 3000 && !s.cut);
+        // the first message shared too (compress): cut
+        auto m = old_t;
+        m.resize(9000);
+        m = cat(m, seq(4000, 600000));
+        const Supersede c = supersedes(old_t, m, sys.size(), {}, 3600);
+        CHECK(c.yes && c.keep == 9000 && c.cut);
+        // the first message only partly shared: not cut; task_end unknown (max): not cut; 0: the old rule
+        auto q = old_t;
+        q.resize(3400);
+        q = cat(q, seq(1500, 610000));
+        CHECK(supersedes(old_t, q, sys.size(), {}, 3600).yes && !supersedes(old_t, q, sys.size(), {}, 3600).cut);
+        CHECK(!supersedes(old_t, m, sys.size(), {}, static_cast<std::size_t>(-1)).cut);
+        CHECK(supersedes(old_t, n, sys.size()).cut);
+        // marks carry it
+        SupersedeTracker t2;
+        t2.mark(5, 6, 3000, 1, false);
+        const auto pp = t2.take(5);
+        CHECK(pp.size() == 1 && !pp[0].cut);
+    }
+    // FIX-CACHE P3-3: near-end divergence (in-place spill allowed) uses the same threshold
+    CHECK(nearEndDivergence(23000, 23000 - 600) && nearEndDivergence(23000, 23000 - 5000));  // 25 % of 23000 = 5750
+    CHECK(!nearEndDivergence(23000, 3000) && !nearEndDivergence(23000, 23000 - 5750));
+    CHECK(nearEndDivergence(6000, 3000) && !nearEndDivergence(9000, 3000));  // min_tail 4096
+    CHECK(nearEndDivergence(5000, 6000));  // continues past the end
     // too short for the host tiers
     CHECK(tooShortForTier(2047, 2048) && !tooShortForTier(2048, 2048));
     // deferred marks: taken once per new entry, re-marking updates, forget drops

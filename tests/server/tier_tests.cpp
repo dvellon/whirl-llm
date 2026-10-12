@@ -3243,6 +3243,52 @@ static void testCapOwnCopyDropped(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+// FIX-CACHE P2-4: Tier::demote (an entry that shares only its system prompt with a newer conversation): kept,
+// the first RAM eviction victim, dropped instead of written to SSD; any use undoes it.
+static void testDemote(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 9300;
+    auto t = Tier::create(ops, 72ull << 20, 97, 0);  // 36 blocks; a spilled 3000-token entry takes 11
+    Config c = env.cfg(4ull << 30);
+    c.ssd_delay_ms = 600000;  // nothing due: a RAM eviction would write an entry now
+    t->start(c, kLay, 97);
+    Sess a(ops, 24), b(ops, 24), cc(ops, 24), d(ops, 24);
+    a.toks = freshToks(3000, seed);
+    b.toks = freshToks(3000, seed);
+    cc.toks = freshToks(3000, seed);
+    d.toks = freshToks(3000, seed);
+    spillSess(*t, a, 0);
+    spillSess(*t, b, 0);
+    spillSess(*t, cc, 0);
+    CHECK(t->countRam() == 3);
+    t->demote(t->find(b.id));
+    CHECK(t->stats.demoted == 1 && t->find(b.id)->demoted);
+    spillSess(*t, d, 0);  // needs room: b goes first (not a, the LRU), dropped without an SSD write
+    CHECK(t->find(b.id) == nullptr);
+    CHECK(t->find(a.id) != nullptr && t->find(a.id)->in_ram);
+    CHECK(t->find(d.id) != nullptr && t->find(d.id)->in_ram);
+    CHECK(tickIdle(*t));
+    CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);
+    // a use undoes it
+    Entry* ea = t->find(a.id);
+    t->demote(ea);
+    CHECK(ea->demoted);
+    CHECK(restoreMatches(*t, ops, ea, a));
+    CHECK(!t->find(a.id)->demoted);
+    // an in-place update too
+    Entry* ed = t->find(d.id);
+    t->demote(ed);
+    const std::size_t dn = d.toks.size();
+    auto more = freshToks(200, seed);
+    d.toks.insert(d.toks.end(), more.begin(), more.end());
+    CHECK(!spillSess(*t, d, dn));
+    CHECK(!t->find(d.id)->demoted);
+    t.reset();
+    fs::remove_all(dir, ec);
+}
+
 // FIX-CACHE P2-2 (FR-CACHE): a restart with another per-slot context (tok_cap: --ctx, --parallel, or the
 // VRAM-based auto-shrink) changes the file layout (dataOff). Before: the files of the same fingerprint were
 // deleted as corrupt. Now: kept like foreign files (counted against the cap, evicted first), and used again
@@ -3468,6 +3514,10 @@ int main(int argc, char** argv) {
     if (want("testWriteAmplification")) {
         std::printf("-- %s\n", "testWriteAmplification");
         testWriteAmplification(ops, dir);
+    }
+    if (want("testDemote")) {
+        std::printf("-- %s\n", "testDemote");
+        testDemote(ops, dir);
     }
     if (want("testTokCapRestart")) {
         std::printf("-- testTokCapRestart\n");

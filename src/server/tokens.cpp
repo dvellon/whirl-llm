@@ -48,6 +48,14 @@ std::size_t ChatTokens::sysBoundary(std::span<const std::uint32_t> toks) const {
     return 0;
 }
 
+std::size_t ChatTokens::nextTurn(std::span<const std::uint32_t> toks, std::size_t from) const {
+    if (im_start == none || im_end == none) return 0;
+    for (std::size_t i = from + 1; i + 2 < toks.size(); ++i) {
+        if (toks[i] == im_end && toks[i + 1] == nl && toks[i + 2] == im_start) return i + 2;
+    }
+    return 0;
+}
+
 std::vector<std::uint32_t> ChatTokens::crlfToLf(const Tokenizer& tok) {
     const std::size_t n = tok.size();
     std::vector<std::uint32_t> norm(n);

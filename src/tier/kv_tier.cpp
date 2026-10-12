@@ -478,6 +478,7 @@ void Tier::persistUse() {
 }
 
 void Tier::touch(Entry* e) {
+    e->demoted = false;
     lru_seq_ += 1;
     e->lru = lru_seq_;
     touchOwners(e);
@@ -581,6 +582,7 @@ bool Tier::evictable(Entry* e, Entry* keep) {
 // its RAM blocks are freed by a later pass) if it is worth a disk write (>= min_tokens, SSD tier
 // in `always` mode); else it is dropped (older consistent SSD copy, or gone: a cold prefill later).
 bool Tier::evictWanted(const Entry* v) const {
+    if (v->demoted) return false;  // probably superseded: not worth a disk write
     if (!ssd_dir_w_ || cfg.ssd_shutdown_only || v->n_tok < cfg.min_tokens || v->n_tok == 0 || !seenOk(v)) return false;
     return !v->ssd || v->hasDirty();  // clean: nothing to write
 }
@@ -712,6 +714,7 @@ void Tier::dropCkBlocks(Entry* e, std::uint32_t k) {
 // ---- copies (tier stream) -------------------------------------------------------
 
 std::uint64_t Tier::copyOut(Entry* e, std::span<const Span> spans) {
+    if (e->demoted) touch(e);  // updated in place: its session went on
     std::uint64_t bytes = 0;
     for (const Span& s : spans) {
         std::uint64_t done = 0;
@@ -1207,6 +1210,13 @@ void Tier::gcOwners() {
             break;
         }
     }
+}
+
+void Tier::demote(Entry* e) {
+    if (!contains(e) || e->demoted) return;
+    e->demoted = true;
+    e->lru = 0;  // older than every touched entry
+    stats.demoted += 1;
 }
 
 // Superseded session: cut e to tokens [0, keep) -- rounded down to its last
