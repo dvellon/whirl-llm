@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cwchar>
+#include <filesystem>
 #include <format>
+#include <stdexcept>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -23,9 +25,17 @@ std::uint64_t tierFingerprint(const FingerprintInputs& in) {
                                      in.model_base, in.tensors, in.bytes, in.kv_name, in.use_mtp, in.n_gdn, in.ck_bytes,
                                      in.page_bytes, in.max_batch));
     h = tier::hashStr(h, "numerics " + in.numerics);
-    // empty / 0 hash as before R-1's format (tests compare with it); the server always sets gpu_arch
-    if (!in.gpu_arch.empty() || !in.gpu_name.empty() || !in.kernel_set.empty())
+    // legacy_no_gpu: the format before FIX-NUM P2-2 (tests compare with it). Otherwise the GPU identity
+    // is required: no silent fallback to the old format when it is empty (FIX-TEST-A, FR-TEST P2-3).
+    if (in.legacy_no_gpu) {
+        if (!in.gpu_arch.empty() || !in.gpu_name.empty() || !in.kernel_set.empty())
+            throw std::invalid_argument("tier fingerprint: legacy_no_gpu with GPU fields set");
+    } else {
+        if (in.gpu_arch.empty() || in.kernel_set.empty())
+            throw std::invalid_argument(std::format("tier fingerprint: GPU identity missing (gpu_arch \"{}\", kernel_set \"{}\")",
+                                                    in.gpu_arch, in.kernel_set));
         h = tier::hashStr(h, std::format("gpu {} name {} kernels {}", in.gpu_arch, in.gpu_name, in.kernel_set));
+    }
     std::vector<std::pair<std::string, std::string>> kv;
     for (const auto& p : in.env)
         if (fingerprintEnvKept(p.first)) kv.push_back(p);
@@ -37,6 +47,30 @@ std::uint64_t tierFingerprint(const FingerprintInputs& in) {
         h = tier::hashStr(h, ";");
     }
     return h;
+}
+
+FingerprintInputs serverFingerprintInputs(const ServerIdentity& s) {
+    if (s.gpu_arch.empty()) throw std::invalid_argument("tier fingerprint: no GPU arch (hip::DeviceInfo::gcn_arch is empty)");
+    if (s.kernel_arch.empty() || s.kernel_co_bytes == 0)
+        throw std::invalid_argument(std::format("tier fingerprint: no kernel code object (arch \"{}\", {} bytes)", s.kernel_arch,
+                                                s.kernel_co_bytes));
+    FingerprintInputs in;
+    in.exe_id = s.exe_id;
+    in.model_base = narrow(std::filesystem::path(widen(s.model_path)).filename().wstring());
+    in.tensors = s.tensors;
+    in.bytes = s.bytes;
+    in.kv_name = s.kv_name;
+    in.use_mtp = s.use_mtp;
+    in.n_gdn = s.n_gdn;
+    in.ck_bytes = s.ck_bytes;
+    in.page_bytes = s.page_bytes;
+    in.max_batch = s.max_batch;
+    in.numerics = s.numerics;
+    in.gpu_arch = s.gpu_arch;
+    in.gpu_name = s.gpu_name;
+    in.kernel_set = std::format("{} co {}", s.kernel_arch, s.kernel_co_bytes);
+    in.env = s.env;
+    return in;
 }
 
 bool fingerprintEnvKept(std::string_view key) {

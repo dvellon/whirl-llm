@@ -321,25 +321,27 @@ double gib(std::size_t a, std::size_t b) { return static_cast<double>(a > b ? a 
 // Identity of everything that decides the bits of a tier entry.
 std::uint64_t tierFingerprint(const qwen35::Model& m, const std::string& path, const qwen35::LoadStats& stats, bool use_mtp,
                               std::uint64_t n_gdn, const tier::Layout& lay) {
-    cache::FingerprintInputs in;
-    in.exe_id = tier::exeIdentity();
-    in.model_base = narrow(std::filesystem::path(widen(path)).filename().wstring());
-    in.tensors = stats.tensors;
-    in.bytes = stats.bytes;
-    in.kv_name = m.kvName();
-    in.use_mtp = use_mtp;
-    in.n_gdn = n_gdn;
-    in.ck_bytes = lay.ck_bytes;
-    in.page_bytes = lay.page_bytes;
-    in.max_batch = m.max_batch;
-    in.numerics = whirl::numerics::logLine(m.num_plan);
+    // assembly in cache::serverFingerprintInputs (tested in whirl-cache-tests; FIX-TEST-A, FR-TEST P2-3)
+    cache::ServerIdentity id;
+    id.exe_id = tier::exeIdentity();
+    id.model_path = path;
+    id.tensors = stats.tensors;
+    id.bytes = stats.bytes;
+    id.kv_name = m.kvName();
+    id.use_mtp = use_mtp;
+    id.n_gdn = n_gdn;
+    id.ck_bytes = lay.ck_bytes;
+    id.page_bytes = lay.page_bytes;
+    id.max_batch = m.max_batch;
+    id.numerics = whirl::numerics::logLine(m.num_plan);
     const hip::DeviceInfo dev = hip::describeDevice(hip::getDevice());
-    in.gpu_arch = dev.gcn_arch;
-    in.gpu_name = dev.name;
+    id.gpu_arch = dev.gcn_arch;
+    id.gpu_name = dev.name;
     const hip::EmbeddedObject* co = hip::embeddedObjectFor(m.arch);
-    in.kernel_set = std::format("{} co {}", hip::archName(m.arch), co != nullptr ? *co->size : 0ull);
-    in.env = cache::fingerprintEnv();
-    return cache::tierFingerprint(in);
+    id.kernel_arch = hip::archName(m.arch);
+    id.kernel_co_bytes = co != nullptr ? *co->size : 0ull;
+    id.env = cache::fingerprintEnv();
+    return cache::tierFingerprint(cache::serverFingerprintInputs(id));
 }
 
 }  // namespace
@@ -1239,7 +1241,6 @@ int serveMain(int argc, char** argv, const char* program) {
                 lay.page_bytes = per_tok * kv_page;
                 lay.page_tokens = kv_page;
                 lay.tok_cap = slot_ctx_eff;
-                const std::uint64_t fp = tierFingerprint(model, opt.path, stats, use_mtp, n_gdn, lay);
                 const TimePoint t_tier0 = Clock::now();
                 tier::Config tc;
                 tc.ram_bytes = kv_ram_mb << 20;
@@ -1254,6 +1255,8 @@ int serveMain(int argc, char** argv, const char* program) {
                 // the wake hook must be in place before the IO thread starts
                 engine.attachTier(tier_pre.get());
                 try {
+                    // throws when the GPU identity is missing: an error, never the old shared format
+                    const std::uint64_t fp = tierFingerprint(model, opt.path, stats, use_mtp, n_gdn, lay);
                     tier_pre->start(tc, lay, fp);
                     tier_owned = std::move(tier_pre);
                 } catch (const std::exception& ex) {
