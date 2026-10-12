@@ -1,6 +1,7 @@
 // WHIRL host-side unit tests (no GPU, no model files needed).
 // SPDX-License-Identifier: Apache-2.0
 
+#include "../test_env.h"
 #include "whirl/chat.h"
 #include "whirl/common.h"
 #include "whirl/gguf.h"
@@ -1575,6 +1576,7 @@ void testValueScope() {
 }
 
 int main() {
+    whirl::test::clearWhirlEnv();  // FR-TEST P3-11
     testRelaxAccept();
     testJson();
     testUnicode();

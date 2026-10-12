@@ -6,6 +6,7 @@
 // Usage: whirl-tier-tests [temp dir for the SSD tier]
 //   (default: %WHIRL_TEST_TMP%\tier_test_tmp, else %TEMP%\whirl-tests\tier_test_tmp)
 
+#include "../test_env.h"
 #include "tier/kv_tier.h"
 #include "tier/ram_size.h"
 #include "cache/prefix_cache.h"
@@ -3373,13 +3374,18 @@ static void testTokCapRestart(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
-// WHIRL_TIER_ONLY=<test name>: run only that test (regression proofs)
+// WHIRL_TIER_ONLY=<test name>: run only that test (regression proofs). A name that matches no test is
+// a usage error (exit 2; FIX-TEST-A, FR-TEST P3-3: a typo used to run 1 check in main and pass).
+static int g_only_matched = 0;
 static bool want(const char* name) {
     const char* only = std::getenv("WHIRL_TIER_ONLY");
-    return only == nullptr || *only == 0 || std::strcmp(only, name) == 0;
+    const bool all = only == nullptr || *only == 0;
+    if (!all && std::strcmp(only, name) == 0) ++g_only_matched;
+    return all || std::strcmp(only, name) == 0;
 }
 
 int main(int argc, char** argv) {
+    whirl::test::clearWhirlEnv({L"WHIRL_TIER_ONLY", L"WHIRL_TIER_AMP"});  // FR-TEST P3-11
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // default: WHIRL_TEST_TMP, else %TEMP%\whirl-tests; this test uses <base>\tier_test_tmp
     fs::path base;
@@ -3545,5 +3551,13 @@ int main(int argc, char** argv) {
         testPowerLoss(ops, dir);
     }
     std::printf("tier tests: %d passed, %d failed\n", g_pass, g_fail);
+    if (const char* only = std::getenv("WHIRL_TIER_ONLY"); only && *only && g_only_matched == 0) {
+        std::printf("tier tests: WHIRL_TIER_ONLY=%s matches no test\n", only);
+        return 2;
+    }
+    if (g_pass + g_fail == 0) {
+        std::printf("tier tests: 0 checks ran: refusing to report success\n");
+        return 2;
+    }
     return g_fail == 0 ? 0 : 1;
 }

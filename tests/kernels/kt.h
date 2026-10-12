@@ -10,6 +10,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -106,13 +107,28 @@ public:
     void add(Result r);
     void skip(const std::string& family, const std::string& name, const std::string& why);
     int summary() const;  // prints, returns failure count
+    std::size_t checks() const { return results_.size(); }
+    struct Skip {
+        std::string family, name, why;
+        std::string key() const { return family + " " + name; }
+    };
+    const std::vector<Skip>& skips() const { return skips_; }
     bool verbose = false;
     std::string family;   // current family label
 
 private:
     std::vector<Result> results_;
     std::vector<std::string> skipped_;
+    std::vector<Skip> skips_;
 };
+
+// FIX-TEST-A (FR-TEST P3-4): a skip whose reason is a kernel absent from the code object (as opposed to
+// a model / tensor that was not given): with --require-all such a skip fails unless the device's arch
+// lists it as absent by design (requiredKernelAbsentOk).
+bool skipIsMissingKernel(const std::string& why);
+// arch: hip::DeviceInfo::gcn_arch prefix ("gfx1201", "gfx1151"); key: "family name" of the skip.
+// nullopt: no list for this arch (--require-all then refuses to run: exit 2).
+std::optional<bool> requiredKernelAbsentOk(const std::string& arch, const std::string& key);
 
 // Exact comparison of raw bytes (float arrays compared bitwise).
 Result cmpExactBits(const std::string& name, const void* got, const void* ref, std::size_t n_elems,

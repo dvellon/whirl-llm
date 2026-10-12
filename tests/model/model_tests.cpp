@@ -3,6 +3,7 @@
 // draft allocation (cycle cost, slot acceptance, allocDrafts).
 // SPDX-License-Identifier: Apache-2.0
 
+#include "../test_env.h"
 #include "whirl/dflash_policy.h"
 #include "whirl/gguf.h"
 #include "whirl/kernels_abi.h"
@@ -1502,6 +1503,7 @@ void testDraftWindowRestore() {
 }
 
 int main() {
+    whirl::test::clearWhirlEnv();  // FR-TEST P3-11
     testDraftWindowRestore();
     testFloatGemvDispatch();
     testArchWhitelist();

@@ -6,6 +6,7 @@
 // The GGUF only provides the tokenizer (vocabulary + merges); default: the
 // Qwen3.8-27B UD-Q4_K_M file of this machine, or WHIRL_TEST_GGUF.
 
+#include "../test_env.h"
 #include "http_client.h"
 #include "mock_backend.h"
 #include "server/draft_caps.h"
@@ -2615,6 +2616,19 @@ void testFrToolTruncated() {
     const ToolResolution b = resolveTools(o2.view(true), "length", tools);
     CHECK(!b.calls);
     CHECK_EQ(b.reason, std::string("length"));
+    // FIX-TEST-A (FR-TEST P3-2): the length rule on its own. max_tokens reached right after a complete,
+    // well-formed call (</tool_call> written): the text parses, but the generation was still cut, so
+    // finish stays length and there are no tool_calls (mutation M3 -- parse on length too -- passed every
+    // case above because each was also syntactically incomplete).
+    Out o4 = o;
+    o4.text = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>";
+    o4.valid = o4.text.size();
+    const Out::View v4 = o4.view(true);
+    CHECK(v4.tool.has_value() && parseToolCalls(*v4.tool, tools).has_value());  // the region itself is a valid call
+    const ToolResolution d = resolveTools(v4, "length", tools);
+    CHECK(!d.calls);
+    CHECK_EQ(d.reason, std::string("length"));
+    CHECK(d.content.find("</tool_call>") != std::string::npos);
     // a generation that ended normally with a complete call: tool_calls as before
     Out o3 = o;
     o3.text = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>";
@@ -3060,6 +3074,7 @@ void testFrLogInjection() {
 }
 
 int main(int argc, char** argv) {
+    whirl::test::clearWhirlEnv();  // FR-TEST P3-11
     std::set<std::string> only;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -3159,6 +3174,17 @@ int main(int argc, char** argv) {
         {"fr_log_injection", testFrLogInjection},
         {"fr_short_followup", testFrShortFollowUp},
     };
+    // FIX-TEST-A (FR-TEST P3-3): an --only name that matches no test, or a run with 0 checks, is a usage
+    // error (exit 2), never "0 passed, 0 failed" with exit 0
+    for (const std::string& n : only) {
+        bool known = false;
+        for (const T& t : tests) known = known || n == t.name;
+        if (!known) {
+            std::fprintf(stderr, "whirl-server-tests: --only: no test named \"%s\"\n", n.c_str());
+            Log::setHook(nullptr, nullptr);
+            return 2;
+        }
+    }
     for (const T& t : tests) {
         if (!only.empty() && !only.count(t.name)) continue;
         const int f0 = g_fail, p0 = g_pass;
@@ -3175,5 +3201,9 @@ int main(int argc, char** argv) {
     }
     std::printf("server tests: %d passed, %d failed\n", g_pass, g_fail);
     Log::setHook(nullptr, nullptr);
+    if (g_pass + g_fail == 0) {
+        std::printf("server tests: 0 checks ran: refusing to report success\n");
+        return 2;
+    }
     return g_fail ? 1 : 0;
 }

@@ -2,17 +2,22 @@
 // with C++ CPU references and with each other (bitwise invariances).
 // SPDX-License-Identifier: Apache-2.0
 //
-// usage: whirl-kernel-test [--device SPEC] [--only fam,fam] [--quick] [-v]
+// usage: whirl-kernel-test [--device SPEC] [--only fam,fam] [--quick] [-v] [--require-all]
 //                          [--q4 GGUF] [--mx GGUF] [--moe GGUF] [--moemx GGUF]
+// Exit: 0 pass, 1 a failing check (or, with --require-all, a kernel missing that the arch requires),
+// 2 usage error: unknown --only family, a given model path that does not exist, 0 checks run, or
+// --require-all on an arch without a required-kernel list (FIX-TEST-A, FR-TEST P3-3 / P3-4).
 // families: quant gemv gemm attn gdn moe moemx misc
 
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <set>
 #include <sstream>
 #include <string>
 
 #include "cpu_ref.h"
+#include "whirl/common.h"
 
 namespace {
 
@@ -26,6 +31,7 @@ int usage() {
     std::printf(
         "usage: whirl-kernel-test [--device SPEC] [--only quant,gemv,gemm,attn,attndq4,gdn,moe,moemx,moef,misc,dflash,gemvh] [--quick] [-v]\n"
         "                         [--q4 GGUF] [--mx GGUF] [--moe GGUF] [--moemx GGUF]\n"
+        "  --require-all  a kernel missing from the code object fails unless the arch lacks it by design\n"
         "  --device  index, gfx arch, name substring, r9700 or 8060s (default: WHIRL_DEVICE, else the\n"
         "            first R9700, else the first GPU this build has kernels for)\n"
         "  models default to WHIRL_TEST_Q4 (else WHIRL_TEST_GGUF) / WHIRL_TEST_MX / WHIRL_TEST_MOE /\n"
@@ -38,6 +44,7 @@ int usage() {
 int main(int argc, char** argv) {
     std::string device = envOr("WHIRL_DEVICE");
     std::set<std::string> only;
+    bool require_all = false;
     kt::Ctx c;
     c.models = {envOr("WHIRL_TEST_Q4"), envOr("WHIRL_TEST_MX"), envOr("WHIRL_TEST_MOE"), envOr("WHIRL_TEST_MOEMX")};
     if (c.models.q4.empty()) c.models.q4 = envOr("WHIRL_TEST_GGUF");
@@ -54,6 +61,7 @@ int main(int argc, char** argv) {
                 std::string f;
                 while (std::getline(ss, f, ',')) only.insert(f);
             } else if (a == "--quick") c.quick = true;
+            else if (a == "--require-all") require_all = true;
             else if (a == "-v" || a == "--verbose") c.rep.verbose = true;
             else if (a == "--q4") c.models.q4 = next();
             else if (a == "--mx") c.models.mx = next();
@@ -67,6 +75,25 @@ int main(int argc, char** argv) {
     }
     for (std::string* p : {&c.models.q4, &c.models.mx, &c.models.moe, &c.models.moemx})
         if (*p == "-") p->clear();
+    // a model path that was given but does not exist is an error, not "synthetic data" (FR-TEST P3-4)
+    for (const std::string* p : {&c.models.q4, &c.models.mx, &c.models.moe, &c.models.moemx}) {
+        std::error_code ec;
+        if (!p->empty() && !std::filesystem::exists(std::filesystem::path(whirl::widen(*p)), ec)) {
+            std::printf("whirl-kernel-test: model file not found: %s\n", p->c_str());
+            return 2;
+        }
+    }
+    const char* fam_names[] = {"quant", "gemv", "gemm", "attn", "attndq4", "gdn", "moe", "moemx", "moef", "misc", "attnbench",
+                               "gemvh", "gemvhbench", "dflash"};
+    for (const std::string& f : only) {
+        bool known = false;
+        for (const char* n : fam_names) known = known || f == n;
+        if (!known) {
+            std::printf("whirl-kernel-test: --only: no family named \"%s\"\n", f.c_str());
+            return usage();
+        }
+    }
+    std::string arch;
 
     try {
         namespace hip = whirl::hip;
@@ -89,6 +116,11 @@ int main(int argc, char** argv) {
         hip::setDevice(dev);
         const auto info = hip::describeDevice(dev);
         std::printf("device %d: %s (%s)\n", dev, info.name.c_str(), info.gcn_arch.c_str());
+        arch = info.gcn_arch;
+        if (require_all && !kt::requiredKernelAbsentOk(arch, "").has_value()) {
+            std::printf("whirl-kernel-test: --require-all: no required-kernel list for %s\n", arch.c_str());
+            return 2;
+        }
         c.mod = hip::Module::loadEmbedded();
         c.k = whirl::kernels::KernelTable::load(c.mod, whirl::kernels::KvFormat::f16);
         // gfx1151 stores packed int8 scale words; the CPU references follow the code object
@@ -128,7 +160,23 @@ int main(int argc, char** argv) {
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::printf("   (%s: %.1f s)\n", f.name, s);
     }
-    const int fails = c.rep.summary();
+    int fails = c.rep.summary();
     whirl::hip::streamDestroy(c.s);
+    if (c.rep.checks() == 0) {
+        std::printf("whirl-kernel-test: 0 checks ran: refusing to report success\n");
+        return 2;
+    }
+    // FR-TEST P3-4: a renamed or unbuilt kernel used to turn its family green as a skip
+    int missing = 0;
+    for (const auto& s : c.rep.skips()) {
+        if (!kt::skipIsMissingKernel(s.why)) continue;
+        const bool ok = kt::requiredKernelAbsentOk(arch, s.key()).value_or(false);
+        if (require_all && !ok) {
+            std::printf("MISSING (required on %s): %s: %s\n", arch.c_str(), s.key().c_str(), s.why.c_str());
+            ++missing;
+        }
+    }
+    if (require_all) std::printf("--require-all: %d required kernel(s) missing\n", missing);
+    fails += missing;
     return fails ? 1 : 0;
 }
