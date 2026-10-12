@@ -101,7 +101,7 @@ unit tests and block tests. Until they exist, run G0 for those changes.
 | prefix_cache / PagePool | whirl-server-tests (prefix, shared sys, pool, restore), prefix_cache unit tests | no | no; on a behaviour change (not just a move) add server-gate mt_cache, sys (R9700) |
 | tier (RAM/SSD) | whirl-tier-tests, whirl-server-tests testTiers/testRestoreConcurrent | no | no; on an IO path change add server-gate tier (R9700) |
 | sampling / spec policy (CPU side) | whirl-model-tests, whirl-tests specSample, whirl-server-tests sampler/sampling/slotDraft | no | no |
-| spec acceptance behaviour (specsample/relaxacc) | the row above + G0 (fast, balance) + cmp_mtp + server-gate fast_stream (dense and MoE) | yes | yes |
+| spec acceptance behaviour (specsample/relaxacc) | the row above + G0 (fast, balance) + seqtest (balance, fast) + server-gate fast_stream (dense and MoE) | yes | yes |
 | engine scheduling (prefill grouping, decode loop) | all whirl-server-tests + G0 (pair suite) + server-gate basic (+ fast_stream when MTP prefill rows move) | yes | R9700 only; 8060S at merge time |
 | one forward block (host dispatch) | block tests (after R-7) + G0 | yes | shared caps paths: both; gfx1151-only paths: 8060S |
 | one kernel (*.hip, gfx1201) | whirl-kernel-test --family X (R9700) + G0 | yes | no |
@@ -110,9 +110,21 @@ unit tests and block tests. Until they exist, run G0 for those changes.
 | weights/loader (quant formats, repack) | whirl-model-tests, kernel test quant/moemx, G0 | yes | yes |
 | tune (tuning tables/candidates) | G0 (tuning only picks bit-identical candidates, so the hashes must not change) + check.ps1 speed | yes | only the affected arch |
 | platform layer | whirl-server-tests, tier-tests, server-gate basic+tier | yes (basic) | no |
-| before a release / rc merge | run_gates.ps1, the full set on both GPUs | yes | **yes** |
+| before a release / rc merge | `tools/gates/release_gate.ps1 -Device r9700` and `-Device 8060s` (every step must pass; exit 0 and a PASS_ marker) | yes | **yes** |
 
 **Cases that still need the full R9700 + 8060S set:** a kernels_abi change, a change to the
 default ExecFlags or the default KV format, a change to what a precision or numerics mode means,
 an rc merge and a release. A change that only affects the 8060S does not rerun the full R9700
 set. The R9700 set is checked once, when the change is merged.
+
+**The release gate** (`tools/gates/release_gate.ps1`, FIX-TEST-A) is the versioned list of those
+checks: the CPU test binaries and self-tests, golden xcheck, `whirl-kernel-test --require-all`,
+selftest, golden check (with its in-run cross-checks), seqtest (dense precise / balance / fast, MoE
+precise / balance), bench DFlash2 hashes in all three modes, and the server gate (balance and fast
+basic,mt_cache; precise basic with `--cli`; fast_stream dense and MoE; tier,sys,restore_conc,pool in
+balance and precise with `--kv auto`). Each step has an exit code and an output rule; the gate prints a
+table, writes `PASS_<tag>` or `FAIL_<tag>` and exits 0 only when every selected step passed (1 a step
+failed, 2 setup error such as a missing model or the wrong `-ExpectCommit`). Model and text paths come
+from `WHIRL_GATE_*` variables (see the script header). `-InjectFail` turns one golden reference into a
+mismatch to prove the gate goes red. `whirl-server-tests --only`, `WHIRL_TIER_ONLY` and
+`whirl-kernel-test --only` exit 2 for a name that matches nothing or a run with 0 checks.
