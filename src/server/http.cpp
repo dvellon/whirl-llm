@@ -121,6 +121,23 @@ public:
         stalled_ = false;
     }
     bool bad() const { return bad_; }
+    // FIN / reset from the client: readable with nothing to read (or an error). Bytes waiting
+    // (a pipelined request) count as alive. Non-blocking; the engine calls it while the
+    // connection thread waits for the job.
+    bool alive() override {
+        if (bad_) return false;
+        fd_set rs;
+        FD_ZERO(&rs);
+        FD_SET(s_, &rs);
+        timeval tv{0, 0};
+        const int n = ::select(0, &rs, nullptr, nullptr, &tv);
+        if (n <= 0) return true;  // nothing to read (or select failed: assume alive)
+        char c;
+        const int r = ::recv(s_, &c, 1, MSG_PEEK);
+        if (r > 0) return true;
+        if (r == 0) return false;
+        return WSAGetLastError() == WSAEWOULDBLOCK;
+    }
 
 private:
     bool setBad() {

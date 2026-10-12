@@ -72,6 +72,9 @@ public:
     virtual ~Conn() = default;
     virtual bool write(std::string_view data) = 0;
     virtual bool flush() = 0;
+    // false once the client has closed the connection (FR-SRV P2-2: polled by the engine for
+    // requests that write nothing for a long time: queued, prefilling, non-streaming)
+    virtual bool alive() { return true; }
 };
 
 enum class JobKind { chat, completion };
@@ -523,6 +526,8 @@ private:
     void flushTierOnStop();
     void releaseSlot(Slot& sl);
     void failSlot(Slot& sl, const std::string& err);
+    // FR-SRV P2-2: queued / running requests whose client disconnected end (slot freed)
+    void reapDisconnected();
     void failJobNoSlot(Job& job);
     void writeError(Job& job, int status, const std::string& msg);
     void logBatchStats(bool force);
@@ -606,6 +611,7 @@ private:
     std::uint64_t stat_cow_pages_ = 0;
     std::uint64_t stat_q_waits_ = 0;
     TimePoint last_tick_{};
+    TimePoint last_reap_{};
     std::vector<std::uint16_t> page_ref_;
     std::vector<Spe> spes_;
     std::uint64_t stat_spe_new_ = 0, stat_spe_hits_ = 0, stat_spe_tok_ = 0, stat_spe_evict_ = 0, stat_unshare_ = 0;
