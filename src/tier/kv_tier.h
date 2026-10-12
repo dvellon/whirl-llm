@@ -17,7 +17,9 @@
 // never queued behind a long transfer.
 // SSD: one sparse file per entry (4 KiB header, token ids, block table, data
 // region), written by an IO thread with unbuffered positional writes (dirty
-// blocks only; the header is invalidated first and rewritten last), read back
+// blocks only; the header is invalidated first, behind a flush barrier when the
+// file already existed, and the valid header is written last behind another, so a
+// power loss never leaves a valid header over other bytes), read back
 // the same way (read_qd overlapped reads in flight).
 // Block dedup (CACHE-1): a KV block (2 MiB of the data region) that holds the
 // same token prefix as a block already on SSD and hashes the same (128-bit
@@ -490,5 +492,18 @@ std::uint64_t hashStr(std::uint64_t h, std::string_view s);
 // Identity of the running executable (size + last write time): an SSD entry
 // written by another build is not restored (its numerics may differ).
 std::uint64_t exeIdentity();
+
+// CPU-test hook (power-loss fault injection; nullptr in the product). When set, the SSD write
+// job's positional writes and flush barriers go through it, so a test can model the drive's
+// volatile write cache: writes not yet covered by a flush may reach the media in any order, or
+// not at all. While dead() (the simulated power is off) no file is deleted, truncated or
+// re-stamped. Set it only while no IO job is running.
+struct WriteSim {
+    virtual ~WriteSim() = default;
+    virtual bool write(void* fh, const std::uint8_t* buf, std::uint64_t len, std::uint64_t off) = 0;
+    virtual bool flush(void* fh) = 0;
+    virtual bool dead() const = 0;
+};
+extern std::atomic<WriteSim*> g_write_sim;
 
 }  // namespace whirl::tier

@@ -25,6 +25,8 @@
 
 namespace whirl::tier {
 
+std::atomic<WriteSim*> g_write_sim{nullptr};
+
 namespace {
 
 constexpr std::uint64_t alignUp(std::uint64_t x, std::uint64_t a) { return (x + a - 1) / a * a; }
@@ -88,7 +90,13 @@ OVERLAPPED ovAt(std::uint64_t off) {
     return ov;
 }
 
+bool simDead() {
+    const WriteSim* s = g_write_sim.load(std::memory_order_acquire);
+    return s != nullptr && s->dead();
+}
+
 bool writeAt(HANDLE fh, const std::uint8_t* buf, std::uint64_t len, std::uint64_t off) {
+    if (WriteSim* s = g_write_sim.load(std::memory_order_acquire)) return s->write(fh, buf, len, off);
     std::uint64_t done = 0;
     while (done < len) {
         const DWORD n = static_cast<DWORD>(std::min<std::uint64_t>(len - done, 64ull << 20));
@@ -100,9 +108,19 @@ bool writeAt(HANDLE fh, const std::uint8_t* buf, std::uint64_t len, std::uint64_
     return true;
 }
 
+// Write barrier: everything written to fh before it is on the media before anything written after it.
+// FILE_FLAG_NO_BUFFERING only bypasses the Windows cache; the drive's own volatile cache may still
+// reorder or drop writes at a power loss. FlushFileBuffers (NTFS metadata + the device's FLUSH CACHE)
+// is what orders them.
+bool flushFile(HANDLE fh) {
+    if (WriteSim* s = g_write_sim.load(std::memory_order_acquire)) return s->flush(fh);
+    return FlushFileBuffers(fh) != 0;
+}
+
 // Delete a cache file. false: it is still there (locked by another program, access denied); the caller
 // keeps counting its bytes against the cap (a file that stays on disk must not leave the accounting).
 bool removeFile(const std::wstring& p) {
+    if (simDead()) return false;
     if (DeleteFileW(p.c_str()) != 0) return true;
     const DWORD err = GetLastError();
     return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND;
@@ -423,6 +441,10 @@ void Tier::stampFile(std::uint64_t id, std::int64_t unix_s) {
         HANDLE h = CreateFileW(p.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                OPEN_EXISTING, 0, nullptr);
         if (h == INVALID_HANDLE_VALUE) return;
+        if (simDead()) {
+            CloseHandle(h);
+            return;
+        }
         ULARGE_INTEGER u;
         u.QuadPart = (static_cast<std::uint64_t>(unix_s) + 11644473600ull) * 10000000ull;
         FILETIME ft{u.LowPart, u.HighPart};
@@ -2153,10 +2175,19 @@ void Tier::runJob(Job* j) {
         HANDLE fh = CreateFileW(j->path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
                                 FILE_FLAG_NO_BUFFERING, nullptr);
         bool ok = fh != INVALID_HANDLE_VALUE;
+        // crash safety (FIX-HDR0): the valid header (hdr1) goes out only after a barrier that puts
+        // everything else on the media. An existing file still holds a valid header for its old
+        // contents, so it is first invalidated (hdr0) behind a barrier of its own: otherwise the
+        // drive may land new payload before hdr0 and a power loss leaves the old valid header over
+        // half-new bytes. A new file needs no extra barrier: until hdr1 lands its header reads as
+        // hdr0 or zeros (no magic), both rejected at startup.
+        const bool existed = ok && GetLastError() == ERROR_ALREADY_EXISTS;
         if (ok) {
             DWORD br = 0;
             DeviceIoControl(fh, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &br, nullptr);
-            ok = writeAt(fh, j->hdr0.get(), header_bytes, 0) && writeAt(fh, j->toks.get(), j->toks_len, j->tok_off);
+            ok = writeAt(fh, j->hdr0.get(), header_bytes, 0);
+            if (ok && existed) ok = flushFile(fh);
+            ok = ok && writeAt(fh, j->toks.get(), j->toks_len, j->tok_off);
             j->written += header_bytes + j->toks_len;
             if (ok) {
                 for (std::size_t i = 0; i < j->lbs.size(); ++i) {
@@ -2191,20 +2222,20 @@ void Tier::runJob(Job* j) {
                 ok = writeAt(fh, j->tbl.get(), tl, j->tbl_off);
                 j->written += tl;
             }
-            ok = ok && FlushFileBuffers(fh) != 0;
+            ok = ok && flushFile(fh);
             ok = ok && writeAt(fh, j->hdr1.get(), header_bytes, 0);
             j->written += header_bytes;
             if (ok) {
                 LARGE_INTEGER dist;
                 dist.QuadPart = static_cast<LONGLONG>(j->file_bytes);
                 LARGE_INTEGER np;
-                if (SetFilePointerEx(fh, dist, &np, FILE_BEGIN) != 0) SetEndOfFile(fh);
-                ok = FlushFileBuffers(fh) != 0;
+                if (!simDead() && SetFilePointerEx(fh, dist, &np, FILE_BEGIN) != 0) SetEndOfFile(fh);
+                ok = flushFile(fh);
             }
             CloseHandle(fh);
         }
         if (!ok) {
-            DeleteFileW(j->path.c_str());
+            if (!simDead()) DeleteFileW(j->path.c_str());
             j->failed.store(true, std::memory_order_release);
         }
         j->finished.store(true, std::memory_order_release);

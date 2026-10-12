@@ -2954,6 +2954,175 @@ static void testWriteAmplification(MockDeviceOps& ops, const fs::path& dir) {
     CHECK(coalesced <= final_logical + final_logical / 10);  // stride padding only
     CHECK(per_turn > 2 * coalesced);
 }
+
+// A drive with a volatile write cache, for power-loss fault injection (FIX-HDR0). Writes stay in
+// the "cache" until a flush barrier puts them on the media in order. The power fails at write
+// number crash_at: that write and every later one are lost, and of the writes still cached the
+// adversarial subset reaches the media: those at or past persist_from (the data region), none
+// before it (header, token ids, block table). That is a legal outcome for a drive that reorders
+// unflushed writes, and the worst one for an in-place rewrite.
+class PowerLossSim final : public WriteSim {
+public:
+    int crash_at = 0;  // 1-based; 0: the power never fails
+    std::uint64_t persist_from = 0;
+    int writes = 0, flushes = 0;
+    ~PowerLossSim() override { drop(); }
+    bool write(void* fh, const std::uint8_t* buf, std::uint64_t len, std::uint64_t off) override {
+        if (dead_) return true;  // lost with the power (the dying process never learns)
+        if (++writes == crash_at) {
+            powerFail();
+            return true;
+        }
+        auto* p = static_cast<std::uint8_t*>(_aligned_malloc(static_cast<std::size_t>(len), 4096));
+        std::memcpy(p, buf, static_cast<std::size_t>(len));
+        pending_.push_back(Pending{fh, off, len, p});
+        return true;
+    }
+    bool flush(void* fh) override {
+        if (dead_) return true;
+        flushes += 1;
+        bool ok = true;
+        for (const Pending& p : pending_) ok = realWrite(p) && ok;
+        drop();
+        return ok && FlushFileBuffers(static_cast<HANDLE>(fh)) != 0;
+    }
+    bool dead() const override { return dead_; }
+
+private:
+    struct Pending {
+        void* fh;
+        std::uint64_t off, len;
+        std::uint8_t* buf;
+    };
+    std::vector<Pending> pending_;
+    bool dead_ = false;
+    static bool realWrite(const Pending& p) {
+        OVERLAPPED ov{};
+        ov.Offset = static_cast<DWORD>(p.off);
+        ov.OffsetHigh = static_cast<DWORD>(p.off >> 32);
+        DWORD w = 0;
+        return WriteFile(static_cast<HANDLE>(p.fh), p.buf, static_cast<DWORD>(p.len), &w, &ov) != 0 && w == p.len;
+    }
+    void powerFail() {
+        for (const Pending& p : pending_)
+            if (p.off >= persist_from) realWrite(p);
+        drop();
+        dead_ = true;
+    }
+    void drop() {
+        for (const Pending& p : pending_) _aligned_free(p.buf);
+        pending_.clear();
+    }
+};
+
+// Power loss at every write of (a) an in-place rewrite of a valid file and (b) a fresh file's
+// first write: the next start must never restore bytes the file's header does not describe
+// (the old version or a cold miss; the new version only when nothing was lost). Before
+// FIX-HDR0, (a) kept the old valid header over half-new data and restored wrong KV.
+static void testPowerLoss(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    SsdEnv env{dir};
+    int crash_runs = 0, wrong = 0, cold = 0, old_ok = 0;
+    for (int n = 1; n < 64; ++n) {
+        fs::remove_all(dir, ec);
+        std::uint64_t seed = 3100;
+        Sess a1(ops, 24), a2(ops, 24);
+        a1.toks = freshToks(3000, seed);
+        std::uint64_t id = 0;
+        PowerLossSim sim;
+        sim.crash_at = n;
+        sim.persist_from = kLay.dataOff();
+        {
+            auto t = Tier::create(ops, 256ull << 20, 31, 0);
+            t->start(env.cfg(4ull << 30), kLay, 78);
+            spillSess(*t, a1, 0);
+            CHECK(tickIdle(*t));
+            CHECK(a1.e != nullptr && a1.e->ssd.has_value());
+            id = a1.id;
+            // regenerate from token 1000, in place (same entry, same file)
+            a2.toks = a1.toks;
+            a2.toks.resize(1000);
+            auto tail = freshToks(2200, seed);
+            a2.toks.insert(a2.toks.end(), tail.begin(), tail.end());
+            a2.id = a1.id;
+            a2.seq = a1.seq;
+            a2.fillFrom(0);
+            g_write_sim.store(&sim);
+            CHECK(!spillSess(*t, a2, 1000));
+            CHECK(tickIdle(*t));
+            if (!sim.dead()) g_write_sim.store(nullptr);
+            t.reset();  // the process is gone (a dead sim keeps the files untouched)
+            g_write_sim.store(nullptr);
+        }
+        const bool crashed = sim.dead();
+        {
+            auto t = Tier::create(ops, 256ull << 20, 32, 0);
+            t->start(env.cfg(4ull << 30), kLay, 78);
+            Entry* e = t->find(id);
+            if (e == nullptr) {
+                cold += 1;
+            } else if (e->n_tok == a1.toks.size() && restoreMatches(*t, ops, e, a1)) {
+                old_ok += 1;
+            } else if (!crashed && e->n_tok == a2.toks.size() && restoreMatches(*t, ops, e, a2)) {
+            } else {
+                wrong += 1;
+                std::printf("  in-place rewrite, power lost at write %d: restored bytes are wrong\n", n);
+            }
+            CHECK(!crashed || e == nullptr || e->n_tok == a1.toks.size());
+            CHECK(tickIdle(*t));
+        }
+        if (!crashed) {
+            CHECK(n > 3 && sim.flushes >= 2);  // ran to the end: the rewrite took n - 1 writes
+            break;
+        }
+        crash_runs += 1;
+    }
+    std::printf("  in-place: %d crash points, cold %d, old version %d, wrong %d\n", crash_runs, cold, old_ok, wrong);
+    CHECK(crash_runs >= 4);
+    CHECK(wrong == 0);
+    // (b) a fresh file: nothing to restore until the whole file is on the media
+    int fresh_runs = 0, fresh_bad = 0;
+    for (int n = 1; n < 64; ++n) {
+        fs::remove_all(dir, ec);
+        std::uint64_t seed = 3200;
+        Sess b(ops, 24);
+        b.toks = freshToks(2500, seed);
+        std::uint64_t id = 0;
+        PowerLossSim sim;
+        sim.crash_at = n;
+        sim.persist_from = kLay.dataOff();
+        {
+            auto t = Tier::create(ops, 256ull << 20, 33, 0);
+            t->start(env.cfg(4ull << 30), kLay, 78);
+            g_write_sim.store(&sim);
+            CHECK(spillSess(*t, b, 0));
+            id = b.id;
+            CHECK(tickIdle(*t));
+            if (!sim.dead()) g_write_sim.store(nullptr);
+            t.reset();
+            g_write_sim.store(nullptr);
+        }
+        const bool crashed = sim.dead();
+        {
+            auto t = Tier::create(ops, 256ull << 20, 34, 0);
+            t->start(env.cfg(4ull << 30), kLay, 78);
+            Entry* e = t->find(id);
+            if (crashed && e != nullptr) {
+                fresh_bad += 1;
+                std::printf("  fresh file, power lost at write %d: entry restored\n", n);
+            }
+            if (!crashed) CHECK(e != nullptr && restoreMatches(*t, ops, e, b));
+            CHECK(tickIdle(*t));
+        }
+        if (!crashed) break;
+        fresh_runs += 1;
+    }
+    std::printf("  fresh: %d crash points, restored %d\n", fresh_runs, fresh_bad);
+    CHECK(fresh_runs >= 3);
+    CHECK(fresh_bad == 0);
+    fs::remove_all(dir, ec);
+}
+
 // WHIRL_TIER_ONLY=<test name>: run only that test (regression proofs)
 static bool want(const char* name) {
     const char* only = std::getenv("WHIRL_TIER_ONLY");
@@ -3104,6 +3273,10 @@ int main(int argc, char** argv) {
     if (want("testWriteAmplification")) {
         std::printf("-- %s\n", "testWriteAmplification");
         testWriteAmplification(ops, dir);
+    }
+    if (want("testPowerLoss")) {
+        std::printf("-- %s\n", "testPowerLoss");
+        testPowerLoss(ops, dir);
     }
     std::printf("tier tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
