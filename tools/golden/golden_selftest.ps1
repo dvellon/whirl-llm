@@ -7,6 +7,7 @@
 #   - a run with only "G header" + "G info" (no step lines): exit 2, against any reference
 #   - a reference with only model + header + info lines: exit 2 (it has no step lines)
 #   - a record run where one case fails: exit 2 and no reference / models.txt is written
+#   - record without a KL gate report, with one for another exe, or with a failing one: exit 2, nothing written
 $ErrorActionPreference = "Stop"
 $gate = Join-Path $PSScriptRoot "golden.ps1"
 $fake = Join-Path $PSScriptRoot "fake_whirl.cmd"
@@ -18,12 +19,22 @@ $savedDense = $env:WHIRL_GOLDEN_DENSE
 $env:WHIRL_GOLDEN_DENSE = $model
 $bad = 0
 
-function RunGate([string]$action, [string]$root, [hashtable]$fakeEnv) {
+# a passing KL gate report for the fake exe (tools/klgate/klgate.py --report format)
+function KlRep([string]$name, [bool]$pass, [string]$sha) {
+    $p = Join-Path $tmp $name
+    @{ exe_sha256 = $sha; device = "default"; pass = $pass; summary = "selftest"; modes = @("balance", "fast")
+       lengths = @(8192, 32768, 98304, 131072); models = @{ dense = "fake-model.gguf" } } | ConvertTo-Json -Depth 4 | Set-Content $p
+    return $p
+}
+$fakeSha = (Get-FileHash -Algorithm SHA256 $fake).Hash.ToLower()
+$klGood = KlRep "kl_good.json" $true $fakeSha
+function RunGate([string]$action, [string]$root, [hashtable]$fakeEnv, [string]$kl = $klGood) {
     foreach ($k in @("FAKEGOLD_FAIL_SUITE", "FAKEGOLD_NOSTEPS")) { [Environment]::SetEnvironmentVariable($k, $null) }
     foreach ($k in $fakeEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $fakeEnv[$k]) }
     $env:WHIRL_GOLDEN_DENSE = $model
+    $klArg = if ($kl) { @("-KlReport", $kl) } else { @() }
     $out = & pwsh -NoProfile -File $gate $action -Models dense -Modes precise -Suites "single,pair" -Exe $fake `
-        -GoldenRoot $root -Out (Join-Path $tmp "out") 2>&1 | ForEach-Object { "$_" }
+        -GoldenRoot $root -Out (Join-Path $tmp "out") @klArg 2>&1 | ForEach-Object { "$_" }
     $rc = $LASTEXITCODE
     foreach ($k in @("FAKEGOLD_FAIL_SUITE", "FAKEGOLD_NOSTEPS")) { [Environment]::SetEnvironmentVariable($k, $null) }
     return @{ rc = $rc; out = $out }
@@ -57,6 +68,14 @@ try {
     $r = RunGate "record" $g2 @{ FAKEGOLD_FAIL_SUITE = "pair" }
     Expect "record with a failing case writes no reference and no models.txt" $r 2 {
         -not (Test-Path (Join-Path $g2 "gfx1201\dense\precise_single.txt")) -and -not (Test-Path (Join-Path $g2 "models.txt")) }
+    # 5) record without a passing KL gate report for this exe: refused, nothing written
+    $cases = @(@("no report", ""), @("report of another exe", (KlRep "kl_other.json" $true ("0" * 64))),
+               @("failing report", (KlRep "kl_fail.json" $false $fakeSha)))
+    foreach ($c in $cases) {
+        $g3 = Join-Path $tmp ("g3_" + ($c[0] -replace " ", "_"))
+        $r = RunGate "record" $g3 @{} $c[1]
+        Expect "record with $($c[0]) is refused and writes nothing" $r 2 { -not (Test-Path (Join-Path $g3 "gfx1201\dense\precise_single.txt")) }
+    }
 } finally {
     $env:WHIRL_GOLDEN_DENSE = $savedDense
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

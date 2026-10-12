@@ -1141,6 +1141,66 @@ void testTailCkOnSchedule() {
     }
 }
 
+// FIX-TEST-B: the shared cold prefill schedule (include/whirl/prefill_schedule.h, used by the engine
+// and by whirl seqtest's GPU gate). Every forward the engine can run ends at a schedule point, a
+// resume point is a schedule point, the tail checkpoint is 257..1280 rows before the end, and no
+// forward crosses a kept checkpoint.
+void testPrefillSchedule() {
+    using namespace whirl::sched;
+    const std::span<const std::uint32_t> noimg;
+    std::uint64_t forwards = 0;
+    for (std::size_t n : {1u, 64u, 1023u, 1024u, 1280u, 1281u, 2048u, 2304u, 2305u, 4000u, 4096u, 8232u, 9500u, 30001u, 131072u}) {
+        for (std::size_t sys : {0u, 2500u}) {
+            for (std::size_t th : {std::size_t{0}, n > 1 ? n - 1 : 0}) {
+                if (sys >= n) continue;
+                std::vector<std::size_t> pts;  // schedule points (chunk starts) + n
+                for (std::size_t pos = 0; pos < n;) {
+                    pts.push_back(pos);
+                    const std::size_t len = prefillChunkLen(schedNext(n, sys, th, noimg, pos) - pos);
+                    CHECK(len >= 1 && len <= prefill_chunk + prefill_merge);
+                    pos += len;
+                }
+                pts.push_back(n);
+                for (std::size_t a = 0; a <= n; a += (n > 5000 ? 509 : 1)) {
+                    const bool on = std::find(pts.begin(), pts.end(), a) != pts.end();
+                    if (on != onSchedule(n, sys, th, noimg, a) || (a < n && schedFloor(n, sys, th, noimg, a) > a)) {
+                        CHECK(false);
+                        break;
+                    }
+                }
+                for (std::size_t p : pts) CHECK(onSchedule(n, sys, th, noimg, p));
+                const std::size_t tail = tailPoint(n, sys, th, noimg);
+                CHECK(onSchedule(n, sys, th, noimg, tail) && tail < n);
+                if (n >= 4096 && th == 0) CHECK(n - tail >= prefill_merge + 1 && n - tail <= prefill_chunk + prefill_merge);
+                for (std::size_t exec : {std::size_t{1024}, std::size_t{2048}, std::size_t{3072}}) {
+                    for (std::size_t from : {std::size_t{0}, pts[pts.size() / 2], tail}) {
+                        if (from >= n) continue;
+                        const std::array<std::size_t, 2> stops = {tail, pts[pts.size() / 3]};
+                        const std::vector<std::size_t> e = forwardEnds(n, sys, th, noimg, from, exec, stops);
+                        CHECK(!e.empty() && e.back() == n);
+                        std::size_t prev = from;
+                        for (std::size_t x : e) {
+                            forwards += 1;
+                            CHECK(x > prev && x - prev <= std::max(exec, prefill_chunk) + prefill_merge);
+                            CHECK(onSchedule(n, sys, th, noimg, x));
+                            for (std::size_t st : stops) CHECK(!(st > prev && st < x));  // never across a kept checkpoint
+                            if (sys > prev && sys < x) CHECK(false);                      // nor across a forced split
+                            prev = x;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CHECK(forwards > 1000);
+    // no forced splits: chunk starts are the multiples of 1024 below the last chunk
+    CHECK(onSchedule(9500, 0, 0, noimg, 8192) && !onSchedule(9500, 0, 0, noimg, 8192 + 64) && tailPoint(9500, 0, 0, noimg) == 9216);
+    CHECK(tailPoint(8232, 0, 0, noimg) == 7168);  // 8232 = 7168 + 1064: the tail merges, 8192 is not a chunk start
+    CHECK(!onSchedule(8232, 0, 0, noimg, 8192));
+    CHECK_EQ(prefillExecFor(2048, 4096), std::size_t{2048});
+    CHECK_EQ(prefillExecFor(16384, 4096), std::size_t{3072});
+}
+
 // TAIL-CK regression: run a request sequence with the tail checkpoint on and off (same server
 // settings otherwise); every answer equals the greedy reference.
 struct TailRun {
@@ -3115,6 +3175,7 @@ int main(int argc, char** argv) {
         {"dflash_trim_ring", testDFlashTrimRing},
         {"doc_qa", testDocQa},
         {"tail_ck_sched", testTailCkOnSchedule},
+        {"prefill_sched", testPrefillSchedule},
         {"tail_ck_regress", testTailCkRegression},
         {"concurrency", [] { testConcurrency(4, 12, true); }},
         {"concurrency16", [] { testConcurrency(16, 24, true); }},

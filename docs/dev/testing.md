@@ -72,8 +72,9 @@ about 3 minutes. The Radeon 8060S takes about the same (8-30 s a run). A subset 
 mode) takes about 30 s.
 
 `--fast` has its own items (q4 KV, relaxacc on dense models with an MTP head), so the fast
-files differ from the balance files wherever those items apply (re-record them only together with a
-KL check of the fast items).
+files differ from the balance files wherever those items apply. `golden.ps1 record` refuses to write
+any reference without a passing KL gate report of the same executable (`-KlReport`, see
+[KL gate](#kl-gate) below).
 
 ### Rules
 
@@ -84,6 +85,54 @@ KL check of the fast items).
   `golden update: <reason>`. Otherwise the gate stops meaning anything.
 - Run the check three times after recording on a new machine or driver to confirm the run is
   deterministic there.
+- **No re-record without the KL gate.** Before any `golden.ps1 record` (every mode: a precise change
+  moves the reference the other modes are measured against), run `tools/klgate/klgate.py` with the
+  same `whirl.exe` on the same GPU family, for every model being recorded, and pass its report as
+  `-KlReport`. record checks the report (pass, exe SHA-256, device, models, modes balance + fast,
+  lengths 8k / 32k / 96k / 128k) and otherwise writes nothing (exit 2). The report goes into the
+  commit message's `golden update:` note (one line per model: worst KL / top-1 per mode).
+
+## <a id="kl-gate"></a>KL gate
+
+`tools/klgate/klgate.py` measures what the golden hashes cannot: how far balance and fast are from
+precise. For every model x prompt x mode one `whirl chat` run prefills a fixed prompt (raw, no MTP)
+and dumps the teacher-forced logits of the 128 positions before 8,192 / 32,768 / 98,304 / 131,072
+tokens (`WHIRL_DUMP_LOGITS` + `WHIRL_DUMP_AT`, 16-row forwards; the zh prompt has 129,297 tokens, so
+its last window ends there). Per window it takes the mean KL(precise || mode) and the top-1
+agreement with precise; the limits are the published ones:
+
+| Mode | KL mean (per 128-row window) | top-1 agreement |
+|---|---|---|
+| balance | <= 0.005 | >= 98% |
+| fast | <= 0.03 | >= 93% |
+
+Exit 0 only when every case ran and passed; 1 when a limit failed; 2 on a failed run, a missing or
+changed corpus file (`tools/klgate/corpus.sha256`), a too-short prompt or 0 cases. The corpus is two
+fixed texts: `code.txt` (C++ / HIP source with Chinese design notes, 131,478 tokens) and `zh.txt`
+(Chinese prose with some code); the workstation copy is `C:\ClaudeWorkspace\whirl-work\klgate\corpus`.
+
+```
+python tools/klgate/klgate.py --exe build\Release\whirl.exe --corpus <corpus dir> ^
+    --model dense=<Qwen3.8-27B-UD-Q4_K_M.gguf> --model moe=<Ornith-1.5-35B-A3B-MXFP4.gguf> ^
+    [--device 8060s] --report kl_<arch>.json
+```
+
+R9700: 12 runs (2 models x 2 prompts x precise / balance / fast), about 25 minutes; take the R9700
+lock around the whole run. 8060S: pass `--wrap "python <gpu_lock.py> --max-min 30 --"` so each run
+takes the shared lock on its own. Required: before any golden re-record (above), after a change to
+a numerics item or a default KV format, and before an rc merge / release on both GPUs.
+
+## <a id="chunks"></a>Chunk schedule gate (`whirl seqtest`)
+
+`whirl seqtest` (part of its `ok`) runs a golden long prompt of 9,500 tokens through the server's
+cold prefill schedule (`include/whirl/prefill_schedule.h`, the same functions the engine uses) and
+requires the same last-row logits bits from every execution the server can choose: forwards of 1 or
+more whole 1024-row chunks (decode floor, `WHIRL_PREFILL_CHUNK`, `WHIRL_PREFILL_BATCH`), with or
+without the TAIL-CK tail checkpoint, and resumed from a checkpoint at a schedule point (the tail, a
+prefix checkpoint). Splits off the schedule and the CLI's own chunking are printed as `info:` lines
+and do not fail the gate (they are not guaranteed; see kv-and-caching.md section 7). Run it in each
+mode (`--precise`, default balance, `--fast`) on dense and MoE; it needs the default `--slot-ctx`
+(12288) or larger. CPU side: whirl-server-tests `prefill_sched` checks the schedule functions.
 
 ## Change → required tests
 
@@ -110,7 +159,9 @@ unit tests and block tests. Until they exist, run G0 for those changes.
 | weights/loader (quant formats, repack) | whirl-model-tests, kernel test quant/moemx, G0 | yes | yes |
 | tune (tuning tables/candidates) | G0 (tuning only picks bit-identical candidates, so the hashes must not change) + check.ps1 speed | yes | only the affected arch |
 | platform layer | whirl-server-tests, tier-tests, server-gate basic+tier | yes (basic) | no |
-| before a release / rc merge | run_gates.ps1, the full set on both GPUs | yes | **yes** |
+| numerics item / default KV format / anything that changes balance or fast output | the rows above + KL gate (tools/klgate) | yes | **yes** |
+| prefill schedule (`prefill_schedule.h`, engine chunking, checkpoint positions) | whirl-server-tests (prefill_sched, tail_ck_*) + seqtest in precise / balance / fast, dense and MoE | yes | R9700; 8060S at merge time |
+| before a release / rc merge | run_gates.ps1, the full set on both GPUs, including the KL gate and seqtest (precise / balance / fast, dense and MoE) | yes | **yes** |
 
 **Cases that still need the full R9700 + 8060S set:** a kernels_abi change, a change to the
 default ExecFlags or the default KV format, a change to what a precision or numerics mode means,

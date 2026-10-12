@@ -1,0 +1,6 @@
+# klgate fixed corpus (SHA-256, file name in --corpus DIR). Changing a file changes every KL number:
+# replace a line only together with a full re-run on both GPUs, noted in the CHANGELOG.
+# code.txt: C++ / HIP source with Chinese design notes (en code), 131,478 tokens (Qwen3.8 tokenizer)
+# zh.txt:   Chinese prose docs with some code, 129,297 tokens
+255faee3107b35125c509b675ffdd47a4385576cea80a1cf67b93aa7e56fbcdc code.txt
+0092e27009f1a3c10b93cfe8eba15fb4698404324aca0156887cdf021ee5cc10 zh.txt

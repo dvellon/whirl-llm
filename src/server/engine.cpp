@@ -612,21 +612,13 @@ std::uint32_t Engine::sysSplit(std::span<const std::uint32_t> toks) const {
 }
 
 std::size_t Engine::schedNext(std::size_t n, std::size_t sys, std::size_t think, std::size_t pos) {
-    if (sys > pos) return sys;
-    if (think > pos) return think;
-    return n;
+    return sched::schedNext(n, sys, think, {}, pos);
 }
 
 // vision: schedNext with the prompt's image-end splits (imgs sorted; empty for text)
 std::size_t Engine::schedNextV(std::size_t n, std::size_t sys, std::size_t think, std::span<const std::uint32_t> imgs,
                                std::size_t pos) {
-    std::size_t nx = schedNext(n, sys, think, pos);
-    for (std::uint32_t b : imgs)
-        if (b > pos) {
-            nx = std::min<std::size_t>(nx, b);
-            break;
-        }
-    return nx;
+    return sched::schedNext(n, sys, think, imgs, pos);
 }
 
 // vision: the image-end splits of toks (position after the <|vision_end|> that follows a
@@ -651,20 +643,13 @@ std::vector<std::uint32_t> Engine::imgSplits(std::span<const std::uint32_t> toks
 }
 
 std::size_t Engine::schedFloor(std::span<const std::uint32_t> toks, std::size_t lim) const {
-    const std::size_t sys = sysSplit(toks);
-    const std::size_t th = ct_.thinkOpenSplit(toks);
     const std::vector<std::uint32_t> imgs = imgSplits(toks);
-    std::size_t pos = 0, last = 0;
-    while (pos < toks.size() && pos <= lim) {
-        last = pos;
-        pos += prefillChunkLen(schedNextV(toks.size(), sys, th, imgs, pos) - pos);
-    }
-    if (pos <= lim) last = pos;
-    return last;
+    return sched::schedFloor(toks.size(), sysSplit(toks), ct_.thinkOpenSplit(toks), imgs, lim);
 }
 
 bool Engine::onSchedule(std::span<const std::uint32_t> toks, std::size_t a) const {
-    return a == 0 || schedFloor(toks, a) == a;
+    const std::vector<std::uint32_t> imgs = imgSplits(toks);
+    return sched::onSchedule(toks.size(), sysSplit(toks), ct_.thinkOpenSplit(toks), imgs, a);
 }
 
 Spe* Engine::speMatch(std::span<const std::uint32_t> toks) {
@@ -1355,7 +1340,8 @@ bool Engine::startJob(Slot& sl, Job& job) {
         // enough slots that prompt-end / gen-end stay (EngineOptions::tail_ck, tail_ck_slots).
         sl.tail_ck = 0;
         if (opt_.tail_ck && sl.on_sched && sl.ckpts.size() >= tail_ck_slots && N >= opt_.tail_ck_min) {
-            const std::uint32_t t = static_cast<std::uint32_t>(schedFloor(toks, N - 1));
+            const std::vector<std::uint32_t> imgs = imgSplits(toks);
+            const std::uint32_t t = static_cast<std::uint32_t>(sched::tailPoint(N, sysSplit(toks), ct_.thinkOpenSplit(toks), imgs));
             if (t > mt.reuse && t != sl.sys_split && t != sl.lcp_ck && t != sl.img_ck && t != sl.pf_split) {
                 sl.tail_ck = t;
                 logI("req {} | slot {} | keeping a tail checkpoint @{} ({} tokens before the prompt end)", job.id, sl.id, t, N - t);
@@ -1408,24 +1394,19 @@ bool Engine::startJob(Slot& sl, Job& job) {
 
 std::size_t Engine::chunkLen(const Slot& sl) const {
     const std::size_t cur = sl.reuse + sl.pf_off;
-    const std::size_t lim = schedNextV(sl.job->tokens.size(), sl.sys_split, sl.pf_split, imgSplits(sl.job->tokens), cur);
-    std::size_t n = prefillChunkLen(lim - cur);
-    if (opt_.prefill_exec <= prefill_chunk) return n;
+    const std::vector<std::uint32_t> imgs = imgSplits(sl.job->tokens);
+    const std::size_t N = sl.job->tokens.size();
     // With the decode floor on, any decoding slot keeps forwards at one chunk, also
     // an unprotected one of the same burst: next to a long prompt a 2048-row forward
     // doubled its stall (96k: 1.2 -> 3.3 s, ~1.5 tok/s) for ~4% faster prefill.
     // With the floor off (--decode-min-tps 0, throughput first) chunks merge anyway.
-    if (floor_.on())
+    std::size_t exec = opt_.prefill_exec;
+    if (exec > prefill_chunk && floor_.on())
         for (const Slot& o : slots_)
-            if (&o != &sl && o.phase == Phase::decode) return n;
-    while (cur + n < lim) {
-        if (sl.lcp_ck > 0 && cur + n == sl.lcp_ck) break;  // a shared-prefix checkpoint is kept there
-        if (sl.tail_ck > 0 && cur + n == sl.tail_ck) break;  // TAIL-CK: the tail checkpoint is kept there
-        const std::size_t nx = prefillChunkLen(lim - cur - n);
-        if (n + nx > opt_.prefill_exec + prefill_merge) break;
-        n += nx;
-    }
-    return n;
+            if (&o != &sl && o.phase == Phase::decode) exec = prefill_chunk;
+    // a shared-prefix checkpoint / the TAIL-CK tail checkpoint is kept there: no forward crosses it
+    const std::array<std::size_t, 2> stops = {sl.lcp_ck, sl.tail_ck};
+    return sched::execLen(N, sl.sys_split, sl.pf_split, imgs, cur, exec, stops);
 }
 
 void Engine::maybeSplitCkpt(Slot& sl, DevPtr hid_row) {

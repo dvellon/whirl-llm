@@ -18,6 +18,7 @@
 #include "whirl/chat.h"
 #include "whirl/json.h"
 #include "whirl/model.h"
+#include "whirl/prefill_schedule.h"
 #include "whirl/tokenizer.h"
 
 #include <array>
@@ -48,23 +49,14 @@ constexpr std::uint32_t max_small_batch = qwen35::max_small_batch;
 constexpr std::uint32_t k_small = 256;
 constexpr std::uint32_t k_big = 16384;
 constexpr std::uint32_t max_rows = qwen35::max_verify_rows;
-constexpr std::size_t prefill_chunk = 1024;
-constexpr std::size_t prefill_merge = 256;
+// the cold prefill schedule (shared with whirl seqtest's gate: include/whirl/prefill_schedule.h)
+using sched::prefill_chunk;
+using sched::prefill_merge;
 // TAIL-CK: per-slot checkpoints needed for the tail checkpoint (tail + prompt-end + gen-end); with
 // fewer, a tail would evict what a regenerate or the next chat turn resumes from, so none is taken
 constexpr std::size_t tail_ck_slots = cache::ckpt_keep_prefix_min;
-
-inline std::size_t prefillChunkLen(std::size_t remaining) {
-    return remaining <= prefill_chunk + prefill_merge ? remaining : prefill_chunk;
-}
-
-// EngineOptions::prefill_exec for a prefill batch: whole schedule chunks, and a forward (+ the merged
-// tail) must fit the batch; never below one chunk (the batch is >= prefill_chunk + prefill_merge,
-// vram::min_prefill_batch). `requested`: WHIRL_PREFILL_CHUNK, default 2048.
-inline std::size_t prefillExecFor(std::size_t requested, std::uint32_t max_batch) {
-    const std::size_t mb = max_batch > prefill_merge ? max_batch - prefill_merge : 0;
-    return std::max(prefill_chunk, std::min(requested / prefill_chunk * prefill_chunk, mb / prefill_chunk * prefill_chunk));
-}
+using sched::prefillChunkLen;
+using sched::prefillExecFor;
 
 // Connection writer (buffered; errors make it "gone").
 class Conn {

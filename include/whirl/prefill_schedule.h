@@ -1,0 +1,99 @@
+// The server's cold prefill schedule as pure functions (FIX-TEST-B): the server engine and
+// `whirl seqtest` use the same code, so the seqtest gate checks the schedule the server really runs.
+//
+// Schedule: chunks of prefill_chunk (1024) rows from position 0; a remainder of up to
+// prefill_chunk + prefill_merge (1280) rows is one chunk (no short tail); forced splits (system
+// boundary, think-open split, image ends) restart the chunking there. Checkpoints are kept, and
+// reused, only at schedule points (chunk starts). Execution: consecutive whole chunks run as one
+// forward of up to `exec` rows (+ a merged tail), never across a kept checkpoint.
+//
+// What holds (measured, docs/guide/en/kv-and-caching.md section 7): splitting a prefill into
+// several forwards at schedule points gives the same logits bits as fewer, larger forwards over the
+// same schedule; resuming from a checkpoint at a schedule point is such a split.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <vector>
+
+namespace whirl::sched {
+
+inline constexpr std::size_t prefill_chunk = 1024;
+inline constexpr std::size_t prefill_merge = 256;
+
+inline std::size_t prefillChunkLen(std::size_t remaining) {
+    return remaining <= prefill_chunk + prefill_merge ? remaining : prefill_chunk;
+}
+
+// EngineOptions::prefill_exec for a prefill batch: whole schedule chunks, and a forward (+ the merged
+// tail) must fit the batch; never below one chunk (the batch is >= prefill_chunk + prefill_merge,
+// vram::min_prefill_batch). `requested`: WHIRL_PREFILL_CHUNK, default 2048.
+inline std::size_t prefillExecFor(std::size_t requested, std::uint32_t max_batch) {
+    const std::size_t mb = max_batch > prefill_merge ? max_batch - prefill_merge : 0;
+    return std::max(prefill_chunk, std::min(requested / prefill_chunk * prefill_chunk, mb / prefill_chunk * prefill_chunk));
+}
+
+// next forced split after pos: the system boundary, then the think-open split, then the first image
+// end (imgs sorted), else n (0 = none)
+inline std::size_t schedNext(std::size_t n, std::size_t sys, std::size_t think, std::span<const std::uint32_t> imgs, std::size_t pos) {
+    std::size_t nx = sys > pos ? sys : think > pos ? think : n;
+    for (std::uint32_t b : imgs)
+        if (b > pos) {
+            nx = std::min<std::size_t>(nx, b);
+            break;
+        }
+    return nx;
+}
+
+// the last schedule point <= lim (0 if none)
+inline std::size_t schedFloor(std::size_t n, std::size_t sys, std::size_t think, std::span<const std::uint32_t> imgs, std::size_t lim) {
+    std::size_t pos = 0, last = 0;
+    while (pos < n && pos <= lim) {
+        last = pos;
+        pos += prefillChunkLen(schedNext(n, sys, think, imgs, pos) - pos);
+    }
+    if (pos <= lim) last = pos;
+    return last;
+}
+
+inline bool onSchedule(std::size_t n, std::size_t sys, std::size_t think, std::span<const std::uint32_t> imgs, std::size_t a) {
+    return a == 0 || schedFloor(n, sys, think, imgs, a) == a;
+}
+
+// TAIL-CK: the tail checkpoint position, the start of the prompt's last schedule chunk
+inline std::size_t tailPoint(std::size_t n, std::size_t sys, std::size_t think, std::span<const std::uint32_t> imgs) {
+    return n == 0 ? 0 : schedFloor(n, sys, think, imgs, n - 1);
+}
+
+// rows of the forward that starts at cur: whole chunks up to exec (+ merged tail), not past the next
+// forced split, never across a stop (a kept checkpoint); exec <= prefill_chunk = one chunk per forward
+inline std::size_t execLen(std::size_t n, std::size_t sys, std::size_t think, std::span<const std::uint32_t> imgs, std::size_t cur,
+                           std::size_t exec, std::span<const std::size_t> stops) {
+    const std::size_t lim = schedNext(n, sys, think, imgs, cur);
+    std::size_t len = prefillChunkLen(lim - cur);
+    if (exec <= prefill_chunk) return len;
+    while (cur + len < lim) {
+        if (std::find(stops.begin(), stops.end(), cur + len) != stops.end()) break;
+        const std::size_t nx = prefillChunkLen(lim - cur - len);
+        if (len + nx > exec + prefill_merge) break;
+        len += nx;
+    }
+    return len;
+}
+
+// the forward ends of a prefill of n tokens that starts (or resumes) at `from` (a schedule point)
+inline std::vector<std::size_t> forwardEnds(std::size_t n, std::size_t sys, std::size_t think, std::span<const std::uint32_t> imgs,
+                                            std::size_t from, std::size_t exec, std::span<const std::size_t> stops) {
+    std::vector<std::size_t> ends;
+    for (std::size_t cur = from; cur < n;) {
+        cur += execLen(n, sys, think, imgs, cur, exec, stops);
+        ends.push_back(cur);
+    }
+    return ends;
+}
+
+}  // namespace whirl::sched
