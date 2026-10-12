@@ -29,8 +29,11 @@
 // chained). Dropping an owner's SSD copy (LRU, rewrite of a referenced block,
 // removal) first drops every entry referencing it; at startup a reference
 // whose owner is missing or hashes differently drops the referencing file.
-// A file is never restored unless all its blocks verify, so the worst case of
-// any cache fault is a miss (re-prefill), never wrong KV bytes.
+// Startup checks a file's header, size, token checksum and block references
+// (owner present, same hash); with the crash-safe write protocol below, a crash,
+// power loss, truncation or stale file is a miss (re-prefill), never wrong KV
+// bytes. The KV / checkpoint data is not checksummed on read: silent corruption
+// inside a file (bit rot, a failing disk) is not detected.
 //
 // Threading: the main (engine) thread owns all entry bookkeeping and calls
 // every Tier method; the IO thread only moves file bytes and reports progress
