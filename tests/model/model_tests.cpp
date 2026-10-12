@@ -639,6 +639,19 @@ GgufImage dflashImage(std::uint32_t embd, std::uint32_t vocab, bool mask = true,
     return g;
 }
 
+// FIX-K97 (FR-K97 P2-3): gemmr_moe* step k by 64 with no tail; the host gate (Model::moeGuR) refuses other E / F
+void testGemmrMoeShape() {
+    namespace wk = whirl::kernels;
+    check(wk::kGemmrMoeBk == 64, "gemmr_moe shape: k step 64");
+    check(wk::gemmrMoeShapeOk(2048, 512), "gemmr_moe shape: Ornith 35B-A3B (E 2048, F 512) accepted");
+    check(wk::gemmrMoeShapeOk(64, 64), "gemmr_moe shape: one k step accepted");
+    check(!wk::gemmrMoeShapeOk(2048 + 32, 512), "gemmr_moe shape: E % 64 = 32 refused");
+    check(!wk::gemmrMoeShapeOk(2048, 512 + 32), "gemmr_moe shape: F % 64 = 32 refused (down BK 64)");
+    check(!wk::gemmrMoeShapeOk(2048, 520), "gemmr_moe shape: F % 64 = 8 refused");
+    check(!wk::gemmrMoeShapeOk(0, 512) && !wk::gemmrMoeShapeOk(2048, 0), "gemmr_moe shape: empty refused");
+    static_assert(wk::gemmrMoeShapeOk(4096, 1536), "constexpr");
+}
+
 void testDFlashConfig() {
     q::Config t;
     t.n_embd = 64;
@@ -1302,6 +1315,7 @@ int main() {
     testDraftVocab();
     testDraftWindowArg();
     testDFlashConfig();
+    testGemmrMoeShape();
     testDFlashCompat();
     testCycleCost();
     testSlotAccept();

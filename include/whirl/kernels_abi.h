@@ -206,6 +206,12 @@ inline constexpr int kDFlashAttnKeys = 2304;  // DF_MAXK: keys (context ring + b
 inline constexpr int kDFlashMaxKeys = 65536;  // host limit on ring + block for dflash_attn_long (ring VRAM, int indexing)
 inline constexpr int kGemm3Bm = 256, kGemm3Bn = 256, kGemm3Threads = 512;  // GEMM3_*
 inline constexpr int kMoeBm = 128, kMoeBn = 64;                            // MOE_BM, gemm_moe_* token tile
+// gemmr_moe* (gfx1201 precise MoE prefill) step k by BK with no tail: gate + up over E (BK 64), down over F
+// (BK 32 / 64). The host uses them only when both are multiples of 64 (FIX-K97); else gemm_moe + moe_act_f16.
+inline constexpr int kGemmrMoeBk = 64;
+inline constexpr bool gemmrMoeShapeOk(std::uint32_t E, std::uint32_t F) {
+    return E > 0 && F > 0 && E % kGemmrMoeBk == 0 && F % kGemmrMoeBk == 0;
+}
 inline constexpr int kMoeBn32 = 32;                                        // gemm_moe32_* token tile
 inline constexpr int kNTypes = 40;           // table size: > every ggml type id used (mxfp4 = 39)
 

@@ -200,6 +200,8 @@ void benchAttn(Ctx& c);  // "attnbench": timing only, run with --only attnbench
 void testGdn(Ctx& c);
 void testMoe(Ctx& c);
 void testMoeMx(Ctx& c);
+// gfx1201 precise MoE prefill gemmr_moe* == gemm_moe + moe_act_f16 (test_moe_gu.cpp), called by testMoeMx
+void gemmrChecks(Ctx& c, const HostMat& gate, const HostMat& up, const HostMat& down, int R, int K);
 // 8060S grouped expert GEMMs (test_moe_gu.cpp), called by testMoe / testMoeMx
 void moeGuChecks(Ctx& c, const HostMat& gate, const HostMat& up, const HostMat& down, int R, int K);
 void testMisc(Ctx& c);
