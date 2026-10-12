@@ -100,7 +100,7 @@ const char* k_help_chat =
     "  --tokens ID,ID,...         token ids instead of a prompt (no template)\n"
     "  --out FILE                 write the last prompt position's logits (f32) to FILE (no MTP)\n"
     "  --draft mtp|dflash         draft source (default mtp). dflash: the DFlash2 drafter GGUF in\n"
-    "                             --draft-model FILE (or WHIRL_DRAFT_MODEL) drafts up to block - 1 tokens per cycle (n-gram drafts\n"
+    "                             --draft-model FILE (else WHIRL_DRAFT_MODEL) drafts up to block - 1 tokens per cycle (n-gram drafts\n"
     "                             stay on); the MTP block is not loaded. Without a matching drafter: mtp\n"
     "  --mmproj MMPROJ.gguf       vision encoder (Qwen3-VL style mmproj, F16 / BF16) for --image\n"
     "  --image IMAGE              an image placed before the prompt text (repeatable; needs --mmproj)\n"
@@ -122,6 +122,7 @@ const char* k_help_bench =
     "  --modes M,M,...            decode modes: mtp-ngram (MTP + n-gram drafts), mtp, plain; with\n"
     "                             --draft dflash: dflash-ngram, dflash, plain (default: all three)\n"
     "  --draft mtp|dflash         draft source (default mtp; dflash: --draft-model, see whirl chat)\n"
+    "  --draft-model FILE         DFlash2 drafter GGUF for --draft dflash (wins over env WHIRL_DRAFT_MODEL)\n"
     "  --no-think / --think       thinking off / on for the decode prompt (default on)\n"
     "  --device SPEC              GPU: r9700 (default), 8060s, an index, or a name / gfx substring\n"
     WHIRL_HELP_MODES
@@ -911,7 +912,7 @@ void printProfile(const char* label, q::Profile& p, std::size_t n_tok) {
 
 
 // Runtime A/B switches shared by chat and bench (WHIRL_FLOAT_GEMV, ...).
-// --draft dflash: true when WHIRL_DRAFT_MODEL holds a DFlash2 drafter that fits this model
+// --draft dflash: true when --draft-model FILE (else WHIRL_DRAFT_MODEL) is a DFlash2 drafter that fits this model
 // (headers only, before loading); otherwise a warning and the MTP drafts (whirl/dflash_policy.h).
 std::optional<std::string> draftModelOpt(const Args& a) {
     std::optional<std::string> cli;
@@ -923,6 +924,12 @@ bool wantDFlash(const Args& a, const gguf::File& f) {
     const auto src = whirl::dflash::parseSource(mode);
     if (!src) throw std::runtime_error("--draft must be mtp or dflash");
     const auto dm = draftModelOpt(a);
+    if (*src == whirl::dflash::Source::dflash) {
+        std::optional<std::string> cli;
+        if (a.get("--draft-model")) cli = *a.get("--draft-model");
+        if (const std::string note = whirl::dflash::draftModelNote(cli, envGet("DRAFT_MODEL")); !note.empty())
+            std::fprintf(stderr, "note: %s\n", note.c_str());
+    }
     std::string why;
     if (*src == whirl::dflash::Source::dflash && dm) why = q::dflashIncompatible(f, gguf::File::open(*dm));
     const whirl::dflash::Choice c = whirl::dflash::choose(*src, dm, why, true);

@@ -196,8 +196,26 @@ selftest in every mode unchanged).
   (policy only, MTP-01).
 - Golden gate: empty model / mode / suite lists, runs without `G` lines, empty references, an
   unrecorded model file and a suite `ngram` that never drafts are errors; every `WHIRL_*`
-  variable is cleared for the runs; new suite `ngram` (gfx1201). `fast_stream` of the server gate
-  now requires MTP on and `cached_tokens > 0` for the repeats (FS-001).
+  variable is cleared for the runs; new suite `ngram` (in the default list for both gfx1201 and
+  gfx1151). `fast_stream` of the server gate now requires MTP on and `cached_tokens > 0` for the
+  repeats (FS-001). A reference or run with no step line, and a `record` in which a case failed
+  (nothing is written then, so references and `models.txt` never disagree), are errors too.
+- Server gate: no `--suite`, or a suite that ran no check, is an error (exit 2); every "A == B"
+  check requires HTTP 200 and a non-empty reply on both sides (two failed requests no longer compare
+  equal).
+- `WHIRL_PREFILL_BATCH` below 1280 is raised to 1280 with a warning (a smaller batch failed every
+  long prompt with BatchTooLarge).
+- SSD / RAM tier review fixes (FIX-RC4-A, FIX-HDR0): in `always` mode with both RAM and SSD
+  tiers full, restoring or prefetching an SSD-only session could delete that same session while it
+  was being restored (use after free); the entry is now held for the whole restore. An exception in
+  the first copy of a restore no longer leaks the restore and pins the entry. Sessions used from the
+  RAM tier record that use on their SSD file (a graceful stop, hourly in `always` mode), so they no
+  longer expire at the next start. `shutdown` mode really writes nothing while running. A file that
+  cannot be deleted still counts against `--kv-ssd-gb`. Rewriting an existing SSD file now flushes
+  the invalidated header before overwriting the data, so a power loss can leave a cold entry but
+  never an old valid header over half-new data. Asynchronous GPU copy errors fail the restore
+  (cold prefill) instead of counting as done. `--help` and the docs now give the real defaults
+  (`shutdown`, `--kv-ssd-delay`).
 
 ## 0.1.4 — 2026-10-06
 
@@ -208,7 +226,7 @@ bit-identical to 0.1.3.
 ### DFlash2 speculative decoding (`--draft dflash`, in development)
 
 - `--draft mtp|dflash` for `whirl chat` / `whirl bench` / `whirl-server`: with
-  `WHIRL_DRAFT_MODEL` = a DFlash2 drafter GGUF that fits the model (incoai/Qwen3.8-27B-DFlash2,
+  `--draft-model FILE` (else `WHIRL_DRAFT_MODEL`; the command line wins) = a DFlash2 drafter GGUF that fits the model (incoai/Qwen3.8-27B-DFlash2,
   Apache-2.0), the block-diffusion drafter proposes up to block - 1 (7) tokens per cycle from the
   target's hidden states at its target layers; the MTP block is then not loaded and the KV pool is
   sized after the drafter. n-gram drafts stay on. DFlash2 drafts are verified like n-gram drafts

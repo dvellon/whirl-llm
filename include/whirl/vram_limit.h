@@ -77,6 +77,9 @@ std::uint64_t processCap(std::uint64_t free_at_first, std::uint64_t total, std::
 // every long prompt, so the planner refuses to shrink below it (it reduces the checkpoints, or the
 // server stops with the VRAM message).
 inline constexpr std::uint32_t min_prefill_batch = 1280;
+// The same floor for a prefill batch the user set (WHIRL_PREFILL_BATCH): a smaller value is raised to
+// min_prefill_batch (the server logs a warning) instead of failing every long prompt (REVIEW-RC4-C P2-3).
+inline std::uint32_t prefillBatchFloor(std::uint32_t requested) { return requested < min_prefill_batch ? min_prefill_batch : requested; }
 struct FitInput {
     std::uint64_t avail = 0;          // VRAM the model may use from now on (free' minus reserve, WDDM room)
     std::uint64_t weights = 0;        // weight bytes uploaded to VRAM

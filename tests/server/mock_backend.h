@@ -171,8 +171,11 @@ public:
     // Hidden rows consumed with the wrong position (MTP bookkeeping).
     std::uint64_t hidMismatch() const { return hid_mismatch_.load(); }
     std::uint64_t rowsRun() const { return rows_run_; }
+    // most rows of one prefill forward so far (like Model::forward, more than max_batch throws BatchTooLarge)
+    std::uint32_t maxPrefillRows() const { return max_pf_rows_.load(); }
 
 private:
+    void prefillRows(std::size_t n);
     struct State {
         std::uint64_t h = 0;   // recurrent hash
         std::uint64_t kv = 0;  // fold of the KV rows 0 .. pos
@@ -232,6 +235,7 @@ private:
     std::vector<std::uint32_t> text_ids_;
     std::uint32_t im_end_ = 0, eot_ = 0;
     mutable std::atomic<std::uint64_t> poison_{0};
+    std::atomic<std::uint32_t> max_pf_rows_{0};
     mutable std::atomic<std::uint64_t> hid_mismatch_{0};
     std::uint64_t rows_run_ = 0;
     std::vector<std::uint32_t> seg_logits_rows_;

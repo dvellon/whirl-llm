@@ -654,6 +654,13 @@ public:
     std::uint32_t draft_rows = 0;
     std::optional<DevPtr> draft_map;
     std::int32_t attn_win = 0;  // KvArgs::win of the current attnBlock (set around the MTP calls only)
+    // The MTP draft attention (both MTP call sites, mtpEnqueue and mtpBatchStepEx): attnBlock of the
+    // MTP layer with attn_win = the draft window, restored on every exit, also when attnBlock throws
+    // (OVH-C1: the engine keeps serving after a failed step, the trunk must not inherit the window).
+    void draftAttn(const AttnW& a, std::uint32_t n);
+    // test seam (tests/model, no GPU): called first in attnBlock with the window it will use; may throw
+    void (*attn_test_hook)(void* ctx, std::int32_t win) = nullptr;
+    void* attn_test_ctx = nullptr;
     // DFlash2 drafter (loadDrafter) and the target hidden capture it needs. Capture slot j of
     // cap_buf holds x at the input of layer dflash->cfg.target_layers[j] for the last cap_n rows
     // of the latest run() (layer-major: [slot][cap_rows][n_embd] f32). Off unless enabled.
@@ -858,6 +865,14 @@ public:
     void gemvLaunch(std::span<const Mat> ws, DevPtr xin, std::span<const DevPtr> ys, std::uint32_t n, std::int32_t acc);
     void matmulGroup(std::span<const Mat> ws, DevPtr xin, std::span<const DevPtr> ys, std::uint32_t n);
     void matmul(const Mat& w, DevPtr xin, DevPtr y, std::uint32_t n, bool accumulate);
+    // The kernel family matmul() runs for w at n rows (host-only decision; tests/model checks the
+    // f32 / f16 dispatch of RC-R1 / PREFILL-R2 with it, no GPU).
+    enum class MatmulPath { gemvq, gemv1, float_gemv, gemm_fp8, gemm_f16 };
+    MatmulPath matmulPath(const Mat& w, std::uint32_t n) const;
+    // tokens per launch of the f32 / f16 multi-token GEMV loop: gemv_<T>_8 / _4 when present, else _1
+    static std::uint32_t floatGemvStep(std::uint32_t left, bool has8, bool has4) {
+        return left >= 8 && has8 ? 8 : left >= 4 && has4 ? 4 : 1;
+    }
     void gemmF16(const Mat& w, DevPtr x16in, DevPtr y, std::uint32_t n, std::int32_t acc);
     bool gdnIn2(const GdnW& g, std::uint32_t n) const;
     // x16b: f16 sub-buffer of x16 past the fp8 rows (tiled fp8 pads to 16 rows), 256-aligned

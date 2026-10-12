@@ -9,6 +9,7 @@
 //   whirl-server-gate --exe PATH --kind whirl|proto --model GGUF --suite NAME[,NAME...]
 //                     [--work DIR] [--port 8093] [--results OUT.json] [--compare REF.json]
 //                     [--cli EXE] [--no-lock] [--server-env NAME=VALUE ...] [--kv FORMAT]
+//   whirl-server-gate --selftest   (CPU only: the reply-comparison helpers, no server)
 // Suites: basic, mt_cache, pool, tier, sys, restore_conc, vis (see each function;
 // vis / vis_speed need --mmproj MMPROJ.gguf and --images DIR).
 // A GPU lock file (WHIRL_GPU_LOCK, default %TEMP%\whirl-gpu.lock, opened with
@@ -29,6 +30,7 @@
 #include "http_client.h"
 #include "whirl/common.h"
 #include "whirl/json.h"
+#include "whirl/numerics.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -389,6 +391,36 @@ struct ChatResult {
     }
 };
 
+// The "A == B" checks compare two replies. Two failed requests (4xx / 5xx, a crashed server) both have
+// empty texts, so a plain comparison of them is green: every comparison goes through these helpers.
+bool answered(const ChatResult& r) { return r.status == 200 && (!r.content.empty() || !r.reasoning.empty() || !r.tool_calls.empty()); }
+bool sameContent(const ChatResult& a, const ChatResult& b) { return answered(a) && answered(b) && a.content == b.content; }
+bool sameText(const ChatResult& a, const ChatResult& b) { return answered(a) && answered(b) && a.text() == b.text(); }
+// concurrency check (thinking off): each concurrent reply == the same request alone, both HTTP 200 with
+// non-empty content ("=" / "x" per request in d)
+bool concSame(const std::vector<ChatResult>& res, const std::vector<ChatResult>& alone, std::string& d) {
+    bool same = res.size() == alone.size();
+    for (std::size_t i = 0; i < res.size() && i < alone.size(); ++i) {
+        const bool eq = res[i].status == 200 && alone[i].status == 200 && !res[i].content.empty() && !alone[i].content.empty() &&
+                        sameContent(res[i], alone[i]);
+        same = same && eq;
+        d += eq ? "=" : "x";
+    }
+    return same;
+}
+
+// Do the servers run with relaxed acceptance (fast mode's relaxacc)? From WHIRL_MODE / WHIRL_RELAX as
+// the servers see them (--server-env, else this process's environment).
+bool relaxAccOn(const std::optional<std::string>& mode, const std::optional<std::string>& relax) {
+    if (!mode) return false;
+    try {
+        const numerics::Request r = numerics::parseMode(*mode, "WHIRL_MODE");  // as the server parses it
+        return r.mode == numerics::Mode::fast && r.has(numerics::Item::relaxacc) && !(relax && *relax == "0");
+    } catch (const std::exception&) {
+        return false;  // the server refuses such a mode: no relaxed acceptance to account for
+    }
+}
+
 const json::Value* path(const json::Value& v, std::initializer_list<const char*> keys) {
     const json::Value* cur = &v;
     for (const char* k : keys) {
@@ -673,7 +705,6 @@ void suiteBasic() {
         if (std::string(c.key) != "zh_nothink") cli_ref[c.key] = cliRun(c.prompt, c.think, c.max);
     std::optional<ServerLease> s_opt;
     s_opt.emplace("basic", std::vector<std::string>{}, std::map<std::string, std::string>{});
-    ServerLease& s = *s_opt;
     {
         auto h = test::httpRequest("127.0.0.1", g.port, "GET", "/health");
         check("basic: GET /health", h.status == 200 && h.body.find("\"status\":\"ok\"") != std::string::npos, h.body);
@@ -701,12 +732,12 @@ void suiteBasic() {
     std::map<std::string, ChatResult> solo;
     for (const Case& c : cases) {
         ChatResult r = chat(arr({msg("user", c.prompt)}), greedy(c.max) + thinkKw(c.think));
-        check(std::string("basic: greedy ") + c.key, r.status == 200 && !r.content.empty() || !r.reasoning.empty(), brief(r));
+        check(std::string("basic: greedy ") + c.key, r.status == 200 && (!r.content.empty() || !r.reasoning.empty()), brief(r));
         record(std::string("basic/") + c.key, r.text());
         solo[c.key] = r;
         ChatResult st = chat(arr({msg("user", c.prompt)}), greedy(c.max) + thinkKw(c.think), true);
         check(std::string("basic: stream == non-stream ") + c.key,
-              st.content == r.content && st.reasoning == r.reasoning && st.finish == r.finish, brief(st));
+              sameContent(st, r) && st.reasoning == r.reasoning && st.finish == r.finish, brief(st));
         if (const auto& cli = cli_ref[c.key]) {
             std::string reason, content = *cli;
             if (c.think) {
@@ -731,14 +762,14 @@ void suiteBasic() {
         const std::string extra = ",\"temperature\":0.7,\"top_p\":0.9,\"seed\":1234,\"max_tokens\":64" + thinkKw(false);
         ChatResult a = chat(arr({msg("user", "Write a haiku about GPUs.")}), extra);
         ChatResult b = chat(arr({msg("user", "Write a haiku about GPUs.")}), extra);
-        check("basic: same seed -> same text", a.status == 200 && a.content == b.content, brief(a));
+        check("basic: same seed -> same text", a.status == 200 && sameContent(a, b), brief(a));
         record("basic/seed1234", a.text());
         std::vector<std::function<ChatResult()>> jobs;
         for (int i = 0; i < 4; ++i)
             jobs.push_back([&] { return chat(arr({msg("user", "Write a haiku about GPUs.")}), extra); });
         auto res = parallel(jobs);
         bool same = true;
-        for (const auto& r : res) same = same && r.content == a.content;
+        for (const auto& r : res) same = same && sameContent(r, a);
         check("basic: same seed under load (4 concurrent) -> same text", same);
     }
     // tool round trip
@@ -792,24 +823,21 @@ void suiteBasic() {
         for (const auto& p : ps) jobs.push_back([&, p] { return chat(arr({msg("user", p)}), greedy(96) + thinkKw(false)); });
         auto res = parallel(jobs);
         std::string d;
-        bool same = true;
-        for (std::size_t i = 0; i < ps.size(); ++i) {
-            same = same && res[i].content == alone[i].content;
-            d += res[i].content == alone[i].content ? "=" : "x";
-            if (gated) record(std::format("basic/conc{}", i), alone[i].text());
-        }
+        const bool same = concSame(res, alone, d);
+        if (gated)
+            for (std::size_t i = 0; i < ps.size(); ++i) record(std::format("basic/conc{}", i), alone[i].text());
         if (gated)
             check(name, same, d);
         else
             logLine(std::format("INFO {}: {} ({}; not a gate)", name, same ? "equal" : "differs", d));
     };
-    auto envMode = [] {
-        auto it = g.server_env.find("WHIRL_MODE");
+    auto envOf = [](const char* name) -> std::optional<std::string> {
+        auto it = g.server_env.find(name);
         if (it != g.server_env.end()) return it->second;
-        const char* m = std::getenv("WHIRL_MODE");
-        return std::string(m ? m : "");
+        if (const char* m = std::getenv(name)) return std::string(m);
+        return std::nullopt;
     };
-    if (envMode() == "fast") {
+    if (relaxAccOn(envOf("WHIRL_MODE"), envOf("WHIRL_RELAX"))) {
         concCheck("basic: 4 concurrent requests == each alone (fast, relaxacc on)", false);
         s_opt.reset();
         ServerLease s2("basic_norelax", {}, {{"WHIRL_RELAX", "0"}});
@@ -977,7 +1005,7 @@ void suiteFastStream() {
                       std::format("cached {} of {}", r.cached, r.prompt));
             const ChatResult& want = c.shared ? first : ref[c.key];
             check(std::format("fast_stream: {} #{} ({}) == {}", c.key, i, st ? "stream" : "non-stream", c.shared ? "#0" : "cold"),
-                  r.status == 200 && r.content == want.content && r.reasoning == want.reasoning && r.finish == want.finish, brief(r));
+                  r.status == 200 && sameContent(r, want) && r.reasoning == want.reasoning && r.finish == want.finish, brief(r));
         }
     }
 }
@@ -1001,13 +1029,13 @@ void suitePool() {
         for (auto [k, r] : {std::pair{"P1", &a1}, std::pair{"P2", &a2}, std::pair{"P3", &a3}}) record(std::string("pool/") + k, r->text());
         check("pool: pool full -> an idle slot was evicted", s->logCount("kv pool full: evicting") >= 1);
         check("pool: P2 again: prompt fully reused", b2.cached >= b2.prompt - 1, std::format("cached {} of {}", b2.cached, b2.prompt));
-        check("pool: P2 again: same text", b2.content == a2.content);
+        check("pool: P2 again: same text", sameContent(b2, a2));
         check("pool: P1 again (evicted): restored from the RAM tier, same text",
-              b1.cached >= b1.prompt - 1 && b1.content == a1.content && s->logCount(R"(kv tier: restored \d+ tok from RAM)") >= 1,
+              b1.cached >= b1.prompt - 1 && sameContent(b1, a1) && s->logCount(R"(kv tier: restored \d+ tok from RAM)") >= 1,
               std::format("cached {} of {}", b1.cached, b1.prompt));
         std::vector<std::function<ChatResult()>> jobs = {[&] { return ask(P[1], q); }, [&] { return ask(P[2], q); }};
         auto res = parallel(jobs);
-        check("pool: P2, P3 concurrently == solo", res[0].content == a2.content && res[1].content == a3.content);
+        check("pool: P2, P3 concurrently == solo", sameContent(res[0], a2) && sameContent(res[1], a3));
     }
     {
         ServerLease s("pool_long", {"--parallel", "4", "--ctx", "65536", "--ctx-per-slot", "65536"}, {});
@@ -1067,7 +1095,7 @@ void tierMode(const std::string& mode) {
         ServerLease s("tier_" + mode, args, {{"WHIRL_KV_SSD_DIR", ssd}}, false);
         for (const auto& ss : S) {
             t1[ss.name] = chat(t1msg(ss), greedy(64) + thinkKw(ss.think));
-            check(std::format("tier {}: {} turn 1 == reference", mode, ss.name), t1[ss.name].text() == ref[ss.name].first.text());
+            check(std::format("tier {}: {} turn 1 == reference", mode, ss.name), sameText(t1[ss.name], ref[ss.name].first));
         }
         // (the spill is logged after the response is sent: wait for the line)
         check(std::format("tier {}: every turn 1 spilled to the RAM tier", mode), s->waitLog("kv tier: spill ", S.size(), 30),
@@ -1077,7 +1105,7 @@ void tierMode(const std::string& mode) {
             auto b = chat(t2msg(S[i], t1[S[i].name]), greedy(96) + thinkKw(S[i].think));
             const auto& rb = ref[S[i].name].second;
             check(std::format("tier {}: {} turn 2 after eviction (RAM restore) == never-evicted", mode, S[i].name),
-                  b.text() == rb.text() && b.cached == rb.cached, std::format("cached {} vs {}", b.cached, rb.cached));
+                  sameText(b, rb) && b.cached == rb.cached, std::format("cached {} vs {}", b.cached, rb.cached));
         }
         check(std::format("tier {}: RAM restores logged", mode), s->logCount(R"(kv tier: restored \d+ tok from RAM)") >= n_ev);
         std::this_thread::sleep_for(std::chrono::seconds(3));
@@ -1095,7 +1123,7 @@ void tierMode(const std::string& mode) {
             after[ss.name] = b;
             const auto& rb = ref[ss.name].second;
             check(std::format("tier {}: {} turn 2 after restart (SSD restore) == never-evicted", mode, ss.name),
-                  b.content == rb.content && b.reasoning == rb.reasoning,
+                  sameContent(b, rb) && b.reasoning == rb.reasoning,
                   std::format("cached {} (ref {}), prompt {}", b.cached, rb.cached, b.prompt));
         }
         check(std::format("tier {}: SSD restores logged", mode), s->logCount(R"(kv tier: restored \d+ tok from SSD)") >= 1);
@@ -1107,7 +1135,7 @@ void tierMode(const std::string& mode) {
         for (const auto& ss : S) {
             auto b = chat(t2msg(ss, t1[ss.name]), greedy(96) + thinkKw(ss.think));
             check(std::format("tier p1: {} turn 2 after restart (SSD restore) == no prefix cache", ss.name),
-                  b.content == after[ss.name].content && b.reasoning == after[ss.name].reasoning,
+                  sameContent(b, after[ss.name]) && b.reasoning == after[ss.name].reasoning,
                   std::format("cached {} vs {}", after[ss.name].cached, b.cached));
         }
     }
@@ -1144,7 +1172,7 @@ ChatResult sysAsk(const SysCase& c) {
     return chat(arr({msg("system", c.sys), msg("user", c.user)}), greedy(c.think ? 96 : 48) + thinkKw(c.think) + ",\"tools\":" + sysTools());
 }
 
-bool same(const ChatResult& a, const ChatResult& b) { return a.text() == b.text() && a.prompt == b.prompt; }
+bool same(const ChatResult& a, const ChatResult& b) { return sameText(a, b) && a.prompt == b.prompt; }
 
 std::optional<std::int64_t> boundary(Server& s) {
     std::optional<std::int64_t> b;
@@ -1336,7 +1364,7 @@ void suiteRestoreConc() {
     {
         ServerLease s("rconc", {"--parallel", "4"}, env, false);
         auto a1 = turn(arr({msg("user", m1u)}), 48);
-        check("restore_conc: S turn 1 == reference", a1.text() == r1.text());
+        check("restore_conc: S turn 1 == reference", sameText(a1, r1));
         for (int i = 0; i < 4; ++i) turn(arr({msg("user", codeText(1800, 40 + 3 * i) + "\n\nOne sentence: what is this?")}), 8);
         std::vector<std::function<ChatResult()>> jobs;
         for (int i = 0; i < 3; ++i) jobs.push_back([&, i] { return turn(arr({msg("user", DEC[i])}), 160); });
@@ -1346,12 +1374,12 @@ void suiteRestoreConc() {
         });
         auto res = parallel(jobs);
         check("restore_conc: S turn 2 restored next to 3 decoding requests == never-evicted",
-              res[3].text() == r2.text() && res[3].cached == r2.cached, std::format("cached {} vs {}", res[3].cached, r2.cached));
+              sameText(res[3], r2) && res[3].cached == r2.cached, std::format("cached {} vs {}", res[3].cached, r2.cached));
         check("restore_conc: decode texts next to the restore == alone",
-              res[0].content == rdec[0].content && res[1].content == rdec[1].content && res[2].content == rdec[2].content);
+              sameContent(res[0], rdec[0]) && sameContent(res[1], rdec[1]) && sameContent(res[2], rdec[2]));
         check("restore_conc: RAM restore logged", s->logCount(R"(kv tier: restored \d+ tok from RAM)") >= 1);
         auto b0 = turn(burst(bq, 0), 48);
-        check("restore_conc: burst session 0 == reference", b0.content == rb[0].content);
+        check("restore_conc: burst session 0 == reference", sameContent(b0, rb[0]));
         turn(arr({msg("system", sysB), msg("user", "One word: ok?")}), 8);
         const std::size_t w0 = s->logCount("waiting for the restore of its prefix");
         const std::size_t rr0 = s->logCount(R"(kv tier: restored \d+ tok from RAM)");
@@ -1359,7 +1387,7 @@ void suiteRestoreConc() {
                                                        [&] { return turn(burst(bq, 0), 48); }};
         auto res2 = parallel(j2);
         check("restore_conc: burst on a RAM shared entry: texts == reference",
-              res2[0].content == rb[1].content && res2[1].content == rb[2].content && res2[2].content == rb[0].content);
+              sameContent(res2[0], rb[1]) && sameContent(res2[1], rb[2]) && sameContent(res2[2], rb[0]));
         const std::size_t nw = s->logCount("waiting for the restore of its prefix") - w0;
         const std::size_t nr = s->logCount(R"(kv tier: restored \d+ tok from RAM)") - rr0;
         check("restore_conc: burst on a RAM shared entry: one restore, the others wait", nr == 1 && nw >= 1,
@@ -1376,7 +1404,7 @@ void suiteRestoreConc() {
             return turn(m3, 48);
         });
         auto res = parallel(jobs);
-        check("restore_conc: S turn 3 after restart (queued, prefetched, restored) == never-evicted", res[4].content == r3.content,
+        check("restore_conc: S turn 3 after restart (queued, prefetched, restored) == never-evicted", sameContent(res[4], r3),
               std::format("cached {} (ref {})", res[4].cached, r3.cached));
         const std::size_t npf = s->logCount(R"(prefetching \d+ tok from SSD)");
         const std::size_t nrs = s->logCount(R"(kv tier: restored \d+ tok from (SSD|RAM))");
@@ -1386,7 +1414,7 @@ void suiteRestoreConc() {
         for (std::size_t i = 0; i < 3; ++i) j2.push_back([&, i] { return turn(burst(bq2, i), 48); });
         auto res2 = parallel(j2);
         check("restore_conc: burst of new sessions on an SSD shared entry: texts == reference",
-              res2[0].content == rb2[0].content && res2[1].content == rb2[1].content && res2[2].content == rb2[2].content);
+              sameContent(res2[0], rb2[0]) && sameContent(res2[1], rb2[1]) && sameContent(res2[2], rb2[2]));
         check("restore_conc: burst on an SSD shared entry: the others wait for the one restore",
               s->logCount("waiting for the restore of its prefix") - w0 >= 1);
     }
@@ -1532,7 +1560,7 @@ void suiteVis() {
         auto a = ask(m_shapes, 160);
         auto b = ask(m_dialog, 160);
         record("vis/plain_shapes", a.text());
-        check("vis: MTP greedy == plain greedy (shapes, dialog)", a.text() == ref["shapes"].text() && b.text() == ref["dialog"].text(),
+        check("vis: MTP greedy == plain greedy (shapes, dialog)", sameText(a, ref["shapes"]) && sameText(b, ref["dialog"]),
               brief(a));
     }
     const std::string ssd = g.work + "\\vis_gate_ssd";
@@ -1565,23 +1593,23 @@ void suiteVis() {
         const auto dv = logReal(*s.s, R"(VRAM change (-?[\d.]+) MiB)");
         check("vis: VRAM change at mmproj load <= 2 MiB", dv && std::abs(*dv) <= 2.0, std::format("{} MiB", dv ? *dv : -1.0));
         auto t = ask(m_text, 96);
-        check("vis: text answer == base, encoder not loaded", t.text() == base_text.text() && s->logCount("encoded in") == 0, brief(t));
+        check("vis: text answer == base, encoder not loaded", sameText(t, base_text) && s->logCount("encoded in") == 0, brief(t));
         auto a = ask(m_shapes, 160);
-        check("vis: shapes == ref", a.text() == ref["shapes"].text(), brief(a));
+        check("vis: shapes == ref", sameText(a, ref["shapes"]), brief(a));
         auto a2 = ask(m_shapes, 160);
-        check("vis: same image again: prompt fully cached, == ref", a2.text() == ref["shapes"].text() && a2.cached >= a2.prompt - 1,
+        check("vis: same image again: prompt fully cached, == ref", sameText(a2, ref["shapes"]) && a2.cached >= a2.prompt - 1,
               std::format("cached {} of {}", a2.cached, a2.prompt));
         auto b = ask(m_dialog, 160);
         check("vis: other image: no reuse of the first image, == ref, answer differs",
-              b.text() == ref["dialog"].text() && b.cached == 0 && b.content != a.content, std::format("cached {}", b.cached));
+              sameText(b, ref["dialog"]) && b.cached == 0 && b.content != a.content, std::format("cached {}", b.cached));
         auto c = ask(m_two, 160);
-        check("vis: two images == ref, embeddings from the cache", c.text() == ref["two"].text() && s->logCount("embeddings cached") >= 2,
+        check("vis: two images == ref, embeddings from the cache", sameText(c, ref["two"]) && s->logCount("embeddings cached") >= 2,
               brief(c));
         auto d = ask(m_1080, 96);
-        check("vis: 1080p == ref", d.text() == ref["s1080"].text(), brief(d));
+        check("vis: 1080p == ref", sameText(d, ref["s1080"]), brief(d));
         auto e = ask(m_1080b, 64);
         check("vis: 1080p, new conversation: starts at the image-end checkpoint, == cold",
-              e.text() == ref["s1080b"].text() && e.cached >= 2040, std::format("cached {} of {}", e.cached, e.prompt));
+              sameText(e, ref["s1080b"]) && e.cached >= 2040, std::format("cached {} of {}", e.cached, e.prompt));
         // one image request next to three text requests
         std::vector<std::function<ChatResult()>> jobs = {[&] { return ask(m_dialog, 160); },
                                                          [&] { return ask(arr({msg("user", "What is RAII? Two sentences.")}), 96); },
@@ -1591,15 +1619,15 @@ void suiteVis() {
         for (const auto& j : jobs) solo.push_back(j());
         auto res = parallel(jobs);
         bool same_all = true;
-        for (std::size_t i = 0; i < res.size(); ++i) same_all = same_all && res[i].text() == solo[i].text();
-        check("vis: 1 image + 3 text requests concurrently == each alone", same_all && res[0].text() == ref["dialog"].text());
+        for (std::size_t i = 0; i < res.size(); ++i) same_all = same_all && sameText(res[i], solo[i]);
+        check("vis: 1 image + 3 text requests concurrently == each alone", same_all && sameText(res[0], ref["dialog"]));
         // idle release
         const bool rel = s->waitLog("encoder released", 1, 40);
         const auto delta = logReal(*s.s, R"(encoder released; VRAM free .* delta (-?[\d.]+) MiB)");
         check("vis: idle release: VRAM back to the level before the first image (delta <= 8 MiB)", rel && delta && std::abs(*delta) <= 8.0,
               std::format("delta {} MiB", delta ? *delta : -1.0));
         auto f = ask(m_shapes, 160);
-        check("vis: after the release: shapes == ref (encoder reloaded or cache)", f.text() == ref["shapes"].text(), brief(f));
+        check("vis: after the release: shapes == ref (encoder reloaded or cache)", sameText(f, ref["shapes"]), brief(f));
         std::this_thread::sleep_for(std::chrono::seconds(3));
         s->waitTierIdle(60);  // pending SSD writes done before the stop
     }
@@ -1609,7 +1637,7 @@ void suiteVis() {
         ServerLease s("vis_restart", mm, env, false);
         auto e = ask(m_1080b, 64);
         check("vis: restart: 1080p question restored from SSD, == cold",
-              e.text() == ref["s1080b"].text() && s->logCount(R"(kv tier: restored \d+ tok from SSD)") >= 1,
+              sameText(e, ref["s1080b"]) && s->logCount(R"(kv tier: restored \d+ tok from SSD)") >= 1,
               std::format("cached {} of {}", e.cached, e.prompt));
     }
     fs::remove_all(widen(ssd), ec);
@@ -1649,6 +1677,46 @@ void suiteVisSpeed() {
     writeFile(path, old + csv);
 }
 
+// --selftest: CPU-only checks of the comparison helpers (no server, no GPU)
+int selfTest() {
+    auto mk = [](int status, std::string content, std::string reasoning = "") {
+        ChatResult r;
+        r.status = status;
+        r.content = std::move(content);
+        r.reasoning = std::move(reasoning);
+        return r;
+    };
+    const ChatResult err = mk(500, ""), err4 = mk(400, ""), ok = mk(200, "hello"), ok2 = mk(200, "world"), think = mk(200, "", "hmm"),
+                     empty200 = mk(200, "");
+    std::string d;
+    check("selftest: concurrency, equal answers -> same", concSame({ok, ok2}, {ok, ok2}, d));
+    d.clear();
+    check("selftest: concurrency, one differs -> not same", !concSame({ok, ok}, {ok, ok2}, d) && d == "=x", d);
+    d.clear();
+    check("selftest: concurrency, all requests failed (500 / 400) -> not same", !concSame({err, err4}, {err, err4}, d), d);
+    d.clear();
+    check("selftest: concurrency, 200 with empty content -> not same", !concSame({empty200}, {empty200}, d), d);
+    d.clear();
+    check("selftest: concurrency, reasoning only (no content) -> not same", !concSame({think}, {think}, d), d);
+    check("selftest: sameContent of two failed requests -> false", !sameContent(err, err));
+    check("selftest: sameContent of a failure and an empty 200 -> false", !sameContent(err, empty200));
+    check("selftest: sameContent of equal answers -> true", sameContent(ok, ok));
+    check("selftest: sameText of two failed requests -> false", !sameText(err, err4));
+    check("selftest: sameText of a reasoning-only reply with itself -> true", sameText(think, think));
+    check("selftest: sameText of different answers -> false", !sameText(ok, ok2));
+    using OS = std::optional<std::string>;
+    check("selftest: WHIRL_MODE=fast -> relaxacc on", relaxAccOn(OS("fast"), std::nullopt));
+    check("selftest: WHIRL_MODE=FAST / ' fast ' -> relaxacc on (the server parses case-insensitively)",
+          relaxAccOn(OS("FAST"), std::nullopt) && relaxAccOn(OS(" fast "), std::nullopt));
+    check("selftest: WHIRL_MODE=fast:relaxacc,kvq8 -> relaxacc on", relaxAccOn(OS("fast:relaxacc,kvq8"), std::nullopt));
+    check("selftest: WHIRL_MODE=fast:kvq8 (no relaxacc) -> off", !relaxAccOn(OS("fast:kvq8"), std::nullopt));
+    check("selftest: WHIRL_MODE=fast + WHIRL_RELAX=0 -> off", !relaxAccOn(OS("fast"), OS("0")));
+    check("selftest: balance / unset / invalid -> off",
+          !relaxAccOn(OS("balance"), std::nullopt) && !relaxAccOn(std::nullopt, std::nullopt) && !relaxAccOn(OS("bogus"), std::nullopt));
+    std::printf("== whirl-server-gate --selftest: %d passed, %d failed\n", g_pass, g_fail);
+    return g_fail ? 1 : 0;
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** wargv) {
@@ -1657,6 +1725,7 @@ int wmain(int argc, wchar_t** wargv) {
     SetConsoleCtrlHandler(nullptr, FALSE);
     std::vector<std::string> a;
     for (int i = 1; i < argc; ++i) a.push_back(narrow(wargv[i]));
+    if (a.size() == 1 && a[0] == "--selftest") return selfTest();
     for (std::size_t i = 0; i < a.size(); ++i) {
         auto val = [&]() -> std::string {
             if (i + 1 >= a.size()) throw std::runtime_error(a[i] + " needs a value");
@@ -1734,17 +1803,26 @@ int wmain(int argc, wchar_t** wargv) {
                                                                  {"vis", suiteVis},     {"vis_speed", suiteVisSpeed},
                                                                  {"fast_stream", suiteFastStream}};
     if (!g.exe.empty()) {
+        // a gate that runs nothing must not be green (REVIEW-RC4-C P2-1): no --suite is an error
+        if (g.suites.empty()) {
+            std::fprintf(stderr, "whirl-server-gate: no suites run (pass --suite NAME[,NAME...])\n");
+            return 2;
+        }
         for (const auto& name : g.suites) {
-            auto it = suites.find(name);
-            if (it == suites.end()) {
+            if (!suites.contains(name)) {
                 std::fprintf(stderr, "unknown suite %s\n", name.c_str());
                 return 2;
             }
+        }
+        for (const auto& name : g.suites) {
+            const int before = g_pass + g_fail;
             try {
-                it->second();
+                suites.at(name)();
             } catch (const std::exception& ex) {
                 check("suite " + name + " ran", false, ex.what());
             }
+            // a suite that returned without a single check proves nothing
+            if (g_pass + g_fail == before) check("suite " + name + " ran at least one check", false, "0 checks");
         }
         if (!g.results.empty()) writeFile(g.results, json::dumpPython(json::Value(g_results)));
     } else {
@@ -1767,6 +1845,10 @@ int wmain(int argc, wchar_t** wargv) {
             }
         }
         check(std::format("compare with {}: {} / {} outputs identical", g.compare, same, n), n > 0 && same == n);
+    }
+    if (g_pass + g_fail == 0) {
+        std::printf("== whirl-server-gate: 0 checks ran (no suites run): refusing to report success\n");
+        return 2;
     }
     std::printf("== whirl-server-gate: %d passed, %d failed%s\n", g_pass, g_fail, g_fail ? "" : " (ALL PASS)");
     for (const auto& f : g_failed) std::printf("   FAILED: %s\n", f.c_str());

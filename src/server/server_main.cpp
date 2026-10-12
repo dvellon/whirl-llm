@@ -139,7 +139,7 @@ const char* kHelpBody =
     "                           come out of the KV pool (about 2 GiB net of the MTP block).\n"
     "                           A model without a matching drafter (e.g. a MoE model) keeps mtp.\n"
     "                           n-gram drafts stay on in both modes; outputs equal plain greedy decoding\n"
-    "  --draft-model FILE       DFlash2 drafter GGUF for --draft dflash (env WHIRL_DRAFT_MODEL overrides)\n"
+    "  --draft-model FILE       DFlash2 drafter GGUF for --draft dflash (wins over env WHIRL_DRAFT_MODEL)\n"
     "  --decode-min-tps N       while other requests prefill, keep every streaming (decoding) request\n"
     "                           at >= N tok/s by limiting prefill forwards (default 20; 0 = off:\n"
     "                           prefill forwards are not limited)\n"
@@ -184,7 +184,7 @@ struct Options {
     std::optional<std::uint32_t> ctx_per_slot;
     std::optional<std::uint32_t> mtp_drafts;
     std::string draft = "mtp";
-    std::string draft_model;  // --draft-model FILE (WHIRL_DRAFT_MODEL overrides)
+    std::string draft_model;  // --draft-model FILE (wins over WHIRL_DRAFT_MODEL)
     std::optional<std::uint32_t> decode_min_tps;
     std::optional<std::string> log_file;
     std::optional<std::string> alias;
@@ -503,6 +503,14 @@ int serveMain(int argc, char** argv, const char* program) {
                 lo.max_batch = std::clamp(static_cast<std::uint32_t>(std::stoul(*v)), 1u, qwen35::max_batch_limit);
             } catch (const std::exception&) {
             }
+            // the scheduler's largest forward is a 1024-row chunk + a 256-row tail: a smaller batch would
+            // fail every long prompt with BatchTooLarge (VRAM-01), so it is raised to that floor
+            if (lo.max_batch < vram::min_prefill_batch) {
+                logW("WHIRL_PREFILL_BATCH={} is below the smallest prefill batch the scheduler needs ({} rows: one {}-row chunk + "
+                     "a {}-row tail); using {}",
+                     *v, vram::min_prefill_batch, prefill_chunk, prefill_merge, vram::min_prefill_batch);
+                lo.max_batch = vram::prefillBatchFloor(lo.max_batch);
+            }
         }
         // prefix checkpoints (per slot / shared); the auto-shrink below may lower the defaults
         const bool no_pc = envOn("NO_PREFIX_CACHE", false);
@@ -571,7 +579,8 @@ int serveMain(int argc, char** argv, const char* program) {
                 n_ck = plan.n_ck;
                 n_spe_plan = plan.n_spe;
                 logW("VRAM is tight (about {:.2f} GiB usable for weights {:.2f} GiB + buffers + checkpoints + KV): reduced {} so the KV "
-                     "pool gets about {} tokens (wanted {}); set WHIRL_PREFILL_BATCH / WHIRL_SERVE_CKPTS / WHIRL_SYS_CKPTS to choose",
+                     "pool gets about {} tokens (wanted {}); WHIRL_PREFILL_BATCH (at least 1280) / WHIRL_SERVE_CKPTS / WHIRL_SYS_CKPTS "
+                     "choose these yourself, --ctx a smaller pool",
                      av / g, est.weights / g, plan.note, plan.pool_tokens, fi.pool_min_tokens);
             }
             // not even the weights + smallest buffers fit (no room for any KV): stop before a load that
@@ -597,18 +606,18 @@ int serveMain(int argc, char** argv, const char* program) {
             logI("prefill forward up to {} rows requested (WHIRL_PREFILL_CHUNK)", prefill_exec);
         }
         // whole schedule chunks, and a forward (+ the merged tail) must fit the prefill batch
-        {
-            const std::size_t mb = lo.max_batch > prefill_merge ? lo.max_batch - prefill_merge : 0;
-            prefill_exec = std::max(prefill_chunk, std::min(prefill_exec / prefill_chunk * prefill_chunk, mb / prefill_chunk * prefill_chunk));
-        }
+        prefill_exec = prefillExecFor(prefill_exec, lo.max_batch);
         // --draft dflash: check the drafter against the target before loading (headers only); a
         // model without a matching drafter keeps the MTP drafts (whirl/dflash_policy.h)
         bool use_dflash = false;
         std::optional<std::string> dm_resolved;
         std::optional<gguf::File> dfile;
         {
-            const auto dm = dm_resolved = whirl::dflash::resolveDraftModel(opt.draft_model.empty() ? std::nullopt : std::optional<std::string>(opt.draft_model), env("DRAFT_MODEL"));
+            const std::optional<std::string> dm_cli = opt.draft_model.empty() ? std::nullopt : std::optional<std::string>(opt.draft_model);
+            const auto dm = dm_resolved = whirl::dflash::resolveDraftModel(dm_cli, env("DRAFT_MODEL"));
             const auto src = *whirl::dflash::parseSource(opt.draft);
+            if (src == whirl::dflash::Source::dflash)
+                if (const std::string note = whirl::dflash::draftModelNote(dm_cli, env("DRAFT_MODEL")); !note.empty()) logI("{}", note);
             std::string why;
             if (src == whirl::dflash::Source::dflash && dm) {
                 dfile.emplace(gguf::File::open(*dm));
@@ -687,8 +696,8 @@ int serveMain(int argc, char** argv, const char* program) {
         if (env("NAIVE_ATTN")) model.naive_attn = true;
         if (env("GDN_SEQ")) model.gdn_chunked = false;
         if (auto v = env("MOE_BN")) model.moe_bn_force = static_cast<std::uint32_t>(std::strtoul(v->c_str(), nullptr, 10));
-        if (auto v = env("PREFILL_BATCH"))
-            model.max_batch = std::max(1u, std::min(model.max_batch, static_cast<std::uint32_t>(std::stoul(*v))));
+        if (auto v = env("PREFILL_BATCH"))  // (same floor as above: never below vram::min_prefill_batch)
+            model.max_batch = std::min(model.max_batch, vram::prefillBatchFloor(static_cast<std::uint32_t>(std::stoul(*v))));
         // WHIRL_DRAFT_VOCAB: unset = embedded 64k subset (dense qwen35, 248320 vocab), 64k = embedded,
         // 48k / <file> = frequency subset file, N = the first N rows (old experiment), off = full head
         const qwen35::DraftVocabChoice draft_vocab = qwen35::draftVocabChoice(env("DRAFT_VOCAB"), qwen35::exeDirectory());

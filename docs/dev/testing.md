@@ -50,7 +50,11 @@ fails on the first line. Modes: `--precise`, `--balance`, `--fast`. The fast mod
 The gate cannot pass vacuously (FIX-REVIEW2). An empty model, mode or suite list, a run that printed no
 `G` lines, a reference file with no step lines, and a model file that differs from the recorded one (name,
 size and a hash of its size plus first and last 4 MiB, kept in `tests/golden/models.txt` and rewritten by
-`record`) all exit 2. The script clears every `WHIRL_*` environment variable before the runs (a stray
+`record`) all exit 2. A step line is any `G` line other than `G model`, `G header` and `G info`; a run or a
+reference without one is an error. `record` stages the references and writes them together with
+`tests/golden/models.txt` only when every case ran (a partial record writes nothing, so references and model
+hashes never disagree). `pwsh tools/golden/golden_selftest.ps1` checks these verdicts on the CPU with a fake
+`whirl.exe` (`tools/golden/fake_whirl.cmd`). The script clears every `WHIRL_*` environment variable before the runs (a stray
 `WHIRL_HIP_DEVICE` or `WHIRL_MODE` would change what is measured; `--device` picks the GPU) and restores
 them afterwards. Suites: `single`, `pair`, and `ngram` (the forced n-gram MTP drafts on a copy-the-text
 prompt; the runner fails the case when `ng_cycles` is 0, because the n-gram case of `single` never drafts on

@@ -15,6 +15,7 @@
 #include "server/protocol.h"
 #include "server/tokens.h"
 #include "tier/kv_tier.h"
+#include "whirl/vram_limit.h"
 #include "whirl/common.h"
 #include "whirl/gguf.h"
 #include "whirl/json.h"
@@ -1544,6 +1545,28 @@ void testPoolPressure() {
     CHECK_EQ(srv.model().poison(), 0u);
 }
 
+// VRAM-01 / REVIEW-RC4-C P2-3, P3-2: a long prompt on the smallest prefill batch. The engine is sized as
+// whirl-server sizes it for WHIRL_PREFILL_BATCH (max_batch, then prefill_exec = prefillExecFor), and
+// the mock throws BatchTooLarge for a forward of more rows than max_batch (as Model::forward). 2300
+// tokens = one 1024-row chunk + a 1276-row merged tail: the tail forward needs a batch of >= 1280.
+void testPrefillBatchFloor() {
+    for (const bool mtp : {true, false})
+        for (const std::uint32_t env_batch : {512u, 1024u, 1280u}) {
+            ServerSetup su = baseSetup(mtp);
+            su.mc.max_batch = vram::prefillBatchFloor(env_batch);  // what whirl-server now does with WHIRL_PREFILL_BATCH
+            su.eo.prefill_exec = server::prefillExecFor(2048, su.mc.max_batch);
+            TestServer srv(su);
+            const auto p = makePrompt(2300, 91);
+            auto r = srv.post("/v1/completions", completionBody(p, 16));
+            CHECK_EQ(r.status, 200);
+            CHECK_EQ(completionText(r), decode(srv.model().greedyReference(p, 16, true)));
+            CHECK(srv.model().maxPrefillRows() > server::prefill_chunk && srv.model().maxPrefillRows() <= su.mc.max_batch);
+            CHECK_EQ(srv.model().poison(), 0u);
+            if (r.status != 200) std::fprintf(stderr, "  (prefill_batch_floor: WHIRL_PREFILL_BATCH=%u, mtp %d, max_batch %u, status %d)\n", env_batch,
+                                         mtp ? 1 : 0, su.mc.max_batch, r.status);
+        }
+}
+
 // shared system-prompt checkpoint (item S): sessions with the same long
 // system message reuse its checkpoint; outputs equal the cold result
 void testSharedSystemPrompt() {
@@ -2084,6 +2107,7 @@ int main(int argc, char** argv) {
         {"dflash_rollback", testDFlashRollback},
         {"dflash_tier", testDFlashTier},
         {"concurrency_floor", [] { testConcurrency(4, 12, true, 20); }},
+        {"prefill_batch_floor", testPrefillBatchFloor},
         {"slot_draft_plan", testSlotDraftPlan},
         {"slot_drafts_one_slot", testSlotDraftsOneSlot},
         {"concurrency_slot2", [] { testConcurrency(4, 12, true, 0, 2); }},

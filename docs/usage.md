@@ -141,6 +141,8 @@ speed and, with MTP, the verify cycles and draft acceptance.
 | `--raw` | no chat template: the prompt text is tokenized as is |
 | `--tokens ID,ID,...` | token ids instead of a prompt (no template) |
 | `--out FILE` | write the last prompt position's logits (f32, one value per vocabulary entry) to FILE; disables MTP |
+| `--draft mtp\|dflash` | draft source (default `mtp`). `dflash`: the DFlash2 drafter GGUF (`--draft-model`) drafts up to block - 1 tokens per cycle, n-gram drafts stay on, the MTP block is not loaded; without a drafter that fits the model: MTP drafts with a warning |
+| `--draft-model FILE` | DFlash2 drafter GGUF for `--draft dflash`. Wins over `WHIRL_DRAFT_MODEL` (the environment variable is only used when `--draft-model` is not given; the log says which one was used) |
 | `--mmproj MMPROJ.gguf` | vision encoder (Qwen3-VL style mmproj, F16 / BF16), needed for `--image` |
 | `--image IMAGE` | an image placed before the prompt text; repeatable |
 | `--device SPEC` | GPU: `r9700`, `8060s`, an index, or a substring of the name / gfx architecture (also `WHIRL_DEVICE`). Default: the first R9700, else the first GPU the build has kernels for (a Radeon 8060S on its own) |
@@ -173,6 +175,7 @@ difference is reported.
 | `--prompt TEXT` / `@FILE` | prompt of the decode runs (default: a zh/en coding question) |
 | `--modes M,M,...` | decode modes: `mtp-ngram` (MTP + n-gram drafts, the default path), `mtp` (MTP only), `plain` (no MTP); default all three |
 | `--no-think` / `--think` | thinking off / on for the decode prompt (default on) |
+| `--draft mtp\|dflash`, `--draft-model FILE` | draft source and DFlash2 drafter, as for `chat` (with `dflash` the modes are `dflash-ngram`, `dflash`, `plain`) |
 | `--device SPEC` | GPU, as for `chat` |
 | `--precise` / `--balance` / `--fast` / `--mode M` | numerics mode, as for `chat` |
 
@@ -205,7 +208,7 @@ request slots, a prefix cache in VRAM and host RAM / SSD tiers for idle sessions
 | `--precise` / `--balance` / `--fast` / `--mode M` | numerics mode (default balance; `--precise`: f16 KV; when the f16 pool cannot hold a full request the context per request is lowered with a warning, or the server refuses to start if `--ctx` / `--ctx-per-slot` was given). See [numerics modes](#modes) |
 | `--mtp-drafts N` | fixed MTP drafts per cycle, 1–10 (default: chosen per model type by a cost model) |
 | `--draft mtp\|dflash` | draft source of the speculative decode (default `mtp`). `dflash`: the DFlash2 drafter GGUF given by `--draft-model` (block 8: up to 7 drafts per cycle); a model without a matching drafter (e.g. a MoE model) keeps `mtp`. n-gram drafts stay on in both modes; greedy outputs equal plain greedy decoding |
-| `--draft-model FILE` | DFlash2 drafter GGUF for `--draft dflash` (`WHIRL_DRAFT_MODEL` overrides) |
+| `--draft-model FILE` | DFlash2 drafter GGUF for `--draft dflash` (wins over `WHIRL_DRAFT_MODEL`, as for `chat`) |
 | `--decode-min-tps N` | decode floor: while other requests prefill, every streaming (decoding) request keeps at least N tok/s; prefill forwards are shortened and decode cycles interleaved to hold it (default 20; `0` = off, prefill forwards are not limited). Outputs are identical for any N ([server.md](guide/en/server.md#batching)) |
 | `--kv-ram-mb N` | host RAM tier of the prefix cache, MiB of pinned memory (default: 1/4 of physical RAM, at least 8 GiB or one full-length session if that is larger — about 9 GiB for the 27B model —, at most 32 GiB, and at most half of the RAM available at startup; 16 GiB on a 64 GB PC; integrated GPUs: OS-visible RAM / 8 within [one max-context entry (about 6 GiB for the 27B model at 262k), 16 GiB], at most 1/4 of the RAM available at startup, off under 32 GB of OS-visible RAM (the BIOS VRAM carve-out does not count; 8 GiB on a 64 GB machine)). The startup log prints the chosen size and why. Idle sessions are copied there and restored instead of prefilled again. `0` disables both host tiers. **Radeon 8060S** (integrated GPU): on by default with the size above (the KV pool is the BIOS carve-out, the tier is separate pinned OS RAM; a 128k session restores in 0.3 s from RAM or 2 s from SSD instead of a 537 s prefill); `--kv-ram-mb 0` turns both host tiers off, `--kv-ssd-gb 0` / `--kv-ssd-mode off` only the SSD tier |
 | `--kv-ssd-dir PATH` | SSD tier directory (default `%LOCALAPPDATA%\whirl\kvcache`) |
@@ -400,6 +403,7 @@ experiments and measurements.
 | `WHIRL_GPU_WAIT=S` | seconds to wait for another WHIRL process to free the GPU (default 1800) |
 | `WHIRL_MODE=precise\|balance\|fast[:ITEMS]` | numerics mode (= `--precise` / `--balance` / `--fast` / `--mode`; default balance). See [numerics modes](#modes) |
 | `WHIRL_PREFILL_BATCH=N` | prefill rows per forward (default 4096, up to 16384) |
+| `WHIRL_PREFILL_BATCH` below 1280 (server) | raised to 1280 with a warning: the scheduler's largest prefill forward is a 1024-row chunk plus a 256-row tail |
 | `WHIRL_MAX_CTX=N` | default context size of `chat` (= `--ctx`; default 8192) |
 | `WHIRL_CODE_OBJECT=FILE` | development: load the GPU kernels from this code object instead of the built-in one |
 | `WHIRL_MOE_FP8=0\|1` | MoE models with MXFP4 experts: expert prefill with fp8 activations (item `moefp8`: on in balance / fast, off in precise; fp8 is the faster path — about 11.7k vs 8.6k tok/s at 2k tokens for Ornith MXFP4). Affects prefill only |
@@ -435,6 +439,7 @@ The output always equals plain greedy decoding (with sampling: the same distribu
 | `WHIRL_MTP_FULLHEAD=1` | drafts use the full output head |
 | `WHIRL_DRAFT_VOCAB=off\|64k\|48k\|FILE\|N` | MTP draft head over a frequency subset of the vocabulary. Default: the 64k subset embedded in the executable, used only for dense qwen35 models with the 2-bit draft head and a 248,320-token vocabulary (outputs unchanged). `off` = full draft head; `48k` = `draft_vocab\subset_48k.bin` next to the exe; FILE = uint32 little-endian token ids; N = the first N rows |
 | `WHIRL_NGRAM=0` | no n-gram (prompt-lookup) drafts |
+| `WHIRL_DRAFT_MODEL=FILE` | DFlash2 drafter GGUF for `--draft dflash` when `--draft-model` is not given (debug override; `--draft-model` wins) |
 | `WHIRL_NGRAM_MIN=N` | minimum matched suffix for an n-gram draft (default 3) |
 | `WHIRL_NGRAM_SLOPE=X` | prior cost of one more n-gram verify row, relative to a 1-draft cycle, until n-gram cycles are timed (default 0.015; Radeon 8060S 0.12) |
 | `WHIRL_NGRAM_MAX=N` | most n-gram drafts per cycle (default 15) |

@@ -17,6 +17,9 @@
 #include <map>
 #include <fstream>
 #include <functional>
+#include <format>
+#include <iterator>
+#include <regex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -1139,7 +1142,110 @@ void testLoadEstimate() {
     }
 }
 
+// RC-R1 / PREFILL-R2: f32 / f16 matrices (no int8 GEMV) at n = 2..gvMax() rows take the multi-token
+// GEMV loop, bitwise == n = 1 per token: up to 16 rows, up to 32 inside a wide verify (small_max 32),
+// and only the n = 1 kernel is required (without gemv_<T>_4 / _8 the loop runs _1 per token).
+// Host-only: Model::matmulPath is the decision matmul() dispatches on (no GPU, no kernels loaded).
+void testFloatGemvDispatch() {
+    using MP = q::Model::MatmulPath;
+    static int fake_kernel = 0;
+    for (const gguf::GgmlType ty : {gguf::GgmlType::f16, gguf::GgmlType::f32}) {
+        const std::string tag = ty == gguf::GgmlType::f16 ? " (f16)" : " (f32)";
+        const std::size_t t = static_cast<std::size_t>(ty);
+        q::Model m;
+        m.k.gemv1[t] = &fake_kernel;  // only the n = 1 instance
+        q::Mat w;
+        w.ty = ty;
+        w.nrows = 64;
+        w.ncols = 64;
+        check(m.matmulPath(w, 1) == MP::gemv1, "float dispatch: n = 1 -> gemv1" + tag);
+        bool all = true;
+        for (std::uint32_t n = 2; n <= 16; ++n) all = all && m.matmulPath(w, n) == MP::float_gemv;
+        check(all, "float dispatch: n = 2..16 -> GEMV loop with only gemv_1" + tag);
+        check(m.matmulPath(w, 17) == MP::gemm_f16, "float dispatch: n = 17 outside a wide verify -> f16 GEMM" + tag);
+        m.small_max = 32;  // inside a wide verify / MTP step
+        all = true;
+        for (std::uint32_t n = 2; n <= 32; ++n) all = all && m.matmulPath(w, n) == MP::float_gemv;
+        check(all, "float dispatch: wide verify n = 2..32 -> GEMV loop with only gemv_1 (RC-R1)" + tag);
+        check(m.matmulPath(w, 33) == MP::gemm_f16, "float dispatch: n = 33 -> f16 GEMM" + tag);
+        m.k.gemv4[t] = m.k.gemv8[t] = &fake_kernel;
+        all = true;
+        for (std::uint32_t n = 2; n <= 32; ++n) all = all && m.matmulPath(w, n) == MP::float_gemv;
+        check(all, "float dispatch: wide verify n = 2..32 with gemv_4 / _8 -> GEMV loop" + tag);
+        m.prec_dec = true;  // precise decode: every small batch on the f16 GEMM (unchanged by RC-R1)
+        check(m.matmulPath(w, 1) == MP::gemm_f16 && m.matmulPath(w, 20) == MP::gemm_f16, "float dispatch: precise decode -> f16 GEMM" + tag);
+        m.prec_dec = false;
+        m.k.gemvq[t] = &fake_kernel;  // a type with the int8 GEMV keeps it
+        check(m.matmulPath(w, 20) == MP::gemvq, "float dispatch: int8 GEMV present -> gemvq" + tag);
+    }
+    // the loop covers every token exactly once whatever instances the code object has
+    bool cover = true;
+    for (const bool h8 : {false, true})
+        for (const bool h4 : {false, true})
+            for (std::uint32_t n = 1; n <= 32; ++n) {
+                std::uint32_t done = 0, launches = 0;
+                while (done < n) {
+                    const std::uint32_t st = q::Model::floatGemvStep(n - done, h8, h4);
+                    cover = cover && st >= 1 && st <= n - done && (st == 1 || (st == 4 && h4) || (st == 8 && h8));
+                    done += st;
+                    ++launches;
+                }
+                cover = cover && done == n && (h8 || h4 || launches == n);
+            }
+    check(cover, "float dispatch: GEMV loop steps cover n tokens (8 / 4 / 1 by the instances present)");
+}
+
+// OVH-C1: the MTP draft window (Model::attn_win) is set only around the MTP draft attention and restored
+// when that attention throws. (a) Model::draftAttn, through the attnBlock test hook (throws before any
+// GPU work): the hook sees the draft window, and attn_win is back to its previous value after the throw.
+// (b) both MTP call sites in forward.cpp go through draftAttn and nothing else assigns attn_win (a call
+// site reverted to "attn_win = ...; attnBlock(); attn_win = 0;" fails here).
+void testDraftWindowRestore() {
+    struct Seen {
+        std::int32_t win = -1;
+        int calls = 0;
+    } seen;
+    q::Model m;
+    m.draft_window = 16384;
+    m.draft_window_min = 65536;
+    m.attn_test_ctx = &seen;
+    m.attn_test_hook = [](void* ctx, std::int32_t win) {
+        auto* s = static_cast<Seen*>(ctx);
+        s->win = win;
+        ++s->calls;
+        throw q::ModelError("TestThrow", "attnBlock failed");
+    };
+    for (const std::int32_t before : {0, 7}) {
+        m.attn_win = before;
+        bool threw = false;
+        try {
+            m.draftAttn(q::AttnW{}, 1);
+        } catch (const q::ModelError&) {
+            threw = true;
+        }
+        check(threw && seen.win == q::draftWindowArg(16384, 65536) && seen.win != 0,
+              "OVH-C1: draftAttn runs attnBlock with the draft window");
+        check(m.attn_win == before, "OVH-C1: attn_win restored after the draft attention threw (before = " + std::to_string(before) + ")");
+    }
+    check(seen.calls == 2, "OVH-C1: test hook reached");
+#ifdef WHIRL_SOURCE_DIR
+    std::ifstream in(std::string(WHIRL_SOURCE_DIR) + "/src/model/forward.cpp", std::ios::binary);
+    const std::string fw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    check(!fw.empty(), "OVH-C1: src/model/forward.cpp readable");
+    std::size_t sites = 0, raw_mtp_attn = 0, assigns = 0;
+    for (std::size_t p = fw.find("draftAttn(mw.attn, n)"); p != std::string::npos; p = fw.find("draftAttn(mw.attn, n)", p + 1)) ++sites;
+    for (std::size_t p = fw.find("attnBlock(mw.attn"); p != std::string::npos; p = fw.find("attnBlock(mw.attn", p + 1)) ++raw_mtp_attn;
+    const std::regex asg(R"(\battn_win\s*=[^=])");
+    for (auto it = std::sregex_iterator(fw.begin(), fw.end(), asg); it != std::sregex_iterator(); ++it) ++assigns;
+    check(sites == 2 && raw_mtp_attn == 0 && assigns == 0,
+          std::format("OVH-C1: both MTP call sites use draftAttn ({} sites, {} raw MTP attnBlock calls, {} attn_win assignments)", sites,
+                      raw_mtp_attn, assigns));
+#endif
+}
+
 int main() {
+    testDraftWindowRestore();
+    testFloatGemvDispatch();
     testArchWhitelist();
     testLoadEstimate();
     testLoadValidation();

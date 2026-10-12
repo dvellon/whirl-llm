@@ -642,6 +642,12 @@ void testVramLimit() {
         }
     }
     CHECK_EQ(vram::min_prefill_batch, 1280u);
+    // the same floor for a user-set WHIRL_PREFILL_BATCH (REVIEW-RC4-C P2-3)
+    CHECK_EQ(vram::prefillBatchFloor(1u), 1280u);
+    CHECK_EQ(vram::prefillBatchFloor(512u), 1280u);
+    CHECK_EQ(vram::prefillBatchFloor(1279u), 1280u);
+    CHECK_EQ(vram::prefillBatchFloor(1280u), 1280u);
+    CHECK_EQ(vram::prefillBatchFloor(4096u), 4096u);
 }
 
 // server defaults by card size (vram::cardDefaults)
@@ -1082,14 +1088,19 @@ void testDflashPolicy() {
         // an incompatible drafter is reported before missing kernels
         CHECK(d::choose(d::Source::dflash, dm, "x", false).warning.find("does not fit") != std::string::npos);
     }
-    // --draft-model FILE vs the WHIRL_DRAFT_MODEL debug override: the environment wins, empty = not set
+    // --draft-model FILE vs WHIRL_DRAFT_MODEL: the command line wins, the environment is the fallback
+    // (a debug override when no --draft-model is given); empty = not set (REVIEW-RC4-C P3-8)
     {
         const std::optional<std::string> cli = std::string("a.gguf"), env = std::string("b.gguf"), empty = std::string();
         CHECK(*d::resolveDraftModel(cli, none) == "a.gguf");
         CHECK(*d::resolveDraftModel(none, env) == "b.gguf");
-        CHECK(*d::resolveDraftModel(cli, env) == "b.gguf");
+        CHECK(*d::resolveDraftModel(cli, env) == "a.gguf");
         CHECK(*d::resolveDraftModel(cli, empty) == "a.gguf");
         CHECK(!d::resolveDraftModel(none, none) && !d::resolveDraftModel(empty, empty) && !d::resolveDraftModel(none, empty));
+        // the log line names the source
+        CHECK(d::draftModelNote(cli, env).find("WHIRL_DRAFT_MODEL=b.gguf ignored") != std::string::npos);
+        CHECK(d::draftModelNote(none, env).find("from WHIRL_DRAFT_MODEL") != std::string::npos);
+        CHECK(d::draftModelNote(cli, none).empty() && d::draftModelNote(none, none).empty() && d::draftModelNote(cli, cli).empty());
     }
     // relaxacc: MTP drafts only (DFlash2 keeps exact acceptance in fast mode)
     CHECK(d::relaxApplies(d::Source::mtp, true) && !d::relaxApplies(d::Source::mtp, false));
