@@ -219,6 +219,10 @@ Plan plan(const Request& r, const Target& t) {
                 else note = "q4: int4 + f16 scale / 32, Hadamard-rotated q/k";
                 break;
             case Item::relaxacc:
+                if (!t.mtp) {
+                    why = "no MTP head (relaxacc relaxes MTP drafts only)";
+                    break;
+                }
                 if (t.moe) {
                     // FAST-2 (8060S): MoE runs one MTP draft per cycle there; relaxed acceptance moved
                     // Ornith 1.75 -> 1.85 tok/cycle with no decode gain (short +2%, 32k -12%, n=1)
@@ -246,6 +250,25 @@ void setQ8dec(Plan& p, bool q8, const std::string& env) {
         p.lossy_override = true;
     } else {
         p.overrides.push_back(std::format("WHIRL_Q8DEC={}: q8dec off (f16 decode activations)", env));
+    }
+}
+
+void skipItem(Plan& p, Item it, const std::string& why) {
+    ItemState& s = p.items[static_cast<std::size_t>(it)];
+    if (!s.enabled) return;
+    s.enabled = false;
+    s.note = why;
+}
+
+const char* const k_numerics_switches[] = {"FD_SPLITS", "GEMV_MAX",   "GV_NMAX",  "GV_GROUP", "NO_FUSE", "FLOAT_GEMV",
+                                           "GDN_SEQ",   "NAIVE_ATTN", "DBG",      "ATTN_WIDE", "ATTN_DQ4", "MOE_BN", nullptr};
+
+void noteSwitches(Plan& p, const std::function<std::optional<std::string>(const char*)>& get) {
+    for (const char* const* n = k_numerics_switches; *n != nullptr; ++n) {
+        const auto v = get(*n);
+        if (!v || v->empty()) continue;
+        p.overrides.push_back(std::format("WHIRL_{}={}: A/B switch (kernel paths differ from the tested defaults)", *n, *v));
+        p.lossy_override = true;
     }
 }
 

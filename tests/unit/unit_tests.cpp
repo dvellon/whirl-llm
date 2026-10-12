@@ -831,6 +831,31 @@ void testNumerics() {
         CHECK(p.on(Item::relaxacc) && nu::logLine(p).find("fast runs as balance") == std::string::npos);
         CHECK(!nu::plan(bal, swift).on(Item::relaxacc) && !nu::plan(pre, swift).on(Item::relaxacc));
         CHECK(!nu::plan(fast, ornith).on(Item::relaxacc));  // MoE: skipped (no measured gain)
+        {
+            // FIX-NUM P3-7: relaxacc needs an MTP head; a run that cannot use it reports it skipped
+            nu::Target nomtp = swift;
+            nomtp.mtp = false;
+            const nu::Plan pn = nu::plan(fast, nomtp);
+            CHECK(!pn.on(Item::relaxacc));
+            CHECK(pn.items[static_cast<std::size_t>(Item::relaxacc)].note.find("no MTP head") != std::string::npos);
+            CHECK(nu::logLine(pn).find("fast runs as balance") != std::string::npos);
+            nu::Plan pd = nu::plan(fast, swift);
+            nu::skipItem(pd, Item::relaxacc, "--draft dflash");
+            CHECK(!pd.on(Item::relaxacc) && nu::logLine(pd).find("relaxacc (--draft dflash)") != std::string::npos);
+            CHECK(nu::logLine(pd).find("fast runs as balance") != std::string::npos);
+            // FIX-NUM P3-5: kernel-path A/B switches are recorded as overrides
+            nu::Plan ps = nu::plan(bal, swift);
+            nu::noteSwitches(ps, [](const char*) -> std::optional<std::string> { return std::nullopt; });
+            CHECK(ps.overrides.empty() && nu::modeLabel(ps) == "balance");
+            nu::noteSwitches(ps, [](const char* n) -> std::optional<std::string> {
+                if (std::string(n) == "GEMV_MAX") return std::string("8");
+                if (std::string(n) == "FD_SPLITS") return std::string("128");
+                if (std::string(n) == "NO_FUSE") return std::string("");
+                return std::nullopt;
+            });
+            CHECK(ps.overrides.size() == 2 && nu::modeLabel(ps) == "balance+overrides");
+            CHECK(nu::logLine(ps).find("WHIRL_GEMV_MAX=8") != std::string::npos && nu::logLine(ps).find("WHIRL_FD_SPLITS=128") != std::string::npos);
+        }
         nu::Request fk = nu::parseMode("fast:kvq8", "t");  // custom fast list without relaxacc / kvq4
         CHECK(nu::logLine(nu::plan(fk, swift)).find("fast runs as balance") != std::string::npos);
         nu::Target t8 = s8060;
