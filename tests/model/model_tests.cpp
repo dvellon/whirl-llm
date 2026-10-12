@@ -674,7 +674,13 @@ GgufImage dflashImage(std::uint32_t embd, std::uint32_t vocab, bool mask = true,
     g.kvU32(a + ".attention.sliding_window", 2048);
     g.kvI32Array(a + ".target_layers", {2, 4, 6});
     if (mask) g.kvU32("tokenizer.ggml.mask_token_id", 95);
-    g.tensor("fc.weight", 3ull * embd, embd, 0, 3ull * embd * embd * 4);
+    if (g_trunk_edit && g_trunk_edit->name == "fc.weight") {  // FR-DFL P3-7: fc of another type (bytes by ggml type)
+        const std::uint32_t ty = g_trunk_edit->type;
+        const std::uint64_t n = 3ull * embd * embd;
+        g.tensor("fc.weight", 3ull * embd, embd, ty, ty == 39 ? n / 32 * 17 : ty == 8 ? n / 32 * 34 : ty == 1 ? 2 * n : 0);
+    } else {
+        g.tensor("fc.weight", 3ull * embd, embd, 0, 3ull * embd * embd * 4);
+    }
     addDFlashTrunk(g, embd, 8);
     g.tensor("selector_predecessor.weight", 8, vocab);
     g.tensor("selector_successor.weight", 8, vocab);
@@ -827,6 +833,11 @@ void testDFlashTensors() {
     rejected({"blk.4.attn_v.weight", {}, 0, true}, "a missing layer tensor");
     rejected({"blk.1.attn_norm.weight", {}, 1}, "an f16 norm vector");
     rejected({"blk.1.attn_q.weight", {}, 1000}, "a matrix of an unknown type");
+    // FR-DFL P3-7: fc is split into per-target-layer column blocks: MXFP4 (repacked, per-row reference) refused
+    rejected({"fc.weight", {}, 39}, "an MXFP4 fc");
+    check(why({"fc.weight", {}, 8}).empty(), "DFlash2 tensors: a Q8_0 fc accepted (" + why({"fc.weight", {}, 8}) + ")");
+    check(why({"fc.weight", {}, 1}).empty(), "DFlash2 tensors: an f16 fc accepted");
+    rejected({"fc.weight", {}, 1000}, "an fc of an unknown type");
     // block_count / head_dim limits (the metadata the shapes come from)
     const auto img = dflashImage(64, 100).build();
     const gguf::File f = gguf::File::parse(img);

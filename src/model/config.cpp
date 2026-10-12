@@ -382,6 +382,16 @@ void validateDFlashTensors(const DFlashConfig& c, const gguf::File& f) {
     };
     const u64 E = c.n_embd, HD = c.head_dim, QW = static_cast<u64>(c.n_head) * HD, KW = static_cast<u64>(c.n_head_kv) * HD;
     const u64 F = c.n_ff, K = c.conv_k, DS = 2 * K * (E / c.conv_group);
+    // fc (shape checked by validate): the ingest splits it into n_target_layers column blocks of E values
+    // (Model::dflashIngest: ptr + j * row_bytes / nl, ncols E), so each block must start on a whole quant
+    // block; MXFP4 is refused: it is repacked per 256 values with one reference exponent per full row
+    // (Loader::uploadMx), which a column block does not have (FR-DFL P3-7; no MXFP4 drafter exists to test)
+    if (const gguf::TensorInfo* fc = f.tensor("fc.weight")) {
+        if (fc->type == GgmlType::mxfp4) bad("fc.weight is MXFP4 (the drafter splits fc into column blocks; use Q8_0 / f16 / f32)");
+        const gguf::TypeTraits* tt = gguf::typeTraits(fc->type);
+        if (!tt || fc->nbytes() == 0 || E % tt->block_size != 0)
+            bad("fc.weight: type " + gguf::typeName(fc->type) + " cannot be split into column blocks of " + std::to_string(E));
+    }
     vec("enc.output_norm.weight", {E, 1, 1, 1});
     vec("output_norm.weight", {E, 1, 1, 1});
     mat("selector_hidden.weight", E, c.sel_rank);
