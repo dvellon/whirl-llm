@@ -2631,11 +2631,8 @@ void testFrPoolPrefill() {
     }
     CHECK_EQ(srv.model().poison(), 0u);
     // the residual path (a prefill that still runs out of pages) answers 503 + Retry-After
-    const std::string e503 = errorResponse(503, "full", "Retry-After: 5
-");
-    CHECK(e503.starts_with("HTTP/1.1 503 Service Unavailable
-Retry-After: 5
-Content-Type: application/json"));
+    const std::string e503 = errorResponse(503, "full", "Retry-After: 5\r\n");
+    CHECK(e503.starts_with("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Type: application/json"));
 }
 
 // P3-8 (with P2-3): decode-time pool exhaustion is not a silent "length"
@@ -2668,6 +2665,17 @@ void testFrPoolDecode() {
 // P2-4: disallowed Origin -> 403 for POST (also text/plain simple requests); Host allow-list (DNS rebinding)
 void testFrCrossOrigin() {
     const std::string chat = R"({"messages":[{"role":"user","content":"q"}],"max_tokens":4,"temperature":0})";
+    CHECK(hostAllowed("192.168.1.5:8080", {}, "0.0.0.0"));
+    CHECK(hostAllowed("[fe80::1]:80", {}, "::"));
+    CHECK(!hostAllowed("evil.example", {}, "0.0.0.0"));
+    CHECK(hostAllowed("192.168.1.5", {}, "192.168.1.5"));
+    CHECK(!hostAllowed("192.168.1.6", {}, "192.168.1.5"));
+    CHECK(hostAllowed("[fe80::1]:8080", {}, "fe80::1"));
+    CHECK(hostAllowed("localhost.:8080", {}, "127.0.0.1"));
+    CHECK(!hostAllowed("localhost:80x", {}, "127.0.0.1"));
+    CHECK(!hostAllowed("127.0.0.1.nip.io", {}, "127.0.0.1"));
+    CHECK(hostAllowed("anything.example", {"*"}, "127.0.0.1"));
+    CHECK(hostAllowed("", {}, "127.0.0.1"));  // no Host header (HTTP/1.0 tools)
     {
         ServerSetup su = baseSetup();
         TestServer srv(su);

@@ -35,7 +35,8 @@ model and GPU on disk).
 | `--log-file` | log file (also printed to the console) | per-user local app-data directory |
 | `--alias` | model id reported by `/v1/models` | GGUF file name |
 | `--mmproj FILE`, `--vis-idle-s`, `--vis-mode`, `--vis-cache-mb` | image input ([vision.md](vision.md)) | off / 60 / auto / 1024 |
-| `--cors-origin ORIGIN` | extra web-page origin allowed to call the server from a browser (repeatable; `*` = any page, the pre-v0.1.4 behaviour) | only `http(s)://localhost`, `127.0.0.1`, `[::1]` pages |
+| `--cors-origin ORIGIN` | extra web-page origin allowed to call the server from a browser (repeatable; `*` = any page, the pre-v0.1.4 behaviour); a `POST` from any other page is refused (403) | only `http(s)://localhost`, `127.0.0.1`, `[::1]` pages |
+| `--allow-host NAME` | extra `Host` header name the server answers (repeatable; `*` = any); other names get 403 (DNS rebinding guard) | `localhost`, `127.0.0.1`, `[::1]`, the `--host` address |
 
 Useful environment variables (all of them: [usage.md](../../usage.md#env)):
 

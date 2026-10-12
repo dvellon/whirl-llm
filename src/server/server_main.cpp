@@ -170,7 +170,11 @@ const char* kHelpBody =
     "  --allow-local-images     also accept local file paths / file:// URLs as image sources\n"
     "  --cors-origin ORIGIN     web pages from ORIGIN (e.g. https://app.example.com) may call the server\n"
     "                           from a browser (CORS); repeatable; * = any page (the behaviour before\n"
-    "                           v0.1.4). Default: only pages on http(s)://localhost, 127.0.0.1, [::1]\n"
+    "                           v0.1.4). Default: only pages on http(s)://localhost, 127.0.0.1, [::1].\n"
+    "                           A POST from any other page is refused (403)\n"
+    "  --allow-host NAME        also answer requests whose Host header is NAME (repeatable; * = any).\n"
+    "                           Default: localhost, 127.0.0.1, [::1] and the --host address (any IP\n"
+    "                           address with --host 0.0.0.0); other names get 403 (DNS rebinding guard)\n"
     "  --log-file PATH          log file (default %LOCALAPPDATA%\\whirl\\server.log; the log also goes to\n"
     "                           the console)\n"
     "  -h, --help               this text\n"
@@ -205,6 +209,7 @@ struct Options {
     std::uint64_t vis_cache_mb = 1024;
     bool allow_local_images = false;
     std::vector<std::string> cors_origins;  // --cors-origin (repeatable)
+    std::vector<std::string> allowed_hosts;  // --allow-host (repeatable)
     std::optional<std::string> mode_spec;   // --precise / --balance[=items] / --fast[=items] / --mode M
 };
 
@@ -421,6 +426,10 @@ int serveMain(int argc, char** argv, const char* program) {
             if (*v17 != "*" && v17->find("://") == std::string::npos)
                 die("invalid --cors-origin " + *v17 + " (give an origin such as https://app.example.com, or *)");
             opt.cors_origins.push_back(*v17);
+        }
+        else if (auto v18 = argValue(args, i, "--allow-host")) {
+            if (v18->empty() || v18->find_first_of(" /\\") != std::string::npos) die("invalid --allow-host " + *v18 + " (give a host name such as myhost.lan, or *)");
+            opt.allowed_hosts.push_back(*v18);
         }
         else if (!arg.empty() && arg[0] == '-') die("unknown option " + arg);
         else if (opt.path.empty()) opt.path = arg;
@@ -1313,6 +1322,7 @@ int serveMain(int argc, char** argv, const char* program) {
                  probe_1ms, sleepMs(std::chrono::milliseconds(1), 50), probe_200us, sleepMs(std::chrono::microseconds(200), 50));
         HttpOptions ho;
         ho.cors_origins = opt.cors_origins;
+        ho.allowed_hosts = opt.allowed_hosts;
         HttpServer http(engine, ho);
         http.start(opt.host, opt.port);
         logI("server listening on http://{}:{} (model id \"{}\", {} slots); endpoints: GET /health, GET /v1/models, POST "

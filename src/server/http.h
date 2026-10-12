@@ -44,6 +44,10 @@ struct HttpOptions {
 std::string corsHeaders(std::string_view origin, const std::vector<std::string>& extra);
 // http(s)://localhost, 127.0.0.1 or [::1] with an optional port.
 bool isLoopbackOrigin(std::string_view origin);
+// FR-SRV P2-4 (DNS rebinding): a Host header value the server answers. Allowed: localhost,
+// 127.0.0.1, [::1], the bound address (any IP literal when bound to 0.0.0.0 / ::), the names in
+// `extra` ("*" = any); an optional :port; no Host header (non-browser HTTP/1.0 clients).
+bool hostAllowed(std::string_view host, const std::vector<std::string>& extra, std::string_view bound);
 
 class HttpServer {
 public:
@@ -69,6 +73,7 @@ private:
 
     Engine& e_;
     HttpOptions o_;
+    std::string bound_;  // the --host address (Host header allow-list)
     std::mutex conns_mu_;
     std::set<std::uintptr_t> conns_;    // open connection sockets
     std::set<std::uintptr_t> reading_;  // ... of which still reading their request
