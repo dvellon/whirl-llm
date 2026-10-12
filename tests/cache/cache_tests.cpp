@@ -283,6 +283,18 @@ static void testFingerprint() {
     p.numerics = "precise (items)";
     CHECK(tierFingerprint(p) != base);
     CHECK(tierFingerprint(p) == oldFingerprint(p, {}));
+    // KV format is part of the key (FR-CACHE: corrupting kv_name went unnoticed)
+    for (const char* kv : {"q8h", "q8", "q8v", "q4", ""}) {
+        p = in;
+        p.kv_name = kv;
+        CHECK(tierFingerprint(p) != base);
+    }
+    p = in;
+    p.max_batch = 2048;
+    CHECK(tierFingerprint(p) != base);
+    p = in;
+    p.exe_id += 1;
+    CHECK(tierFingerprint(p) != base);
     // model identity / layout / mtp
     p = in;
     p.use_mtp = false;
@@ -302,6 +314,22 @@ static void testFingerprint() {
     CHECK(e1 == oldFingerprint(in, {{"WHIRL_A", "1"}, {"WHIRL_B", "2"}}));
     p.env = {{"WHIRL_A", "1"}, {"WHIRL_B", "3"}};
     CHECK(tierFingerprint(p) != e1);
+    // FIX-NUM P2-2: the GPU code object is part of the key (one exe, R9700 + 8060S kernels)
+    {
+        FingerprintInputs a = in, b = in;
+        a.gpu_arch = "gfx1201";
+        b.gpu_arch = "gfx1151";
+        CHECK(tierFingerprint(a) != tierFingerprint(b));
+        CHECK(tierFingerprint(a) != base && tierFingerprint(b) != base);
+        CHECK(tierFingerprint(a) == tierFingerprint(a));
+        // device name and kernel set (FR-CACHE P1-1)
+        FingerprintInputs e = a;
+        e.gpu_name = "AMD Radeon(TM) 8060S Graphics";
+        CHECK(tierFingerprint(e) != tierFingerprint(a));
+        e = a;
+        e.kernel_set = "gfx1151 co 123";
+        CHECK(tierFingerprint(e) != tierFingerprint(a));
+    }
     p.env = {{"Whirl_Relax", "1"}};  // prefix check is case-insensitive, the key is hashed as written
     CHECK(tierFingerprint(p) != base);
     CHECK(fingerprintEnvKept("WHIRL_NUMERICS"));

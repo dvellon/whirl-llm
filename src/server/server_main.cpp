@@ -320,6 +320,11 @@ std::uint64_t tierFingerprint(const qwen35::Model& m, const std::string& path, c
     in.page_bytes = lay.page_bytes;
     in.max_batch = m.max_batch;
     in.numerics = whirl::numerics::logLine(m.num_plan);
+    const hip::DeviceInfo dev = hip::describeDevice(hip::getDevice());
+    in.gpu_arch = dev.gcn_arch;
+    in.gpu_name = dev.name;
+    const hip::EmbeddedObject* co = hip::embeddedObjectFor(m.arch);
+    in.kernel_set = std::format("{} co {}", hip::archName(m.arch), co != nullptr ? *co->size : 0ull);
     in.env = cache::fingerprintEnv();
     return cache::tierFingerprint(in);
 }
@@ -864,6 +869,8 @@ int serveMain(int argc, char** argv, const char* program) {
             // the fast mode's other items (4-bit KV, ...) stay and the decode equals greedy of them
             logI("relaxacc: not used with --draft dflash (DFlash2 / n-gram drafts keep exact acceptance)");
             eo.relax.on = false;
+            // /props and the tier fingerprint must not report relaxacc as active
+            numerics::skipItem(model.num_plan, numerics::Item::relaxacc, "--draft dflash: DFlash2 / n-gram drafts keep exact acceptance");
         }
         eo.n_draft = drafts;
         eo.p_min = p_min;

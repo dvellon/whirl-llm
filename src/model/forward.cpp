@@ -1925,10 +1925,11 @@ void Model::run(u32 n) {
         return;
     }
     const DevPtr last = x + static_cast<u64>(n - 1) * E * 4;
-    if (fused(1))
-        rmsnormQ8(last, output_norm, h, 1);
-    else
-        rmsnorm(last, output_norm, h, E, 1, E, E);
+    // FIX-NUM P2-1: every head input uses the 256-thread rmsnorm (the reduction order of the
+    // verify / all-logits rows above, which the server's decode and the CLI's MTP / n-gram verify
+    // take), never rmsnormQ8's 1024-thread block sum: plain decode, prompt-end logits and verify
+    // rows then give the same logits bits for the same hidden row.
+    rmsnorm(last, output_norm, h, E, 1, E, E);
     head_phase = true;
     matmul(output, h, logits, 1, false);
     head_phase = false;
@@ -2059,10 +2060,7 @@ void Model::prefillSegs(std::span<const PSeg> segs, bool with_mtp) {
         const PSeg& sg = segs[kk];
         if (sg.off + sg.n != sg.tokens.size()) continue;
         const DevPtr last = x + (static_cast<u64>(rows[kk].r0) + rows[kk].n - 1) * E * 4;
-        if (fused(1))
-            rmsnormQ8(last, output_norm, h, 1);
-        else
-            rmsnorm(last, output_norm, h, static_cast<u32>(E), 1, static_cast<u32>(E), static_cast<u32>(E));
+        rmsnorm(last, output_norm, h, static_cast<u32>(E), 1, static_cast<u32>(E), static_cast<u32>(E));  // P2-1: as run()
         head_phase = true;
         matmul(output, h, logits + static_cast<u64>(kk) * cfg.n_vocab * 4, 1, false);
         head_phase = false;

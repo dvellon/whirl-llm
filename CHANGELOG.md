@@ -50,19 +50,29 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 - New `--precise` / `--balance` / `--fast` (or `--mode M`, env `WHIRL_MODE`) for `whirl` and
   `whirl-server`; one mode per process, reported in the start-up log and in `GET /props`
   (`"numerics"`). See [docs/usage.md](docs/usage.md#modes).
-- **balance stays the default** when no mode is given (owner decision for 0.2.0; same output as
-  0.1.x, including q8v KV on cards under 20 GiB); `--precise` and `--fast` are opt-in, `--balance`
-  is still accepted, and `GET /props` `"numerics"` reports `"source"` (`default`, `command line` or
-  `WHIRL_MODE`).
+- **balance stays the default** when no mode is given (owner decision for 0.2.0); `--precise` and
+  `--fast` are opt-in, `--balance` is still accepted, and `GET /props` `"numerics"` reports
+  `"source"` (`default`, `command line` or `WHIRL_MODE`).
+- What each mode is, in one place (the entries below give the details):
+
+  | mode | KV format | activations / kernels | output guarantee |
+  |---|---|---|---|
+  | precise | f16 (every model, every GPU) | no fp8, f32 DeltaNet, no h16; f16 decode / verify activations | bitwise reproducible: the same bits with or without drafts, solo or batched, CLI or server |
+  | balance (default) | q8h on dense models, f16 on MoE models | items `fp8`, `moefp8`, `gdnwmma`, `h16`, `kvq8`; int8 decode / verify activations | near-lossless (KL vs precise about 1e-4 to 5e-4), MTP / n-gram == plain greedy; **not** bit for bit the 0.1.x output (q8v KV gone, KG-1 kernels, specsample sampler) |
+  | fast | q4 (R9700 since FAST-1c, Radeon 8060S) | balance + `kvq4`, `relaxacc` (dense models with an MTP head) | lossy within the published KL; the text may depend on drafts |
+
 - **precise** (`--precise`) on every GPU: no fp8 MXFP4 prefill activations (and no rounding of
   folded MXFP4 exponents), no fp8 MoE expert prefill, f32 DeltaNet prefill chunks instead of
   f16-WMMA, no f16 GEMM intermediates (h16), and **f16 KV everywhere** (no automatic q8v / q8h / q8,
   also on cards under 20 GiB and on the Radeon 8060S). When f16 KV does not fit, the context is
   lowered with a warning, or the program stops with a message when `--ctx` / `--ctx-per-slot` was
   given. MXFP4 prefill is slower in precise mode than in 0.1.x.
-- **balance** is the 0.1.x / 0.2.0-rc behaviour, bit for bit (items `fp8`, `moefp8`, `gdnwmma`,
-  `h16`, `kvq8`; `--balance=ITEMS` picks a subset). **fast** lists the future gated lossy items
-  (4-bit KV, relaxed acceptance, ...); none is implemented yet, so fast runs as balance.
+- **balance** uses the items `fp8`, `moefp8`, `gdnwmma`, `h16` and `kvq8` (`--balance=ITEMS` picks
+  a subset). It is near-lossless, not bit for bit the 0.1.x output: the KV format is q8h on dense
+  models (BAL-Q8, no q8v), dense models get the KG-1 kernels, and sampling uses specsample (see
+  those entries). **fast** is balance plus the lossy items `kvq4` (4-bit KV) and `relaxacc`
+  (relaxed MTP acceptance, dense models with an MTP head); where neither applies (e.g. MoE models
+  on a GPU without q4 KV kernels) the log says "fast runs as balance".
 - `whirl selftest`: the precise decode checks turn fp8 prefill, MoE fp8 and h16 off themselves
   (FIX-PS). Since balance became the default, selftest loaded in balance and its "== prefill GEMM
   rows" (MXFP4) and precise MoE n=17..32 checks compared against the fp8 prefill paths and

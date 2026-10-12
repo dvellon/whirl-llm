@@ -20,6 +20,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -127,6 +128,15 @@ void applyOverride(Plan& p, Item it, const char* var, const std::string& value, 
 // WHIRL_Q8DEC value ("" = unset); a value that changes the mode's default is recorded as an
 // override (int8 in precise: lossy, user-requested).
 void setQ8dec(Plan& p, bool q8, const std::string& env);
+
+// An item the run cannot use after all (e.g. relaxacc with --draft dflash): skipped with `why`.
+void skipItem(Plan& p, Item it, const std::string& why);
+
+// WHIRL_* A/B switches that change which kernels run (WHIRL_FD_SPLITS, WHIRL_GEMV_MAX, ...):
+// each one set is recorded as an override ("+overrides" label), so the log and /props show that
+// the run's bits are not the mode's tested paths. get(name) reads WHIRL_<name>.
+extern const char* const k_numerics_switches[];
+void noteSwitches(Plan& p, const std::function<std::optional<std::string>(const char*)>& get);
 
 // "numerics: balance - enabled: fp8 (...), ...; skipped: gdnwmma (...); always: q8dec (...)"
 std::string logLine(const Plan& p);

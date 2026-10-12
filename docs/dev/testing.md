@@ -71,9 +71,9 @@ R9700 a run takes 12-19 s with the model files in the OS file cache, and a full 
 about 3 minutes. The Radeon 8060S takes about the same (8-30 s a run). A subset (one model, one
 mode) takes about 30 s.
 
-In this version `--fast` has no items of its own yet and runs as balance, so the fast files
-match the balance files. They are kept separate so the gate already covers fast once its items
-land.
+`--fast` has its own items (q4 KV, relaxacc on dense models with an MTP head), so the fast
+files differ from the balance files wherever those items apply (re-record them only together with a
+KL check of the fast items).
 
 ### Rules
 
