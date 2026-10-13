@@ -1147,13 +1147,25 @@ void tierMode(const std::string& mode) {
                   sameText(b, rb) && b.cached == rb.cached, std::format("cached {} vs {}", b.cached, rb.cached));
         }
         check(std::format("tier {}: RAM restores logged", mode), s->logCount(R"(kv tier: restored \d+ tok from RAM)") >= n_ev);
+        // CLOSE-COV: shutdown mode writes only reused entries at the stop, so a session that ran one turn here
+        // (p1's thinking session T, p4's B-E) would not reach the SSD and would cold-prefill after the restart,
+        // where the content-only checks still pass. Each of them runs its turn 2 here too: the entry becomes
+        // reused (restored from RAM, or resumed in place), the stop writes it, and the restart checks below
+        // require every session to come back from the SSD.
+        for (std::size_t i = n_ev; i < S.size(); ++i) {
+            auto b = chat(t2msg(S[i], t1[S[i].name]), greedy(96) + thinkKw(S[i].think));
+            const auto& rb = ref[S[i].name].second;
+            check(std::format("tier {}: {} turn 2 before the restart == never-evicted", mode, S[i].name),
+                  sameText(b, rb) && b.cached == rb.cached, std::format("cached {} vs {}", b.cached, rb.cached));
+        }
         std::this_thread::sleep_for(std::chrono::seconds(3));
         s->waitTierIdle(60);  // pending SSD writes done before the stop
     }
     std::size_t files = 0;
     if (fs::exists(widen(ssd)))
         for (const auto& e : fs::directory_iterator(widen(ssd))) files += e.is_regular_file() ? 1 : 0;
-    check(std::format("tier {}: entries on SSD after the restart", mode), files >= 1, std::format("{} files", files));
+    check(std::format("tier {}: entries on SSD after the restart (one per session)", mode), files >= S.size(),
+          std::format("{} files, {} sessions", files, S.size()));
     std::map<std::string, ChatResult> after;
     {
         ServerLease s("tier_" + mode + "_restart", args, {{"WHIRL_KV_SSD_DIR", ssd}}, false);
@@ -1164,8 +1176,14 @@ void tierMode(const std::string& mode) {
             check(std::format("tier {}: {} turn 2 after restart (SSD restore) == never-evicted", mode, ss.name),
                   sameContent(b, rb) && b.reasoning == rb.reasoning,
                   std::format("cached {} (ref {}), prompt {}", b.cached, rb.cached, b.prompt));
+            // CLOSE-COV: the content check alone passes on a cold prefill too; the restored prefix must cover at
+            // least what the never-evicted run reused (its turn 1), which only the session's SSD entry can give
+            check(std::format("tier {}: {} turn 2 after restart restored from SSD (cached >= never-evicted)", mode, ss.name),
+                  rb.cached > 0 && b.cached >= rb.cached, std::format("cached {} (ref {}), prompt {}", b.cached, rb.cached, b.prompt));
         }
-        check(std::format("tier {}: SSD restores logged", mode), s->logCount(R"(kv tier: restored \d+ tok from SSD)") >= 1);
+        const std::size_t n_ssd = s->logCount(R"(kv tier: restored \d+ tok from SSD)");
+        check(std::format("tier {}: SSD restores logged (one per session)", mode), n_ssd >= S.size(),
+              std::format("{} SSD restores, {} sessions", n_ssd, S.size()));
     }
     fs::remove_all(widen(ssd), ec);
     if (p1) {
