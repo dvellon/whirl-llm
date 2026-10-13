@@ -249,7 +249,7 @@ agent 情境（8 個 session，各自「詢問某個檔案 → `read_file` → �
 
 ### 8.3 SSD 層
 
-- 每個項目一個檔案（4 KiB 標頭、token id、資料區）。一個 I/O 執行緒以無緩衝的定位寫入只寫髒區塊：標頭標記無效 → 資料 → flush → 有效標頭。預設 `--kv-ssd-mode shutdown` 執行中不寫，只有主記憶體層必須擠出的重用過的項目例外（前綴被還原過、接續過的 session、被共用的 system checkpoint；至少 2048 token，背景寫入），其餘在優雅關閉時寫；`always` 模式在項目 `--kv-ssd-delay` 秒（預設 300）未變動後寫，且只寫重用過的項目。
+- 每個項目一個檔案（4 KiB 標頭、token id、資料區）。一個 I/O 執行緒以無緩衝的定位寫入只寫髒區塊：標頭標記無效 → 資料 → flush → 有效標頭。預設 `--kv-ssd-mode shutdown` 在關閉 WHIRL 時寫（Ctrl+C、關閉主控台視窗、登出、作業系統關機；後三者只有約 5 秒，Ctrl+C 會完整寫完），執行中不寫，但主記憶體層必須擠出的重用過的項目也會寫入（前綴被還原過、接續過的 session、被共用的 system checkpoint；至少 2048 token，背景寫入），其餘在優雅關閉時寫；`always` 模式在項目 `--kv-ssd-delay` 秒（預設 300）未變動後寫，且只寫重用過的項目。
 - 啟動時掃描並索引目錄；檢查 magic、fingerprint 與 token checksum，刪除損壞的檔案。超過大小上限（預設 64 GiB）時刪除 LRU 檔案。
 - **Fingerprint：** 執行檔（大小 + 修改時間）、模型檔名 + tensor 數量 + 位元組數、KV 格式、MTP 開/關、配置、prefill batch，以及所有會改變數值的引擎設定（排程/日誌/分層設定除外）。由不同 build 或不同數值設定寫出的項目永遠不會被還原。
 - 讀取：最多 4 個重疊讀取同時進行，依序完成（NVMe 2 MiB QD4 7.0 GB/s vs QD1 4.1 GB/s）；還原是管線化的——一個區塊讀完，其片段就立刻做 H2D 複製。

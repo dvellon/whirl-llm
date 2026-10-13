@@ -451,10 +451,10 @@ then KV page j at `nck × ck_stride + j × page_bytes` (13.0 MiB per page for q8
 
 - One file per entry (4 KiB header, token ids, data region). An I/O thread writes only dirty blocks
   with unbuffered positional writes: header marked invalid → data → flush → valid header. An entry
-  is written (`--kv-ssd-mode always` only; the default `shutdown` writes at a graceful stop) after it has been
+  is written (`--kv-ssd-mode always` only; the default `shutdown` writes when WHIRL is closed: Ctrl+C, console window closed, logoff, OS shutdown; the last three allow only about 5 s, Ctrl+C a full flush) after it has been
   unchanged for `--kv-ssd-delay` seconds (default 300), and only if it was reused or resumed at least once (a
   one-shot prompt is never written); a graceful stop writes the most recently used entries first. Shutdown
-  mode writes nothing while running, except reused entries that RAM has to evict: a reused entry (restored,
+  mode writes nothing while running, except that reused entries that RAM must evict are also written: a reused entry (restored,
   resumed, or a shared system-message checkpoint that requests attached) of at least 2048 tokens that RAM
   pressure pushes out is written in the background instead of dropped (size cap and dedup apply as for any
   write; the spill that needed the room is retried when the write is done).

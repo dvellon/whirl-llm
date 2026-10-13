@@ -226,7 +226,7 @@ request slots, a prefix cache in VRAM and host RAM / SSD tiers for idle sessions
 | `--kv-ram-mb N` | host RAM tier of the prefix cache, MiB of pinned memory (default: 1/4 of physical RAM, at least 8 GiB or one full-length session if that is larger — about 9 GiB for the 27B model —, at most 32 GiB, and at most half of the RAM available at startup; 16 GiB on a 64 GB PC; integrated GPUs: OS-visible RAM / 8 within [one max-context entry (about 6 GiB for the 27B model at 262k), 16 GiB], at most 1/4 of the RAM available at startup, off under 32 GB of OS-visible RAM (the BIOS VRAM carve-out does not count; 8 GiB on a 64 GB machine)). The startup log prints the chosen size and why. Idle sessions are copied there and restored instead of prefilled again. `0` disables both host tiers. **Radeon 8060S** (integrated GPU): on by default with the size above (the KV pool is the BIOS carve-out, the tier is separate pinned OS RAM; a 128k session restores in 0.3 s from RAM or 2 s from SSD instead of a 537 s prefill); `--kv-ram-mb 0` turns both host tiers off, `--kv-ssd-gb 0` / `--kv-ssd-mode off` only the SSD tier |
 | `--kv-ssd-dir PATH` | SSD tier directory (default `%LOCALAPPDATA%\whirl\kvcache`) |
 | `--kv-ssd-gb N` | SSD tier size cap in GiB (default 64; `0` = no SSD tier) |
-| `--kv-ssd-mode M` | when the SSD tier writes: `shutdown` (default; sessions stay in RAM and are written on a graceful stop; while running only reused entries that RAM has to evict are written), `always` (idle sessions go to the SSD after `--kv-ssd-delay`), `off` (no SSD files). See [how the SSD tier stores sessions](#ssd-tier) |
+| `--kv-ssd-mode M` | when the SSD tier writes: `shutdown` (default; sessions stay in RAM and are written when WHIRL is closed: Ctrl+C, console window closed, logoff, OS shutdown — the last three allow only about 5 s; reused entries that RAM must evict are also written), `always` (idle sessions go to the SSD after `--kv-ssd-delay`), `off` (no SSD files). See [how the SSD tier stores sessions](#ssd-tier) |
 | `--kv-ssd-delay SEC` | `--kv-ssd-mode always`: write a session to the SSD once it has been unchanged for SEC seconds (default 300). A session that is used again sooner is served from RAM and never written |
 | `--mmproj FILE` | vision encoder (Qwen3-VL style mmproj GGUF, F16 / BF16). `image_url` parts (`data:` URLs with base64 PNG / JPEG / …) become image tokens. Weights stay in pinned host RAM; nothing goes to VRAM until an image arrives |
 | `--vis-idle-s N` | release the vision encoder after N seconds without images (default 60) |
@@ -357,13 +357,15 @@ turns it off (debugging).
 
 ### <a id="ssd-tier"></a>How the SSD tier stores sessions
 
-- **When it writes.** `--kv-ssd-mode shutdown` (default): shutdown mode writes nothing while running,
-  except reused entries that RAM has to evict. Sessions stay in the RAM tier and are written during a
-  graceful stop (Ctrl+C; up to 60 s), so the next start finds them. When the RAM tier is full, an entry
-  that was reused (its prefix restored at least once, a resumed session, or a shared system-message
-  checkpoint other requests attached) and has at least 2048 tokens is written to the SSD in the
-  background instead of being dropped (subject to the size cap below); a one-shot prompt is dropped and
-  never written. A crash loses what is only in RAM. `always`: an idle
+- **When it writes.** `--kv-ssd-mode shutdown` (default): sessions stay in the RAM tier and are
+  written when WHIRL is closed (Ctrl+C, console window closed, logoff, OS shutdown), so the next start
+  finds them. Ctrl+C allows a full flush (up to 60 s); closing the console window, logging off or
+  shutting down Windows allow only about 5 s (Windows ends the process then), so a large backlog may be
+  only partly written. Nothing is written while running, except that reused entries that RAM must evict
+  are also written: when the RAM tier is full, an entry that was reused (its prefix restored at least
+  once, a resumed session, or a shared system-message checkpoint other requests attached) and has at
+  least 2048 tokens is written to the SSD in the background instead of being dropped (subject to the
+  size cap below); a one-shot prompt is dropped and never written. A crash loses what is only in RAM. `always`: an idle
   session's entry is written once it has been unchanged for `--kv-ssd-delay` seconds (default 300,
   5 minutes). A conversation whose next request comes within that time is served from RAM and
   costs no disk write; under RAM pressure an entry that is not due yet is written (if it has at
@@ -421,7 +423,8 @@ turns it off (debugging).
 
 ### <a id="stop"></a>Stopping the server
 
-Press **Ctrl+C** (or Ctrl+Break, or close the console window). The server then stops gracefully:
+Press **Ctrl+C** (or Ctrl+Break, or close the console window; logging off and shutting down Windows
+do the same). The server then stops gracefully:
 
 1. new and queued requests are answered with HTTP 503;
 2. running requests finish;
@@ -433,8 +436,9 @@ Press **Ctrl+C** (or Ctrl+Break, or close the console window). The server then s
    lost, never corrupted).
 
 The next start therefore restores recent conversations from the SSD instead of prefilling them
-again. A second Ctrl+C exits immediately. When the console window is closed, Windows ends the
-process after about 5 seconds regardless. Killing the process (Task Manager, `taskkill /F`) skips
+again. A second Ctrl+C exits immediately. When the console window is closed, or on logoff / OS
+shutdown, Windows ends the process after about 5 seconds regardless, so only what fits in those
+seconds is written (Ctrl+C allows the full flush). Killing the process (Task Manager, `taskkill /F`) skips
 all of this; there is no shutdown endpoint.
 
 ## <a id="other"></a>5. `whirl devices`, `selftest`, `seqtest`, `vis-encode`

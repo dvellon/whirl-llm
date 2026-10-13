@@ -7,8 +7,9 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ### SSD tier: shutdown mode keeps reused entries that RAM has to evict (TIER-EVICT)
 
-- `--kv-ssd-mode shutdown` (default) writes nothing while running, except reused entries that RAM has to
-  evict: a reused entry (prefix restored, session resumed, or a shared system-message checkpoint that
+- `--kv-ssd-mode shutdown` (default) writes when WHIRL is closed (Ctrl+C, console window closed, logoff,
+  OS shutdown; the last three allow only about 5 s, Ctrl+C a full flush), and now reused entries that RAM
+  must evict are also written: a reused entry (prefix restored, session resumed, or a shared system-message checkpoint that
   requests attached) of at least 2048 tokens pushed out of a full RAM tier is written to the SSD in the
   background instead of dropped (cap, dedup and the crash-safe write protocol as for any write; one-shot
   prompts are still never written). Fixes the system checkpoint lost across a restart on the Radeon 8060S
