@@ -5,6 +5,10 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## Unreleased (0.2.0)
 
+### SSD tier: shutdown mode also writes reused entries after about 5 minutes idle (TIER-IDLE)
+
+- `--kv-ssd-mode shutdown` (default) writes when WHIRL is closed (Ctrl+C, console window closed, logoff, OS shutdown), plus reused entries that RAM must evict, plus, after about 5 minutes with no request, reused entries in the background (one at a time; a new request stops it; one-shot prompts are never written while running); console close, logoff and OS shutdown allow only about 5 s, so Ctrl+C is the way to guarantee a full write (audit/TIER-IDLE.md).
+
 ### SSD tier: shutdown mode keeps reused entries that RAM has to evict (TIER-EVICT)
 
 - `--kv-ssd-mode shutdown` (default) writes when WHIRL is closed (Ctrl+C, console window closed, logoff,

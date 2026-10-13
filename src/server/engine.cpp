@@ -3010,6 +3010,36 @@ void Engine::flushTierOnStop() {
     logTier();
 }
 
+// TIER-IDLE (policy: tier/idle_flush.h). Called from the idle wait of runLoop: once the server has been idle
+// for opt_.kv_idle_flush_ms, the tier writes its reused entries to SSD in the background (shutdown mode only).
+static std::int64_t steadyMs(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count();
+}
+
+void Engine::idleFlushPoll() {
+    tier::Tier* t = tier_;
+    if (!t || !tier::idleFlushEnabled(t->cfg.ssd_shutdown_only, t->hasSsd(), opt_.kv_idle_flush_ms)) return;
+    if (n_building_.load() > 0) {  // a request is being built: not idle
+        idle_clock_.activity();
+        t->endIdleWrite();
+        return;
+    }
+    if (idle_clock_.poll(steadyMs(std::chrono::steady_clock::now()), opt_.kv_idle_flush_ms)) {
+        if (const std::size_t n = t->beginIdleWrite(); n > 0)
+            logI("kv tier: idle for {:g} s: writing {} reused prefix-cache entries to SSD in the background (shutdown mode; "
+                 "a request stops it)",
+                 static_cast<double>(opt_.kv_idle_flush_ms) / 1000.0, n);
+    }
+}
+
+std::optional<std::chrono::steady_clock::time_point> Engine::idleFlushDue() const {
+    const tier::Tier* t = tier_;
+    if (!t || !tier::idleFlushEnabled(t->cfg.ssd_shutdown_only, t->hasSsd(), opt_.kv_idle_flush_ms)) return std::nullopt;
+    const auto d = idle_clock_.deadline(opt_.kv_idle_flush_ms);
+    if (!d) return std::nullopt;
+    return std::chrono::steady_clock::time_point(std::chrono::milliseconds(*d));
+}
+
 // ---------------------------------------------------------------------------
 
 void Engine::releaseSlot(Slot& sl) {
@@ -3281,6 +3311,7 @@ void Engine::runLoop() {
                 if (tier_ != nullptr) {
                     const std::uint64_t seq = wake_seq_;
                     lk.unlock();
+                    idleFlushPoll();
                     const bool busy = tierTick();
                     if (busy) logged = false;
                     if (!busy && !logged) {
@@ -3310,15 +3341,21 @@ void Engine::runLoop() {
                     continue;
                 }
                 tier_wake_ = false;
-                if (tier_ != nullptr && tier_->nextWake()) {
-                    // an SSD write is due at a known time, or the periodic SSD expiry check: wake then
-                    // (re-checked every minute)
-                    const auto due = std::min(*tier_->nextWake() + std::chrono::milliseconds(2), std::chrono::steady_clock::now() + std::chrono::seconds(60));
+                std::optional<std::chrono::steady_clock::time_point> wake;
+                if (tier_ != nullptr) wake = tier_->nextWake();
+                if (const auto idle_due = idleFlushDue(); idle_due && (!wake || *idle_due < *wake)) wake = idle_due;  // TIER-IDLE
+                if (wake) {
+                    // an SSD write is due at a known time, the periodic SSD expiry check, or the idle write: wake
+                    // then (re-checked every minute)
+                    const auto due = std::min(*wake + std::chrono::milliseconds(2), std::chrono::steady_clock::now() + std::chrono::seconds(60));
                     q_cond_.wait_until(lk, due, [&] { return !queue_.empty() || tier_wake_ || stop_; });
                 } else {
                     q_cond_.wait(lk, [&] { return !queue_.empty() || tier_wake_ || stop_; });
                 }
             }
+            // a request arrived: the idle period ends, an idle write stops starting new entries (TIER-IDLE)
+            idle_clock_.activity();
+            if (tier_ != nullptr) tier_->endIdleWrite();
             stat_t0_ = Clock::now();
         }
         const std::uint64_t wake_seq0 = wake_seq_;  // a later arrival ends this iteration's wait (below)

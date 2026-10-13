@@ -276,7 +276,9 @@ struct Stats {
     std::uint64_t spills = 0, spill_bytes = 0, restores_ram = 0, restores_ssd = 0, restore_bytes = 0,
                   ssd_writes = 0, ssd_write_bytes = 0, ram_evictions = 0, ssd_evictions = 0, dropped = 0,
                   ssd_dedup_bytes = 0, superseded = 0, superseded_bytes = 0, demoted = 0,
-                  evict_writes = 0;  // shutdown mode: writes of reused entries RAM had to evict (TIER-EVICT)
+                  evict_writes = 0,  // shutdown mode: writes of reused entries RAM had to evict (TIER-EVICT)
+                  idle_writes = 0,   // shutdown mode: writes of reused entries after the server sat idle (TIER-IDLE)
+                  idle_passes = 0;   // idle write passes started (one per idle period at most)
 };
 
 class Tier {
@@ -403,6 +405,14 @@ public:
     // graceful shutdown: write due entries now (also in ssd_shutdown_only mode)
     bool flushing = false;
 
+    // TIER-IDLE (shutdown mode; policy in idle_flush.h): the engine has been idle long enough. tick() then
+    // writes the entries idleWriteWanted picks, one write at a time, and ends the pass by itself when none
+    // is left. endIdleWrite: a request arrived -- no further write is started (one already running finishes).
+    // Returns the entries it will write (0: nothing to do, no pass started).
+    std::size_t beginIdleWrite();
+    void endIdleWrite();
+    bool idleWriting() const { return idle_writing_; }
+
     // public state read by the engine
     Config cfg;
     Layout lay;
@@ -508,6 +518,12 @@ private:
     bool seenOk(const Entry* e) const { return cfg.ssd_shutdown_only || !cfg.ssd_seen_filter || e->reused; }
     bool evictWanted(const Entry* v) const;
     bool evictWrite(Entry* v);
+    bool idleWanted(const Entry* v) const;
+    // TIER-IDLE pass state
+    bool idle_writing_ = false;
+    std::vector<std::uint64_t> idle_skip_;  // entries whose write could not start in this pass (not retried)
+    std::uint64_t idle_pass_writes_ = 0, idle_pass_bytes0_ = 0;
+    std::chrono::steady_clock::time_point idle_t0_{};
 };
 
 // Write %LOCALAPPDATA%\whirl\pinned\<pid>.txt = the pinned host bytes this

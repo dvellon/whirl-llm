@@ -6,6 +6,7 @@
 
 #include "kv_tier.h"
 #include "evict_policy.h"
+#include "idle_flush.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -610,6 +611,45 @@ bool Tier::evictWrite(Entry* v) {
                        static_cast<unsigned long long>(v->id), v->n_tok));
     }
     return v->io_busy;
+}
+
+// TIER-IDLE: the same facts, judged by the idle-write rule (idle_flush.h).
+bool Tier::idleWanted(const Entry* v) const {
+    EvictFacts f;
+    f.ssd_on = ssd_dir_w_.has_value();
+    f.shutdown_only = true;
+    f.seen_filter = cfg.ssd_seen_filter;
+    f.demoted = v->demoted;
+    f.reused = v->reused;
+    f.n_tok = v->n_tok;
+    f.min_tokens = cfg.min_tokens;
+    f.on_ssd = v->ssd.has_value();
+    f.dirty = f.on_ssd && v->hasDirty();
+    return idleWriteWanted(f);
+}
+
+std::size_t Tier::beginIdleWrite() {
+    if (idle_writing_ || !cfg.ssd_shutdown_only || !ssd_dir_w_) return 0;
+    std::size_t n = 0;
+    for (const Entry* e : entries)
+        if (e->in_ram && !e->io_busy && e->n_tok > 0 && idleWanted(e)) n += 1;
+    if (n == 0) return 0;  // nothing to write: no pass (and no log lines)
+    idle_writing_ = true;
+    idle_skip_.clear();
+    idle_pass_writes_ = 0;
+    idle_pass_bytes0_ = stats.ssd_write_bytes;
+    idle_t0_ = std::chrono::steady_clock::now();
+    stats.idle_passes += 1;
+    return n;
+}
+
+void Tier::endIdleWrite() {
+    if (!idle_writing_) return;
+    idle_writing_ = false;
+    if (log_fn)
+        log_fn(fmt("kv tier: idle write stopped by a request after %llu entries (%.0f ms); the rest waits for the next idle "
+                   "period or for WHIRL to be closed",
+                   static_cast<unsigned long long>(idle_pass_writes_), msSince(idle_t0_)));
 }
 
 // Free RAM until `blocks` arena blocks are free (LRU). false: not possible (now).
@@ -1830,8 +1870,35 @@ bool Tier::tick() {
                 return a->t_mod != b->t_mod ? a->t_mod > b->t_mod : a->lru > b->lru;
             });
         const bool writes_on = !cfg.ssd_shutdown_only || flushing;
+        // TIER-IDLE: shutdown mode, the server idle long enough: reused entries, one write at a time
+        const bool idle_pass = idle_writing_ && cfg.ssd_shutdown_only && !flushing;
+        bool write_running = false;
+        if (idle_pass)
+            for (const Job* j : jobs_) write_running = write_running || j->kind == JobKind::write;
         for (Entry* e : snapshot) {
             if (!contains(e)) continue;
+            if (idle_pass) {
+                if (!e->in_ram || e->io_busy || e->pin > 0 || e->n_tok == 0 || !idleWanted(e)) continue;
+                if (std::find(idle_skip_.begin(), idle_skip_.end(), e->id) != idle_skip_.end()) continue;
+                busy = true;
+                if (write_running || !gpuIdle(e)) continue;
+                try {
+                    startWrite(e);
+                } catch (...) {
+                }
+                if (!e->io_busy) {
+                    idle_skip_.push_back(e->id);  // could not start (cap, references): not retried in this pass
+                    continue;
+                }
+                write_running = true;
+                idle_pass_writes_ += 1;
+                stats.idle_writes += 1;
+                if (log_fn)
+                    log_fn(fmt("kv tier: entry %016llx (%u tok, reused) written to SSD after the server sat idle (shutdown "
+                               "mode)",
+                               static_cast<unsigned long long>(e->id), e->n_tok));
+                continue;
+            }
             // (shutdown mode: not even the header / table rewrite of a trimmed entry while running)
             if (writes_on && e->meta_dirty && e->ssd && !e->io_busy && e->pin == 0) {
                 // trimmed (superseded session): header / table rewrite, file cut
@@ -1871,6 +1938,24 @@ bool Tier::tick() {
     } else {
         for (Entry* e : entries) {
             if (!gpuIdle(e)) busy = true;
+        }
+    }
+    if (idle_writing_ && ssd_dir_w_ && !flushing) {
+        bool write_running = false;
+        for (const Job* j : jobs_) write_running = write_running || j->kind == JobKind::write;
+        bool left = false;
+        for (const Entry* e : entries)
+            if (e->in_ram && !e->io_busy && e->pin == 0 && e->n_tok > 0 && idleWanted(e) &&
+                std::find(idle_skip_.begin(), idle_skip_.end(), e->id) == idle_skip_.end())
+                left = true;
+        if (!left && !write_running) {
+            idle_writing_ = false;  // pass done: nothing more is written while the server stays idle
+            if (log_fn)
+                log_fn(fmt("kv tier: idle write done: %llu entries, %.0f MiB in %.0f ms",
+                           static_cast<unsigned long long>(idle_pass_writes_),
+                           static_cast<double>(stats.ssd_write_bytes - idle_pass_bytes0_) / 1048576.0, msSince(idle_t0_)));
+        } else {
+            busy = true;
         }
     }
     if (gc_due_) gcOwners();

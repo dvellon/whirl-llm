@@ -10,6 +10,7 @@
 #include "tier/kv_tier.h"
 #include "tier/ram_size.h"
 #include "tier/evict_policy.h"
+#include "tier/idle_flush.h"
 #include "cache/prefix_cache.h"
 
 #include <malloc.h>
@@ -2722,6 +2723,192 @@ static void testShutdownEvictReused(MockDeviceOps& ops, const fs::path& dir) {
     }
 }
 
+// TIER-IDLE: the idle-write policy (tier/idle_flush.h) with a fake clock. Fires once per idle period after
+// after_ms of continuous idleness, never again while the server stays idle, again after a request ends the
+// period; picks entries by the shutdown-mode eviction rule (reused, not demoted, >= min_tokens, not current).
+static void testIdleFlushPolicy() {
+    // when
+    CHECK(idleFlushEnabled(true, true, 300000));
+    CHECK(!idleFlushEnabled(false, true, 300000));  // always mode: entries are written after their delay
+    CHECK(!idleFlushEnabled(true, false, 300000));  // no SSD tier
+    CHECK(!idleFlushEnabled(true, true, 0));        // test override 0: off
+    CHECK(idle_flush_ms_default == 300000);
+    IdleFlushClock c;
+    CHECK(!c.deadline(1000).has_value());  // not idle yet
+    CHECK(!c.poll(10000, 1000));           // idle from t=10 s
+    CHECK(c.idle() && !c.fired());
+    CHECK(c.deadline(1000).has_value() && *c.deadline(1000) == 11000);
+    CHECK(!c.poll(10999, 1000));
+    CHECK(c.poll(11000, 1000));  // 1 s idle: fires
+    CHECK(c.fired() && !c.deadline(1000).has_value());
+    CHECK(!c.poll(11001, 1000));   // still idle: no second pass
+    CHECK(!c.poll(500000, 1000));  // however long it stays idle
+    c.activity();                  // a request: the period ends
+    CHECK(!c.idle() && !c.fired());
+    CHECK(!c.poll(600000, 1000));  // a new idle period starts now
+    CHECK(!c.poll(600999, 1000));
+    CHECK(c.poll(601000, 1000));  // and fires once again
+    CHECK(!c.poll(700000, 1000));
+    c.activity();
+    CHECK(!c.poll(800000, 1000));
+    c.activity();  // activity before the delay ran out: restarts the period
+    CHECK(!c.poll(800900, 1000));
+    CHECK(!c.poll(801000, 1000));  // only 100 ms into the new period
+    CHECK(c.poll(801900, 1000));
+    IdleFlushClock off;
+    CHECK(!off.poll(0, 0) && !off.poll(1000000, 0) && !off.deadline(0).has_value());
+    // what
+    EvictFacts b;  // reused, never written, 4096 tokens, SSD on
+    b.ssd_on = true;
+    b.shutdown_only = true;
+    b.reused = true;
+    b.n_tok = 4096;
+    b.min_tokens = 2048;
+    CHECK(idleWriteWanted(b));
+    EvictFacts f = b;
+    f.reused = false;  // one-shot prompt: never, whatever the seen filter says
+    CHECK(!idleWriteWanted(f));
+    f.seen_filter = false;
+    CHECK(!idleWriteWanted(f));
+    f.shutdown_only = false;  // the rule is the shutdown one even if the caller passed always-mode facts
+    CHECK(!idleWriteWanted(f));
+    f = b;
+    f.demoted = true;
+    CHECK(!idleWriteWanted(f));
+    f = b;
+    f.n_tok = 2047;
+    CHECK(!idleWriteWanted(f));
+    f = b;
+    f.ssd_on = false;
+    CHECK(!idleWriteWanted(f));
+    f = b;
+    f.on_ssd = true;  // current on SSD: never rewritten
+    CHECK(!idleWriteWanted(f));
+    f.dirty = true;  // changed since its write (resumed): written again
+    CHECK(idleWriteWanted(f));
+}
+
+// TIER-IDLE in the Tier: shutdown mode writes nothing while running; Tier::beginIdleWrite (the engine's idle
+// clock fired) writes the reused entries, one write at a time, never the one-shot one, then ends the pass by
+// itself; staying idle writes nothing more; a new pass rewrites only an entry that changed since (dirty);
+// endIdleWrite (a request) stops starting writes after the one running; always mode ignores it.
+static void testIdleWriteTier(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 9900;
+    const std::uint64_t fp = 99;
+    auto mkcfg = [&](bool shutdown) {
+        Config c = env.cfg(4ull << 30);
+        c.ssd_seen_filter = true;
+        c.ssd_shutdown_only = shutdown;
+        c.ssd_delay_ms = shutdown ? 0 : 3600000;
+        return c;
+    };
+    std::vector<std::string> logs;
+    auto countLog = [&](const char* s) {
+        std::size_t n = 0;
+        for (const auto& l : logs) n += l.find(s) != std::string::npos ? 1 : 0;
+        return n;
+    };
+    Sess a(ops, 24), b(ops, 24), d(ops, 24);
+    a.toks = freshToks(3000, seed);
+    b.toks = freshToks(3000, seed);
+    d.toks = freshToks(3000, seed);
+    std::uint64_t id_a = 0, id_b = 0, id_d = 0;
+    {
+        auto t = Tier::create(ops, 256ull << 20, 99, 0);
+        t->log_fn = [&](std::string_view s) { logs.emplace_back(s); };
+        t->start(mkcfg(true), kLay, fp);
+        spillSess(*t, a, 0);
+        id_a = a.id;
+        spillSess(*t, b, 0);
+        id_b = b.id;
+        spillSess(*t, d, 0);
+        id_d = d.id;
+        CHECK(restoreMatches(*t, ops, t->find(id_a), a));  // a, d reused; b one-shot
+        CHECK(restoreMatches(*t, ops, t->find(id_d), d));
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);  // shutdown mode: nothing while running
+        // the idle pass: one write at a time
+        CHECK(t->beginIdleWrite() == 2);
+        CHECK(t->idleWriting() && t->stats.idle_passes == 1);
+        t->tick();
+        std::size_t busy = 0;
+        for (const Entry* e : t->entries) busy += e->io_busy ? 1 : 0;
+        CHECK(busy == 1);
+        CHECK(tickIdle(*t, 20000));
+        CHECK(!t->idleWriting());  // the pass ended by itself
+        CHECK(t->stats.idle_writes == 2 && t->stats.ssd_writes == 2 && countFiles(dir) == 2);
+        CHECK(t->find(id_a)->ssd.has_value() && t->find(id_d)->ssd.has_value());
+        CHECK(!t->find(id_b)->ssd.has_value());  // the one-shot prompt is never written
+        CHECK(countLog("written to SSD after the server sat idle") == 2 && countLog("idle write done") == 1);
+        // still idle: nothing more
+        for (int i = 0; i < 20; ++i) t->tick();
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 2);
+        // a later idle period: everything current, nothing rewritten (no pass started)
+        CHECK(t->beginIdleWrite() == 0);
+        CHECK(tickIdle(*t));
+        CHECK(!t->idleWriting() && t->stats.ssd_writes == 2 && t->stats.idle_passes == 1);
+        // a resumed (changed) entry: written again by the next pass; the clean one is not
+        auto more = freshToks(500, seed);
+        a.toks.insert(a.toks.end(), more.begin(), more.end());
+        spillSess(*t, a, 3000);
+        CHECK(t->find(id_a)->hasDirty());
+        CHECK(t->beginIdleWrite() == 1);
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.idle_writes == 3 && t->stats.ssd_writes == 3 && !t->find(id_a)->hasDirty());
+        CHECK(!t->find(id_b)->ssd.has_value());
+        // interrupted: both a and d changed; a request arrives right after the first write started
+        more = freshToks(500, seed);
+        a.toks.insert(a.toks.end(), more.begin(), more.end());
+        spillSess(*t, a, 3500);
+        more = freshToks(500, seed);
+        d.toks.insert(d.toks.end(), more.begin(), more.end());
+        spillSess(*t, d, 3000);
+        CHECK(t->beginIdleWrite() == 2);
+        t->tick();
+        t->endIdleWrite();
+        CHECK(!t->idleWriting());
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.idle_writes == 4 && t->stats.ssd_writes == 4);  // the running one finished, no other started
+        CHECK(countLog("idle write stopped by a request") == 1);
+        CHECK(t->find(id_a)->hasDirty() != t->find(id_d)->hasDirty());  // exactly one of them is still dirty
+        // the next idle period writes the other
+        t->beginIdleWrite();
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.idle_writes == 5 && !t->find(id_a)->hasDirty() && !t->find(id_d)->hasDirty());
+        CHECK(!t->find(id_b)->ssd.has_value() && countFiles(dir) == 2);
+    }
+    {
+        // restart: the idle-written entries restore bit-exactly (same files and header protocol as any write)
+        auto t = Tier::create(ops, 256ull << 20, 100, 0);
+        t->start(mkcfg(true), kLay, fp);
+        CHECK(t->ssdEntries() == 2);
+        Entry* ea = t->find(id_a);
+        CHECK(ea != nullptr && !ea->in_ram);
+        if (ea) CHECK(restoreMatches(*t, ops, ea, a));
+        CHECK(t->find(id_b) == nullptr);
+        CHECK(tickIdle(*t));
+    }
+    fs::remove_all(dir, ec);
+    {
+        // always mode: the idle pass does not exist (beginIdleWrite is ignored)
+        auto t = Tier::create(ops, 256ull << 20, 101, 0);
+        t->start(mkcfg(false), kLay, fp);
+        Sess x(ops, 24);
+        x.toks = freshToks(3000, seed);
+        spillSess(*t, x, 0);
+        CHECK(restoreMatches(*t, ops, t->find(x.id), x));
+        CHECK(t->beginIdleWrite() == 0);
+        CHECK(!t->idleWriting());
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.idle_writes == 0 && t->stats.ssd_writes == 0);  // its delay (1 h) has not run out
+    }
+    fs::remove_all(dir, ec);
+}
+
 // FIX-RC4-A P3-3: a cache file that cannot be deleted (another program holds it) stays counted against the
 // cap -- at an LRU eviction, for a corrupt file at startup -- and a file that cannot be opened at startup is
 // kept and counted (aged by its last-write time), not reported as expired and dropped from the accounting.
@@ -3720,6 +3907,14 @@ int main(int argc, char** argv) {
     if (want("testSeenOnce")) {
         std::printf("-- %s\n", "testSeenOnce");
         testSeenOnce(ops, dir);
+    }
+    if (want("testIdleFlushPolicy")) {
+        std::printf("-- %s\n", "testIdleFlushPolicy");
+        testIdleFlushPolicy();
+    }
+    if (want("testIdleWriteTier")) {
+        std::printf("-- %s\n", "testIdleWriteTier");
+        testIdleWriteTier(ops, dir);
     }
     if (want("testShutdownEvictReused")) {
         std::printf("-- %s\n", "testShutdownEvictReused");

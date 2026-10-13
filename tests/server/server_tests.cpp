@@ -38,6 +38,11 @@
 #include <thread>
 #include <vector>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 using namespace whirl;
 using namespace whirl::server;
 using whirl::test::HttpResult;
@@ -2241,6 +2246,146 @@ void testShutdownEvictSys() {
     }
 }
 
+// TIER-IDLE end to end (mock engine, --kv-ssd-mode shutdown, idle delay overridden to 300 ms): after the server
+// sits idle, the reused session (resumed once) is written to SSD in the background; the one-shot prompt is not;
+// staying idle writes nothing more; a request arriving while an idle write runs (writes slowed by a WriteSim)
+// is answered bit-exactly and stops the pass; a restart restores the idle-written session from SSD.
+class SlowWriteSim final : public tier::WriteSim {
+public:
+    std::atomic<int> delay_ms{0};
+    std::atomic<int> writes{0};
+    bool write(void* fh, const std::uint8_t* buf, std::uint64_t len, std::uint64_t off) override {
+        writes.fetch_add(1);
+        if (const int d = delay_ms.load(); d > 0) std::this_thread::sleep_for(std::chrono::milliseconds(d));
+        std::uint64_t done = 0;
+        while (done < len) {
+            const DWORD n = static_cast<DWORD>(std::min<std::uint64_t>(len - done, 64ull << 20));
+            OVERLAPPED ov{};
+            ov.Offset = static_cast<DWORD>(off + done);
+            ov.OffsetHigh = static_cast<DWORD>((off + done) >> 32);
+            DWORD w = 0;
+            if (WriteFile(static_cast<HANDLE>(fh), buf + done, n, &w, &ov) == 0 || w == 0) return false;
+            done += w;
+        }
+        return true;
+    }
+    bool flush(void* fh) override { return FlushFileBuffers(static_cast<HANDLE>(fh)) != 0; }
+    bool dead() const override { return false; }
+};
+
+void testIdleWrite() {
+    std::filesystem::path base;
+    if (const char* t = std::getenv("WHIRL_TEST_TMP"); t && *t) base = std::filesystem::path(widen(t));
+    else base = std::filesystem::temp_directory_path() / L"whirl-tests";
+    const std::string dir = narrow((base / L"server_test_ssd_idle").wstring());
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 8192;
+    su.mc.pool_tokens = 8192;
+    su.tier = true;
+    su.ssd_dir = dir;
+    su.tier_min = 512;
+    su.tier_shutdown = true;
+    su.tier_ram_mb = 256;
+    su.eo.kv_idle_flush_ms = 300;
+    auto waitFor = [](const std::function<bool()>& f, int ms) {
+        for (int i = 0; i < ms / 10; ++i) {
+            if (f()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return f();
+    };
+    auto ask = [](TestServer& srv, const std::vector<std::uint32_t>& p, double* ms = nullptr) {
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = srv.post("/v1/completions", completionBody(p, 16));
+        if (ms) *ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        CHECK_EQ(completionText(r), decode(srv.model().greedyReference(p, 16, true)));
+        return r;
+    };
+    const auto p0 = makePrompt(3000, 601);  // one-shot
+    const auto p1 = makePrompt(3000, 602);  // a session: turn 1 ...
+    const auto p2 = makePrompt(3300, 603, p1);  // ... turn 2 resumes it (reused)
+    const auto p3 = makePrompt(3600, 604, p2);  // turn 3 (changes the entry after its idle write)
+    std::uint64_t sess_id = 0;
+    {
+        TestServer srv(su);
+        tier::Tier* t = srv.tierp();
+        g_log.clear();
+        ask(srv, p0);
+        ask(srv, p1);
+        ask(srv, p2);
+        // the idle write: the session only
+        CHECK(waitFor([&] { return t->stats.idle_writes >= 1 && !t->idleWriting(); }, 10000));
+        CHECK(g_log.count("idle write done") >= 1);
+        const tier::Entry* sess = nullptr;
+        const tier::Entry* one = nullptr;
+        for (const tier::Entry* e : t->entries) {
+            if (e->tokens.size() >= p2.size() && std::equal(p2.begin(), p2.end(), e->tokens.begin())) sess = e;
+            if (e->tokens.size() >= p0.size() && std::equal(p0.begin(), p0.end(), e->tokens.begin())) one = e;
+        }
+        CHECK(sess != nullptr && one != nullptr);
+        if (sess) {
+            CHECK(sess->reused && sess->ssd.has_value() && !sess->hasDirty());
+            sess_id = sess->id;
+        }
+        if (one) CHECK(!one->reused && !one->ssd.has_value());  // one-shot: never written while running
+        CHECK_EQ(t->stats.idle_writes, 1u);
+        CHECK_EQ(t->stats.ssd_writes, t->stats.idle_writes);  // nothing else written while running
+        // staying idle (5 idle delays): no second pass, no write
+        const std::uint64_t passes = t->stats.idle_passes, writes = t->stats.ssd_writes;
+        const std::size_t fired = g_log.count("idle for ");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        CHECK_EQ(t->stats.idle_passes, passes);
+        CHECK_EQ(t->stats.ssd_writes, writes);
+        CHECK_EQ(g_log.count("idle for "), fired);
+        // baseline latency of a fresh request with no idle write running
+        double ms_base = 0, ms_mid = 0;
+        ask(srv, makePrompt(2500, 605), &ms_base);
+        // turn 3 changes the session; then, while its idle write runs (slowed), a new request arrives
+        SlowWriteSim sim;
+        sim.delay_ms = 250;
+        tier::g_write_sim.store(&sim);
+        ask(srv, p3);
+        const std::size_t fired3 = g_log.count("idle for ");
+        CHECK(waitFor([&] { return g_log.count("idle for ") > fired3; }, 10000));
+        const auto q = makePrompt(2500, 606);
+        ask(srv, q, &ms_mid);
+        CHECK(sim.writes.load() >= 1);
+        CHECK(g_log.count("idle write stopped by a request") >= 1);
+        // the write that was running completes; nothing else was started for the one-shot prompts
+        CHECK(waitFor([&] {
+            for (const tier::Entry* e : t->entries)
+                if (e->io_busy) return false;
+            return true;
+        }, 20000));
+        tier::g_write_sim.store(nullptr);
+        CHECK_EQ(t->stats.ssd_writes, t->stats.idle_writes);
+        if (const tier::Entry* s = t->find(sess_id)) CHECK(s->ssd.has_value() && s->ssd->n_tok >= p3.size() - 64);
+        for (const tier::Entry* e : t->entries)
+            if (!e->reused) CHECK(!e->ssd.has_value());
+        std::fprintf(stderr, "  (idle_write: request latency %.1f ms with no idle write, %.1f ms while one ran; idle writes %llu, passes %llu)\n",
+                     ms_base, ms_mid, static_cast<unsigned long long>(t->stats.idle_writes),
+                     static_cast<unsigned long long>(t->stats.idle_passes));
+        CHECK(ms_mid < ms_base + 2000.0);  // not held behind the slowed write
+        CHECK_EQ(srv.model().poison(), 0u);
+        // the close flush below does not rewrite it (clean)
+    }
+    {
+        TestServer srv(su);
+        g_log.clear();
+        CHECK(srv.tierp()->find(sess_id) != nullptr);
+        const auto p4 = makePrompt(3900, 607, p3);
+        auto r = ask(srv, p4);
+        CHECK(cachedTokens(r) >= p2.size());
+        CHECK(srv.tierp()->stats.restores_ssd >= 1);
+        CHECK_EQ(srv.model().poison(), 0u);
+    }
+    std::filesystem::remove_all(dir, ec);
+}
+
 // FIX-CACHE P2-4 (FR-CACHE), the agent pattern on one slot: the main agent's long session goes idle while a
 // subagent with the same system prompt (another task) runs two turns; then the main agent resumes.
 // supersede 1: before, the subagent's second turn cut the idle main entry to the system prompt (verified:
@@ -3303,6 +3448,7 @@ int main(int argc, char** argv) {
         {"sys_prompt", testSharedSystemPrompt},
         {"tiers", testTiers},
         {"shutdown_evict_sys", testShutdownEvictSys},
+        {"idle_write", testIdleWrite},
         {"restore_conc", testRestoreConcurrent},
         {"restore_throws", testRestoreThrows},
         {"tier_inplace", testTierInPlaceRegen},

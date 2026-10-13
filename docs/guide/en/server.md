@@ -30,7 +30,7 @@ model and GPU on disk).
 | `--decode-min-tps N` | decode floor per streaming request while others prefill ([§6](#batching)); 0 = off | 20 |
 | `--kv-ram-mb N` | pinned RAM KV tier size; 0 disables RAM and SSD tiers | 1/4 of physical RAM within [max(8 GiB, one full f16 session + checkpoints), 32 GiB], at most half of the RAM available at startup; 16 GiB on a 64 GB PC; integrated GPU (Radeon 8060S): OS-visible RAM / 8 within [one max-context entry (about 6 GiB for the 27B model at 262k), 16 GiB], at most 1/4 of the RAM available at startup, off under 32 GB of OS-visible RAM (the BIOS VRAM carve-out does not count; 8 GiB on a 64 GB machine) |
 | `--kv-ssd-dir` / `--kv-ssd-gb N` | SSD tier directory / size cap; 0 GB disables SSD | per-user local app-data directory / 64 |
-| `--kv-ssd-mode shutdown\|always\|off` | when the SSD tier writes (shutdown = when WHIRL is closed: Ctrl+C, console window closed, logoff, OS shutdown — the last three allow only about 5 s; reused entries that RAM must evict are also written; always = idle sessions after `--kv-ssd-delay`; off = no SSD files) | shutdown |
+| `--kv-ssd-mode shutdown\|always\|off` | when the SSD tier writes (shutdown = when WHIRL is closed: Ctrl+C, console window closed, logoff, OS shutdown — the last three allow only about 5 s; reused entries that RAM must evict, and reused entries after about 5 minutes idle, are also written; always = idle sessions after `--kv-ssd-delay`; off = no SSD files) | shutdown |
 | `--kv-ssd-delay SEC` | `always` mode: write a session once unchanged for SEC seconds | 300 |
 | `--log-file` | log file (also printed to the console) | per-user local app-data directory |
 | `--alias` | model id reported by `/v1/models` | GGUF file name |
@@ -64,7 +64,7 @@ second instance waits ([windows-hip.md](windows-hip.md#wddm-demote)).
 
 **Stopping.** Ctrl+C, Ctrl+Break, closing the console window, logoff or OS shutdown stops the server gracefully: queued
 requests get 503, running ones finish, finished sessions spill to the RAM tier and every RAM-tier
-entry not yet on the SSD tier (by default `--kv-ssd-mode shutdown` writes only reused entries that RAM must evict while running; in
+entry not yet on the SSD tier (by default `--kv-ssd-mode shutdown` writes only reused entries that RAM must evict, and reused entries after about 5 minutes idle, while running; in
 `always` mode 5 minutes after its last change) is written now, for at most 60 s (10 s in `always` mode;
 `shutdown: tier writes done …` in the log), so the next start restores the last turns
 from the SSD. A second Ctrl+C exits at once; for a console close, logoff or OS shutdown Windows ends the process after

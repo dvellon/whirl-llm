@@ -12,6 +12,7 @@
 #include "decode_floor.h"
 #include "protocol.h"
 #include "tier/device_ops.h"
+#include "tier/idle_flush.h"
 #include "tier/kv_tier.h"
 #include "tokens.h"
 #include "vision_iface.h"
@@ -298,6 +299,9 @@ struct EngineOptions {
     std::string numerics_json;   // GET /props "numerics" (numerics::propsJson; empty: not reported)
     std::string kv_ssd_mode = "off";  // --kv-ssd-mode as in effect (GET /props kv_ssd)
     bool kv_supersede = true;         // CACHE-1 superseded-session cut (WHIRL_KV_SUPERSEDE=0: off)
+    // TIER-IDLE: --kv-ssd-mode shutdown writes reused entries to SSD after this long idle (tier/idle_flush.h);
+    // no CLI flag, WHIRL_KV_IDLE_FLUSH_MS overrides it for tests (0: off)
+    std::uint64_t kv_idle_flush_ms = tier::idle_flush_ms_default;
     std::uint32_t parallel = 4;
     chat::TemplateKind tmpl = chat::TemplateKind::a;
     bool use_mtp = false;
@@ -524,6 +528,10 @@ private:
     bool tierTick();
     void logTier();
     void flushTierOnStop();
+    // TIER-IDLE hooks (runLoop's idle wait): start the idle write once idle long enough; when it is due
+    void idleFlushPoll();
+    std::optional<std::chrono::steady_clock::time_point> idleFlushDue() const;
+    tier::IdleFlushClock idle_clock_;
     void releaseSlot(Slot& sl);
     void failSlot(Slot& sl, const std::string& err);
     // FR-SRV P2-2: queued / running requests whose client disconnected end (slot freed)

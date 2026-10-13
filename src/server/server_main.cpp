@@ -158,7 +158,8 @@ const char* kHelpBody =
     "  --kv-ssd-gb N            SSD tier size cap in GiB (default 64; 0 = no SSD tier)\n"
     "  --kv-ssd-mode M          shutdown (default: sessions stay in RAM and are written to the SSD when\n"
     "                           WHIRL is closed: Ctrl+C up to 60 s; console close / logoff / OS shutdown\n"
-    "                           only about 5 s; reused entries that RAM must evict are also written),\n"
+    "                           only about 5 s; reused entries that RAM must evict, and after about\n"
+    "                           5 min idle reused entries, are also written in the background),\n"
     "                           always (idle sessions go to the SSD after --kv-ssd-delay), off (no SSD files)\n"
     "  --kv-ssd-delay SEC       --kv-ssd-mode always: write a session once it has been unchanged for SEC\n"
     "                           seconds (default 300; used again sooner: served from RAM, never written)\n"
@@ -980,6 +981,8 @@ int serveMain(int argc, char** argv, const char* program) {
         if (auto v = env("PROFILE")) eo.profile = *v == "2" ? 2 : 1;
         eo.sys_min = envU32("SYS_MIN", sys_min_default);
         eo.kv_supersede = envU32("KV_SUPERSEDE", 1) != 0;
+        // TIER-IDLE: hidden test override of the 300 s idle write delay (no CLI flag; 0: off)
+        if (env("KV_IDLE_FLUSH_MS")) eo.kv_idle_flush_ms = envU32("KV_IDLE_FLUSH_MS", 0);
         eo.lcp_on = envOn("SYS_LCP", true);
         eo.n_ck = n_ck;
         eo.tail_ck = envOn("TAIL_CK", true);  // debug knob: WHIRL_TAIL_CK=0 turns the tail checkpoint off
