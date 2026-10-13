@@ -802,8 +802,9 @@ void testNumerics() {
         const nu::Plan p = nu::plan(bal, swift);
         CHECK(p.on(Item::fp8) && !p.on(Item::moefp8) && p.on(Item::gdnwmma) && p.on(Item::h16) && p.on(Item::kvq8));
         CHECK(p.items[static_cast<std::size_t>(Item::moefp8)].note == "dense model");
-        const nu::Plan po = nu::plan(bal, ornith);
-        CHECK(po.on(Item::fp8) && po.on(Item::moefp8) && po.on(Item::gdnwmma) && po.on(Item::h16) && !po.on(Item::kvq8));
+        const nu::Plan po = nu::plan(bal, ornith);  // MOE-BAL: MoE balance = gdnwmma + h16 (+ q8dec), f16 KV
+        CHECK(!po.on(Item::fp8) && !po.on(Item::moefp8) && po.on(Item::gdnwmma) && po.on(Item::h16) && !po.on(Item::kvq8));
+        CHECK(po.on(Item::specsample) && po.q8dec);
         const nu::Plan pq = nu::plan(bal, q4);
         CHECK(!pq.on(Item::fp8) && pq.on(Item::gdnwmma) && pq.on(Item::h16) && pq.on(Item::kvq8));  // KG-1: dense Q4_K_M on the R9700
         CHECK(pq.items[static_cast<std::size_t>(Item::fp8)].note.find("no MXFP4") != std::string::npos);
@@ -886,6 +887,68 @@ void testNumerics() {
         nu::Plan pb = nu::plan(bal, swift);
         nu::applyOverride(pb, Item::specsample, "SPEC_SAMPLE", "0", false, true);
         CHECK(!pb.on(Item::specsample) && !pb.lossy_override);
+    }
+    // MOE-BAL mode table (2026-10-13): on MoE models fp8 / moefp8 are fast-only; dense unchanged
+    {
+        const std::uint32_t moe_bal = nu::balance_items & ~nu::moe_fast_items;
+        CHECK(nu::moe_fast_items == (nu::bit(Item::fp8) | nu::bit(Item::moefp8)));
+        const nu::Request rb = nu::forModel(bal, true);
+        CHECK(rb.mode == Mode::balance && rb.items == moe_bal && rb.moved == nu::moe_fast_items);
+        CHECK(!rb.has(Item::fp8) && !rb.has(Item::moefp8) && rb.has(Item::gdnwmma) && rb.has(Item::h16) && rb.has(Item::specsample));
+        const nu::Request rb2 = nu::forModel(rb, true);  // idempotent
+        CHECK(rb2.items == rb.items && rb2.moved == rb.moved);
+        CHECK(nu::forModel(bal, false).items == nu::balance_items && nu::forModel(bal, false).moved == 0);  // dense: unchanged
+        CHECK(nu::forModel(fast, true).items == fast.items && nu::forModel(fast, true).moved == 0);       // fast: unchanged
+        CHECK(nu::forModel(pre, true).items == 0 && nu::forModel(pre, true).moved == 0);
+        const nu::Request cust = nu::parseMode("balance:fp8,moefp8,gdnwmma", "t");  // an explicit list is honoured
+        CHECK(nu::forModel(cust, true).items == cust.items && nu::forModel(cust, true).moved == 0);
+        // R9700 Ornith (MXFP4 MoE): balance skips fp8 / moefp8 with the reason, fast enables them
+        const nu::Plan pb = nu::plan(bal, ornith);
+        const nu::ItemState& f8 = pb.items[static_cast<std::size_t>(Item::fp8)];
+        CHECK(!f8.enabled && !f8.requested && f8.moved && f8.note.find("MoE: fast only") == 0);
+        CHECK(pb.items[static_cast<std::size_t>(Item::moefp8)].note.find("MoE: fast only") == 0);
+        const std::string l = nu::logLine(pb);
+        CHECK(l.find("numerics: balance - enabled: gdnwmma") == 0 && l.find("skipped: fp8 (MoE: fast only") != std::string::npos &&
+              l.find("moefp8 (MoE: fast only") != std::string::npos && l.find("decode: q8dec") != std::string::npos);
+        const std::string j = nu::propsJson(pb, "f16");
+        CHECK(j.find("\"enabled\":[\"gdnwmma\",\"h16\",\"specsample\"]") != std::string::npos &&
+              j.find("{\"item\":\"fp8\",\"reason\":\"MoE: fast only") != std::string::npos);
+        CHECK(nu::plan(rb, ornith).items[static_cast<std::size_t>(Item::fp8)].moved);  // pre-applied request: same plan
+        nu::Target ornith_q4 = ornith;
+        ornith_q4.k_kv_q4 = true;  // R9700 since FAST-1c
+        const nu::Plan pf = nu::plan(fast, ornith_q4);
+        CHECK(pf.on(Item::fp8) && pf.on(Item::moefp8) && pf.on(Item::gdnwmma) && pf.on(Item::h16) && pf.on(Item::kvq4));
+        CHECK(!pf.items[static_cast<std::size_t>(Item::fp8)].moved);
+        CHECK(nu::plan(cust, ornith).on(Item::fp8) && nu::plan(cust, ornith).on(Item::moefp8));
+        // KV: MoE balance f16, MoE fast q4 (where the kernels exist), dense balance q8h
+        CHECK(nu::chooseKv(rb, true, nu::KvCaps{true, true, true}, std::nullopt).kv == nu::KvKind::f16);
+        CHECK(nu::chooseKv(nu::forModel(fast, true), true, nu::KvCaps{true, true, true}, std::nullopt).kv == nu::KvKind::q4);
+        CHECK(nu::chooseKv(nu::forModel(bal, false), false, nu::KvCaps{true, true, true}, std::nullopt).kv == nu::KvKind::q8h);
+        // a user override turning fp8 back on in MoE balance is lossy and user-requested
+        nu::Plan po = nu::plan(bal, ornith);
+        nu::applyOverride(po, Item::fp8, "FP8", "1", true, true);
+        CHECK(po.on(Item::fp8) && po.lossy_override && nu::modeLabel(po) == "balance+overrides");
+        // dense: unchanged (MXFP4 dense keeps fp8 in balance; Q4_K_M had no fp8 anyway)
+        CHECK(nu::plan(bal, swift).on(Item::fp8) && !nu::plan(bal, swift).items[static_cast<std::size_t>(Item::fp8)].moved);
+        const nu::Plan pq = nu::plan(bal, q4);
+        CHECK(!pq.on(Item::fp8) && pq.on(Item::gdnwmma) && pq.on(Item::h16) && pq.on(Item::kvq8) && !pq.items[0].moved);
+        // Radeon 8060S MoE: no fp8 WMMA there, so the enabled set is the same as before MOE-BAL and
+        // the hardware reason is kept (enabled: h16, specsample; f16 KV)
+        nu::Target s8m = s8060;
+        s8m.moe = s8m.moe_mxfp4 = true;
+        const nu::Plan p8 = nu::plan(bal, s8m);
+        CHECK(!p8.on(Item::fp8) && !p8.on(Item::moefp8) && !p8.on(Item::gdnwmma) && p8.on(Item::h16) && !p8.on(Item::kvq8) && p8.on(Item::specsample));
+        CHECK(p8.items[static_cast<std::size_t>(Item::fp8)].note.find("gfx1151") != std::string::npos);
+        CHECK(p8.items[static_cast<std::size_t>(Item::moefp8)].note.find("gfx1151") != std::string::npos);
+        std::uint32_t en_old = 0, en_new = 0;  // old = the request without forModel's change
+        nu::Request bal_old = bal;
+        bal_old.custom = true;  // custom: forModel leaves it alone (the pre-MOE-BAL table)
+        const nu::Plan p8o = nu::plan(bal_old, s8m);
+        for (std::size_t i = 0; i < nu::n_items; ++i) {
+            if (p8o.items[i].enabled) en_old |= 1u << i;
+            if (p8.items[i].enabled) en_new |= 1u << i;
+        }
+        CHECK(en_old == en_new);
     }
     // per-item environment overrides
     {

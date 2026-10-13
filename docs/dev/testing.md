@@ -96,15 +96,34 @@ any reference without a passing KL gate report of the same executable (`-KlRepor
 
 `tools/klgate/klgate.py` measures what the golden hashes cannot: how far balance and fast are from
 precise. For every model x prompt x mode one `whirl chat` run prefills a fixed prompt (raw, no MTP)
-and dumps the teacher-forced logits of the 128 positions before 8,192 / 32,768 / 98,304 / 131,072
-tokens (`WHIRL_DUMP_LOGITS` + `WHIRL_DUMP_AT`, 16-row forwards; the zh prompt has 129,297 tokens, so
-its last window ends there). Per window it takes the mean KL(precise || mode) and the top-1
-agreement with precise; the limits are the published ones:
+and dumps the teacher-forced logits of the 256 positions (`--rows`; 128 before MOE-BAL) before
+8,192 / 32,768 / 98,304 / 131,072 tokens (`WHIRL_DUMP_LOGITS` + `WHIRL_DUMP_AT`, 16-row forwards; the
+zh prompt has 129,297 tokens, so its last window ends there). Per window it takes the mean
+KL(precise || mode) and the top-1 agreement with precise. The limits depend on the model type (the
+`arch` line of the precise run's log; owner decision 2026-10-13, audit/MOE-KL.md, audit/MOE-BAL.md):
 
-| Mode | KL mean (per 128-row window) | top-1 agreement |
+Dense models (`qwen35`), absolute, every window:
+
+| Mode | KL mean (per 256-row window) | top-1 agreement |
 |---|---|---|
 | balance | <= 0.005 | >= 98% |
 | fast | <= 0.03 | >= 93% |
+
+MoE models (`qwen35moe`), relative to the noise floor **N** measured in the same gate run: one more
+run per prompt, precise with the sequential DeltaNet prefill (`WHIRL_GDN_SEQ=1`, an equally exact
+f32 path), compared with precise on the same windows. N = the mean of its window KLs; N_top1(w) =
+its top-1 agreement in window w. Two equally exact paths through a 256-expert top-8 router already
+differ by KL 0.002-0.006 on these prompts (near-tied 8th experts flip), more than the dense balance
+limit, so an absolute limit cannot tell a real regression from the model's own sensitivity:
+
+| Mode | mean KL over the 4 windows | KL of each window | top-1 of each window |
+|---|---|---|---|
+| balance | <= 2 N | <= 3 N | >= N_top1(w) - 2.4 points |
+| fast | <= 8 N | <= 12 N | >= N_top1(w) - 8 points |
+
+The fast multipliers were set from the measured fast numbers as a regression guard, not as a quality
+claim. 256 rows per window: with 128 rows one row is 0.78 points of top-1 (dense fast zh 8k once
+missed 93% by a single row); the limits were not relaxed for it.
 
 Exit 0 only when every case ran and passed; 1 when a limit failed; 2 on a failed run, a missing or
 changed corpus file (`tools/klgate/corpus.sha256`), a too-short prompt or 0 cases. The corpus is two
@@ -117,7 +136,7 @@ python tools/klgate/klgate.py --exe build\Release\whirl.exe --corpus <corpus dir
     [--device 8060s] --report kl_<arch>.json
 ```
 
-R9700: 12 runs (2 models x 2 prompts x precise / balance / fast), about 25 minutes; take the R9700
+R9700: 14 runs (2 models x 2 prompts x precise / balance / fast, + the MoE noise run per prompt), about 35 minutes; take the R9700
 lock around the whole run. 8060S: pass `--wrap "python <gpu_lock.py> --max-min 30 --"` so each run
 takes the shared lock on its own. Required: before any golden re-record (above), after a change to
 a numerics item or a default KV format, and before an rc merge / release on both GPUs.

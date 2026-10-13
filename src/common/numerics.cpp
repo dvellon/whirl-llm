@@ -170,7 +170,17 @@ Request resolve(std::optional<std::string> cli_spec, std::optional<std::string> 
     return parseMode("balance", "default");  // no flag: balance (precise and fast are opt-in)
 }
 
-Plan plan(const Request& r, const Target& t) {
+Request forModel(const Request& r, bool moe) {
+    Request o = r;
+    if (moe && r.mode == Mode::balance && !r.custom) {
+        o.moved |= o.items & moe_fast_items;
+        o.items &= ~moe_fast_items;
+    }
+    return o;
+}
+
+Plan plan(const Request& r_in, const Target& t) {
+    const Request r = forModel(r_in, t.moe);
     Plan p;
     p.mode = r.mode;
     p.source = r.source;
@@ -180,7 +190,8 @@ Plan plan(const Request& r, const Target& t) {
         ItemState& s = p.items[i];
         s.item = it;
         s.requested = r.has(it);
-        if (!s.requested) continue;
+        s.moved = !s.requested && (r.moved & bit(it)) != 0;
+        if (!s.requested && !s.moved) continue;
         std::string why;  // non-empty: skipped
         std::string note;
         switch (it) {
@@ -235,7 +246,9 @@ Plan plan(const Request& r, const Target& t) {
                 why = "not yet implemented (balance behaviour)";
                 break;
         }
-        s.enabled = why.empty();
+        if (s.moved && why.empty())
+            why = "MoE: fast only (balance with fp8 activations measured 3.3-3.6x the model's KL noise floor; --fast turns it on)";
+        s.enabled = s.moved ? false : why.empty();
         s.note = s.enabled ? note : why;
     }
     return p;
@@ -298,7 +311,7 @@ std::string logLine(const Plan& p) {
     std::string en, sk;
     for (const ItemState& s : p.items) {
         if (s.enabled) en += std::format("{}{}{}", en.empty() ? "" : ", ", itemName(s.item), s.note.empty() ? "" : " (" + s.note + ")");
-        else if (s.requested) sk += std::format("{}{} ({})", sk.empty() ? "" : ", ", itemName(s.item), s.note);
+        else if (s.requested || s.moved) sk += std::format("{}{} ({})", sk.empty() ? "" : ", ", itemName(s.item), s.note);
     }
     std::string l = "numerics: " + modeLabel(p);
     if (p.mode == Mode::precise && en.empty())
@@ -330,7 +343,7 @@ std::string propsJson(const Plan& p, std::string_view kv) {
     b += "],\"skipped\":[";
     first = true;
     for (const ItemState& s : p.items) {
-        if (s.enabled || !s.requested) continue;
+        if (s.enabled || (!s.requested && !s.moved)) continue;
         if (!first) b += ',';
         first = false;
         b += "{\"item\":";

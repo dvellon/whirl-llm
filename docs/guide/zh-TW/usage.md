@@ -66,15 +66,15 @@ whirl-server --help | --version
 | 模式 | 內容 |
 |---|---|
 | **precise**（`--precise`） | GGUF 權重反量化成 f16；prefill 的 activation 與累加用 f16 / f32；DeltaNet prefill 用 f32 區塊路徑；**KV 快取在每張卡上都是 f16**。decode、MTP / n-gram 驗證與其他小 batch 也用 f16 activation 進同一個 f16 GEMM（f32 累加，不用 int8 activation）。除了檔案本身的量化權重，不再額外量化。f16 KV 放不下時：沒有指定 context 就降低 context 並發出警告；有指定（`--ctx`、`--ctx-per-slot`）就停止並說明（結束代碼 5）——絕不自行改用 int8 KV |
-| **balance**（預設；`--balance`） | 沒指定模式時的預設：下表以速度為主的項目，dense 模型用 q8h KV、MoE 模型用 f16 KV。輸出可能與 precise 有些微差異（KL / 準確度實測見 [quantization.md](quantization.md)） |
+| **balance**（預設；`--balance`） | 沒指定模式時的預設：下表以速度為主的項目，dense 模型用 q8h KV、MoE 模型用 f16 KV；MoE 模型不開 `fp8` / `moefp8`（在 MoE 上只屬於 fast）。輸出可能與 precise 有些微差異（KL / 準確度實測見 [quantization.md](quantization.md)） |
 | **fast** | balance 再加上更積極的有損項目，每項都要先通過 KL 與配對準確度門檻。已實作：`kvq4` 與 `relaxacc`；其他列為略過 |
 
 項目（用 `--balance=fp8,kvq8` 或 `--fast=...` 只選一部分；`WHIRL_MODE=balance:fp8,kvq8`）：
 
 | 項目 | 模式 | 內容 | R9700（gfx1201） | Radeon 8060S（gfx1151） |
 |---|---|---|---|---|
-| `fp8` | balance | MXFP4 dense prefill GEMM 用 fp8（e4m3）activation，含 MXFP4 指數折疊的捨入 | MXFP4 模型 | 略過（沒有 fp8 WMMA） |
-| `moefp8` | balance | MoE 專家 prefill GEMM 用 fp8 activation | MXFP4 MoE（Ornith MXFP4） | 略過 |
+| `fp8` | balance（MoE 模型：fast） | MXFP4 dense prefill GEMM 用 fp8（e4m3）activation，含 MXFP4 指數折疊的捨入 | MXFP4 模型 | 略過（沒有 fp8 WMMA） |
+| `moefp8` | fast（只限 MoE 模型） | MoE 專家 prefill GEMM 用 fp8 activation | MXFP4 MoE（Ornith MXFP4） | 略過 |
 | `gdnwmma` | balance | DeltaNet prefill 區塊用 f16 WMMA，取代 f32 區塊路徑 | MXFP4 模型，以及任何權重格式的 dense 模型（Q4_K_M、Q5_K、Q6_K、IQ4_XS 等；KG-1）；MoE 模型只限 MXFP4 | 略過（還沒有 kernel） |
 | `h16` | balance | FFN / DeltaNet 的 GEMM 輸出先存成 f16 再進逐元素運算 | MXFP4 模型，以及任何權重格式的 dense 模型（KG-1）；MoE 模型只限 MXFP4 | MXFP4 模型，只有 f16 權重 |
 | `kvq8` | balance | dense 模型一律用 q8h KV（不是 f16 放不下才換）；MoE 模型維持 f16 | dense 模型 | dense 模型 |
@@ -82,6 +82,17 @@ whirl-server --help | --version
 | `relaxacc` | fast | 寬鬆推測接受（只對 MTP draft；n-gram draft 維持精確接受）。放寬接受若會讓結尾的 6-gram 與最近 4096 個 token 內重複，就不接受（重複防護）。greedy：draft 不是驗證列的 argmax 時，只要它在該列前 `WHIRL_RELAX_K` 名（預設 4）且 p(draft) >= `WHIRL_RELAX_ALPHA` × p(argmax)（預設 0.1）就保留；最後一個保留的 draft 之後那個 token 一定是目標模型自己的 argmax。temperature > 0：typical acceptance（Medusa）：在請求過濾後的分布上 p(draft) >= min(`WHIRL_RELAX_EPS` 0.09, `WHIRL_RELAX_DELTA` 0.3 × exp(−熵)) 就保留（此時不用 `specsample`）。**會改變 greedy 輸出**：fast 的 greedy 不等於 plain greedy，MTP ≠ plain；同樣的 prompt、seed、設定仍是確定的（此時 draft 數量策略改用固定的合成週期成本，不看牆鐘時間；並發請求共用 draft 數量，可能互相影響輸出）。`WHIRL_RELAX=0` 關閉；MoE 模型略過（每輪只有一個 MTP draft，量不到收益；`WHIRL_RELAX=1` 強制開） | dense MTP 模型 | dense MTP 模型 |
 | `headq`、`moeskip`、`a8`、`a4` | fast | 低位元輸出頭、略過 MoE 專家、W4A8 / W4A4 prefill | 尚未實作 | 尚未實作 |
 | `q8dec` | balance、fast | decode / verify GEMV 的 activation 用 int8（每 32 個值一個 f32 scale，同 llama.cpp 的 q8_1；balance 與 fast 一律包含） | 開 | 開 |
+
+balance 與 fast 依模型類型開了什麼（R9700；Radeon 8060S 沒有 fp8 WMMA，所以 `fp8` / `moefp8` 在任何模式都略過）：
+
+| 模式 | dense 模型（Qwen3.8-27B Q4_K_M、MXFP4 dense） | MoE 模型（Ornith-1.5-35B-A3B MXFP4） |
+|---|---|---|
+| precise | 全程 f16 / f32，f16 KV | 全程 f16 / f32，f16 KV |
+| balance | `fp8`（只限 MXFP4 檔）、`gdnwmma`、`h16`、`kvq8`（q8h KV）、`specsample`、`q8dec` | `gdnwmma`、`h16`、`specsample`、`q8dec`，f16 KV。**不開 `fp8` / `moefp8`**（MOE-BAL 起）：256 選 8 的 router 前面用了 fp8 activation 時，MoE balance 的 KL 是此模型自身噪音底線的 3.3–3.6 倍；拿掉後在 2 倍以內（見下方 KL gate） |
+| fast | balance + `kvq4`（q4 KV）+ `relaxacc` | balance + `fp8` + `moefp8` + `kvq4`（q4 KV）；`relaxacc` 略過 |
+
+這個 MoE 改動的代價是 R9700 上 MoE balance 的 prefill（128k 約 −11% 到 8k 約 −26%，decode 不變）；`--fast` 保有 fp8 的 prefill 速度，
+`--balance=fp8,moefp8,gdnwmma,h16,specsample`（明確列出的項目照用）可回到舊的 MoE balance。
 
 precise 模式關閉 `q8dec`：decode、MTP / n-gram 驗證與並發 batch 的每個 matmul 都用 f16 activation 進 f16 WMMA GEMM（權重從 GGUF 型別解成 f16、f32 累加、每列加總順序固定），所以每一列不論 batch 大小都得到相同的位元；如果 GPU 的 kernel 對模型某種權重型別缺少這條路徑，precise 模式會拒絕載入，不會退回 int8。
 不適用於該 GPU 或模型的項目會記錄為略過（不會出錯）。啟動 log 會有一行，例如
@@ -355,7 +366,7 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 | `WHIRL_PREFILL_BATCH=N` | 每次 forward 的 prefill 列數（預設 4096，最多 16384） |
 | `WHIRL_MAX_CTX=N` | `chat` 的預設 context 大小（= `--ctx`；預設 8192） |
 | `WHIRL_CODE_OBJECT=FILE` | 開發用：從這個 code object 載入 GPU kernel，取代內建的 |
-| `WHIRL_MOE_FP8=0\|1` | 專家為 MXFP4 的 MoE 模型：專家 prefill 用 fp8 activation（項目 `moefp8`：balance / fast 開、precise 關；fp8 是較快的路徑——Ornith MXFP4 在 2k token 約 11.7k 對 8.6k tok/s）。只影響 prefill |
+| `WHIRL_MOE_FP8=0\|1` | 專家為 MXFP4 的 MoE 模型：專家 prefill 用 fp8 activation（項目 `moefp8`：fast 開，balance 與 precise 關（MOE-BAL）；fp8 是較快的路徑——Ornith MXFP4 在 2k token 約 11.7k 對 8.6k tok/s）。只影響 prefill |
 | `WHIRL_MOE_MXW=0` | 專家為 MXFP4 的 MoE 模型：改用通用的 MXFP4 專家 decode kernel，不用整塊（whole-block）kernel（預設整塊）。影響 decode / 驗證 |
 | `WHIRL_MOE_WIDE=1` | MoE 模型（balance / fast）：verify 可到 32 列（預設 16），第 17–32 列和 1-token decode 一樣走 int8 decode 專家 kernel。輸出相同；Ornith-1.5-35B-A3B 四人時約慢 2%（每列各讀自己的專家），所以預設關 |
 | `WHIRL_VRAM_LIMIT_MB=N` | 模擬只有 N MiB VRAM 的 GPU（例如在 R9700 上設 `16384` 模擬 16 GB 的 RX 9070 XT）：可用／總 VRAM、WDDM budget 與本行程的配置都以 N 為上限，載入、KV 池大小與自動縮小 prefill batch／checkpoint 數都會跟那張卡一樣。預設關閉 |
@@ -445,7 +456,7 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 
 | 變數 | 說明 |
 |---|---|
-| `WHIRL_FP8=0\|1` | MXFP4 prefill 用 fp8 activation（項目 `fp8`；balance / fast 預設開）。`0` 也會關掉 `WHIRL_MOE_FP8` |
+| `WHIRL_FP8=0\|1` | MXFP4 prefill 用 fp8 activation（項目 `fp8`；balance / fast 預設開，MoE 模型只在 fast 開）。`0` 也會關掉 `WHIRL_MOE_FP8` |
 | `WHIRL_FP8_MASK=BITS` | 使用 fp8 activation 的矩陣乘法類別（預設 7） |
 | `WHIRL_G8T=0` | fp8 GEMM 改用列優先版本，不用 fragment 排列版本（位元相同） |
 | `WHIRL_GDN_WMMA=0\|1` | DeltaNet prefill 區塊用 f16 WMMA（項目 `gdnwmma`；balance / fast 下 MXFP4 模型，以及 R9700 上任何格式的 dense 模型預設開啟） |
