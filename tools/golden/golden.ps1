@@ -73,6 +73,8 @@ function KlReportError([string]$path) {
     $is8060 = "$($r.device)" -eq "8060s"
     if (($Arch -eq "gfx1151") -ne $is8060) { return "KL report $path was measured on device '$($r.device)', not on $Arch" }
     foreach ($md in @("balance", "fast")) { if ($md -notin @($r.modes)) { return "KL report $path has no $md cases" } }
+    # KL-ROBUST: 3 window positions per length (klgate.py default); a 1-position report carries chunk-schedule jitter
+    if ([int]"$($r.positions)" -lt 3) { return "KL report $path has $([int]"$($r.positions)") window position(s) per length, not 3 (KL-ROBUST: rerun klgate.py without --positions)" }
     foreach ($L in @(8192, 32768, 98304, 131072)) { if ($L -notin @($r.lengths)) { return "KL report $path does not cover length $L" } }
     $names = @($r.models.PSObject.Properties | ForEach-Object { "$($_.Value)" })
     foreach ($m in $Models) {

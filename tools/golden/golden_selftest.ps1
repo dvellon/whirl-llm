@@ -23,9 +23,9 @@ $env:WHIRL_GOLDEN_DENSE = $model
 $bad = 0
 
 # a passing KL gate report for the fake exe (tools/klgate/klgate.py --report format)
-function KlRep([string]$name, [bool]$pass, [string]$sha) {
+function KlRep([string]$name, [bool]$pass, [string]$sha, [int]$positions = 3) {
     $p = Join-Path $tmp $name
-    @{ exe_sha256 = $sha; device = "default"; pass = $pass; summary = "selftest"; modes = @("balance", "fast")
+    @{ exe_sha256 = $sha; device = "default"; pass = $pass; summary = "selftest"; modes = @("balance", "fast"); positions = $positions
        lengths = @(8192, 32768, 98304, 131072); models = @{ dense = "fake-model.gguf" } } | ConvertTo-Json -Depth 4 | Set-Content $p
     return $p
 }
@@ -106,7 +106,8 @@ try {
     Expect "xcheck of a reference with seg0 lh != solo0 lh" $r 2
     # 6) record without a passing KL gate report for this exe: refused, nothing written
     $cases = @(@("no report", ""), @("report of another exe", (KlRep "kl_other.json" $true ("0" * 64))),
-               @("failing report", (KlRep "kl_fail.json" $false $fakeSha)))
+               @("failing report", (KlRep "kl_fail.json" $false $fakeSha)),
+               @("single-position report", (KlRep "kl_pos1.json" $true $fakeSha 1)))
     foreach ($c in $cases) {
         $g3 = Join-Path $tmp ("g3_" + ($c[0] -replace " ", "_"))
         $r = RunGate "record" $g3 @{} $c[1]
