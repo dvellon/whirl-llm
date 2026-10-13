@@ -641,7 +641,10 @@ const std::string WEATHER_TOOL =
     R"([{"type":"function","function":{"name":"get_weather","description":"Get the current weather of a city.","parameters":{"type":"object","properties":{"city":{"type":"string","description":"city name"},"unit":{"type":"string","enum":["c","f"]}},"required":["city"]}}}])";
 
 // CLI reference (`EXE chat MODEL @prompt --max-tokens N --no-stream`): body between
-// the "prompt tokens:" line and the "\n\n  prefill:" stats
+// the "prompt tokens:" line and the "\n\n  prefill:" stats, read from the CLI's stdout only.
+// SRV-CLI: the CLI writes diagnostics to stderr; with stderr in the same file the MTP draft
+// head's "draft head: vocabulary subset ..." line (108 bytes, printed when decode starts, i.e.
+// after "prompt tokens:") was parsed as the start of the generated text.
 std::optional<std::string> cliRun(const std::string& prompt, bool think, int max_tokens) {
     if (g.cli.empty()) return std::nullopt;
     const std::string pf = g.work + "\\cli_prompt.txt";
@@ -661,28 +664,34 @@ std::optional<std::string> cliRun(const std::string& prompt, bool think, int max
     }
     SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
     HANDLE oh = CreateFileW(widen(out).c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, 0, nullptr);
+    HANDLE eh = CreateFileW(widen(g.work + "\\cli_err.txt").c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, 0, nullptr);
     STARTUPINFOW si{};
     si.cb = sizeof si;
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = oh;
-    si.hStdError = oh;
+    si.hStdError = eh;
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> cb(cmd.begin(), cmd.end());
     cb.push_back(0);
     g_lock.acquire();
     const BOOL ok = CreateProcessW(nullptr, cb.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
     CloseHandle(oh);
+    CloseHandle(eh);
     if (!ok) {
         g_lock.release();
+        SetEnvironmentVariableW(L"WHIRL_THINK", nullptr);
         for (const auto& [k, v] : env_before) SetEnvironmentVariableW(widen(k).c_str(), v ? widen(*v).c_str() : nullptr);
         return std::nullopt;
     }
-    WaitForSingleObject(pi.hProcess, 900000);
+    DWORD code = 1;
+    if (WaitForSingleObject(pi.hProcess, 900000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    else TerminateProcess(pi.hProcess, 1);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     g_lock.release();
     SetEnvironmentVariableW(L"WHIRL_THINK", nullptr);
     for (const auto& [k, v] : env_before) SetEnvironmentVariableW(widen(k).c_str(), v ? widen(*v).c_str() : nullptr);
+    if (code != 0) return std::nullopt;
     std::string s = readFile(out);
     std::string t;
     for (char c : s)
@@ -761,6 +770,10 @@ void suiteBasic() {
         ChatResult st = chat(arr({msg("user", c.prompt)}), greedy(c.max) + thinkKw(c.think), true);
         check(std::string("basic: stream == non-stream ") + c.key,
               sameContent(st, r) && st.reasoning == r.reasoning && st.finish == r.finish, brief(st));
+        // SRV-CLI: with --cli, a missing reference (CLI failed, timed out or printed no "prompt tokens:")
+        // fails instead of silently skipping the comparison
+        if (cli_ref.count(c.key) && !g.cli.empty() && !cli_ref[c.key])
+            check(std::string("basic: server greedy == CLI ") + c.key, false, "no CLI reference (see cli_out.txt / cli_err.txt in --work)");
         if (const auto& cli = cli_ref[c.key]) {
             std::string reason, content = *cli;
             if (c.think) {
