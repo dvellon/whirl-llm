@@ -94,6 +94,7 @@ struct ServerSetup {
     std::uint64_t tier_ram_mb = 256;
     std::optional<std::string> ssd_dir;
     std::uint32_t tier_min = 512;
+    bool tier_shutdown = false;  // --kv-ssd-mode shutdown (default: always, delay 0)
     std::uint64_t fingerprint = 0x1234;
     // vision: attach a host mock encoder (image_url parts accepted)
     bool vision = false;
@@ -168,6 +169,7 @@ public:
             tc.ssd_cap = 4ull << 30;
             tc.min_tokens = su.tier_min;
             tc.ssd_delay_ms = 0;
+            tc.ssd_shutdown_only = su.tier_shutdown;
             tier::Layout lay;
             const auto& cfg = model_->cfg();
             std::uint64_t n_gdn = 0;
@@ -2151,6 +2153,94 @@ struct ChatBuild {
     }
 };
 
+// TIER-EVICT (INT-RC4F, 8060S srv_cache_precise sys 53/54): `--kv-ssd-mode shutdown` with a RAM tier too small
+// for the system checkpoint plus the sessions. Requests sharing a long system message attach its checkpoint from
+// VRAM (no tier restore), so before the fix its RAM tier entry was never marked reused and, in shutdown mode,
+// an entry pushed out of RAM was dropped: the restart found no system checkpoint. Now the attach marks the
+// entry reused and RAM pressure writes it to SSD (async) instead of dropping it; one-shot sessions are still
+// never written while running, and with enough RAM nothing is written while running.
+void testShutdownEvictSys() {
+    std::filesystem::path base;
+    if (const char* t = std::getenv("WHIRL_TEST_TMP"); t && *t) base = std::filesystem::path(widen(t));
+    else base = std::filesystem::temp_directory_path() / L"whirl-tests";
+    const std::string dir = narrow((base / L"server_test_ssd_evict").wstring());
+    const ChatBuild cb;
+    const std::uint64_t ram_small = []() -> std::uint64_t {
+        if (const char* e = std::getenv("WHIRL_TEST_EVICT_RAM_MB"); e && *e) return std::strtoull(e, nullptr, 10);
+        return 12;
+    }();
+    for (int mode = 0; mode < 2; ++mode) {  // 0: RAM pressure, 1: RAM tier large enough
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        std::filesystem::create_directories(dir, ec);
+        ServerSetup su = baseSetup();
+        su.mc.parallel = 1;
+        su.mc.slot_ctx = 8192;
+        su.mc.pool_tokens = 8192;
+        su.tier = true;
+        su.ssd_dir = dir;
+        su.tier_min = 512;
+        su.tier_shutdown = true;
+        su.tier_ram_mb = mode == 0 ? ram_small : 256;
+        su.eo.sys_min = 512;
+        su.eo.n_ck = 2;
+        std::uint32_t sys_n = 0;
+        std::uint64_t sys_id = 0;
+        {
+            TestServer srv(su);
+            g_log.clear();
+            for (int i = 0; i < 6; ++i) {
+                const auto p = cb.conv(2000, 951, {{300, 960 + static_cast<std::uint64_t>(i)}});
+                auto r = srv.post("/v1/completions", completionBody(p, 16));
+                CHECK_EQ(completionText(r), decode(srv.model().greedyReference(p, 16, true)));
+            }
+            tier::Tier* t = srv.tierp();
+            for (int i = 0; i < 400 && t->stats.ssd_writes < t->stats.evict_writes; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            CHECK(srv.engine().stats().spe_hits >= 5);
+            // writes while running: only the eviction writes of reused entries
+            CHECK_EQ(t->stats.ssd_writes, t->stats.evict_writes);
+            if (mode == 0) {
+                CHECK(t->stats.ram_evictions >= 1);
+                CHECK(t->stats.evict_writes >= 1);
+                CHECK(g_log.count("evicted from RAM: written to SSD") >= 1);
+                for (const tier::Entry* e : t->entries) {
+                    if (e->nck >= 1 && e->ck[0].kind == 4 && e->ck[0].pos == e->n_tok) {  // the system checkpoint
+                        sys_n = e->n_tok;
+                        sys_id = e->id;
+                        CHECK(e->reused);
+                        CHECK(e->ssd.has_value());
+                    }
+                }
+                CHECK(sys_id != 0);
+            } else {
+                CHECK_EQ(t->stats.ram_evictions, 0u);
+                CHECK_EQ(t->stats.ssd_writes, 0u);
+            }
+            std::fprintf(stderr, "  (shutdown_evict_sys mode %d: RAM %llu MiB, RAM evictions %llu, eviction writes %llu, dropped %llu, entries %zu)\n",
+                         mode, static_cast<unsigned long long>(su.tier_ram_mb), static_cast<unsigned long long>(t->stats.ram_evictions),
+                         static_cast<unsigned long long>(t->stats.evict_writes), static_cast<unsigned long long>(t->stats.dropped),
+                         t->entries.size());
+            CHECK_EQ(srv.model().poison(), 0u);
+        }
+        if (mode == 0 && sys_id != 0) {
+            // restart: the system checkpoint is on the SSD; a new conversation with the same system message reuses it
+            TestServer srv(su);
+            g_log.clear();
+            const tier::Entry* e = srv.tierp()->find(sys_id);
+            CHECK(e != nullptr);
+            const auto p = cb.conv(2000, 951, {{300, 990}});
+            auto r = srv.post("/v1/completions", completionBody(p, 16));
+            CHECK_EQ(completionText(r), decode(srv.model().greedyReference(p, 16, true)));
+            CHECK(cachedTokens(r) >= sys_n);
+            CHECK(srv.tierp()->stats.restores_ssd >= 1);
+            CHECK(g_log.count("checkpoint 'system'") >= 1);
+            CHECK_EQ(srv.model().poison(), 0u);
+        }
+        std::filesystem::remove_all(dir, ec);
+    }
+}
+
 // FIX-CACHE P2-4 (FR-CACHE), the agent pattern on one slot: the main agent's long session goes idle while a
 // subagent with the same system prompt (another task) runs two turns; then the main agent resumes.
 // supersede 1: before, the subagent's second turn cut the idle main entry to the system prompt (verified:
@@ -3212,6 +3302,7 @@ int main(int argc, char** argv) {
         {"pool", testPoolPressure},
         {"sys_prompt", testSharedSystemPrompt},
         {"tiers", testTiers},
+        {"shutdown_evict_sys", testShutdownEvictSys},
         {"restore_conc", testRestoreConcurrent},
         {"restore_throws", testRestoreThrows},
         {"tier_inplace", testTierInPlaceRegen},

@@ -789,6 +789,10 @@ void Engine::attachSpe(Slot& sl, Spe& s) {
     s.last_used = pc_->touch();
     s.uses += 1;
     stat_spe_hits_ += 1;
+    // the checkpoint's RAM tier entry was reused (served from VRAM here, so no tier restore marked it):
+    // worth an SSD write under the seen-once filter, and on eviction in shutdown mode (TIER-EVICT)
+    if (tier_ != nullptr && s.tier_id != 0)
+        if (tier::Entry* x = tier_->find(s.tier_id)) x->reused = true;
     stat_spe_tok_ += s.n;
 }
 

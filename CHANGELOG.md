@@ -5,6 +5,15 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## Unreleased (0.2.0)
 
+### SSD tier: shutdown mode keeps reused entries that RAM has to evict (TIER-EVICT)
+
+- `--kv-ssd-mode shutdown` (default) writes nothing while running, except reused entries that RAM has to
+  evict: a reused entry (prefix restored, session resumed, or a shared system-message checkpoint that
+  requests attached) of at least 2048 tokens pushed out of a full RAM tier is written to the SSD in the
+  background instead of dropped (cap, dedup and the crash-safe write protocol as for any write; one-shot
+  prompts are still never written). Fixes the system checkpoint lost across a restart on the Radeon 8060S
+  with an 8 GiB RAM tier and precise f16 KV (audit/INT-RC4F.md, audit/TIER-EVICT.md).
+
 ### MoE balance without fp8 activations; KL gate judges MoE against its noise floor (MOE-BAL)
 
 - **MoE models (`qwen35moe`, e.g. Ornith-1.5-35B-A3B MXFP4): balance = `gdnwmma` + `h16` + `q8dec`

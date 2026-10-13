@@ -579,11 +579,15 @@ bool Tier::evictable(Entry* e, Entry* keep) {
 }
 
 // RAM pressure on an entry whose SSD write is not due yet: it is written now (asynchronously;
-// its RAM blocks are freed by a later pass) if it is worth a disk write (>= min_tokens, SSD tier
-// in `always` mode); else it is dropped (older consistent SSD copy, or gone: a cold prefill later).
+// its RAM blocks are freed by a later pass) if it is worth a disk write (>= min_tokens, SSD tier on,
+// reused per the seen-once filter); else it is dropped (older consistent SSD copy, or gone: a cold
+// prefill later). `shutdown` mode writes nothing while running except here, and only for an entry
+// that was reused (restored, resumed, or a shared prefix checkpoint hit), whatever ssd_seen_filter
+// says: a one-shot prompt is never written, and without RAM pressure nothing is (TIER-EVICT).
 bool Tier::evictWanted(const Entry* v) const {
     if (v->demoted) return false;  // probably superseded: not worth a disk write
-    if (!ssd_dir_w_ || cfg.ssd_shutdown_only || v->n_tok < cfg.min_tokens || v->n_tok == 0 || !seenOk(v)) return false;
+    if (!ssd_dir_w_ || v->n_tok < cfg.min_tokens || v->n_tok == 0) return false;
+    if (cfg.ssd_shutdown_only ? !v->reused : !seenOk(v)) return false;
     return !v->ssd || v->hasDirty();  // clean: nothing to write
 }
 
@@ -592,6 +596,13 @@ bool Tier::evictWrite(Entry* v) {
     try {
         startWrite(v);
     } catch (...) {
+    }
+    if (v->io_busy && cfg.ssd_shutdown_only) {
+        stats.evict_writes += 1;
+        if (log_fn)
+            log_fn(fmt("kv tier: entry %016llx (%u tok, reused) evicted from RAM: written to SSD (shutdown mode writes "
+                       "only reused entries that RAM has to evict)",
+                       static_cast<unsigned long long>(v->id), v->n_tok));
     }
     return v->io_busy;
 }

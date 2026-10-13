@@ -227,7 +227,7 @@ balance, 128k session): cold prefill 537 s, RAM-tier restore 0.34 s, SSD-tier re
 `clamp(OS-visible RAM / 8, one max-context entry (about 6 GiB for 27B at 262k), 16 GiB)`, at most 1/4
 of the RAM available at startup, off under 32 GB of OS-visible RAM; 8 GiB on a 64 GB machine. The
 startup log prints the size and the reason. The SSD tier runs in `shutdown` mode (no writes while
-running). `--kv-ram-mb N` / `WHIRL_KV_RAM_MB` are used as given, `--kv-ram-mb 0` turns both host tiers
+running, except reused entries that RAM has to evict). `--kv-ram-mb N` / `WHIRL_KV_RAM_MB` are used as given, `--kv-ram-mb 0` turns both host tiers
 off, `--kv-ssd-gb 0` or `--kv-ssd-mode off` only the SSD tier. Decided from the
 capability `DeviceInfo::integrated`, not the architecture.
 
@@ -453,7 +453,11 @@ then KV page j at `nck × ck_stride + j × page_bytes` (13.0 MiB per page for q8
   with unbuffered positional writes: header marked invalid → data → flush → valid header. An entry
   is written (`--kv-ssd-mode always` only; the default `shutdown` writes at a graceful stop) after it has been
   unchanged for `--kv-ssd-delay` seconds (default 300), and only if it was reused or resumed at least once (a
-  one-shot prompt is never written); a graceful stop writes the most recently used entries first.
+  one-shot prompt is never written); a graceful stop writes the most recently used entries first. Shutdown
+  mode writes nothing while running, except reused entries that RAM has to evict: a reused entry (restored,
+  resumed, or a shared system-message checkpoint that requests attached) of at least 2048 tokens that RAM
+  pressure pushes out is written in the background instead of dropped (size cap and dedup apply as for any
+  write; the spill that needed the room is retried when the write is done).
 - At startup the directory is scanned and indexed; magic, fingerprint and token checksum are
   checked and bad files deleted (half-written, corrupt, not ours); files of other models are counted and
   deleted first when space is needed; files unused for 7 days are deleted (start-up and hourly). The

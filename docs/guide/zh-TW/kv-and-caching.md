@@ -139,7 +139,7 @@ f16 副本放在 attention 期間閒置的 prefill 緩衝區（預設 prefill ba
 128k）：冷 prefill 537 s、從 RAM 層還原 0.34 s、重啟後從 SSD 層還原 2 s，decode 速度不變。RAM 層大小的規則（只看作業系統可見
 記憶體，不看 128 GB 的總量）：`clamp(可見記憶體 / 8, 一個最大 context 條目, 16 GiB)`，且不超過啟動時可用記憶體的 1/4；可見記憶體
 低於 32 GB 則關閉，啟動日誌會寫明大小與原因。64 GB 的電腦為 8 GiB（實際多佔 8 GiB 作業系統記憶體）。SSD 層預設
-`--kv-ssd-mode shutdown`（執行中不寫碟，優雅關閉時才寫）。`--kv-ram-mb N` / `WHIRL_KV_RAM_MB` 照給定值；`--kv-ram-mb 0` 關閉兩層，
+`--kv-ssd-mode shutdown`（執行中不寫碟，只有主記憶體層必須擠出的重用過的項目例外；優雅關閉時才寫其餘的）。`--kv-ram-mb N` / `WHIRL_KV_RAM_MB` 照給定值；`--kv-ram-mb 0` 關閉兩層，
 `--kv-ssd-gb 0` 或 `--kv-ssd-mode off` 只關 SSD 層。判斷依據是 `DeviceInfo::integrated` 這個能力，而不是架構名稱。
 
 ## <a id="checkpoints"></a>5. 混合模型的前綴快取：檢查點
@@ -249,7 +249,7 @@ agent 情境（8 個 session，各自「詢問某個檔案 → `read_file` → �
 
 ### 8.3 SSD 層
 
-- 每個項目一個檔案（4 KiB 標頭、token id、資料區）。一個 I/O 執行緒以無緩衝的定位寫入只寫髒區塊：標頭標記無效 → 資料 → flush → 有效標頭。項目在 2 s 內未變動後才寫入。
+- 每個項目一個檔案（4 KiB 標頭、token id、資料區）。一個 I/O 執行緒以無緩衝的定位寫入只寫髒區塊：標頭標記無效 → 資料 → flush → 有效標頭。預設 `--kv-ssd-mode shutdown` 執行中不寫，只有主記憶體層必須擠出的重用過的項目例外（前綴被還原過、接續過的 session、被共用的 system checkpoint；至少 2048 token，背景寫入），其餘在優雅關閉時寫；`always` 模式在項目 `--kv-ssd-delay` 秒（預設 300）未變動後寫，且只寫重用過的項目。
 - 啟動時掃描並索引目錄；檢查 magic、fingerprint 與 token checksum，刪除損壞的檔案。超過大小上限（預設 64 GiB）時刪除 LRU 檔案。
 - **Fingerprint：** 執行檔（大小 + 修改時間）、模型檔名 + tensor 數量 + 位元組數、KV 格式、MTP 開/關、配置、prefill batch，以及所有會改變數值的引擎設定（排程/日誌/分層設定除外）。由不同 build 或不同數值設定寫出的項目永遠不會被還原。
 - 讀取：最多 4 個重疊讀取同時進行，依序完成（NVMe 2 MiB QD4 7.0 GB/s vs QD1 4.1 GB/s）；還原是管線化的——一個區塊讀完，其片段就立刻做 H2D 複製。

@@ -2576,6 +2576,96 @@ static void testShutdownNoWrites(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
+// TIER-EVICT (owner decision b): `shutdown` mode writes nothing while running, except a reused entry that RAM
+// pressure has to evict: it is written (async; the spill that needed the room is retried) instead of dropped,
+// so it survives a restart (INT-RC4F: 8060S, 8 GiB RAM tier, precise f16 KV -- the reused system checkpoint
+// was pushed out of RAM and lost). One-shot prompts are still dropped, below min_tokens is dropped, a file
+// that cannot fit the cap is skipped (one log line, dropped), and without RAM pressure nothing is written.
+// Before the fix modes 0 and 1 dropped a (no file; the restart found nothing).
+static void testShutdownEvictReused(MockDeviceOps& ops, const fs::path& dir) {
+    // 0: reused LRU victim -> written, survives a restart; the one-shot b is dropped (not written)
+    // 1: seen filter off: still only reused entries (b dropped, a written)
+    // 2: cap smaller than a's file -> skipped with one log line, dropped, spill not blocked
+    // 3: a reused but below min_tokens -> dropped
+    // 4: no RAM pressure -> nothing written while running (the flush is unchanged)
+    for (int mode = 0; mode < 5; ++mode) {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        SsdEnv env{dir};
+        std::uint64_t seed = 9700 + static_cast<std::uint64_t>(mode) * 10;
+        const std::uint64_t fp = 97;
+        auto mkcfg = [&] {
+            Config c = env.cfg(mode == 2 ? (8ull << 20) : (4ull << 30));
+            c.ssd_seen_filter = mode != 1;
+            c.ssd_delay_ms = 0;  // shutdown mode ignores the delay anyway
+            c.ssd_shutdown_only = true;
+            c.min_tokens = mode == 3 ? 5000 : 2048;
+            return c;
+        };
+        std::vector<std::string> logs;
+        Sess a(ops, 24), b(ops, 24), d(ops, 24);
+        a.toks = freshToks(3000, seed);
+        b.toks = freshToks(3000, seed);
+        d.toks = freshToks(3000, seed);
+        std::uint64_t id_a = 0;
+        {
+            // 32 blocks; a 3000-token entry takes 13 (mode 4: room for all three)
+            auto t = Tier::create(ops, mode == 4 ? (256ull << 20) : (64ull << 20), 97, 0);
+            t->log_fn = [&](std::string_view s) { logs.emplace_back(s); };
+            t->start(mkcfg(), kLay, fp);
+            spillSess(*t, a, 0);
+            id_a = a.id;
+            CHECK(restoreMatches(*t, ops, t->find(id_a), a));  // a is reused (its prefix restored once)
+            CHECK(t->find(id_a) != nullptr && t->find(id_a)->reused);
+            sleepMs(5);
+            spillSess(*t, b, 0);  // one-shot
+            CHECK(tickIdle(*t));
+            CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);  // nothing while running
+            // the third needs room (modes 0-3): the LRU entry a goes
+            bool kept = spillSess(*t, d, 0) && d.id != 0;
+            if (!kept && t->roomPending()) {  // a's write is running: retried once it frees a's blocks
+                CHECK(tickIdle(*t, 20000));
+                kept = spillSess(*t, d, 0) && d.id != 0;
+            }
+            CHECK(kept);
+            CHECK(tickIdle(*t, 20000));
+            Entry* ea = t->find(id_a);
+            if (mode <= 1) {
+                CHECK(t->stats.evict_writes == 1 && t->stats.ssd_writes == 1 && countFiles(dir) == 1);
+                CHECK(ea != nullptr && ea->ssd.has_value());
+                CHECK(t->find(b.id) == nullptr);  // the one-shot entry was dropped, never written
+                std::size_t lines = 0;
+                for (const auto& l : logs) lines += l.find("evicted from RAM: written to SSD") != std::string::npos ? 1 : 0;
+                CHECK(lines == 1);
+            } else if (mode == 4) {
+                CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0 && t->stats.ram_evictions == 0);
+                CHECK(ea != nullptr && ea->in_ram);
+            } else {
+                CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0 && t->stats.evict_writes == 0);
+                CHECK(ea == nullptr);  // dropped as before
+                if (mode == 2) {
+                    std::size_t nofit = 0;
+                    for (const auto& l : logs) nofit += l.find("no room under the cap") != std::string::npos ? 1 : 0;
+                    CHECK(nofit == 1);
+                }
+            }
+            // crash / kill: no flush (shutdown mode loses what is only in RAM)
+        }
+        if (mode <= 1) {
+            // restart: a comes back from the SSD and restores bit-exactly
+            auto t = Tier::create(ops, 64ull << 20, 98, 0);
+            t->start(mkcfg(), kLay, fp);
+            CHECK(t->ssdEntries() == 1);
+            Entry* ea = t->find(id_a);
+            CHECK(ea != nullptr && !ea->in_ram);
+            if (ea) CHECK(restoreMatches(*t, ops, ea, a));
+            CHECK(tickIdle(*t));
+            CHECK(t->stats.ssd_writes == 0);
+        }
+        fs::remove_all(dir, ec);
+    }
+}
+
 // FIX-RC4-A P3-3: a cache file that cannot be deleted (another program holds it) stays counted against the
 // cap -- at an LRU eviction, for a corrupt file at startup -- and a file that cannot be opened at startup is
 // kept and counted (aged by its last-write time), not reported as expired and dropped from the accounting.
@@ -3570,6 +3660,10 @@ int main(int argc, char** argv) {
     if (want("testSeenOnce")) {
         std::printf("-- %s\n", "testSeenOnce");
         testSeenOnce(ops, dir);
+    }
+    if (want("testShutdownEvictReused")) {
+        std::printf("-- %s\n", "testShutdownEvictReused");
+        testShutdownEvictReused(ops, dir);
     }
     if (want("testStartupCleanupCap")) {
         std::printf("-- %s\n", "testStartupCleanupCap");

@@ -153,7 +153,8 @@ struct Config {
     // served from RAM and never costs a disk write)
     std::uint64_t ssd_delay_ms = 300000;
     // --kv-ssd-mode shutdown: entries stay in RAM and are written only while
-    // `flushing` is set (graceful shutdown)
+    // `flushing` is set (graceful shutdown), except a reused entry (Entry::reused) that RAM
+    // pressure has to evict: written then (asynchronously) instead of dropped (TIER-EVICT)
     bool ssd_shutdown_only = false;
     // `always` mode: an entry is written (delay expired, RAM pressure, flush) only if it was reused
     // (its prefix was restored at least once) or is a session that was resumed (grew by appending);
@@ -212,7 +213,8 @@ struct Entry {
     bool meta_dirty = false;
     // an owner of a block it references was dropped while its write ran
     bool ssd_stale = false;
-    // restored at least once, or resumed in place (a multi-turn session); see Config::ssd_seen_filter
+    // restored at least once, resumed in place (a multi-turn session), or a shared prefix checkpoint
+    // (system message) a request attached from VRAM; see Config::ssd_seen_filter, ssd_shutdown_only
     bool reused = false;
     // its SSD write was skipped: a file of nofit_fb bytes did not fit the cap (Tier::startWrite). Not
     // retried until its size changes or SSD room was freed since (Tier::ssd_gen_ moved past nofit_gen).
@@ -273,7 +275,8 @@ struct Restore {
 struct Stats {
     std::uint64_t spills = 0, spill_bytes = 0, restores_ram = 0, restores_ssd = 0, restore_bytes = 0,
                   ssd_writes = 0, ssd_write_bytes = 0, ram_evictions = 0, ssd_evictions = 0, dropped = 0,
-                  ssd_dedup_bytes = 0, superseded = 0, superseded_bytes = 0, demoted = 0;
+                  ssd_dedup_bytes = 0, superseded = 0, superseded_bytes = 0, demoted = 0,
+                  evict_writes = 0;  // shutdown mode: writes of reused entries RAM had to evict (TIER-EVICT)
 };
 
 class Tier {
