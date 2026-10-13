@@ -5,6 +5,7 @@
 // positional file I/O through <windows.h>).
 
 #include "kv_tier.h"
+#include "evict_policy.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -579,16 +580,20 @@ bool Tier::evictable(Entry* e, Entry* keep) {
 }
 
 // RAM pressure on an entry whose SSD write is not due yet: it is written now (asynchronously;
-// its RAM blocks are freed by a later pass) if it is worth a disk write (>= min_tokens, SSD tier on,
-// reused per the seen-once filter); else it is dropped (older consistent SSD copy, or gone: a cold
-// prefill later). `shutdown` mode writes nothing while running except here, and only for an entry
-// that was reused (restored, resumed, or a shared prefix checkpoint hit), whatever ssd_seen_filter
-// says: a one-shot prompt is never written, and without RAM pressure nothing is (TIER-EVICT).
+// its RAM blocks are freed by a later pass) if the policy in evict_policy.h says it is worth a disk
+// write; else it is dropped (older consistent SSD copy, or gone: a cold prefill later).
 bool Tier::evictWanted(const Entry* v) const {
-    if (v->demoted) return false;  // probably superseded: not worth a disk write
-    if (!ssd_dir_w_ || v->n_tok < cfg.min_tokens || v->n_tok == 0) return false;
-    if (cfg.ssd_shutdown_only ? !v->reused : !seenOk(v)) return false;
-    return !v->ssd || v->hasDirty();  // clean: nothing to write
+    EvictFacts f;
+    f.ssd_on = ssd_dir_w_.has_value();
+    f.shutdown_only = cfg.ssd_shutdown_only;
+    f.seen_filter = cfg.ssd_seen_filter;
+    f.demoted = v->demoted;
+    f.reused = v->reused;
+    f.n_tok = v->n_tok;
+    f.min_tokens = cfg.min_tokens;
+    f.on_ssd = v->ssd.has_value();
+    f.dirty = f.on_ssd && v->hasDirty();
+    return evictWriteWanted(f);
 }
 
 bool Tier::evictWrite(Entry* v) {

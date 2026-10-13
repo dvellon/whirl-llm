@@ -9,6 +9,7 @@
 #include "../test_env.h"
 #include "tier/kv_tier.h"
 #include "tier/ram_size.h"
+#include "tier/evict_policy.h"
 #include "cache/prefix_cache.h"
 
 #include <malloc.h>
@@ -773,6 +774,61 @@ static void testSsd(MockDeviceOps& ops, const fs::path& dir) {
     }
     CHECK(ops.live_events.load() == 0 && ops.live_host.load() == 0 && ops.live_streams.load() == 0);
     if (g_fail == 0) fs::remove_all(dir, ec);
+}
+
+// RAM-tier eviction policy (src/tier/evict_policy.h): written to SSD or dropped (TIER-EVICT)
+static void testEvictPolicy() {
+    EvictFacts b;  // a reused, never-written 4096-token entry, SSD tier on, shutdown mode
+    b.ssd_on = true;
+    b.shutdown_only = true;
+    b.seen_filter = true;
+    b.reused = true;
+    b.n_tok = 4096;
+    b.min_tokens = 2048;
+    CHECK(evictWriteWanted(b));
+    // shutdown mode: a one-shot prompt is never written, whatever the seen filter says
+    EvictFacts f = b;
+    f.reused = false;
+    CHECK(!evictWriteWanted(f));
+    f.seen_filter = false;
+    CHECK(!evictWriteWanted(f));
+    // always mode: seen-once filter decides
+    f = b;
+    f.shutdown_only = false;
+    CHECK(evictWriteWanted(f));
+    f.reused = false;
+    CHECK(!evictWriteWanted(f));
+    f.seen_filter = false;
+    CHECK(evictWriteWanted(f));
+    // never written: SSD off, demoted, empty, below min_tokens (both modes)
+    for (bool sh : {true, false}) {
+        f = b;
+        f.shutdown_only = sh;
+        f.ssd_on = false;
+        CHECK(!evictWriteWanted(f));
+        f = b;
+        f.shutdown_only = sh;
+        f.demoted = true;
+        CHECK(!evictWriteWanted(f));
+        f = b;
+        f.shutdown_only = sh;
+        f.n_tok = 0;
+        f.min_tokens = 0;
+        CHECK(!evictWriteWanted(f));
+        f = b;
+        f.shutdown_only = sh;
+        f.n_tok = 2047;
+        CHECK(!evictWriteWanted(f));
+        f.n_tok = 2048;
+        CHECK(evictWriteWanted(f));
+        // current SSD copy: not rewritten; dirty since: rewritten
+        f = b;
+        f.shutdown_only = sh;
+        f.on_ssd = true;
+        CHECK(!evictWriteWanted(f));
+        f.dirty = true;
+        CHECK(evictWriteWanted(f));
+    }
 }
 
 static void testHelpers() {
@@ -3567,6 +3623,10 @@ int main(int argc, char** argv) {
     if (want("testHelpers")) {
         std::printf("-- %s\n", "testHelpers");
         testHelpers();
+    }
+    if (want("testEvictPolicy")) {
+        std::printf("-- %s\n", "testEvictPolicy");
+        testEvictPolicy();
     }
     if (want("testRamTierSize")) {
         std::printf("-- %s\n", "testRamTierSize");
