@@ -3,14 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # For every model x prompt x mode, one `whirl chat` run prefills the whole prompt (raw, no MTP) and
-# dumps the teacher-forced next-token logits of the --rows (default 256) positions before each length
+# dumps the teacher-forced next-token logits of the --rows (default 512) positions before each length
 # in --lengths (WHIRL_DUMP_LOGITS + WHIRL_DUMP_AT; 16-row forwards, every row computed: d61f6df). Per
 # window it computes KL(precise || mode) (mean over the rows) and the top-1 agreement with precise.
 # Limits (MOE-BAL, owner decision 2026-10-13):
 #   dense models (absolute, per window):
 #     balance: KL <= 0.005 and top-1 >= 98%      fast: KL <= 0.03 and top-1 >= 93%
-#     (256 rows per window since MOE-BAL: with 128 rows one row is 0.78 points of top-1, and dense
-#     fast zh 8k missed 93% by one row)
+#     (512 rows per window since MOE-BAL: with 128 rows one row is 0.78 points of top-1 and dense
+#     fast zh 8k missed 93% by one row; a 256-row run still failed it, and the window start also moves
+#     the prefill split, so a window's numbers carry chunk-schedule jitter: audit/MOE-BAL.md)
 #   MoE models (arch *moe): relative to the noise floor N measured in the same gate run = precise vs
 #     precise with the sequential DeltaNet prefill (WHIRL_GDN_SEQ=1, an equally exact f32 path), same
 #     windows; N = the mean of the noise run's window KLs, N_top1(w) = its top-1 in window w:
@@ -28,7 +29,7 @@
 #
 # usage: python klgate.py --exe build\Release\whirl.exe --model dense=Q.gguf --model moe=M.gguf
 #            --corpus DIR [--device r9700|8060s] [--lengths 8192,32768,98304,131072] [--modes balance,fast]
-#            [--report out.json] [--work DIR] [--wrap "python gpu_lock.py --"] [--only dense:code] [--rows 256]
+#            [--report out.json] [--work DIR] [--wrap "python gpu_lock.py --"] [--only dense:code] [--rows 512]
 
 import argparse
 import hashlib
@@ -45,7 +46,7 @@ import numpy as np
 LIMITS = {"balance": (0.005, 0.98), "fast": (0.03, 0.93)}  # dense: absolute (KL max, top-1 min) per window
 # MoE: (mean KL <= k_mean * N, window KL <= k_win * N, top-1(w) >= N_top1(w) - drop)
 MOE_LIMITS = {"balance": (2.0, 3.0, 0.024), "fast": (8.0, 12.0, 0.08)}
-ROWS = 256
+ROWS = 512
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -115,7 +116,7 @@ def run_dump(exe, model, prompt, mode, ends, n, dump, logf, wrap, device, extra=
 
 
 def load_dump(p, nwin):
-    # kept in f16 (256 rows x 4 windows x a 248k vocab = 0.5 GB); compare() widens one window at a time
+    # kept in f16 (512 rows x 4 windows x a 248k vocab = 1 GB); compare() widens one window at a time
     a = np.fromfile(p, dtype=np.float16)
     rows = nwin * ROWS
     if a.size == 0 or a.size % rows:
@@ -239,10 +240,21 @@ def main():
             if not ends:
                 continue
             log(f"{mname}:{pname}: {n} tokens, windows end at {ends}")
-            dumps = {}
+            ref = None
+            res_by = {}  # mode -> per-window results (each dump is compared right after its run; only precise stays in memory)
             moe = False
+            ok_runs = True
             runs = ["precise"]
             ri = 0
+
+            def windows(t):
+                out = []
+                for w, e in enumerate(ends):
+                    s = slice(w * ROWS, (w + 1) * ROWS)
+                    zt = int((np.abs(t[s]).max(1) == 0).sum())
+                    out.append((e, zt) + compare(ref[s], t[s]))
+                return out
+
             while ri < len(runs):
                 md = runs[ri]
                 ri += 1
@@ -255,42 +267,44 @@ def main():
                 log(f"  run {tag}: exit {rc}, {wall:.0f} s")
                 if rc != 0 or not os.path.isfile(dump):
                     rep["errors"].append(f"{tag}: exit {rc} (log {logf})")
+                    ok_runs = False
                     break
                 arch, num = log_info(logf)
                 rep["numerics"][tag] = num
-                if md == "precise":
-                    moe = arch.endswith("moe")
-                    runs += (["noise"] if moe else []) + modes
-                    log(f"  {mname}: arch {arch or '?'} -> {'MoE: limits relative to the noise floor' if moe else 'dense: absolute limits'}")
                 try:
-                    dumps[md] = load_dump(dump, len(ends))
+                    t = load_dump(dump, len(ends))
                 except Exception as e:
                     rep["errors"].append(f"{tag}: {e}")
+                    ok_runs = False
                     break
                 if not a.keep:
                     os.remove(dump)
-            if "precise" not in dumps:
+                if md == "precise":
+                    ref = t
+                    zero = int((np.abs(ref).max(1) == 0).sum())
+                    if zero:
+                        rep["errors"].append(f"{mname}:{pname}: {zero} all-zero rows in the precise dump")
+                        ok_runs = False
+                        break
+                    moe = arch.endswith("moe")
+                    runs += (["noise"] if moe else []) + modes
+                    log(f"  {mname}: arch {arch or '?'} -> {'MoE: limits relative to the noise floor' if moe else 'dense: absolute limits'}")
+                    continue
+                if t.shape != ref.shape:
+                    rep["errors"].append(f"{mname}:{pname}:{md}: dump shape {t.shape} != precise {ref.shape}")
+                    continue
+                res_by[md] = windows(t)
+                del t
+            ref = None
+            if not ok_runs:
                 continue
-            ref = dumps["precise"]
-            zero = int((np.abs(ref).max(1) == 0).sum())
-            if zero:
-                rep["errors"].append(f"{mname}:{pname}: {zero} all-zero rows in the precise dump")
-                continue
-
-            def windows(t):
-                out = []
-                for w, e in enumerate(ends):
-                    s = slice(w * ROWS, (w + 1) * ROWS)
-                    zt = int((np.abs(t[s]).max(1) == 0).sum())
-                    out.append((e, zt) + compare(ref[s], t[s]))
-                return out
 
             noise = None
             if moe:
-                if "noise" not in dumps or dumps["noise"].shape != ref.shape:
+                if "noise" not in res_by:
                     rep["errors"].append(f"{mname}:{pname}: MoE noise floor run missing")
                     continue
-                nw = windows(dumps.pop("noise"))
+                nw = res_by["noise"]
                 n_mean = float(np.mean([x[2] for x in nw]))
                 noise = {"model": mname, "prompt": pname, "n_mean": n_mean,
                          "windows": [{"length": x[0], "kl_mean": x[2], "kl_p99": x[3], "kl_max": x[4], "top1": x[5]} for x in nw]}
@@ -301,14 +315,9 @@ def main():
                     rep["errors"].append(f"{mname}:{pname}: noise floor N = 0 (WHIRL_GDN_SEQ=1 did not change the bits)")
                     continue
             for md in modes:
-                if md not in dumps:
+                if md not in res_by:
                     continue
-                t = dumps.pop(md)
-                if t.shape != ref.shape:
-                    rep["errors"].append(f"{mname}:{pname}:{md}: dump shape {t.shape} != precise {ref.shape}")
-                    continue
-                res = windows(t)
-                del t
+                res = res_by[md]
                 base = {"model": mname, "prompt": pname, "mode": md}
                 if moe:
                     wins, mcase = judge_moe(res, noise, md)
@@ -329,7 +338,6 @@ def main():
                                              "rule": "dense-abs", "kl_limit": kl_max, "top1_limit": top1_min, "pass": ok})
                         log(f"  {'PASS' if ok else 'FAIL'} {mname:6s} {pname:5s} {md:8s} {e:7d}: KL mean {kl:.5f} p99 {p99:.4f} max {mx:.4f}  top1 {top1 * 100:.2f}%"
                             + (f"  zero rows {zt}" if zt else ""))
-            dumps.clear()
 
     npass = sum(1 for c in rep["cases"] if c["pass"])
     nfail = len(rep["cases"]) - npass

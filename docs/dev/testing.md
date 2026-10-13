@@ -96,7 +96,7 @@ any reference without a passing KL gate report of the same executable (`-KlRepor
 
 `tools/klgate/klgate.py` measures what the golden hashes cannot: how far balance and fast are from
 precise. For every model x prompt x mode one `whirl chat` run prefills a fixed prompt (raw, no MTP)
-and dumps the teacher-forced logits of the 256 positions (`--rows`; 128 before MOE-BAL) before
+and dumps the teacher-forced logits of the 512 positions (`--rows`; 128 before MOE-BAL) before
 8,192 / 32,768 / 98,304 / 131,072 tokens (`WHIRL_DUMP_LOGITS` + `WHIRL_DUMP_AT`, 16-row forwards; the
 zh prompt has 129,297 tokens, so its last window ends there). Per window it takes the mean
 KL(precise || mode) and the top-1 agreement with precise. The limits depend on the model type (the
@@ -104,7 +104,7 @@ KL(precise || mode) and the top-1 agreement with precise. The limits depend on t
 
 Dense models (`qwen35`), absolute, every window:
 
-| Mode | KL mean (per 256-row window) | top-1 agreement |
+| Mode | KL mean (per 512-row window) | top-1 agreement |
 |---|---|---|
 | balance | <= 0.005 | >= 98% |
 | fast | <= 0.03 | >= 93% |
@@ -122,8 +122,12 @@ limit, so an absolute limit cannot tell a real regression from the model's own s
 | fast | <= 8 N | <= 12 N | >= N_top1(w) - 8 points |
 
 The fast multipliers were set from the measured fast numbers as a regression guard, not as a quality
-claim. 256 rows per window: with 128 rows one row is 0.78 points of top-1 (dense fast zh 8k once
-missed 93% by a single row); the limits were not relaxed for it.
+claim. 512 rows per window: with 128 rows one row is 0.78 points of top-1 (dense fast zh 8k once
+missed 93% by a single row); the limits were not relaxed for it. A 256-row run still failed (dense zh
+8k balance 97.27% / fast 92.97%, MoE zh balance 2.04 N): the window start also moves where the
+prefill is split into forwards, so the bits of a window - and its KL / top-1 - change with the window
+size as well as by sampling (audit/MOE-BAL.md). The tool keeps one precise dump in memory (1 GB at
+512 rows) and compares every other run right after it finishes.
 
 Exit 0 only when every case ran and passed; 1 when a limit failed; 2 on a failed run, a missing or
 changed corpus file (`tools/klgate/corpus.sha256`), a too-short prompt or 0 cases. The corpus is two

@@ -99,7 +99,7 @@ What balance and fast change, by model type (R9700; the Radeon 8060S has no fp8 
 | Mode | Dense models (Qwen3.8-27B Q4_K_M, MXFP4 dense) | MoE models (Ornith-1.5-35B-A3B MXFP4) |
 |---|---|---|
 | precise | f16 / f32 everywhere, f16 KV | f16 / f32 everywhere, f16 KV |
-| balance | `fp8` (MXFP4 files only), `gdnwmma`, `h16`, `kvq8` (q8h KV), `specsample`, `q8dec` | `gdnwmma`, `h16`, `specsample`, `q8dec`, f16 KV. **No `fp8` / `moefp8`** (since MOE-BAL): with fp8 activations in front of the 256-expert router the MoE balance output was 3.3-3.6x the model's own KL noise floor; without them it is within 2x (KL gate below) |
+| balance | `fp8` (MXFP4 files only), `gdnwmma`, `h16`, `kvq8` (q8h KV), `specsample`, `q8dec` | `gdnwmma`, `h16`, `specsample`, `q8dec`, f16 KV. **No `fp8` / `moefp8`** (since MOE-BAL): with fp8 activations in front of the 256-expert router the MoE balance output was 3.3-3.6x the model's own KL noise floor N (two equally exact precise paths); without them about 1.9x N on the KL gate corpus (code and zh, R9700, docs/dev/testing.md) |
 | fast | balance + `kvq4` (q4 KV) + `relaxacc` | balance + `fp8` + `moefp8` + `kvq4` (q4 KV); `relaxacc` skipped |
 
 The MoE change costs MoE balance prefill on the R9700 (about -11% at 128k to -26% at 8k, decode
@@ -126,7 +126,7 @@ each mode in precise and balance (and fast with `WHIRL_RELAX=0`; with `relaxacc`
 depends on the drafts: a repeated request gives the same text streamed or not, cold or resumed from
 its own prefix-cache checkpoints, but a prompt resumed from another prompt's shared prefix is
 prefilled in other chunks, which can change fast output in the last bits, as concurrency can).
-Fast mode aims at quality within its gate (mean KL vs precise <= 0.03 and top-1 >= 93%, checked by tools/klgate at 8k-128k; the first run met it on Qwen3.8-27B except one zh 8k window at 92.97% top-1, and not on Ornith-1.5-35B-A3B, zh KL up to 0.037), not bitwise-identical output between a concurrent and a solo run: with `relaxacc` the draft cadence depends on the load, so concurrent text can differ from solo text (best effort; precise and balance do guarantee equality). With temperature > 0, MTP decoding gives the same tokens as plain sampling
+Fast mode aims at quality within its gate (mean KL vs precise <= 0.03 and top-1 >= 93%, checked by tools/klgate at 8k-128k on dense models; MoE models are judged against their own noise floor N: fast mean KL <= 8 N, each window <= 12 N, top-1 at most 8 points under N's; on the R9700 (512-row windows) Qwen3.8-27B fast has KL <= 0.0072 and top-1 >= 96.09%, Ornith-1.5-35B-A3B fast is 6.1 N on both prompts), not bitwise-identical output between a concurrent and a solo run: with `relaxacc` the draft cadence depends on the load, so concurrent text can differ from solo text (best effort; precise and balance do guarantee equality). With temperature > 0, MTP decoding gives the same tokens as plain sampling
 for a seed in precise and balance (with `specsample` too), whatever the prefix cache or earlier
 requests; balance (`specsample`) samples by a different (equally exact) rule than precise, so its
 tokens for a seed differ from precise's. Fast with `relaxacc` uses typical acceptance instead.
