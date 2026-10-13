@@ -81,8 +81,8 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
   | mode | KV format | activations / kernels | output guarantee |
   |---|---|---|---|
-  | precise | f16 (every model, every GPU) | no fp8, f32 DeltaNet, no h16; f16 decode / verify activations | bitwise reproducible: the same bits with or without drafts, solo or batched, CLI or server |
-  | balance (default) | q8h on dense models, f16 on MoE models | items `fp8`, `moefp8`, `gdnwmma`, `h16`, `kvq8`; int8 decode / verify activations | near-lossless (KL vs precise about 1e-4 to 5e-4), MTP / n-gram == plain greedy; **not** bit for bit the 0.1.x output (q8v KV gone, KG-1 kernels, specsample sampler) |
+  | precise | f16 (every model, every GPU) | no fp8, f32 DeltaNet, no h16; f16 decode / verify activations | bitwise reproducible: the same bits with or without drafts, solo or batched; on the server the same bits for a prompt whatever the load, forward size or schedule-point resume; CLI == server except a CLI prompt of 4096·k + fewer than 64 tokens and a server system message of 2048+ tokens (kv-and-caching.md section 7) |
+  | balance (default) | q8h on dense models, f16 on MoE models | items `fp8`, `moefp8`, `gdnwmma`, `h16`, `kvq8`; int8 decode / verify activations | near-lossless on dense models (KL vs precise about 1e-4 to 5e-4); on the MoE model 0.003 to 0.02 with top-1 91-100% (KL gate, FIX-TEST-B), MTP / n-gram == plain greedy; **not** bit for bit the 0.1.x output (q8v KV gone, KG-1 kernels, specsample sampler) |
   | fast | q4 (R9700 since FAST-1c, Radeon 8060S) | balance + `kvq4`, `relaxacc` (dense models with an MTP head) | lossy within the published KL; the text may depend on drafts |
 
 - **precise** (`--precise`) on every GPU: no fp8 MXFP4 prefill activations (and no rounding of
@@ -274,6 +274,32 @@ selftest in every mode unchanged).
   part of an entry and then branching from an earlier turn makes a new entry instead of
   overwriting the other branch in place. On integrated GPUs the RAM tier is at least one
   max-context entry (or off, with a log line, when that is more than half the available RAM).
+
+### Test gates for the chunking and KL claims (FIX-TEST-B)
+
+- The chunking guarantee is now stated as measured (docs/guide/en/kv-and-caching.md section 7): on
+  the server a prompt always gets the same bits, whatever the forward size (decode floor,
+  `WHIRL_PREFILL_CHUNK`, `WHIRL_PREFILL_BATCH`), the tail checkpoint, or a resume / tier restore at a
+  schedule point. A split that is not a schedule point (not a multiple of 64 rows, or leaving a
+  forward of fewer than 64 rows) changes the last bits, so the CLI equals the server except when its
+  last 4096-row forward is shorter than 64 rows (and for server system messages of 2048+ tokens).
+  The earlier "batch 1024 / 2048 / 4096 bit-identical" was true only for the server schedule.
+- `whirl seqtest` gates it (part of `ok`): a 9,500-token golden prompt run through the server's real
+  schedule (`include/whirl/prefill_schedule.h`, now shared by the engine and seqtest) in 6 executions
+  the server can choose must give the cold run's bits; R9700 dense + MoE x precise / balance / fast
+  pass. whirl-server-tests `prefill_sched` checks the schedule functions on the CPU.
+- KL gate `tools/klgate/klgate.py`: balance and fast against precise on a fixed code / Chinese corpus
+  at 8k, 32k, 96k and 128k; limits balance KL <= 0.005 and top-1 >= 98%, fast KL <= 0.03 and top-1
+  >= 93%; non-zero exit on a failure or 0 cases. `tools/golden/golden.ps1 record` refuses to write
+  references without a passing KL report of the same exe (`-KlReport`). `WHIRL_DUMP_AT` (debug)
+  dumps logits windows before several positions in one run.
+- First KL gate run (R9700, Qwen3.8-27B Q4_K_M + Ornith-1.5-35B-A3B MXFP4): **fails, 22 of 32 cases
+  pass**. Dense balance passes everywhere (KL 7e-5 to 4.9e-4, top-1 >= 98.4%); dense fast passes
+  except zh at 8k (top-1 92.97%, KL 0.0051). Ornith balance exceeds the balance limit in 6 of 8 cases
+  (KL up to 0.020, top-1 down to 91.4%) and Ornith fast in 4 of 8 (zh KL up to 0.037, top-1 88.3%):
+  the published balance KL range was a dense-model number. The limits stay as published until a
+  decision (per-model limits or a numerics change); until then golden references cannot be
+  re-recorded for these models (record requires a passing report).
 
 ### Fixes from the DFlash2 review (FIX-DFL)
 

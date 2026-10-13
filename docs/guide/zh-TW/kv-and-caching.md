@@ -50,7 +50,7 @@ DeltaNet 狀態本身每個序列是固定大小，與上下文長度無關。se
 
 ### 3.1 品質
 
-最後一個 token 分佈相對 f16 KV 的 KL，同一個執行檔。「路徑雜訊」是兩條同樣正確的 f16 路徑之間的 KL（分塊 vs 循序 DeltaNet prefill）；prefill chunk 4096 vs 512 在兩個模型上都是 0（逐位元相同）。
+最後一個 token 分佈相對 f16 KV 的 KL，同一個執行檔。「路徑雜訊」是兩條同樣正確的 f16 路徑之間的 KL（分塊 vs 循序 DeltaNet prefill）；prefill chunk 4096 vs 512 在兩個模型上都是 0（逐位元相同；這兩種 chunk 大小都在 64 的倍數切開，在這些提示上也不會留下很短的最後一段。哪些切點保持位元不變見[第 7 節](#merge)）。
 
 | 提示詞 | 27B 路徑雜訊 | 27B q8 | 27B q8h | MoE 路徑雜訊 | MoE q8 | MoE q8h |
 |---|---|---|---|---|---|---|
@@ -217,7 +217,13 @@ agent 情境（8 個 session，各自「詢問某個檔案 → `read_file` → �
 
 較大的 prefill 前向計算較快，但檢查點（`prefix`、`system`、`think-open`）只能位於 chunk 邊界。把 server 的 chunk 改成 2048 列能讓冷 prefill 快 +18…+21%，但跨 slot 的後續請求因此重用的是位置 27,418 而非 28,442 的 `prefix` 檢查點，30k 上下文 + 300 / + 1000 個新 token 的 TTFT 從 980 → 1681 ms 與 1548 → 2230 ms。
 
-採用的設計是**排程**維持 1024 token 的 chunk（檢查點位置不變），而在沒有其他 slot 正在 decode、或 decode 保底關閉時（[server.md](server.md#batching)），把連續的完整 chunk 合併成一次最多 2048 列（+256 尾段）的前向計算來**執行**，且絕不跨越檢查點邊界。這依賴 logits 與前向大小無關——已驗證：batch 1024 / 2048 / 4096 的最後一個 token logits 相同，兩個模型、MTP 開/關皆然。
+採用的設計是**排程**維持 1024 token 的 chunk（檢查點位置不變），而在沒有其他 slot 正在 decode、或 decode 保底關閉時（[server.md](server.md#batching)），把連續的完整 chunk 合併成一次最多 2048 列（+256 尾段）的前向計算來**執行**，且絕不跨越檢查點邊界。這依賴「排程中完整的 chunk 怎麼合併成前向計算」不影響 logits。
+
+**保證什麼、不保證什麼**（FIX-TEST-B；R9700、Qwen3.8-27B Q4_K_M 與 Ornith-1.5-35B-A3B MXFP4、precise / balance / fast、9,500 token 的提示實測；由 `whirl seqtest` 把關）：
+
+- **Server：同一個提示永遠得到相同的位元，不論使用者或負載能影響的 chunk 邊界。** 排程只由 token 決定（從 0 開始每 1024 列一個 chunk，最多 1280 列的剩餘部分併入最後一個 chunk，在 B ≥ 2048 的 system 邊界、think-open 切點、圖片結尾強制切開；`include/whirl/prefill_schedule.h`）。engine 執行的每一次前向都結束在排程點上：一次 1 個 chunk（decode 保底啟動時）、2 個（預設）或 3 個（`WHIRL_PREFILL_CHUNK` / `WHIRL_PREFILL_BATCH`），有沒有 TAIL-CK 尾段檢查點（合併到那裡會停），最後一列的 logits 位元都相同。檢查點只在排程點保存與重用（`onSchedule`），所以從尾段檢查點、`prefix` 或 `system` 檢查點，或它們的 RAM / SSD 還原繼續，都是這種切法，得到冷執行的位元（實測：在尾段與 prefix 檢查點續接，2 個與 1 個 chunk 的前向，6 種執行在 6 個模型 / 模式組合下都等於冷執行）。[第 5 節](#checkpoints)表中標「否」的列（gen-end、prompt-end 後接更多 token）不是在排程點續接，仍然是「數值上等價，但不是逐位元相同」。
+- **不在排程點的切法會改變最後幾個位元。** DeltaNet 分塊掃描的 64 列 chunk 從每次前向的起點算起，少於 64 列的前向改走循序掃描（16 列以下走 decode kernel）。同一個提示實測：在排程點後 64 列多切一刀，位元相同；在排程點後 40 列、第 1000 列、結尾前 40 列、結尾前 9 列切開，位元都不同（所有模型與模式）。server 不會這樣切；以前「1024 / 2048 / 4096 逐位元相同」的說法對 server 的排程成立，不是對任意 chunk 大小成立。
+- **CLI 與 server。** `whirl chat` 從 0 開始以 `max_batch`（4096）列為一次前向（加上同樣的 think-open 切點），不是 server 的排程。它的切點是 4096 的倍數（也就是 64 的倍數）：最後一次前向有 64 列以上時，CLI 和 server 位元相同（實測 9,500 token：最後一段 1,308 列，相同）；提示長度是 4096·k 加不到 64 個 token 時，最後一段太短，位元不同（8,232 token：最後一段 40 列，不同）。另外也不同的情況：system 訊息 2048 token 以上的 server 請求（在 B 切開，CLI 不切），以及 CLI 的 `WHIRL_PREFILL_BATCH` 不是 64 的倍數或留下很短的最後一段（同樣的機制；上面實測過在第 1000 列切開）。
 
 | Server，MTP + n-gram | Q4_K_M 修正前 → 後 | MXFP4 修正前 → 後 |
 |---|---|---|

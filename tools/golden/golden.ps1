@@ -26,6 +26,9 @@
 #                        single short.stream is a prefix of mtp.stream, mtp_ngram.stream == mtp.stream
 #   (fast: relaxed acceptance and the fast batch kernels change MTP / batched outputs by design.)
 #   pwsh tools/golden/golden.ps1 xcheck [-Arch ...] ...   cross-checks the reference files only (CPU)
+# record needs -KlReport: the JSON report of a passing KL gate run (tools/klgate/klgate.py: balance and fast
+# vs precise at 8k / 32k / 96k / 128k) made with the same whirl.exe (SHA-256), on the same GPU family, covering
+# every model being recorded. Without it record writes nothing and exits 2 (docs/dev/testing.md, FIX-TEST-B).
 param(
     [Parameter(Mandatory = $true, Position = 0)][ValidateSet("check", "record", "xcheck")][string]$Action,
     [ValidateSet("gfx1201", "gfx1151")][string]$Arch = "gfx1201",
@@ -34,7 +37,8 @@ param(
     [string[]]$Suites = @(),
     [string]$Exe = "",
     [string]$Out = "",  # check: also keep the new outputs here (default: a temp folder)
-    [string]$GoldenRoot = ""  # reference tree (default tests\golden of this checkout; golden_selftest.ps1 uses a temp one)
+    [string]$GoldenRoot = "",  # reference tree (default tests\golden of this checkout; golden_selftest.ps1 uses a temp one)
+    [string]$KlReport = ""  # record: a passing tools/klgate report (--report) of this exe on this arch, for these models
 )
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -58,6 +62,31 @@ $modelPath = @{
     dense = if ($env:WHIRL_GOLDEN_DENSE) { $env:WHIRL_GOLDEN_DENSE } else { Join-Path $lms "unsloth\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-Q4_K_M.gguf" }
     moe   = if ($env:WHIRL_GOLDEN_MOE) { $env:WHIRL_GOLDEN_MOE } else { Join-Path $lms "ornith-ai\Ornith-1.5-35B-A3B-MXFP4\Ornith-1.5-35B-A3B-MXFP4.gguf" }
 }
+# FIX-TEST-B: no reference is recorded without a passing KL gate report for this exe / arch / models
+function KlReportError([string]$path) {
+    if (-not $path) { return "no -KlReport (run tools/klgate/klgate.py --report on this exe first)" }
+    if (-not (Test-Path $path)) { return "KL report $path not found" }
+    try { $r = Get-Content $path -Raw | ConvertFrom-Json } catch { return "KL report $path is not JSON" }
+    if ($r.pass -ne $true) { return "KL report $path did not pass ($($r.summary))" }
+    $h = (Get-FileHash -Algorithm SHA256 $Exe).Hash.ToLower()
+    if ("$($r.exe_sha256)".ToLower() -ne $h) { return "KL report $path is for another exe (sha256 $($r.exe_sha256), this exe $h)" }
+    $is8060 = "$($r.device)" -eq "8060s"
+    if (($Arch -eq "gfx1151") -ne $is8060) { return "KL report $path was measured on device '$($r.device)', not on $Arch" }
+    foreach ($md in @("balance", "fast")) { if ($md -notin @($r.modes)) { return "KL report $path has no $md cases" } }
+    foreach ($L in @(8192, 32768, 98304, 131072)) { if ($L -notin @($r.lengths)) { return "KL report $path does not cover length $L" } }
+    $names = @($r.models.PSObject.Properties | ForEach-Object { "$($_.Value)" })
+    foreach ($m in $Models) {
+        $b = Split-Path -Leaf $modelPath[$m]
+        if ($b -notin $names) { return "KL report $path does not cover model $b" }
+    }
+    return ""
+}
+if ($Action -eq "record") {
+    $klErr = KlReportError $KlReport
+    if ($klErr) { Write-Host "golden: record refused: $klErr"; exit 2 }
+    Write-Host "golden: KL gate report $KlReport passed for this exe ($Arch)"
+}
+
 # (model paths above were read from WHIRL_GOLDEN_*; now drop every WHIRL_* variable, restored in the finally below)
 $savedEnv = @{}
 foreach ($v in @(Get-ChildItem Env: | Where-Object { $_.Name -like "WHIRL_*" -and $_.Name -ne "WHIRL_R9700_LOCK_HELD" })) {

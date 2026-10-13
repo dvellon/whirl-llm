@@ -16,6 +16,7 @@
 #include "whirl/gguf.h"
 #include "whirl/hip.h"
 #include "whirl/model.h"
+#include "whirl/prefill_schedule.h"
 #include "whirl/tokenizer.h"
 #include "whirl/vram_limit.h"
 
@@ -1320,17 +1321,47 @@ int cmdChat(const Args& a) {
         // chunks of max_batch; a thinking-mode prompt runs its last token as its own step
         const std::size_t split = tok.thinkOpenSplit(ids);
         // WHIRL_DUMP_LOGITS=path, WHIRL_DUMP_FROM=N (no MTP): next-token logits of every
-        // prompt position >= N as f16 rows (teacher-forced, 16-row forwards)
+        // prompt position >= N as f16 rows (teacher-forced, 16-row forwards).
+        // WHIRL_DUMP_AT=E1,E2,... instead: the WHIRL_DUMP_ROWS (default 128) positions before each
+        // end Ei (rows in that order; the KL gate, tools/klgate, measures 8k..128k in one run)
         const auto dump_path = envGet("DUMP_LOGITS");
-        const std::size_t dump_from = envU32("DUMP_FROM").value_or(0);
+        std::vector<std::pair<std::size_t, std::size_t>> dump_win;  // [start, end) windows, sorted
+        if (dump_path) {
+            if (const auto at = envGet("DUMP_AT")) {
+                const std::size_t rows = envU32("DUMP_ROWS").value_or(128);
+                std::size_t prev = 0;
+                for (std::size_t p = 0; p < at->size();) {
+                    std::size_t c = at->find(',', p);
+                    if (c == std::string::npos) c = at->size();
+                    const std::size_t e = std::stoul(at->substr(p, c - p));
+                    if (e < rows || e > ids.size() || e - rows < prev) throw std::runtime_error("WHIRL_DUMP_AT: ends must be ascending, >= WHIRL_DUMP_ROWS apart and <= the prompt length");
+                    dump_win.emplace_back(e - rows, e);
+                    prev = e;
+                    p = c + 1;
+                }
+            } else {
+                dump_win.emplace_back(envU32("DUMP_FROM").value_or(0), ids.size());
+            }
+        }
         std::vector<std::uint16_t> dump;
         std::vector<float> row_f32(dump_path ? static_cast<std::size_t>(q::max_small_batch) * model.cfg.n_vocab : 0);
         const double p0 = nowMs();
         std::size_t off = 0;
         while (off < ids.size()) {
-            const bool dumping = dump_path && !use_mtp && off >= dump_from;
+            bool dumping = false;
             std::size_t lim = (split > 0 && off < split) ? split : ids.size();
-            if (dump_path && off < dump_from) lim = std::min(lim, dump_from);
+            if (dump_path && !use_mtp)
+                for (const auto& [ws, we] : dump_win) {
+                    if (off >= ws && off < we) {
+                        dumping = true;
+                        lim = std::min(lim, we);
+                        break;
+                    }
+                    if (off < ws) {
+                        lim = std::min(lim, ws);
+                        break;
+                    }
+                }
             const std::size_t n = dumping ? std::min<std::size_t>(lim - off, q::max_small_batch) : std::min<std::size_t>(lim - off, model.max_batch);
             const double c0 = nowMs();
             // all_logits needs keep_hidden (normed rows in hn); without it forward() computes only
@@ -1647,13 +1678,17 @@ u64 rowHash(q::Model& m, u32 r) {
     return fnvF32(lg);
 }
 
+std::vector<u32> goldenLongIds(const Tok& tok, std::size_t n);
+
 int cmdSeqtest(const Args& a) {
     if (a.pos.empty()) throw std::runtime_error("seqtest: missing MODEL.gguf");
     gguf::File f = gguf::File::open(a.pos[0]);
     selectDevice(a, nullptr);
     Tok tok(f);
     // --slot-ctx N: the context per sequence (P3-6: the solo digest must not depend on it)
-    const u32 slot_ctx = a.get("--slot-ctx") ? static_cast<u32>(std::stoul(*a.get("--slot-ctx"))) : 4096,
+    // (12288: room for the chunk schedule gate's long prompts of long_n / long_n2 tokens)
+    const u32 long_n = 9500, long_n2 = 8232;
+    const u32 slot_ctx = a.get("--slot-ctx") ? static_cast<u32>(std::stoul(*a.get("--slot-ctx"))) : 12288,
               n_gen = a.get("--decode") ? static_cast<u32>(std::stoul(*a.get("--decode"))) : 24;
     const std::vector<u32> pa = tok.encode(chatWrap(std::string("Write a C function that reverses a singly linked list, and explain it.") + k_bench_text, false));
     const std::vector<u32> pb = tok.encode(chatWrap("請用繁體中文說明 TCP 三向交握的過程，並用 Python 寫一個簡單的 socket 伺服器。", false));
@@ -1809,26 +1844,107 @@ int cmdSeqtest(const Args& a) {
         out(fmt("  literal-draft verify (verifyEnqueueEx, %u drafts = %u rows): %u/%u logits hashes and %u tokens differ from the solo rows\n",
                 nd, nd + 1, vbad, nd + 1, tbad));
     }
-    // P3-4 (informational, not part of ok): the prompt's last logits when the prefill is split in two
-    // forwards at row a (a multiple of 64 = a CLI / server chunk start, or not) with t rows after it.
-    // t <= 16 runs the second forward on the decode kernels (gemv / flash-decoding / fused GDN).
-    {
+    // FIX-TEST-B gate (part of ok): the server's cold chunk schedule (include/whirl/prefill_schedule.h,
+    // the functions the engine runs) on a golden long prompt of > 4096 tokens. Every execution the
+    // server can choose for the same prompt must give the same last-row logits bits: forwards of 1, 2
+    // or more chunks (decode floor / WHIRL_PREFILL_CHUNK / WHIRL_PREFILL_BATCH), with or without the
+    // TAIL-CK tail checkpoint, and a resume from a checkpoint at a schedule point (a prefix checkpoint
+    // inside the prompt, the tail checkpoint). Splits off the schedule and the CLI's own chunking
+    // (Model::prefill, max_batch rows) are printed for information only.
+    u32 sched_bad = 0, sched_total = 0;
+    if (slot_ctx < long_n + 64) {
+        out(fmt("  chunk schedule: needs --slot-ctx >= %u (got %u)\n", long_n + 64, slot_ctx));
+        ok = false;
+    } else {
         m.selectSeq(0);
-        const std::span<const u32> ps(pa);
-        const u32 cases[][2] = {{128, 5}, {128, 16}, {128, 17}, {64, 40}, {122, 40}, {64, 1}};
-        for (const auto& c : cases) {
-            const u32 aa = c[0], t = c[1];
-            if (aa + t > ps.size()) continue;
+        const std::vector<u32> lp = goldenLongIds(tok, long_n);
+        const std::span<const u32> ls(lp);
+        const std::size_t N = lp.size(), th = tok.thinkOpenSplit(lp);
+        const std::span<const std::uint32_t> noimg;
+        const std::size_t tail = sched::tailPoint(N, 0, th, noimg);
+        // run forwards ending at `ends` (the first starts at 0); the last row's logits hash
+        auto runEnds = [&](std::span<const u32> ids, const std::vector<std::size_t>& ends) {
             m.reset();
-            m.forward(ps.subspan(0, aa + t), 0);
-            const u64 single = rowHash(m, 0);
+            std::size_t cur = 0;
+            for (std::size_t e : ends) {
+                m.forward(ids.subspan(cur, e - cur), static_cast<u32>(cur));
+                cur = e;
+            }
+            return rowHash(m, 0);
+        };
+        auto cold = [&](std::size_t exec, std::span<const std::size_t> stops) { return sched::forwardEnds(N, 0, th, noimg, 0, exec, stops); };
+        // resume at a schedule point r: the run that kept the checkpoint there (no forward crosses r),
+        // then the resumed request's own forwards from r (the state at r is what the checkpoint holds)
+        auto resumed = [&](std::size_t r, std::size_t exec) {
+            const std::array<std::size_t, 1> st = {r};
+            std::vector<std::size_t> e = sched::forwardEnds(N, 0, th, noimg, 0, exec, st);
+            e.erase(std::upper_bound(e.begin(), e.end(), r), e.end());
+            if (e.empty() || e.back() != r) e.push_back(r);  // the checkpoint holds the state after a forward that ended at r
+            const std::vector<std::size_t> e2 = sched::forwardEnds(N, 0, th, noimg, r, exec, {});
+            e.insert(e.end(), e2.begin(), e2.end());
+            return e;
+        };
+        auto endsStr = [](const std::vector<std::size_t>& e) {
+            std::string r;
+            for (std::size_t x : e) r += (r.empty() ? "" : ",") + std::to_string(x);
+            return r;
+        };
+        const std::size_t ex = sched::prefillExecFor(2048, m.max_batch), ex_big = sched::prefillExecFor(16384, m.max_batch);
+        const std::array<std::size_t, 1> tail_stop = {tail};
+        const std::size_t mid = sched::schedFloor(N, 0, th, noimg, N / 3);  // a prefix checkpoint inside the prompt
+        const std::vector<std::size_t> ref_ends = cold(ex, tail_stop);
+        const u64 ref = runEnds(ls, ref_ends);
+        out(fmt("  chunk schedule (N %zu, tail checkpoint @%zu, exec %zu): reference = cold server forwards [%s]\n", N, tail, ex,
+                endsStr(ref_ends).c_str()));
+        struct Var {
+            const char* name;
+            std::vector<std::size_t> ends;
+        };
+        const Var vars[] = {
+            {"cold, no tail checkpoint (parallel > 4)", cold(ex, {})},
+            {"cold, 1-chunk forwards (decode floor)", cold(sched::prefill_chunk, tail_stop)},
+            {"cold, largest forwards (WHIRL_PREFILL_CHUNK)", cold(ex_big, tail_stop)},
+            {"resume at the tail checkpoint", resumed(tail, ex)},
+            {"resume at a prefix checkpoint", resumed(mid, ex)},
+            {"resume at a prefix checkpoint, 1-chunk forwards", resumed(mid, sched::prefill_chunk)},
+        };
+        for (const Var& v : vars) {
+            bool on = !v.ends.empty() && v.ends.back() == N;
+            for (std::size_t e : v.ends) on = on && sched::onSchedule(N, 0, th, noimg, e);
+            const bool same = on && runEnds(ls, v.ends) == ref;
+            sched_bad += same ? 0 : 1;
+            sched_total += 1;
+            out(fmt("    %-48s [%s]: %s\n", v.name, endsStr(v.ends).c_str(), !on ? "FAIL (a forward ends off the schedule)" : same ? "==" : "DIFFER (FAIL)"));
+        }
+        // information only: one extra split the server never makes (added to the reference's
+        // forwards), and the CLI's own chunking
+        const std::pair<const char*, std::size_t> info[] = {
+            {"split 64 rows after a schedule point", mid + 64},
+            {"split 40 rows after a schedule point", mid + 40},
+            {"split at 1000 (not 64-aligned)", 1000},
+            {"last 40 rows as their own forward", N - 40},
+            {"last 9 rows as their own forward (decode kernels)", N - 9},
+        };
+        for (const auto& [name, sp] : info) {
+            std::vector<std::size_t> e = ref_ends;  // the reference's forwards with one more split at sp
+            if (std::find(e.begin(), e.end(), sp) == e.end()) e.insert(std::upper_bound(e.begin(), e.end(), sp), sp);
+            out(fmt("    info: %-50s: %s\n", name, runEnds(ls, e) == ref ? "==" : "DIFFER"));
+        }
+        for (const std::size_t n2 : {N, static_cast<std::size_t>(long_n2)}) {
+            const std::vector<u32> lp2 = n2 == N ? lp : goldenLongIds(tok, n2);
+            const std::size_t th2 = tok.thinkOpenSplit(lp2);
             m.reset();
-            m.forward(ps.subspan(0, aa), 0);
-            m.forward(ps.subspan(aa, t), aa);
-            out(fmt("  prefill split %u + %u rows: last logits %s the single forward of %u rows\n", aa, t,
-                    rowHash(m, 0) == single ? "==" : "DIFFER from", aa + t));
+            m.prefill(lp2, 0);
+            const u64 cli = rowHash(m, 0);
+            const std::array<std::size_t, 1> st2 = {sched::tailPoint(n2, 0, th2, noimg)};
+            const u64 srv = runEnds(std::span<const u32>(lp2), sched::forwardEnds(n2, 0, th2, noimg, 0, ex, st2));
+            const std::size_t last = n2 % m.max_batch == 0 ? m.max_batch : n2 % m.max_batch;
+            out(fmt("    info: CLI chunking (max_batch %u, last forward %zu rows) vs server, N %zu: %s\n", m.max_batch, last, n2,
+                    srv == cli ? "==" : "DIFFER"));
         }
     }
+    out(fmt("  chunk schedule: %u/%u server executions differ from the cold reference\n", sched_bad, sched_total));
+    ok = ok && sched_bad == 0;
     out(fmt("  head logits bits: %u/%u verify / batched rows differ from the solo decode row\n", lh_bad, lh_total));
     ok = ok && lh_bad == 0;
     out(ok ? "seqtest: ok\n" : "seqtest: FAIL\n");

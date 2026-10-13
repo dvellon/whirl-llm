@@ -113,7 +113,7 @@ each mode in precise and balance (and fast with `WHIRL_RELAX=0`; with `relaxacc`
 depends on the drafts: a repeated request gives the same text streamed or not, cold or resumed from
 its own prefix-cache checkpoints, but a prompt resumed from another prompt's shared prefix is
 prefilled in other chunks, which can change fast output in the last bits, as concurrency can).
-Fast mode guarantees quality within its gate (KL <= 0.03), not bitwise-identical output between a concurrent and a solo run: with `relaxacc` the draft cadence depends on the load, so concurrent text can differ from solo text (best effort; precise and balance do guarantee equality). With temperature > 0, MTP decoding gives the same tokens as plain sampling
+Fast mode aims at quality within its gate (mean KL vs precise <= 0.03 and top-1 >= 93%, checked by tools/klgate at 8k-128k; the first run met it on Qwen3.8-27B except one zh 8k window at 92.97% top-1, and not on Ornith-1.5-35B-A3B, zh KL up to 0.037), not bitwise-identical output between a concurrent and a solo run: with `relaxacc` the draft cadence depends on the load, so concurrent text can differ from solo text (best effort; precise and balance do guarantee equality). With temperature > 0, MTP decoding gives the same tokens as plain sampling
 for a seed in precise and balance (with `specsample` too), whatever the prefix cache or earlier
 requests; balance (`specsample`) samples by a different (equally exact) rule than precise, so its
 tokens for a seed differ from precise's. Fast with `relaxacc` uses typical acceptance instead.

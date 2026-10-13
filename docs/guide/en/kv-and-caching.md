@@ -86,7 +86,8 @@ stages inside the fused prep kernel. 27B KL dropped another 2–3×.
 
 KL of the last-token distribution vs f16 KV, same binary. "Path noise" is the KL between two
 equally correct f16 paths (chunked vs sequential DeltaNet prefill); prefill chunk 4096 vs 512 is
-0 (bit-identical) for both models.
+0 (bit-identical) for both models (both chunk sizes split at multiples of 64 and leave no short last
+forward on these prompts; which splits keep the bits is in [section 7](#merge)).
 
 | Prompt | 27B path noise | 27B q8 | 27B q8h | MoE path noise | MoE q8 | MoE q8h |
 |---|---|---|---|---|---|---|
@@ -368,9 +369,40 @@ context + 300 / + 1000 new tokens went from 980 → 1681 ms and 1548 → 2230 ms
 
 The adopted design keeps the **schedule** at 1024-token chunks (checkpoint positions unchanged) and
 **executes** consecutive whole chunks in one forward of up to 2048 rows (+256 tail) when no other
-slot is decoding or the decode floor is off ([server.md](server.md#batching)), never across a checkpoint boundary. This relies on logits being independent of
-forward size — verified: last-token logits identical for batch 1024 / 2048 / 4096, both models,
-MTP on/off.
+slot is decoding or the decode floor is off ([server.md](server.md#batching)), never across a checkpoint boundary. This relies on the
+logits not depending on how the schedule's whole chunks are grouped into forwards.
+
+**What is guaranteed, and what is not** (FIX-TEST-B; measured on the R9700, Qwen3.8-27B Q4_K_M and
+Ornith-1.5-35B-A3B MXFP4, precise / balance / fast, 9,500-token prompt; `whirl seqtest` gates it):
+
+- **Server: a given prompt always gets the same bits, whatever chunk boundaries the user or the load
+  can influence.** The schedule is a function of the tokens only (1024-row chunks from 0, a
+  remainder of up to 1280 rows merged into the last chunk, forced splits at the system boundary
+  B >= 2048, the think-open split and image ends; `include/whirl/prefill_schedule.h`). Every forward
+  the engine runs ends at a schedule point: forwards of 1 chunk (decode floor engaged), 2 chunks
+  (default) or 3 chunks (`WHIRL_PREFILL_CHUNK` / `WHIRL_PREFILL_BATCH`), with or without the TAIL-CK
+  tail checkpoint (which stops merging there), all give the same last-row logits bits. Checkpoints
+  are kept and reused only at schedule points (`onSchedule`), so a resume from the tail checkpoint,
+  a `prefix` or `system` checkpoint, or a RAM / SSD restore of one, is such a split and gives the
+  cold run's bits (measured: resume at the tail and at a prefix checkpoint, with 2- and 1-chunk
+  forwards: 6 of 6 executions equal the cold run in all 6 model / mode combinations). The rows
+  marked "no" in [section 5](#checkpoints) (gen-end, prompt-end followed by more tokens) are not
+  resumes at a schedule point and stay "numerically equivalent, not bit-identical".
+- **Splits that are not schedule points can change the last bits.** The DeltaNet chunked scan
+  counts its 64-row chunks from the start of each forward, and a forward of fewer than 64 rows runs
+  the sequential scan (16 rows or fewer: the decode kernels). Measured, same prompt: one extra
+  split 64 rows after a schedule point gave the same bits; 40 rows after, at row 1000, 40 rows
+  before the end, and 9 rows before the end all changed them (every model and mode). The server
+  never makes such splits; the earlier claim "1024 / 2048 / 4096 bit-identical" holds for the
+  server's schedule, not for arbitrary chunk sizes.
+- **CLI vs server.** `whirl chat` prefills in forwards of `max_batch` (4096) rows from 0 (plus the
+  same think-open split), not on the server schedule. Its splits are multiples of 4096 (so multiples
+  of 64): when its last forward has 64 or more rows the CLI gives the server's bits (measured, 9,500
+  tokens: last forward 1,308 rows, equal); when the prompt is 4096·k plus fewer than 64 tokens the
+  last forward is short and the bits differ (8,232 tokens: last forward 40 rows, different). Also
+  different: a server request with a system message of 2048+ tokens (split at B, the CLI does not
+  split there), and the CLI with a `WHIRL_PREFILL_BATCH` that is not a multiple of 64 or that leaves
+  a short last forward (same mechanism; a split at row 1000 was measured above).
 
 | Server, MTP + n-gram | Q4_K_M before → after | MXFP4 before → after |
 |---|---|---|
