@@ -38,3 +38,9 @@ The fallback (precChoice, not gemms_c0) is much slower than the isolated gemms_c
 ## Next
 - Re-tune the gemvh body for >=75% of peak (more bytes in flight, S=2 for q6_k/q8_0, wider unit as gemvq) - the e2e ceiling is ~1.3-1.5x above today's gemvh.
 - Check precChoice on 8060S: it should at least choose gemms_c0 for n<=16 (free fallback gain) and for q8_0/q6_k 5120x5120 gemms_c0 is faster than gemvh (per-type dispatch).
+
+## GEMVH-DUAL (2026-10-13, FIX-RC4-B option b)
+The paired kernels now satisfy the documented wave32 layout (both half-waves hold identical A fragments). Per type
+(`WHIRL_GH_KIND_<T>` in kernels/gfx1151/gemv_h.hip): q6_k and q3_k use "dual" (each lane decodes both k-steps, no exchange),
+iq4_xs / mxfp4 / iq4_nl use "paired" with the per-lane select. 8060S e2e (27B UD-Q4_K_M, --precise, decode 128) vs the
+pre-fix kernel: plain -1.2%, MTP+n-gram -1.9%, bits identical. Full table: whirl-work audit/FIX-RC4-B.md, section GEMVH-DUAL.

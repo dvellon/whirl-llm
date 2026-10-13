@@ -15,12 +15,16 @@
 //    loads are in flight while the current one is decoded, and each lane decodes the whole 16-k fragment itself
 //    (no cross-lane join). The decoders reproduce dec_group_h<T> bit for bit; the byte -> half spreading is one
 //    v_perm_b32 per half2 (the low byte of a 0x64xx half is the byte).
-//  * "paired" (q6_k iq4_xs mxfp4 iq4_nl q3_k): same loads, but the two lanes of a row (r and r + 16) each decode ONE
+//  * "paired" (iq4_xs mxfp4 iq4_nl): same loads, but the two lanes of a row (r and r + 16) each decode ONE
 //    of the two k-steps of a pair (half the decode work, half the load registers) and swap the result with one
 //    permlanex16 per dword; a per-lane select then gives both half-waves the identical A fragment of each step, as
 //    the documented wave32 WMMA layout requires (lanes 16-31 replicate 0-15; FIX-RC4-B: the GEMVH-2 version left the
 //    halves different and relied on which lanes one gfx1151 part happened to read). The weights are the first WMMA
 //    operand and the accumulator is D[weight row][token] (the bits are those of the other operand order).
+//  * "dual" (q6_k q3_k, chosen per type by WHIRL_GH_KIND_<T>; GEMVH-DUAL in audit/FIX-RC4-B.md): the paired decoders
+//    without the exchange: every lane loads both halves and decodes both k-steps itself (twice the decode, no
+//    permlanex16 / select), so both half-waves hold identical fragments. Faster than the select form for q6_k/q3_k,
+//    slower for iq4_xs/mxfp4/iq4_nl (those stay "paired").
 //  * "staged" (f16 iq3_s): the original design: the raw stages go through LDS (end of file).
 
 // ---- direct and paired implementations ----
@@ -129,6 +133,38 @@ template <> struct GhW<QT_Q5_K> {
         for (int i = 0; i < 4; ++i) w[i] = (hi ? (q[i] >> 4) & 0x0F0F0F0F : q[i] & 0x0F0F0F0F) | (((h[i] >> s) & 0x01010101) << 4);
         const _Float16 hs = (_Float16)(d * sc), ha = (_Float16)(-dmin * m);
         return gh_join(gh_b8h(w[0], w[1], (_Float16)0.f, hs, ha), gh_b8h(w[2], w[3], (_Float16)0.f, hs, ha));
+    }
+};
+// ---- Q6_K (210-byte superblock, 2-byte aligned) ----
+template <> struct GhW<QT_Q6_K> {
+    static constexpr int UK = 16, UB = 210, DP = 2, SBE = 4;
+    struct Regs { gs_u32x4 ql[8]; gs_u32x4 qh[4]; gs_u32x4 sc; uint32_t d; };
+    static __device__ __forceinline__ void load(Regs &r, const uint8_t *rowp, int u) {
+        const uint8_t *b = rowp + (size_t)u * UB;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) r.ql[i] = gh_ld16a2(b + 16 * i);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) r.qh[i] = gh_ld16a2(b + 128 + 16 * i);
+        r.sc = gh_ld16a2(b + 192);
+        r.d = gh_ld16u(b + 208);
+    }
+    static __device__ __forceinline__ half16 frag(const Regs &r, int kk) {
+        const int n = kk >> 3, quarter = (kk >> 1) & 3, c = kk & 1;
+        const float d = gh_h2f(r.d);
+        const int sidx = 8 * n + c + 2 * quarter;
+        const float ds = d * (float)(int8_t)((r.sc[sidx >> 2] >> (8 * (sidx & 3))) & 0xFF);
+        const gs_u32x4 ql = r.ql[4 * n + 2 * (quarter & 1) + c], qh = r.qh[2 * n + c];
+        const int lsh = (quarter >> 1) ? 4 : 0, hsh = 2 * quarter;
+        half16 out;
+#pragma unroll
+        for (int wi = 0; wi < 4; ++wi) {
+            const uint32_t w = ((ql[wi] >> lsh) & 0x0F0F0F0Fu) | (((qh[wi] >> hsh) & 0x03030303u) << 4);
+            _Float16 x[4];
+            gh_x4(w, 32, x);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) out[4 * wi + i] = (_Float16)(ds * (float)x[i]);
+        }
+        return out;
     }
 };
 // ---- Q8_0 (34-byte blocks of 32 k; unit = 2 blocks = 4 steps, UB = 68) ----
@@ -465,15 +501,124 @@ __device__ __forceinline__ void gemvh_paired_impl(const uint8_t *__restrict__ W,
     }
 }
 
+// gemvh_dual_impl: the paired decoders without the exchange: every lane loads both halves (role 0 and role 1 regs) and decodes
+// both k-steps of a pair itself, so the two half-waves hold identical A fragments with no permlanex16 / select, at
+// twice the decode work of "paired" (FIX-RC4-B timing alternative).
+template <int T, int TN>
+__device__ __forceinline__ void gemvh_dual_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, const _Float16 *__restrict__ X, float *__restrict__ Y,
+                                                int ncols, int nrows, int n_tok, int accumulate) {
+    using D = GhQ<T>;
+    using Regs = typename D::Regs;
+    constexpr int DEPTH = D::DP, SB_EVERY = D::SBE;
+    const int lane = threadIdx.x % WARP;
+    for (int tile = blockIdx.x; tile * 16 < nrows; tile += gridDim.x) {
+    const int m0 = tile * 16;
+    const int nsb = ncols / (16 * D::UK);
+    const int rl = lane % 16;
+    const int row = min(m0 + rl, nrows - 1);
+    const uint8_t *rowp = W + (size_t)row * row_bytes;
+    float8 acc[TN];
+    const _Float16 *xr[TN];
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+        acc[j] = (float8){0, 0, 0, 0, 0, 0, 0, 0};
+        const int t = j * 16 + rl;
+        xr[j] = X + (size_t)min(t, n_tok - 1) * ncols;
+    }
+    Regs b0r[DEPTH], b1r[DEPTH];
+#pragma unroll
+    for (int u = 0; u < DEPTH - 1; ++u)
+        if (u < nsb) { D::load(b0r[u], rowp, u, 0); D::load(b1r[u], rowp, u, 1); }
+    for (int sb0 = 0; sb0 < nsb; sb0 += DEPTH) {
+#pragma unroll
+        for (int u = 0; u < DEPTH; ++u) {
+            const int sb = sb0 + u;
+            if (sb < nsb) {
+                if (sb + DEPTH - 1 < nsb) {
+                    D::load(b0r[(u + DEPTH - 1) % DEPTH], rowp, sb + DEPTH - 1, 0);
+                    D::load(b1r[(u + DEPTH - 1) % DEPTH], rowp, sb + DEPTH - 1, 1);
+                }
+#pragma unroll
+                for (int m = 0; m < D::UK / 2; ++m) {
+                    if (m % (SB_EVERY / 2) == 0) __builtin_amdgcn_sched_barrier(0);
+#if WHIRL_GH_INJECT == 3
+                    const int ph = (sb + 1) & 1;
+#else
+                    const int ph = sb & 1;
+#endif
+#if WHIRL_GH_INJECT == 1
+                    const half16 a1 = D::frag(b0r[u], m, 0, ph);
+                    const half16 a0 = D::frag(b1r[u], m, 1, ph);
+#else
+                    const half16 a0 = D::frag(b0r[u], m, 0, ph);
+                    const half16 a1 = D::frag(b1r[u], m, 1, ph);
+#endif
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        const half16 x0 = ld_frag16(xr[j] + sb * (16 * D::UK) + (2 * m) * 16);
+                        const half16 x1 = ld_frag16(xr[j] + sb * (16 * D::UK) + (2 * m + 1) * 16);
+#if WHIRL_GH_INJECT == 2
+                        acc[j] = WMMA16(a1, x1, acc[j]);
+                        acc[j] = WMMA16(a0, x0, acc[j]);
+#else
+                        acc[j] = WMMA16(a0, x0, acc[j]);
+                        acc[j] = WMMA16(a1, x1, acc[j]);
+#endif
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+        const int t = j * 16 + lane % 16;
+        if (t < n_tok) {
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                const int orow = m0 + 2 * v + lane / 16;
+                if (orow < nrows) {
+                    float *dst = Y + (size_t)t * nrows + orow;
+                    *dst = accumulate ? *dst + acc[j][v] : acc[j][v];
+                }
+            }
+        }
+    }
+    }
+}
+
 #define GH_ENTRY(KIND, SUF, T)                                                                                                                      extern "C" __global__ void __launch_bounds__(32) gemvh_##SUF(const uint8_t *W, uint64_t row_bytes, const _Float16 *X, float *Y, int ncols,                                                                   int nrows, int n_tok, int accumulate) {                                               gemvh_##KIND##_impl<T, 1>(W, row_bytes, X, Y, ncols, nrows, n_tok, accumulate);                                                            }                                                                                                                                              extern "C" __global__ void __launch_bounds__(32) gemvh2_##SUF(const uint8_t *W, uint64_t row_bytes, const _Float16 *X, float *Y, int ncols,                                                                   int nrows, int n_tok, int accumulate) {                                              gemvh_##KIND##_impl<T, 2>(W, row_bytes, X, Y, ncols, nrows, n_tok, accumulate);                                                            }
 GH_ENTRY(direct, q8_0, QT_Q8_0)
 GH_ENTRY(direct, q4_k, QT_Q4_K)
 GH_ENTRY(direct, q5_k, QT_Q5_K)
-GH_ENTRY(paired, q6_k, QT_Q6_K)
-GH_ENTRY(paired, iq4_xs, QT_IQ4_XS)
-GH_ENTRY(paired, mxfp4, QT_MXFP4)
-GH_ENTRY(paired, iq4_nl, QT_IQ4_NL)
-GH_ENTRY(paired, q3_k, QT_Q3_K)
+#define GH_ENTRY_X(KIND, SUF, T) GH_ENTRY(KIND, SUF, T)
+// per-type kind (timing builds override, e.g. -DWHIRL_GH_KIND_PAIRED=dual or -DWHIRL_GH_KIND_Q6_K=direct)
+#ifdef WHIRL_GH_KIND_PAIRED
+#define WHIRL_GH_KIND_Q6_K WHIRL_GH_KIND_PAIRED
+#define WHIRL_GH_KIND_IQ4_XS WHIRL_GH_KIND_PAIRED
+#define WHIRL_GH_KIND_MXFP4 WHIRL_GH_KIND_PAIRED
+#define WHIRL_GH_KIND_IQ4_NL WHIRL_GH_KIND_PAIRED
+#define WHIRL_GH_KIND_Q3_K WHIRL_GH_KIND_PAIRED
+#endif
+#ifndef WHIRL_GH_KIND_Q6_K
+#define WHIRL_GH_KIND_Q6_K dual
+#endif
+#ifndef WHIRL_GH_KIND_IQ4_XS
+#define WHIRL_GH_KIND_IQ4_XS paired
+#endif
+#ifndef WHIRL_GH_KIND_MXFP4
+#define WHIRL_GH_KIND_MXFP4 paired
+#endif
+#ifndef WHIRL_GH_KIND_IQ4_NL
+#define WHIRL_GH_KIND_IQ4_NL paired
+#endif
+#ifndef WHIRL_GH_KIND_Q3_K
+#define WHIRL_GH_KIND_Q3_K dual
+#endif
+GH_ENTRY_X(WHIRL_GH_KIND_Q6_K, q6_k, QT_Q6_K)
+GH_ENTRY_X(WHIRL_GH_KIND_IQ4_XS, iq4_xs, QT_IQ4_XS)
+GH_ENTRY_X(WHIRL_GH_KIND_MXFP4, mxfp4, QT_MXFP4)
+GH_ENTRY_X(WHIRL_GH_KIND_IQ4_NL, iq4_nl, QT_IQ4_NL)
+GH_ENTRY_X(WHIRL_GH_KIND_Q3_K, q3_k, QT_Q3_K)
 
 // ---- staged (LDS) implementation: f16 and iq3_s weights ----
 template <int T, int TN, int S>
