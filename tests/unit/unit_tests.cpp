@@ -12,6 +12,7 @@
 #include "whirl/spec_sample.h"
 #include "whirl/relax_accept.h"
 #include "whirl/dflash_policy.h"
+#include "whirl/device_mem.h"
 #include "whirl/vram_limit.h"
 #include "whirl/value_scope.h"
 
@@ -1638,6 +1639,46 @@ void testValueScope() {
     CHECK_EQ(win, 7);
 }
 
+// VIS-8S-2: device-local memory taken, per device class (numbers from the 8060S / R9700 probes:
+// pinned 887 MiB moves hipMemGetInfo by 2 x 887 on the integrated GPU, 0 on the discrete one).
+void testLocalMemTaken() {
+    using whirl::hip::LocalMemSnap;
+    using whirl::hip::MemClass;
+    constexpr std::uint64_t M = 1ull << 20;
+    auto snap = [&](MemClass c, std::uint64_t fr, bool pdh, std::uint64_t ded, std::uint64_t sh) {
+        LocalMemSnap s;
+        s.cls = c;
+        s.hip_free = fr * M;
+        s.pdh_ok = pdh;
+        s.dedicated = ded * M;
+        s.shared = sh * M;
+        return s;
+    };
+    // integrated: pinned mmproj copy (system RAM) -> 0 taken although hipMemGetInfo dropped 1774 MiB
+    auto t = whirl::hip::localMemTaken(snap(MemClass::integrated, 50000, true, 166, 10), snap(MemClass::integrated, 48226, true, 166, 897));
+    CHECK_EQ(t.mib, 0.0);
+    CHECK_EQ(t.hip_free_mib, 1774.0);
+    CHECK_EQ(t.shared_mib, 887.0);
+    // integrated: a 16 MiB device allocation (carve-out) is caught
+    t = whirl::hip::localMemTaken(snap(MemClass::integrated, 50000, true, 166, 10), snap(MemClass::integrated, 47210, true, 182, 897));
+    CHECK_EQ(t.mib, 16.0);
+    // integrated, counters unreadable: falls back to hipMemGetInfo (over-reports: fails, never passes wrongly)
+    t = whirl::hip::localMemTaken(snap(MemClass::integrated, 50000, false, 0, 0), snap(MemClass::integrated, 48226, false, 0, 0));
+    CHECK_EQ(t.mib, 1774.0);
+    t = whirl::hip::localMemTaken(snap(MemClass::integrated, 50000, true, 166, 0), snap(MemClass::integrated, 48226, false, 0, 0));
+    CHECK_EQ(t.mib, 1774.0);
+    // discrete: hipMemGetInfo, whatever the counters say
+    t = whirl::hip::localMemTaken(snap(MemClass::discrete, 9000, true, 185, 7), snap(MemClass::discrete, 9000, true, 185, 894));
+    CHECK_EQ(t.mib, 0.0);
+    CHECK_EQ(t.shared_mib, 887.0);
+    t = whirl::hip::localMemTaken(snap(MemClass::discrete, 9000, true, 185, 7), snap(MemClass::discrete, 8984, true, 185, 7));
+    CHECK_EQ(t.mib, 16.0);
+    CHECK(std::string(t.how).find("discrete") != std::string::npos);
+    // given back: negative
+    t = whirl::hip::localMemTaken(snap(MemClass::discrete, 8984, false, 0, 0), snap(MemClass::discrete, 9000, false, 0, 0));
+    CHECK_EQ(t.mib, -16.0);
+}
+
 int main() {
     whirl::test::clearWhirlEnv();  // FR-TEST P3-11
     testRelaxAccept();
@@ -1655,6 +1696,7 @@ int main() {
     testValueScope();
     specsample_test::testSpecSample();
     testDflashPolicy();
+    testLocalMemTaken();
     std::printf("unit tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

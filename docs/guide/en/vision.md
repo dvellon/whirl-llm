@@ -94,7 +94,8 @@ system-prompt gate: pin the KV format in gates that compare servers.
 
 `vis_gate` (dense and MXFP4): pool size equal with and without `--mmproj`; VRAM change at mmproj load
 0.0 MiB; image prompts equal cold references; checkpoint reuse after an image (2,045 tokens in one
-case); restore from SSD after a restart; idle release returns VRAM exactly (delta 0.0 MiB). On the
+case); restore from SSD after a restart; idle release returns VRAM exactly (delta 0.0 MiB; the 8060S
+limits are in §7). On the
 candidate build the full chain passed: last-token logits bit-identical to the installed build for
 text prompts, both server suites 50/50, segmented prefill, concurrency, pool, multi-turn, tier,
 system-checkpoint and restore gates, vision gate dense + MXFP4.
@@ -136,11 +137,17 @@ Encode time on the 8060S (`whirl-vis vis-encode`, weights resident, third run):
 | 1024x1024 (1,024) | 332 ms | 92 ms |
 | 1920x1088 (2,040) | 934 ms (attention 532, GEMM 303) | 253 ms |
 
-`whirl-server-gate --suite vis` on the 8060S (`--kv auto`): 16 of 18 checks pass, including image
-cache reuse, the image-end checkpoint (2,045 of 2,066 tokens reused), concurrency with text requests and
-the SSD restore. The two VRAM checks are dGPU criteria: on unified memory `hipMemGetInfo` drops by
-1,775 MiB (twice the 887 MiB pinned mmproj copy) at mmproj load although the KV pool (262,144 tokens)
-is unchanged, and the idle release returned within 4.8 / 8.8 MiB (limit 8 MiB).
+`whirl-server-gate --suite vis` passes on the 8060S and the R9700. The VRAM checks use a counter per
+device class (`include/whirl/device_mem.h`, measurements in VIS-8S-2): on unified memory
+`hipMemGetInfo` drops by 1,775 MiB at mmproj load, twice the 887 MiB pinned mmproj copy, although
+those pages are system RAM (GPU "Shared Usage") and not the BIOS carve-out. On the 8060S the server
+therefore reports the change of its carve-out (GPU "Dedicated Usage", the Task Manager number): 1.9
+MiB, which is the GPU page tables of the pinned copy (8 bytes per 4 KiB page); the limit is 2 MiB plus
+that. The idle release returns to within 8.8 MiB of the level before the first image: the HIP runtime
+grows its own memory once at the first long image prompt with the prefix cache on (8.3–8.8 MiB, flat
+over 20 load / unload cycles, no leak per cycle). The gate allows 16 MiB there on an integrated GPU
+(8 MiB on a discrete one; the R9700 measures 0.0) and checks on both that two more load / unload cycles
+do not grow it (at most 2 MiB).
 
 Streamed weights cost about the same on the 8060S (949 ms for 1080p): host memory and the GPU share
 the same DRAM. The encoder reaches roughly 10–17 TFLOPS on the 8060S, a fraction of its WMMA peak;

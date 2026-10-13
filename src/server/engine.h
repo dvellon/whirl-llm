@@ -641,7 +641,7 @@ private:
     cache::SupersedeTracker supersede_;
     std::array<std::array<std::uint64_t, 2>, 16> vis_lend_raw_{};
     std::vector<vision::Region> vis_lend_;
-    std::uint64_t vis_free0_ = 0;  // VRAM free right after the mmproj was loaded (no image yet)
+    hip::LocalMemSnap vis_snap0_;  // device memory counters right after the mmproj was loaded (no image yet)
     bool vis_rel_pending_ = false;
 };
 

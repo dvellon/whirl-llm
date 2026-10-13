@@ -17,6 +17,7 @@
 #include "tier/kv_tier.h"
 #include "tier/ram_size.h"
 #include "whirl/common.h"
+#include "whirl/device_mem.h"
 #include "whirl/dflash_policy.h"
 #include "whirl/gguf.h"
 #include "whirl/hip.h"
@@ -1295,7 +1296,7 @@ int serveMain(int argc, char** argv, const char* program) {
         std::unique_ptr<ServerVision> vis_srv;
         if (const std::optional<std::string> mmp = opt.mmproj ? opt.mmproj : env("MMPROJ")) {
             const TimePoint tv0 = Clock::now();
-            const hip::MemInfo mem_v0 = hip::memInfo();
+            const hip::LocalMemSnap mem_v0 = hip::localMemSnap();
             try {
                 vis_store = vision::Vision::load(*mmp);
             } catch (const std::exception& ex) {
@@ -1350,13 +1351,13 @@ int serveMain(int argc, char** argv, const char* program) {
             std::uint64_t lent = 0;
             for (std::size_t k = 0; k < n_lend; ++k) lent += raw[k][1];
             tier::declarePinned(lad, embd_pinned + (tier_owned ? tier_owned->pinnedBytes() : 0) + v.pinnedBytes());
-            const hip::MemInfo mem_v1 = hip::memInfo();
+            const hip::LocalMemTaken vis_taken = hip::localMemTaken(mem_v0, hip::localMemSnap());
             engine.attachVision(vc);
-            logI("vision: {}: {} layers, {} pinned MiB in host RAM ({:.1f} s; VRAM change {:.1f} MiB); encoder loaded on demand, released "
+            logI("vision: {}: {} layers, {} pinned MiB in host RAM ({:.1f} s; VRAM change {:.1f} MiB [{}; hipMemGetInfo free {:+.1f} MiB, GPU Shared Usage {:+.1f} MiB]); encoder loaded on demand, released "
                  "after {} s idle; weights {}; activations in the prefill scratch ({} buffers, {:.0f} MiB; one 4096-token image needs {:.0f} "
                  "MiB); embedding cache {} MiB; local image files {}",
                  *mmp, v.hp.n_layer, v.pinnedBytes() >> 20, msSince(tv0) / 1000.0,
-                 (static_cast<double>(mem_v0.free) - static_cast<double>(mem_v1.free)) / 1048576.0, v.idle_s, vision::modeName(v.mode), n_lend,
+                 vis_taken.mib, vis_taken.how, -vis_taken.hip_free_mib, vis_taken.shared_mib, v.idle_s, vision::modeName(v.mode), n_lend,
                  static_cast<double>(lent) / 1048576.0, static_cast<double>(v.arenaBytes(v.hp.max_tokens)) / 1048576.0, cache_mb,
                  vc.allow_files ? "allowed" : "off");
         }

@@ -104,10 +104,14 @@ embedding 與改動前逐位元相同。
 | 1024x1024（1,024） | 332 ms | 92 ms |
 | 1920x1088（2,040） | 934 ms（attention 532、GEMM 303） | 253 ms |
 
-8060S 上的 `whirl-server-gate --suite vis`（`--kv auto`）：18 項中 16 項通過，包括圖片快取重用、圖片結尾檢查點
-（2,066 個 token 重用 2,045 個）、與文字請求並行，以及 SSD 還原。沒過的兩項是為獨立顯卡設計的 VRAM 檢查：
-統一記憶體上載入 mmproj 時 `hipMemGetInfo` 少了 1,775 MiB（887 MiB 鎖頁 mmproj 複本的兩倍），但 KV 池
-（262,144 token）不變；閒置釋放後差 4.8 / 8.8 MiB（上限 8 MiB）。
+`whirl-server-gate --suite vis` 在 8060S 與 R9700 上都通過。VRAM 檢查依裝置類別用不同的計數器
+（`include/whirl/device_mem.h`，量測見 VIS-8S-2）：統一記憶體上載入 mmproj 時 `hipMemGetInfo` 少了
+1,775 MiB，是 887 MiB 鎖頁 mmproj 複本的兩倍，但這些頁面在系統 RAM（GPU「共用使用量」），不在 BIOS
+劃給顯示卡的記憶體。所以 8060S 上伺服器回報自己劃分記憶體的變化（GPU「專用使用量」，即工作管理員的數字）：
+1.9 MiB，是鎖頁複本的 GPU 分頁表（每 4 KiB 頁 8 位元組）；上限為 2 MiB 加上這部分。閒置釋放後與第一張圖片
+之前相差 8.8 MiB 以內：HIP runtime 在第一個開著前綴快取的長圖片提示時自己長一次記憶體（8.3–8.8 MiB，
+20 次載入／釋放循環持平，沒有每次循環的洩漏）。整合式 GPU 在這項允許 16 MiB（獨立顯卡 8 MiB，R9700 量到
+0.0），兩種都另外檢查再做兩次載入／釋放循環不再增加（至多 2 MiB）。
 
 8060S 上權重串流的成本差不多（1080p 949 ms）：主機記憶體與 GPU 共用同一組 DRAM。編碼器在 8060S 上約
 10–17 TFLOPS，只是 WMMA 峰值的一小部分；調校尚未進行（§6）。

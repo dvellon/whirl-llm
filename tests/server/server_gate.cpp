@@ -30,6 +30,7 @@
 
 #include "http_client.h"
 #include "whirl/common.h"
+#include "whirl/device_mem.h"
 #include "whirl/json.h"
 #include "whirl/numerics.h"
 
@@ -1622,6 +1623,8 @@ void suiteVis() {
     const std::string m_1080 = arr({imgMsg({"s1080.png"}, Q_1080)});
     const std::string m_1080b = arr({imgMsg({"s1080.png"}, Q_1080B)});
     const std::string m_text = arr({msg("user", Q_TEXT)});
+    const std::string Q_1080B2 = "And the second most common color? One sentence.";
+    std::string m_1080b2;  // built from the reference answer to m_1080b
     const std::map<std::string, std::string> kv = kvPin();
     const std::vector<std::string> mm = {"--mmproj", g.mmproj};
     std::optional<std::int64_t> pool_base;
@@ -1646,6 +1649,11 @@ void suiteVis() {
         ref["s1080"] = ask(m_1080, 96);
         ref["s1080b"] = ask(m_1080b, 64);
         ref["text"] = ask(m_text, 96);
+        // second turn of the 1080p conversation: resumed in place on the main server, so its entry is
+        // a reused one and the shutdown flush writes it to the SSD (CLOSE-REUSED: one-shot prompts
+        // are never written); the restart check restores it
+        m_1080b2 = arr({imgMsg({"s1080.png"}, Q_1080B), msg("assistant", ref["s1080b"].content), msg("user", Q_1080B2)});
+        ref["s1080b2"] = ask(m_1080b2, 64);
         for (const auto& [k, r] : ref) record("vis/" + k, r.text());
         check("vis: ref: shapes content (red, blue, 42)", hasAll(ref["shapes"], {"red", "blue", "42"}), brief(ref["shapes"]));
         check("vis: ref: dialog content (config.yaml, 0x80070002)", hasAll(ref["dialog"], {"config.yaml", "0x80070002"}), brief(ref["dialog"]));
@@ -1688,8 +1696,16 @@ void suiteVis() {
                   std::format("{} vs {}{}", pool ? *pool : -1, pool_base ? *pool_base : -1,
                               eq ? "" : " (startup VRAM jitter; vision line after the pool line)"));
         }
+        // device class and pinned mmproj size from the server's vision line; the limit per class is
+        // in whirl/device_mem.h (integrated GPU: + the GPU page tables of the pinned copy)
         const auto dv = logReal(*s.s, R"(VRAM change (-?[\d.]+) MiB)");
-        check("vis: VRAM change at mmproj load <= 2 MiB", dv && std::abs(*dv) <= 2.0, std::format("{} MiB", dv ? *dv : -1.0));
+        const auto pinned_mib = logNum(*s.s, R"((\d+) pinned MiB in host RAM)");
+        const bool uma = s->logCount(R"(VRAM change -?[\d.]+ MiB \[integrated GPU)") > 0;
+        const hip::MemClass mcls = uma ? hip::MemClass::integrated : hip::MemClass::discrete;
+        const double load_lim = hip::loadLimitMiB(mcls, static_cast<std::uint64_t>(pinned_mib ? *pinned_mib : 0) << 20);
+        check("vis: VRAM change at mmproj load within the device-class limit (pinned mmproj copy not in VRAM)",
+              dv && pinned_mib && std::abs(*dv) <= load_lim,
+              std::format("{} MiB ({} GPU, limit {:.2f} MiB)", dv ? *dv : -1.0, uma ? "integrated" : "discrete", load_lim));
         auto t = ask(m_text, 96);
         check("vis: text answer == base, encoder not loaded", sameText(t, base_text) && s->logCount("encoded in") == 0, brief(t));
         auto a = ask(m_shapes, 160);
@@ -1708,6 +1724,9 @@ void suiteVis() {
         auto e = ask(m_1080b, 64);
         check("vis: 1080p, new conversation: starts at the image-end checkpoint, == cold",
               sameText(e, ref["s1080b"]) && e.cached >= 2040, std::format("cached {} of {}", e.cached, e.prompt));
+        auto e2 = ask(m_1080b2, 64);
+        check("vis: 1080p conversation, second turn: resumed (cached >= first turn), == cold",
+              sameText(e2, ref["s1080b2"]) && e2.cached >= e.prompt, std::format("cached {} of {}", e2.cached, e2.prompt));
         // one image request next to three text requests
         std::vector<std::function<ChatResult()>> jobs = {[&] { return ask(m_dialog, 160); },
                                                          [&] { return ask(arr({msg("user", "What is RAII? Two sentences.")}), 96); },
@@ -1722,10 +1741,27 @@ void suiteVis() {
         // idle release
         const bool rel = s->waitLog("encoder released", 1, 40);
         const auto delta = logReal(*s.s, R"(encoder released; VRAM free .* delta (-?[\d.]+) MiB)");
-        check("vis: idle release: VRAM back to the level before the first image (delta <= 8 MiB)", rel && delta && std::abs(*delta) <= 8.0,
-              std::format("delta {} MiB", delta ? *delta : -1.0));
+        const double rel_lim = hip::releaseLimitMiB(mcls);
+        check("vis: idle release: VRAM back to the level before the first image (device-class limit)", rel && delta && std::abs(*delta) <= rel_lim,
+              std::format("delta {} MiB (limit {:.0f} MiB)", delta ? *delta : -1.0, rel_lim));
         auto f = ask(m_shapes, 160);
         check("vis: after the release: shapes == ref (encoder reloaded or cache)", sameText(f, ref["shapes"]), brief(f));
+        // two more encoder load / unload cycles (images not in the embedding cache): the release
+        // delta must not grow (a leak per cycle), on both device classes
+        {
+            bool cyc_ok = rel && delta.has_value();
+            for (const char* img : {"s512.png", "s1024.png"}) {
+                const std::size_t n_rel = s->logCount("encoder released");
+                const std::size_t n_enc = s->logCount("encoded in");
+                auto r = ask(arr({imgMsg({img}, Q_1080B)}), 8);
+                cyc_ok = cyc_ok && r.status == 200 && s->logCount("encoded in") > n_enc && s->waitLog("encoder released", n_rel + 1, 40);
+            }
+            const auto last = logReal(*s.s, R"(encoder released; VRAM free .* delta (-?[\d.]+) MiB)");
+            const double growth = (last && delta) ? *last - *delta : -1.0;
+            check("vis: 2 more encoder load/unload cycles: release delta does not grow (<= 2 MiB)",
+                  cyc_ok && last && std::abs(growth) <= hip::releaseGrowthLimitMiB,
+                  std::format("delta {} -> {} MiB", delta ? *delta : -1.0, last ? *last : -1.0));
+        }
         std::this_thread::sleep_for(std::chrono::seconds(3));
         s->waitTierIdle(60);  // pending SSD writes done before the stop
     }
@@ -1733,9 +1769,9 @@ void suiteVis() {
         auto env = kv;
         env["WHIRL_KV_SSD_DIR"] = ssd;
         ServerLease s("vis_restart", mm, env, false);
-        auto e = ask(m_1080b, 64);
-        check("vis: restart: 1080p question restored from SSD, == cold",
-              sameText(e, ref["s1080b"]) && s->logCount(R"(kv tier: restored \d+ tok from SSD)") >= 1,
+        auto e = ask(m_1080b2, 64);
+        check("vis: restart: 1080p conversation (second turn) restored from SSD, == cold",
+              sameText(e, ref["s1080b2"]) && s->logCount(R"(kv tier: restored \d+ tok from SSD)") >= 1 && e.cached >= 2040,
               std::format("cached {} of {}", e.cached, e.prompt));
     }
     fs::remove_all(widen(ssd), ec);

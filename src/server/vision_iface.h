@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "whirl/device_mem.h"
 #include "whirl/vision.h"
 #include "whirl/prefill_schedule.h"
 #include "whirl/vismap.h"
@@ -35,8 +36,8 @@ public:
     // Release after the idle timeout; true when it released now.
     virtual bool idleTick() = 0;
     virtual std::uint32_t idleS() const = 0;
-    // VRAM free now (for the release log).
-    virtual std::uint64_t vramFree() const = 0;
+    // Device memory counters now (for the release log; whirl/device_mem.h).
+    virtual hip::LocalMemSnap memSnap() const = 0;
 };
 
 // Projected image embeddings by content hash (host memory, LRU, engine thread only).

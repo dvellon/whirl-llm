@@ -180,7 +180,7 @@ public:
     bool loaded() const override { return v_.loaded(); }
     bool idleTick() override { return v_.idleTick(); }
     std::uint32_t idleS() const override { return v_.idle_s; }
-    std::uint64_t vramFree() const override { return hip::memInfo().free; }
+    hip::LocalMemSnap memSnap() const override { return hip::localMemSnap(); }
 
 private:
     vision::Vision& v_;

@@ -18,7 +18,7 @@ void Engine::attachVision(const VisionConfig& vc) {
     if (vc.vis == nullptr) return;
     const std::size_t n = m_.lendScratch(vis_lend_raw_);
     for (std::size_t k = 0; k < n; ++k) vis_lend_.push_back({vis_lend_raw_[k][0], vis_lend_raw_[k][1]});
-    vis_free0_ = vc.vis->vramFree();
+    vis_snap0_ = vc.vis->memSnap();
 }
 
 // The embeddings of image p (cache hit, or encode now on the model stream,
@@ -128,9 +128,16 @@ void Engine::visIdle() {
     if (!v->loaded()) m_.visRelease();
     if (vis_rel_pending_ && !v->loaded() && !m_.visRowsAllocated()) {
         vis_rel_pending_ = false;
-        const double fr = static_cast<double>(v->vramFree());
-        logI("vision: idle for {} s; encoder released; VRAM free {:.1f} MiB (before the first image {:.1f} MiB, delta {:.1f} MiB)",
-             v->idleS(), fr / 1048576.0, static_cast<double>(vis_free0_) / 1048576.0, (static_cast<double>(vis_free0_) - fr) / 1048576.0);
+        // delta: hipMemGetInfo free, this process's view on both device classes (it returns exactly on
+        // hipFree; on an integrated GPU it also drops by 2x any pinned host memory allocated since,
+        // which the GPU Shared Usage growth shows). Dedicated / Shared Usage: whirl/device_mem.h.
+        const hip::LocalMemSnap now = v->memSnap();
+        const hip::LocalMemTaken t = hip::localMemTaken(vis_snap0_, now);
+        logI("vision: idle for {} s; encoder released; VRAM free {:.1f} MiB (before the first image {:.1f} MiB, delta {:.1f} MiB) "
+             "[since the first image: GPU Dedicated Usage {:+.1f} MiB, Shared Usage {:+.1f} MiB{}]",
+             v->idleS(), static_cast<double>(now.hip_free) / 1048576.0, static_cast<double>(vis_snap0_.hip_free) / 1048576.0, t.hip_free_mib,
+             (static_cast<double>(now.dedicated) - static_cast<double>(vis_snap0_.dedicated)) / 1048576.0, t.shared_mib,
+             now.pdh_ok && vis_snap0_.pdh_ok ? "" : ", GPU process counters unreadable");
     }
 }
 
