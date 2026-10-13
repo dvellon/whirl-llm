@@ -485,7 +485,7 @@ experiments and measurements.
 | `WHIRL_GPU_SHARE=1` | do not wait for other WHIRL processes on the same GPU |
 | `WHIRL_GPU_WAIT=S` | seconds to wait for another WHIRL process to free the GPU (default 1800) |
 | `WHIRL_MODE=precise\|balance\|fast[:ITEMS]` | numerics mode (= `--precise` / `--balance` / `--fast` / `--mode`; default balance). See [numerics modes](#modes) |
-| `WHIRL_PREFILL_BATCH=N` | prefill rows per forward (default 4096, up to 16384) |
+| `WHIRL_PREFILL_BATCH=N` | prefill batch rows (default 4096, up to 16384); the CLI and the server prefill on the same schedule, a forward is at most this minus 256 rows (CLI-SCHED) |
 | `WHIRL_PREFILL_BATCH` below 1280 (server) | raised to 1280 with a warning: the scheduler's largest prefill forward is a 1024-row chunk plus a 256-row tail |
 | `WHIRL_MAX_CTX=N` | default context size of `chat` (= `--ctx`; default 8192) |
 | `WHIRL_CODE_OBJECT=FILE` | development: load the GPU kernels from this code object instead of the built-in one |

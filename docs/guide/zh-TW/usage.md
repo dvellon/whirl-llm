@@ -366,7 +366,7 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 | `WHIRL_GPU_SHARE=1` | 不等待同一張 GPU 上的其他 WHIRL 行程 |
 | `WHIRL_GPU_WAIT=S` | 等待其他 WHIRL 行程釋放 GPU 的秒數（預設 1800） |
 | `WHIRL_MODE=precise\|balance\|fast[:項目]` | 數值模式（= `--precise` / `--balance` / `--fast` / `--mode`；預設 balance）。見[數值模式](#modes) |
-| `WHIRL_PREFILL_BATCH=N` | 每次 forward 的 prefill 列數（預設 4096，最多 16384） |
+| `WHIRL_PREFILL_BATCH=N` | prefill 批次列數（預設 4096，最多 16384）；CLI 與 server 用同一個排程，一次 forward 最多是這個值減 256 列（CLI-SCHED） |
 | `WHIRL_MAX_CTX=N` | `chat` 的預設 context 大小（= `--ctx`；預設 8192） |
 | `WHIRL_CODE_OBJECT=FILE` | 開發用：從這個 code object 載入 GPU kernel，取代內建的 |
 | `WHIRL_MOE_FP8=0\|1` | 專家為 MXFP4 的 MoE 模型：專家 prefill 用 fp8 activation（項目 `moefp8`：fast 開，balance 與 precise 關（MOE-BAL）；fp8 是較快的路徑——Ornith MXFP4 在 2k token 約 11.7k 對 8.6k tok/s）。只影響 prefill |

@@ -350,7 +350,7 @@ struct EngineOptions {
     // pushes out the prompt-end / gen-end checkpoints a regenerate or the next chat turn resumes from.
     // WHIRL_TAIL_CK=0 turns it off (debug).
     bool tail_ck = true;
-    std::uint32_t tail_ck_min = 4096;
+    std::uint32_t tail_ck_min = sched::tail_ck_min_default;
     std::size_t n_spe = 2;
     bool ckpt_host = false;
     std::size_t prefill_exec = 2048;

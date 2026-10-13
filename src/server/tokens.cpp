@@ -2,6 +2,8 @@
 
 #include "tokens.h"
 
+#include "whirl/prefill_schedule.h"
+
 #include <string>
 #include <unordered_map>
 
@@ -38,14 +40,10 @@ std::size_t ChatTokens::thinkOpenSplit(std::span<const std::uint32_t> toks) cons
 }
 
 std::size_t ChatTokens::sysBoundary(std::span<const std::uint32_t> toks) const {
-    if (toks.size() < 3 || im_start == none || im_end == none) return 0;
-    if (toks[0] != im_start || toks[1] != system) return 0;
     // the turn ends at "<|im_end|>" "\n" "<|im_start|>": a "<|im_end|>" that the
     // system text itself mentions (parsed as the special token) is not the end
-    for (std::size_t i = 2; i + 2 < toks.size(); ++i) {
-        if (toks[i] == im_end && toks[i + 1] == nl && toks[i + 2] == im_start) return i + 2;
-    }
-    return 0;
+    // (shared with the CLI: include/whirl/prefill_schedule.h, CLI-SCHED)
+    return sched::sysBoundary(toks, im_start, system, im_end, nl, none);
 }
 
 std::size_t ChatTokens::nextTurn(std::span<const std::uint32_t> toks, std::size_t from) const {

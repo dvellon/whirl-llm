@@ -606,9 +606,7 @@ bool Engine::ensurePages(Slot& sl, std::uint64_t n_tok) {
 
 std::uint32_t Engine::sysSplit(std::span<const std::uint32_t> toks) const {
     if (opt_.sys_min == 0) return 0;
-    const std::size_t b = ct_.sysBoundary(toks);
-    if (b < opt_.sys_min || b >= toks.size()) return 0;
-    return static_cast<std::uint32_t>(b);
+    return static_cast<std::uint32_t>(sched::sysSplit(ct_.sysBoundary(toks), toks.size(), opt_.sys_min));
 }
 
 std::size_t Engine::schedNext(std::size_t n, std::size_t sys, std::size_t think, std::size_t pos) {
@@ -625,21 +623,9 @@ std::size_t Engine::schedNextV(std::size_t n, std::size_t sys, std::size_t think
 // run of image ids), those >= ck_min; a function of the tokens only, so every prompt
 // with the same prefix gets the same splits there (at most 32)
 std::vector<std::uint32_t> Engine::imgSplits(std::span<const std::uint32_t> toks) const {
-    std::vector<std::uint32_t> out;
-    if (vis_cfg_.vis == nullptr || vis_cfg_.ck_min == 0) return out;
-    std::size_t i = 0;
-    while (i < toks.size() && out.size() < 32) {
-        if (toks[i] < qwen35::image_id_base) {
-            ++i;
-            continue;
-        }
-        std::size_t j = i;
-        while (j < toks.size() && toks[j] >= qwen35::image_id_base) ++j;
-        const std::size_t b = (j < toks.size() && toks[j] == vis_cfg_.vision_end_id) ? j + 1 : j;
-        if (b >= vis_cfg_.ck_min && b < toks.size()) out.push_back(static_cast<std::uint32_t>(b));
-        i = j + 1;
-    }
-    return out;
+    if (vis_cfg_.vis == nullptr) return {};
+    // shared with the CLI (include/whirl/prefill_schedule.h, CLI-SCHED)
+    return sched::imageSplits(toks, qwen35::image_id_base, vis_cfg_.vision_end_id, vis_cfg_.ck_min);
 }
 
 std::size_t Engine::schedFloor(std::span<const std::uint32_t> toks, std::size_t lim) const {

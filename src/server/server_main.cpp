@@ -107,7 +107,7 @@ constexpr std::size_t n_ckpt_default_par = 3;
 constexpr std::size_t n_spe_default = 2;
 // KV pool (tokens, smallest format) below which startup lowers the prefill batch / checkpoints
 constexpr std::uint32_t vram_tight_pool = 16384;
-constexpr std::uint32_t sys_min_default = 2048;
+constexpr std::uint32_t sys_min_default = sched::sys_min_default;  // shared with the CLI (CLI-SCHED)
 constexpr std::uint64_t kv_ssd_gb_default = 64;
 constexpr std::uint32_t decode_min_tps_default = 20;
 

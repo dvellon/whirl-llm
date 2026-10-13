@@ -100,4 +100,68 @@ inline std::vector<std::size_t> forwardEnds(std::size_t n, std::size_t sys, std:
     return ends;
 }
 
+// ---------------------------------------------------------------------------
+// The forced splits as functions of the tokens (shared by the server engine and the CLI, CLI-SCHED)
+
+// server defaults: a leading system message of >= sys_min_default tokens is a split (WHIRL_SYS_MIN,
+// 0 = off); image ends at >= img_split_min_default are splits (WHIRL_VIS_CKPT_MIN, 0 = off); a prompt
+// of >= tail_ck_min_default tokens keeps the TAIL-CK checkpoint (a forward end, WHIRL_TAIL_CK=0 = off)
+inline constexpr std::uint32_t sys_min_default = 2048;
+inline constexpr std::uint32_t img_split_min_default = 1024;
+inline constexpr std::uint32_t tail_ck_min_default = 4096;
+
+// Prompt starting with "<|im_start|>" "system": the position after the first "<|im_end|>" "\n"
+// that is followed by "<|im_start|>" (a "<|im_end|>" the system text itself mentions is not the
+// end). 0 = none. `none` ids never match.
+inline std::size_t sysBoundary(std::span<const std::uint32_t> toks, std::uint32_t im_start, std::uint32_t system, std::uint32_t im_end,
+                               std::uint32_t nl, std::uint32_t none = 0xffffffffu) {
+    if (toks.size() < 3 || im_start == none || im_end == none) return 0;
+    if (toks[0] != im_start || toks[1] != system) return 0;
+    for (std::size_t i = 2; i + 2 < toks.size(); ++i) {
+        if (toks[i] == im_end && toks[i + 1] == nl && toks[i + 2] == im_start) return i + 2;
+    }
+    return 0;
+}
+
+// the system-message split the schedule uses: sysBoundary when it is >= sys_min (> 0) and inside the prompt
+inline std::size_t sysSplit(std::size_t boundary, std::size_t n, std::uint32_t sys_min) {
+    return (sys_min == 0 || boundary < sys_min || boundary >= n) ? 0 : boundary;
+}
+
+// vision: the image-end splits (position after the <|vision_end|> that follows a run of image ids,
+// ids >= image_id_base), those >= ck_min (> 0) and inside the prompt; at most 32. A function of the
+// tokens only, so every prompt with the same prefix gets the same splits there.
+inline std::vector<std::uint32_t> imageSplits(std::span<const std::uint32_t> toks, std::uint32_t image_id_base, std::uint32_t vision_end_id,
+                                              std::uint32_t ck_min) {
+    std::vector<std::uint32_t> out;
+    if (ck_min == 0) return out;
+    std::size_t i = 0;
+    while (i < toks.size() && out.size() < 32) {
+        if (toks[i] < image_id_base) {
+            ++i;
+            continue;
+        }
+        std::size_t j = i;
+        while (j < toks.size() && toks[j] >= image_id_base) ++j;
+        const std::size_t b = (j < toks.size() && toks[j] == vision_end_id) ? j + 1 : j;
+        if (b >= ck_min && b < toks.size()) out.push_back(static_cast<std::uint32_t>(b));
+        i = j + 1;
+    }
+    return out;
+}
+
+// CLI-SCHED: the forward ends of a prompt prefilled alone on a server with default options, from
+// `from` (0 = cold): forwardEnds with the TAIL-CK stop (tail_min > 0, n >= tail_min, the tail point is
+// not already a forced split). `whirl chat` / bench / golden run exactly these forwards.
+inline std::vector<std::size_t> soloForwardEnds(std::size_t n, std::size_t sys, std::size_t think, std::span<const std::uint32_t> imgs,
+                                                std::size_t from, std::size_t exec, std::size_t tail_min) {
+    std::vector<std::size_t> stops;
+    if (tail_min > 0 && n >= tail_min) {
+        const std::size_t t = tailPoint(n, sys, think, imgs);
+        if (t > from && t != sys && t != think && std::find(imgs.begin(), imgs.end(), static_cast<std::uint32_t>(t)) == imgs.end())
+            stops.push_back(t);
+    }
+    return forwardEnds(n, sys, think, imgs, from, exec, stops);
+}
+
 }  // namespace whirl::sched

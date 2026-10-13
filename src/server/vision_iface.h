@@ -8,6 +8,7 @@
 #pragma once
 
 #include "whirl/vision.h"
+#include "whirl/prefill_schedule.h"
 #include "whirl/vismap.h"
 
 #include <array>
@@ -64,7 +65,7 @@ struct VisionConfig {
     std::uint32_t vision_end_id = 0;
     // image ends at >= this position are chunk splits of the prompt's schedule and
     // the last one keeps a shared checkpoint (WHIRL_VIS_CKPT_MIN, 0 = off)
-    std::uint32_t ck_min = 1024;
+    std::uint32_t ck_min = sched::img_split_min_default;
     std::uint64_t cache_bytes = 1ull << 30;  // --vis-cache-mb
     // diagnostics (WHIRL_VIS_DUMP=prefix): each encoded image's embeddings to prefix.<req>.f32
     std::string dump_prefix;

@@ -1209,6 +1209,50 @@ void testPrefillSchedule() {
     CHECK_EQ(prefillExecFor(16384, 4096), std::size_t{3072});
 }
 
+// CLI-SCHED: the forced-split helpers the CLI shares with the engine (sysBoundary / sysSplit /
+// imageSplits) and the solo forward ends the CLI runs (soloForwardEnds = forwardEnds + the TAIL-CK stop).
+void testCliSchedHelpers() {
+    using namespace whirl::sched;
+    const std::uint32_t IS = 1, SY = 2, IE = 3, NL = 4, U = 5, VE = 6, IMG = 0x80000000u;
+    // system boundary: after the first "<|im_end|>" "\n" followed by "<|im_start|>"
+    std::vector<std::uint32_t> t = {IS, SY, NL, 7, 8, IE, NL, 9, IE, NL, IS, U, NL, 10};
+    CHECK_EQ(sysBoundary(t, IS, SY, IE, NL), std::size_t{10});  // the "<|im_end|>" "\n" "9" inside is not the end
+    t[1] = U;
+    CHECK_EQ(sysBoundary(t, IS, SY, IE, NL), std::size_t{0});  // not a system message
+    CHECK_EQ(sysBoundary(t, 0xffffffffu, SY, IE, NL), std::size_t{0});
+    CHECK_EQ(sysSplit(2500, 9000, 2048), std::size_t{2500});
+    CHECK_EQ(sysSplit(2000, 9000, 2048), std::size_t{0});  // shorter than sys_min
+    CHECK_EQ(sysSplit(2500, 9000, 0), std::size_t{0});     // off
+    CHECK_EQ(sysSplit(9000, 9000, 2048), std::size_t{0});  // not inside the prompt
+    // image ends: after the <|vision_end|> that follows a run of image ids, >= ck_min, inside the prompt
+    std::vector<std::uint32_t> v(3000, U);
+    for (std::size_t i = 100; i < 1200; ++i) v[i] = IMG + static_cast<std::uint32_t>(i);
+    v[1200] = VE;
+    for (std::size_t i = 1500; i < 1600; ++i) v[i] = IMG + 7;
+    const std::vector<std::uint32_t> im = imageSplits(v, IMG, VE, 1024);
+    CHECK(im.size() == 2 && im[0] == 1201 && im[1] == 1600);
+    CHECK(imageSplits(v, IMG, VE, 1300).size() == 1);
+    CHECK(imageSplits(v, IMG, VE, 0).empty());
+    // solo forward ends: the cold server forwards with the tail stop (n >= 4096 only)
+    const std::span<const std::uint32_t> noimg;
+    for (std::size_t n : {1u, 1000u, 2100u, 4000u, 4100u, 8232u, 9500u, 32800u}) {
+        for (std::size_t th : {std::size_t{0}, n - 1}) {
+            const std::size_t tail = tailPoint(n, 0, th, noimg);
+            std::vector<std::size_t> st;
+            if (n >= tail_ck_min_default && tail > 0 && tail != th) st.push_back(tail);
+            CHECK(soloForwardEnds(n, 0, th, noimg, 0, 2048, tail_ck_min_default) == forwardEnds(n, 0, th, noimg, 0, 2048, st));
+            CHECK(soloForwardEnds(n, 0, th, noimg, 0, 2048, 0) == forwardEnds(n, 0, th, noimg, 0, 2048, {}));
+        }
+    }
+    // the lengths whose old CLI forwards (max_batch 4096) were off the schedule now end on it
+    CHECK((soloForwardEnds(4100, 0, 0, noimg, 0, 2048, tail_ck_min_default) == std::vector<std::size_t>{2048, 3072, 4100}));
+    CHECK((soloForwardEnds(8232, 0, 0, noimg, 0, 2048, tail_ck_min_default) == std::vector<std::size_t>{2048, 4096, 6144, 7168, 8232}));
+    CHECK(!onSchedule(4100, 0, 0, noimg, 4096) && !onSchedule(8232, 0, 0, noimg, 8192));
+    CHECK_EQ(sys_min_default, 2048u);
+    CHECK_EQ(img_split_min_default, 1024u);
+    CHECK_EQ(tail_ck_min_default, 4096u);
+}
+
 // TAIL-CK regression: run a request sequence with the tail checkpoint on and off (same server
 // settings otherwise); every answer equals the greedy reference.
 struct TailRun {
@@ -3426,6 +3470,7 @@ int main(int argc, char** argv) {
         {"doc_qa", testDocQa},
         {"tail_ck_sched", testTailCkOnSchedule},
         {"prefill_sched", testPrefillSchedule},
+        {"cli_sched_helpers", testCliSchedHelpers},
         {"tail_ck_regress", testTailCkRegression},
         {"concurrency", [] { testConcurrency(4, 12, true); }},
         {"concurrency16", [] { testConcurrency(16, 24, true); }},

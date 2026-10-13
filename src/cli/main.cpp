@@ -234,7 +234,7 @@ struct Args {
 
 bool takesValue(const std::string& o) {
     static const char* v[] = {"--max-tokens", "--ctx", "--tokens", "--out", "--device", "--prefill", "--decode", "--prompt", "--modes", "--mmproj", "--suite",
-                              "--draft", "--draft-model", "--slot-ctx"};
+                              "--draft", "--draft-model", "--slot-ctx", "--sched-lens"};
     for (const char* s : v)
         if (o == s) return true;
     return false;
@@ -340,6 +340,7 @@ std::optional<u32> envU32(const char* name) {
 struct Tok {
     Tokenizer t;
     u32 im_end = 0xffffffffu, eot = 0xffffffffu, think_open = 0xffffffffu, newline = 0xffffffffu;
+    u32 im_start = 0xffffffffu, system = 0xffffffffu, vision_end = 0xffffffffu;  // CLI-SCHED: forced splits
 
     explicit Tok(const gguf::File& f) : t(Tokenizer::fromGguf(f)) {
         auto id = [&](const char* s) {
@@ -351,6 +352,11 @@ struct Tok {
         think_open = id("<think>");
         const std::vector<TokenId> nl = t.encode("\n");
         if (nl.size() == 1) newline = static_cast<u32>(nl[0]);
+        // as the server's ChatTokens (src/server/tokens.cpp) and VisionConfig::vision_end_id
+        im_start = id("<|im_start|>");
+        const std::vector<TokenId> sy = t.encode("system", false);
+        if (sy.size() == 1) system = static_cast<u32>(sy[0]);
+        vision_end = id("<|vision_end|>");
     }
 
     std::vector<u32> encode(const std::string& s) const {
@@ -402,6 +408,37 @@ struct Tok {
         return norm;
     }
 };
+
+// ---------------------------------------------------------------------------
+// CLI-SCHED: every CLI prefill runs the forwards whirl-server runs for the same prompt alone with
+// default options (include/whirl/prefill_schedule.h: the 1024-row chunk schedule with its merged
+// tail, the forced splits - system message, think-open, image ends - the forward grouping, the
+// TAIL-CK forward end), so `whirl chat` and the server give the same bits for the same prompt.
+// The server's knobs apply here too: WHIRL_PREFILL_CHUNK, WHIRL_SYS_MIN, WHIRL_VIS_CKPT_MIN,
+// WHIRL_TAIL_CK=0.
+// (image ends: the ids >= image_id_base exist only in a prompt with images)
+std::vector<std::size_t> serverForwardEnds(const Tok& tok, std::span<const u32> ids, u32 max_batch) {
+    const std::size_t n = ids.size();
+    const std::size_t sys = sched::sysSplit(sched::sysBoundary(ids, tok.im_start, tok.system, tok.im_end, tok.newline), n,
+                                            envU32("SYS_MIN").value_or(sched::sys_min_default));
+    const std::vector<std::uint32_t> imgs =
+        sched::imageSplits(ids, q::image_id_base, tok.vision_end, envU32("VIS_CKPT_MIN").value_or(sched::img_split_min_default));
+    const std::size_t exec = sched::prefillExecFor(envU32("PREFILL_CHUNK").value_or(2048), max_batch);
+    const std::size_t tail_min = envFlag("TAIL_CK", true) ? sched::tail_ck_min_default : 0;
+    return sched::soloForwardEnds(n, sys, tok.thinkOpenSplit(ids), imgs, 0, exec, tail_min);
+}
+
+// the CLI prefill of ids from position 0 on the server's forwards (with the MTP block over the prompt: mtp)
+void prefillLikeServer(q::Model& m, const Tok& tok, std::span<const u32> ids, bool mtp) {
+    std::size_t off = 0;
+    for (const std::size_t e : serverForwardEnds(tok, ids, m.max_batch)) {
+        if (mtp)
+            m.prefillMtpChunk(ids, 0, off, e - off, std::nullopt);
+        else
+            m.forward(ids.subspan(off, e - off), static_cast<u32>(off));
+        off = e;
+    }
+}
 
 // Prints the complete UTF-8 prefix of the decoded generation as it grows.
 struct Streamer {
@@ -1302,7 +1339,9 @@ int cmdChat(const Args& a) {
 #endif
     out(fmt("  prompt tokens: %zu\n\n", ids.size()));
 
-    if (auto v = envU32("PREFILL_BATCH")) model.max_batch = std::max<u32>(1, std::min(model.max_batch, *v));
+    // (CLI-SCHED: not below one schedule chunk + its merged tail, as the server's vram::min_prefill_batch)
+    if (auto v = envU32("PREFILL_BATCH"))
+        model.max_batch = std::max<u32>(sched::prefill_chunk + sched::prefill_merge, std::min(model.max_batch, *v));
     q::Profile prof;
     const bool profiling = envGet("PROFILE").has_value();
     if (profiling) model.prof = &prof;
@@ -1319,7 +1358,9 @@ int cmdChat(const Args& a) {
     if (moe_dump_path) model.moe_dump = &moe_ids;
     const u32 tps_every = envU32("TRACE_TPS").value_or(0);
     {
-        // chunks of max_batch; a thinking-mode prompt runs its last token as its own step
+        // CLI-SCHED: the server's forwards for this prompt (serverForwardEnds: chunk schedule, think-open /
+        // system / image splits). WHIRL_DUMP_LOGITS keeps its own teacher-forced forwards (16-row windows,
+        // max_batch chunks between them; a thinking-mode prompt's last token as its own step).
         const std::size_t split = tok.thinkOpenSplit(ids);
         // WHIRL_DUMP_LOGITS=path, WHIRL_DUMP_FROM=N (no MTP): next-token logits of every
         // prompt position >= N as f16 rows (teacher-forced, 16-row forwards).
@@ -1347,7 +1388,8 @@ int cmdChat(const Args& a) {
         std::vector<std::uint16_t> dump;
         std::vector<float> row_f32(dump_path ? static_cast<std::size_t>(q::max_small_batch) * model.cfg.n_vocab : 0);
         const double p0 = nowMs();
-        std::size_t off = 0;
+        const std::vector<std::size_t> ends = dump_path ? std::vector<std::size_t>{} : serverForwardEnds(tok, ids, model.max_batch);
+        std::size_t off = 0, ei = 0;
         while (off < ids.size()) {
             bool dumping = false;
             std::size_t lim = (split > 0 && off < split) ? split : ids.size();
@@ -1363,7 +1405,9 @@ int cmdChat(const Args& a) {
                         break;
                     }
                 }
-            const std::size_t n = dumping ? std::min<std::size_t>(lim - off, q::max_small_batch) : std::min<std::size_t>(lim - off, model.max_batch);
+            const std::size_t n = !dump_path ? ends[ei++] - off
+                                  : dumping  ? std::min<std::size_t>(lim - off, q::max_small_batch)
+                                             : std::min<std::size_t>(lim - off, model.max_batch);
             const double c0 = nowMs();
             // all_logits needs keep_hidden (normed rows in hn); without it forward() computes only
             // the chunk's last row (into row 0) and the dump held 1 real row per 16
@@ -1689,8 +1733,14 @@ int cmdSeqtest(const Args& a) {
     // --slot-ctx N: the context per sequence (P3-6: the solo digest must not depend on it)
     // (12288: room for the chunk schedule gate's long prompts of long_n / long_n2 tokens)
     const u32 long_n = 9500, long_n2 = 8232;
-    const u32 slot_ctx = a.get("--slot-ctx") ? static_cast<u32>(std::stoul(*a.get("--slot-ctx"))) : 12288,
-              n_gen = a.get("--decode") ? static_cast<u32>(std::stoul(*a.get("--decode"))) : 24;
+    // CLI-SCHED gate: prompt lengths whose old CLI chunking (max_batch forwards) was off the server's
+    // schedule; --sched-lens N,N,... adds lengths (e.g. 32800; the context per sequence grows to fit)
+    std::vector<u32> sched_lens = {4000, 4100, long_n2};  // 4000: the golden suite single long4k prompt
+    if (auto v = a.get("--sched-lens"))
+        for (u32 x : parseIds(*v)) sched_lens.push_back(x);
+    u32 slot_ctx = a.get("--slot-ctx") ? static_cast<u32>(std::stoul(*a.get("--slot-ctx"))) : 12288;
+    const u32 n_gen = a.get("--decode") ? static_cast<u32>(std::stoul(*a.get("--decode"))) : 24;
+    for (u32 x : sched_lens) slot_ctx = std::max<u32>(slot_ctx, (x + 64 + q::kv_page - 1) / q::kv_page * q::kv_page);
     const std::vector<u32> pa = tok.encode(chatWrap(std::string("Write a C function that reverses a singly linked list, and explain it.") + k_bench_text, false));
     const std::vector<u32> pb = tok.encode(chatWrap("請用繁體中文說明 TCP 三向交握的過程，並用 Python 寫一個簡單的 socket 伺服器。", false));
     q::LoadOptions lo;
@@ -1850,8 +1900,8 @@ int cmdSeqtest(const Args& a) {
     // server can choose for the same prompt must give the same last-row logits bits: forwards of 1, 2
     // or more chunks (decode floor / WHIRL_PREFILL_CHUNK / WHIRL_PREFILL_BATCH), with or without the
     // TAIL-CK tail checkpoint, and a resume from a checkpoint at a schedule point (a prefix checkpoint
-    // inside the prompt, the tail checkpoint). Splits off the schedule and the CLI's own chunking
-    // (Model::prefill, max_batch rows) are printed for information only.
+    // inside the prompt, the tail checkpoint). Splits off the schedule are printed for information only;
+    // the CLI's prefill is checked by the CLI-SCHED gate below.
     u32 sched_bad = 0, sched_total = 0;
     if (slot_ctx < long_n + 64) {
         out(fmt("  chunk schedule: needs --slot-ctx >= %u (got %u)\n", long_n + 64, slot_ctx));
@@ -1918,7 +1968,7 @@ int cmdSeqtest(const Args& a) {
             out(fmt("    %-48s [%s]: %s\n", v.name, endsStr(v.ends).c_str(), !on ? "FAIL (a forward ends off the schedule)" : same ? "==" : "DIFFER (FAIL)"));
         }
         // information only: one extra split the server never makes (added to the reference's
-        // forwards), and the CLI's own chunking
+        // forwards)
         const std::pair<const char*, std::size_t> info[] = {
             {"split 64 rows after a schedule point", mid + 64},
             {"split 40 rows after a schedule point", mid + 40},
@@ -1931,21 +1981,92 @@ int cmdSeqtest(const Args& a) {
             if (std::find(e.begin(), e.end(), sp) == e.end()) e.insert(std::upper_bound(e.begin(), e.end(), sp), sp);
             out(fmt("    info: %-50s: %s\n", name, runEnds(ls, e) == ref ? "==" : "DIFFER"));
         }
-        for (const std::size_t n2 : {N, static_cast<std::size_t>(long_n2)}) {
-            const std::vector<u32> lp2 = n2 == N ? lp : goldenLongIds(tok, n2);
-            const std::size_t th2 = tok.thinkOpenSplit(lp2);
-            m.reset();
-            m.prefill(lp2, 0);
-            const u64 cli = rowHash(m, 0);
-            const std::array<std::size_t, 1> st2 = {sched::tailPoint(n2, 0, th2, noimg)};
-            const u64 srv = runEnds(std::span<const u32>(lp2), sched::forwardEnds(n2, 0, th2, noimg, 0, ex, st2));
-            const std::size_t last = n2 % m.max_batch == 0 ? m.max_batch : n2 % m.max_batch;
-            out(fmt("    info: CLI chunking (max_batch %u, last forward %zu rows) vs server, N %zu: %s\n", m.max_batch, last, n2,
-                    srv == cli ? "==" : "DIFFER"));
-        }
     }
     out(fmt("  chunk schedule: %u/%u server executions differ from the cold reference\n", sched_bad, sched_total));
     ok = ok && sched_bad == 0;
+    // CLI-SCHED gate (part of ok): the CLI's prefill (prefillLikeServer, the code `whirl chat` and the golden
+    // suite run) must give the same last-row logits bits as the server's forwards for the same prompt
+    // (the engine's cold solo request: sched::forwardEnds with the TAIL-CK stop, exec from
+    // WHIRL_PREFILL_CHUNK / max_batch), without and with the MTP block. Prompts: no-think chat prompts of
+    // sched_lens tokens (not 64-aligned / short tails past a max_batch boundary), a thinking-mode prompt
+    // (think-open split) and one with a long system message (system split). "old CLI" (max_batch
+    // forwards, the CLI before CLI-SCHED) is printed for information.
+    u32 cli_bad = 0, cli_total = 0;
+    {
+        m.selectSeq(0);
+        const std::span<const std::uint32_t> noimg;
+        const std::size_t ex = sched::prefillExecFor(2048, m.max_batch);
+        auto runEndsMtp = [&](std::span<const u32> ids, const std::vector<std::size_t>& ends, bool mtp) {
+            m.reset();
+            std::size_t cur = 0;
+            for (std::size_t e : ends) {
+                if (mtp)
+                    m.prefillMtpChunk(ids, 0, cur, e - cur, std::nullopt);
+                else
+                    m.forward(ids.subspan(cur, e - cur), static_cast<u32>(cur));
+                cur = e;
+            }
+            return rowHash(m, 0);
+        };
+        struct P {
+            std::string name;
+            std::vector<u32> ids;
+        };
+        std::vector<P> ps;
+        for (u32 n : sched_lens) ps.push_back({fmt("no-think, %u tokens", n), goldenLongIds(tok, n)});
+        {
+            std::string doc;
+            for (int i = 1; i < 5; ++i) doc += fmt("Section %d.\n", i) + std::string(k_bench_text) + "\n";
+            ps.push_back({"thinking mode (think-open split)", tok.encode(chatWrap("Summarize these notes.\n\n" + doc + doc, true))});
+            ps.push_back({"long system message (system split)",
+                          tok.encode("<|im_start|>system\nYou are a careful assistant. Reference notes:\n" + doc + doc + doc +
+                                     "<|im_end|>\n<|im_start|>user\nList the three most important points.<|im_end|>\n<|im_start|>assistant\n"
+                                     "<think>\n\n</think>\n\n")});
+        }
+        const bool has_mtp = m.mtp.has_value();
+        for (const P& pp : ps) {
+            const std::span<const u32> ids(pp.ids);
+            const std::size_t n = ids.size();
+            if (n + 64 > slot_ctx) {
+                out(fmt("    CLI-SCHED %-36s: %zu tokens do not fit --slot-ctx %u (FAIL)\n", pp.name.c_str(), n, slot_ctx));
+                ++cli_bad;
+                ++cli_total;
+                continue;
+            }
+            const std::size_t th = tok.thinkOpenSplit(pp.ids);
+            const std::size_t sy = sched::sysSplit(sched::sysBoundary(ids, tok.im_start, tok.system, tok.im_end, tok.newline), n, sched::sys_min_default);
+            std::vector<std::size_t> st;
+            if (n >= sched::tail_ck_min_default) {
+                const std::size_t t = sched::tailPoint(n, sy, th, noimg);
+                if (t > 0 && t != sy && t != th) st.push_back(t);
+            }
+            const std::vector<std::size_t> srv_ends = sched::forwardEnds(n, sy, th, noimg, 0, ex, st);
+            // the CLI before CLI-SCHED: max_batch forwards, the think-open token as its own step
+            std::vector<std::size_t> old_ends;
+            for (std::size_t off = 0; off < n;) {
+                const std::size_t lim = (th > 0 && off < th) ? th : n;
+                off += std::min<std::size_t>(lim - off, m.max_batch);
+                old_ends.push_back(off);
+            }
+            for (int mt = 0; mt < (has_mtp ? 2 : 1); ++mt) {
+                const bool mtp = mt == 1;
+                if (mtp && pp.name.rfind("no-think", 0) == 0 && n != long_n2) continue;  // MTP: one length + the split prompts
+                const u64 srv = runEndsMtp(ids, srv_ends, mtp);
+                m.reset();
+                prefillLikeServer(m, tok, ids, mtp);
+                const u64 cli = rowHash(m, 0);
+                const u64 old = runEndsMtp(ids, old_ends, mtp);
+                cli_bad += cli == srv ? 0 : 1;
+                cli_total += 1;
+                std::string se;
+                for (std::size_t e : srv_ends) se += (se.empty() ? "" : ",") + std::to_string(e);
+                out(fmt("    CLI-SCHED %-36s%s (N %zu, sys %zu, think %zu, server forwards [%s]): CLI %s server; old CLI %s\n", pp.name.c_str(),
+                        mtp ? " +MTP" : "", n, sy, th, se.c_str(), cli == srv ? "==" : "DIFFER (FAIL)", old == srv ? "==" : "differed"));
+            }
+        }
+    }
+    out(fmt("  CLI-SCHED: %u/%u CLI prefills differ from the server's forwards\n", cli_bad, cli_total));
+    ok = ok && cli_bad == 0;
     out(fmt("  head logits bits: %u/%u verify / batched rows differ from the solo decode row\n", lh_bad, lh_total));
     ok = ok && lh_bad == 0;
     out(ok ? "seqtest: ok\n" : "seqtest: FAIL\n");
@@ -2039,14 +2160,10 @@ int goldenSingle(const Args& a, const gguf::File& f, const Tok& tok, u32 n_dec, 
         ngram_only ? std::string("Copy the following text word for word, twice, and add nothing else.\n\n") + k_bench_text : std::string(k_golden_short), false));
     const std::vector<u32> lp = goldenLongIds(tok, 4000);
     auto* tk = static_cast<std::int32_t*>(hip::hostMalloc(4));
-    // plain chunked prefill, then the pipelined decode step chat runs (graph / fused path)
+    // the chat prefill (the server's forwards, CLI-SCHED), then the pipelined decode step chat runs (graph / fused path)
     auto plain = [&](const char* name, const std::vector<u32>& ids, u32 nd) {
         m.reset();
-        for (std::size_t off = 0; off < ids.size();) {
-            const std::size_t n = std::min<std::size_t>(ids.size() - off, m.max_batch);
-            m.forward(std::span<const u32>(ids).subspan(off, n), static_cast<u32>(off));
-            off += n;
-        }
+        prefillLikeServer(m, tok, ids, false);
         u32 t = m.beginDecode(static_cast<u32>(ids.size()));
         gout(fmt("%s.prefill n=%zu next=%u ", name, ids.size(), t) + gr.line(m));
         std::vector<u32> gen{t};
@@ -2070,11 +2187,7 @@ int goldenSingle(const Args& a, const gguf::File& f, const Tok& tok, u32 n_dec, 
         bool head = false;
         auto spec = [&](const char* name, bool ngram) {
             m.reset();
-            for (std::size_t off = 0; off < sp.size();) {
-                const std::size_t n = std::min<std::size_t>(sp.size() - off, m.max_batch);
-                m.prefillMtpChunk(sp, 0, off, n, std::nullopt);
-                off += n;
-            }
+            prefillLikeServer(m, tok, sp, true);
             const u32 next = m.beginDecode(static_cast<u32>(sp.size()));
             if (!head) {
                 m.buildDraftHeadEx(q::Model::DraftHeadKind::d2);

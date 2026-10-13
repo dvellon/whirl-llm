@@ -395,14 +395,16 @@ Ornith-1.5-35B-A3B MXFP4, precise / balance / fast, 9,500-token prompt; `whirl s
   before the end, and 9 rows before the end all changed them (every model and mode). The server
   never makes such splits; the earlier claim "1024 / 2048 / 4096 bit-identical" holds for the
   server's schedule, not for arbitrary chunk sizes.
-- **CLI vs server.** `whirl chat` prefills in forwards of `max_batch` (4096) rows from 0 (plus the
-  same think-open split), not on the server schedule. Its splits are multiples of 4096 (so multiples
-  of 64): when its last forward has 64 or more rows the CLI gives the server's bits (measured, 9,500
-  tokens: last forward 1,308 rows, equal); when the prompt is 4096·k plus fewer than 64 tokens the
-  last forward is short and the bits differ (8,232 tokens: last forward 40 rows, different). Also
-  different: a server request with a system message of 2048+ tokens (split at B, the CLI does not
-  split there), and the CLI with a `WHIRL_PREFILL_BATCH` that is not a multiple of 64 or that leaves
-  a short last forward (same mechanism; a split at row 1000 was measured above).
+- **CLI vs server: the same bits for the same prompt (CLI-SCHED).** `whirl chat` (and the golden
+  suite) prefill on the server's schedule: the same functions (`include/whirl/prefill_schedule.h`),
+  the same forced splits (system message of 2048+ tokens, think-open, image ends) and the same
+  forwards a prompt sent alone to the server runs (2 chunks per forward, the TAIL-CK forward end;
+  `WHIRL_PREFILL_CHUNK`, `WHIRL_SYS_MIN`, `WHIRL_VIS_CKPT_MIN` apply to both). Before, the CLI ran
+  forwards of `max_batch` (4096) rows, so a prompt of 4096·k plus a few tokens (8,232 tokens: last
+  forward 40 rows) or with a long system message got other bits than the server. `whirl seqtest`
+  checks it (CLI-SCHED gate: last-row logits bits of the CLI prefill == the server's forwards, with
+  and without MTP, at 4,000 / 4,100 / 8,232 tokens, a thinking-mode prompt and a long system message;
+  `--sched-lens 32800` adds lengths). `WHIRL_DUMP_LOGITS` (the KL gate) keeps its own 16-row forwards.
 
 | Server, MTP + n-gram | Q4_K_M before → after | MXFP4 before → after |
 |---|---|---|
