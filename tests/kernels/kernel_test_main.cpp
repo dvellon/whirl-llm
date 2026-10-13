@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
         }
     }
     const char* fam_names[] = {"quant", "gemv", "gemm", "attn", "attndq4", "gdn", "moe", "moemx", "moef", "misc", "attnbench",
-                               "gemvh", "gemvhbench", "dflash"};
+                               "gemvh", "gemvhbench", "dflash", "ws4", "ws4bench", "ws4g", "ws4gbench", "vision"};  // = fams below
     for (const std::string& f : only) {
         bool known = false;
         for (const char* n : fam_names) known = known || f == n;

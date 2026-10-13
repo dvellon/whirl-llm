@@ -24,7 +24,13 @@
 namespace kt {
 namespace {
 
-constexpr int kH = 24, kNkv = 4, kD = 256, kQStr = 2 * kD, kNs = 64;
+// heads: the 27B (24 q / 4 kv heads, GQA 6) by default; the second pass of ws4 / ws4g uses the
+// qwen35moe shape (16 / 2, GQA 8: one 8-column group per row, tiles aligned with rows)
+int kH = 24, kNkv = 4;
+constexpr int kD = 256, kQStr = 2 * kD, kNs = 64;
+// the GQA-8 pass: reduced context list (the 27B pass covers 256k), result names tagged
+bool g_grp8 = false;
+const char* grpTag() { return g_grp8 ? " [grp 8: 16 / 2 heads]" : ""; }
 const float kSc = 1.0f / 16.0f;
 
 enum class F { f16, q8, q4 };
@@ -125,7 +131,7 @@ Partials run(Ctx& c, hip::Function fn, const Pool& p, const Buf& dq, const std::
         g.first[r] = r;
         g.count[r] = 1;
     }
-    hip::launch(fn, {kNkv, static_cast<unsigned>(ns), static_cast<unsigned>(n)}, {128, 1, 1}, 0, c.s, dq.p(), p.args(dkvb.p(), win), ml.p(),
+    hip::launch(fn, {static_cast<unsigned>(kNkv), static_cast<unsigned>(ns), static_cast<unsigned>(n)}, {128, 1, 1}, 0, c.s, dq.p(), p.args(dkvb.p(), win), ml.p(),
                 acc.p(), kH, kNkv, kQStr, dpos.p(), kSc, DevPtr{0}, g);
     c.sync();
     return {ml.down<float>(static_cast<std::size_t>(n) * ns * kH * 2), acc.down<float>(static_cast<std::size_t>(n) * ns * kH * kD)};
@@ -241,17 +247,27 @@ void ws4IndexChecks(Ctx& c) {
     c.rep.add(r);
 }
 
+static void ws4Pass(Ctx& c);
+static void ws4gPass(Ctx& c);
+
 void testAttnWs4(Ctx& c) {
     c.rep.family = "ws4";
     ws4IndexChecks(c);
+    ws4Pass(c);
+    kH = 16, kNkv = 2, g_grp8 = true;
+    ws4Pass(c);
+    kH = 24, kNkv = 4, g_grp8 = false;
+}
+
+static void ws4Pass(Ctx& c) {
     if (!c.fnOpt("attn_ws4")) {
         c.rep.skip("ws4", "attn_ws4", "kernel not in this code object");
         return;
     }
-    const int maxpos = c.quick ? 70000 : 262144;
+    const int maxpos = (c.quick || g_grp8) ? 70000 : 262144;
     const int pages = (maxpos + wk::kKvPage - 1) / wk::kKvPage;
     std::vector<int> ctxs = {1, 2, 31, 32, 33, 63, 64, 65, 255, 256, 257, 511, 4095, 4096, 4097, 8191, 32767, 32768, 32769, 65613};
-    if (!c.quick)
+    if (!c.quick && !g_grp8)
         for (int x : {98304, 131071, 131072, 131073, 196613, 262143, 262144}) ctxs.push_back(x);
     for (int i = 0; i < 24; ++i) ctxs.push_back(1 + static_cast<int>(c.rng() % static_cast<std::uint64_t>(maxpos)));
     const std::vector<float> q = c.randn(static_cast<std::size_t>(8) * kH * kQStr);
@@ -275,7 +291,7 @@ void testAttnWs4(Ctx& c) {
         }
     }
     for (F f : {F::f16, F::q8, F::q4}) {
-        const std::string tag = std::string(" [kv ") + fname(f) + "]";
+        const std::string tag = std::string(" [kv ") + fname(f) + "]" + grpTag();
         const auto fold = c.fnOpt(std::string("attn_wsplit1") + fsuf(f));
         if (!fold) {
             c.rep.skip("ws4", std::string("attn_ws4") + fsuf(f), "attn_wsplit1 reference not in this code object");
@@ -412,7 +428,7 @@ void benchAttnWs4(Ctx& c) {
                     continue;
                 }
                 auto launch = [&]() {
-                    hip::launch(fn, {kNkv, kNs, 1}, {threads, 1, 1}, 0, c.s, dq.p(), p.args(dkvb.p()), ml.p(), acc.p(), kH, kNkv, kQStr, dpos.p(), kSc,
+                    hip::launch(fn, {static_cast<unsigned>(kNkv), kNs, 1}, {threads, 1, 1}, 0, c.s, dq.p(), p.args(dkvb.p()), ml.p(), acc.p(), kH, kNkv, kQStr, dpos.p(), kSc,
                                 DevPtr{0}, g);
                 };
                 for (int i = 0; i < 3; ++i) launch();
@@ -431,7 +447,7 @@ void benchAttnWs4(Ctx& c) {
             }
             if (f == F::q8 && L == lens[0]) {  // attn_combine (24 heads, 64 splits), for the fusion estimate
                 auto launch = [&]() {
-                    hip::launch(c.k.attn_combine, {kH, 1, 1}, {256, 1, 1}, 0, c.s, ml.p(), acc.p(), dq.p(), out.p(), kH, kD, kQStr, kNs);
+                    hip::launch(c.k.attn_combine, {static_cast<unsigned>(kH), 1, 1}, {256, 1, 1}, 0, c.s, ml.p(), acc.p(), dq.p(), out.p(), kH, kD, kQStr, kNs);
                 };
                 for (int i = 0; i < 3; ++i) launch();
                 c.sync();
@@ -464,10 +480,10 @@ void benchAttnWs4(Ctx& c) {
 // L - 1) for attn_ws4g vs the single-row attn_ws4 and the old per-row attn_wsplit1 groups.
 namespace {
 
-constexpr int kGrp = kH / kNkv;
+int kGrp() { return kH / kNkv; }
 
 // natural tile count for a group of `rows` rows (16-column tiles, at most 3 = 8 rows per block)
-int ws4gCg(int rows) { return std::min(3, (rows * kGrp + 15) / 16); }
+int ws4gCg(int rows) { return std::min(3, (rows * kGrp() + 15) / 16); }
 
 // host grouping rule: consecutive rows with the same split ranges (per and draft window)
 std::vector<std::pair<int, int>> ws4grp(const std::vector<int>& pos, int win, int maxc = 32) {
@@ -495,7 +511,7 @@ Partials runG(Ctx& c, hip::Function fn, int cg, const Pool& p, const Buf& dq, co
     ml.fill(0x7f);
     acc.fill(0x7f);
     wk::AwGroups g{};
-    const int rpb = ws4::rows_per_block(cg, kGrp);
+    const int rpb = ws4::rows_per_block(cg, kGrp());
     int ncg = 1;
     for (std::size_t i = 0; i < grps.size(); ++i) {
         g.first[i] = grps[i].first;
@@ -512,6 +528,13 @@ Partials runG(Ctx& c, hip::Function fn, int cg, const Pool& p, const Buf& dq, co
 
 void testAttnWs4g(Ctx& c) {
     c.rep.family = "ws4g";
+    ws4gPass(c);
+    kH = 16, kNkv = 2, g_grp8 = true;
+    ws4gPass(c);
+    kH = 24, kNkv = 4, g_grp8 = false;
+}
+
+static void ws4gPass(Ctx& c) {
     {
         std::size_t bad = 0;
         for (int kb = 0; kb < 4; ++kb)
@@ -527,10 +550,10 @@ void testAttnWs4g(Ctx& c) {
         c.rep.skip("ws4g", "attn_ws4g3", "kernel not in this code object");
         return;
     }
-    const int maxpos = c.quick ? 70000 : 262144;
+    const int maxpos = (c.quick || g_grp8) ? 70000 : 262144;
     const int pages = (maxpos + wk::kKvPage - 1) / wk::kKvPage;
     std::vector<int> ctxs = {1, 2, 3, 8, 31, 32, 33, 40, 63, 64, 65, 255, 256, 257, 4095, 4096, 4097, 4100, 8191, 32767, 32768, 32769, 65613};
-    if (!c.quick)
+    if (!c.quick && !g_grp8)
         for (int x : {98304, 131071, 131072, 131073, 196613, 262143, 262144}) ctxs.push_back(x);
     for (int i = 0; i < 8; ++i) ctxs.push_back(1 + static_cast<int>(c.rng() % static_cast<std::uint64_t>(maxpos)));
     const std::vector<float> q = c.randn(static_cast<std::size_t>(32) * kH * kQStr);
@@ -555,7 +578,7 @@ void testAttnWs4g(Ctx& c) {
         }
     }
     for (F f : {F::f16, F::q8}) {
-        const std::string tag = std::string(" [kv ") + fname(f) + "]";
+        const std::string tag = std::string(" [kv ") + fname(f) + "]" + grpTag();
         const auto fold = c.fnOpt(std::string("attn_wsplit1") + fsuf(f));
         const auto fsolo = c.fnOpt(std::string("attn_ws4") + fsuf(f));
         hip::Function fg[4];
@@ -719,14 +742,14 @@ void benchAttnWs4g(Ctx& c) {
                     g.count[0] = 1;
                     const auto fn = c.fnOpt(std::string("attn_ws4") + fsuf(f));
                     t1 = timeit([&]() {
-                        hip::launch(fn, {kNkv, kNs, 1}, {128, 1, 1}, 0, c.s, dq.p(), kva, ml.p(), acc.p(), kH, kNkv, kQStr, dpos.p(), kSc, DevPtr{0}, g);
+                        hip::launch(fn, {static_cast<unsigned>(kNkv), kNs, 1}, {128, 1, 1}, 0, c.s, dq.p(), kva, ml.p(), acc.p(), kH, kNkv, kQStr, dpos.p(), kSc, DevPtr{0}, g);
                     });
                     std::printf("   ws4gbench %-4s L %6d rows  1 attn_ws4 (single row)      %8.1f us  %6.1f GB/s\n", fname(f), L, t1, bytes / t1 / 1e3);
                 }
                 const auto grps = ws4grp(pos, 0);
                 int maxc = 1;
                 for (const auto& gg : grps) maxc = std::max(maxc, gg.second);
-                const int cg = ws4gCg(maxc), rpb = ws4::rows_per_block(cg, kGrp);
+                const int cg = ws4gCg(maxc), rpb = ws4::rows_per_block(cg, kGrp());
                 wk::AwGroups g{};
                 for (std::size_t i = 0; i < grps.size(); ++i) {
                     g.first[i] = grps[i].first;
@@ -748,7 +771,7 @@ void benchAttnWs4g(Ctx& c) {
                     }
                     const auto fo = c.fnOpt(std::string("attn_wsplit1") + fsuf(f));
                     const double uo = timeit([&]() {
-                        hip::launch(fo, {kNkv, kNs, static_cast<unsigned>(R)}, {128, 1, 1}, 0, c.s, dq.p(), kva, ml.p(), acc.p(), kH, kNkv, kQStr, dpos.p(), kSc,
+                        hip::launch(fo, {static_cast<unsigned>(kNkv), kNs, static_cast<unsigned>(R)}, {128, 1, 1}, 0, c.s, dq.p(), kva, ml.p(), acc.p(), kH, kNkv, kQStr, dpos.p(), kSc,
                                     DevPtr{0}, go);
                     });
                     std::printf("   ws4gbench %-4s L %6d rows %2d attn_wsplit1 (per-row groups)  %8.1f us\n", fname(f), L, R, uo);
