@@ -1,6 +1,7 @@
 // Unit tests of the prefix cache module (src/cache) against a mock tier.
 // SPDX-License-Identifier: Apache-2.0
 
+#include "../test_env.h"
 #include "cache/fingerprint.h"
 #include "cache/prefix_cache.h"
 #include "mock_tier.h"
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <format>
 #include <numeric>
+#include <stdexcept>
 
 using namespace whirl::cache;
 using whirl::cache::test::MockTier;
@@ -280,6 +282,75 @@ static std::uint64_t oldFingerprint(const FingerprintInputs& in, std::vector<std
     return h;
 }
 
+// FIX-TEST-A (FR-TEST P2-3): the server's fingerprint assembly (cache::serverFingerprintInputs, called
+// by server_main.cpp). Mutation M5 (server_main stopped filling gpu_arch / gpu_name) passed every test.
+static void testServerFingerprintInputs() {
+    ServerIdentity s;
+    s.exe_id = 0x77;
+    s.model_path = "C:\\models\\x\\Qwen3.8-27B-Q4_K_M.gguf";
+    s.tensors = 851;
+    s.bytes = 16'000'000'000ull;
+    s.kv_name = "q8h";
+    s.use_mtp = true;
+    s.n_gdn = 48;
+    s.ck_bytes = 1 << 20;
+    s.page_bytes = 1 << 18;
+    s.max_batch = 4096;
+    s.numerics = "balance";
+    s.gpu_arch = "gfx1201";
+    s.gpu_name = "AMD Radeon AI PRO R9700";
+    s.kernel_arch = "gfx1201";
+    s.kernel_co_bytes = 123456;
+    s.env = {{"WHIRL_A", "1"}};
+    const FingerprintInputs in = serverFingerprintInputs(s);
+    CHECK(in.gpu_arch == "gfx1201");
+    CHECK(in.gpu_name == "AMD Radeon AI PRO R9700");
+    CHECK(in.kernel_set == "gfx1201 co 123456");
+    CHECK(in.model_base == "Qwen3.8-27B-Q4_K_M.gguf");
+    CHECK(in.kv_name == "q8h" && in.numerics == "balance" && in.max_batch == 4096 && in.use_mtp && in.n_gdn == 48);
+    CHECK(in.tensors == 851 && in.bytes == 16'000'000'000ull && in.ck_bytes == (1u << 20) && in.page_bytes == (1u << 18));
+    CHECK(in.exe_id == 0x77 && in.env.size() == 1);
+    CHECK(!in.legacy_no_gpu);
+    const std::uint64_t fp = tierFingerprint(in);
+    // a different GPU (same exe, same model) -> a different fingerprint, field by field
+    ServerIdentity o = s;
+    o.gpu_arch = "gfx1151";
+    CHECK(tierFingerprint(serverFingerprintInputs(o)) != fp);
+    o = s;
+    o.gpu_name = "AMD Radeon(TM) 8060S Graphics";
+    CHECK(tierFingerprint(serverFingerprintInputs(o)) != fp);
+    o = s;
+    o.kernel_arch = "gfx1151";
+    CHECK(tierFingerprint(serverFingerprintInputs(o)) != fp);
+    o = s;
+    o.kernel_co_bytes += 1;
+    CHECK(tierFingerprint(serverFingerprintInputs(o)) != fp);
+    o = s;
+    o.kv_name = "f16";
+    CHECK(tierFingerprint(serverFingerprintInputs(o)) != fp);
+    // missing GPU identity -> error (no silent old format)
+    auto throws = [](const ServerIdentity& x) {
+        try {
+            (void)serverFingerprintInputs(x);
+        } catch (const std::invalid_argument&) {
+            return true;
+        }
+        return false;
+    };
+    o = s;
+    o.gpu_arch.clear();
+    CHECK(throws(o));
+    o = s;
+    o.kernel_arch.clear();
+    CHECK(throws(o));
+    o = s;
+    o.kernel_co_bytes = 0;
+    CHECK(throws(o));
+    o = s;
+    o.gpu_name.clear();  // the name is informative only; the arch is the key
+    CHECK(!throws(o));
+}
+
 static void testFingerprint() {
     FingerprintInputs in;
     in.exe_id = 0x1234abcd;
@@ -293,6 +364,7 @@ static void testFingerprint() {
     in.page_bytes = 1 << 18;
     in.max_batch = 4096;
     in.numerics = "balance (items a,b)";
+    in.legacy_no_gpu = true;  // the format checks below compare with the pre-FIX-NUM hash
     const std::uint64_t base = tierFingerprint(in);
     CHECK(base == tierFingerprint(in));
     CHECK(base == oldFingerprint(in, {}));
@@ -335,8 +407,10 @@ static void testFingerprint() {
     // FIX-NUM P2-2: the GPU code object is part of the key (one exe, R9700 + 8060S kernels)
     {
         FingerprintInputs a = in, b = in;
+        a.legacy_no_gpu = b.legacy_no_gpu = false;
         a.gpu_arch = "gfx1201";
         b.gpu_arch = "gfx1151";
+        a.kernel_set = b.kernel_set = "co 1";
         CHECK(tierFingerprint(a) != tierFingerprint(b));
         CHECK(tierFingerprint(a) != base && tierFingerprint(b) != base);
         CHECK(tierFingerprint(a) == tierFingerprint(a));
@@ -347,6 +421,29 @@ static void testFingerprint() {
         e = a;
         e.kernel_set = "gfx1151 co 123";
         CHECK(tierFingerprint(e) != tierFingerprint(a));
+        // FIX-TEST-A (FR-TEST P2-3): an empty GPU identity is an error, not the old format
+        auto throws = [](const FingerprintInputs& x) {
+            try {
+                (void)tierFingerprint(x);
+            } catch (const std::invalid_argument&) {
+                return true;
+            }
+            return false;
+        };
+        e = a;
+        e.gpu_arch.clear();
+        CHECK(throws(e));
+        e = a;
+        e.kernel_set.clear();
+        CHECK(throws(e));
+        e = a;
+        e.gpu_arch.clear();
+        e.gpu_name.clear();
+        e.kernel_set.clear();
+        CHECK(throws(e));  // all three empty: used to hash silently as the pre-FIX-NUM format
+        e = a;
+        e.legacy_no_gpu = true;  // legacy format with GPU fields set: contradictory
+        CHECK(throws(e));
     }
     p.env = {{"Whirl_Relax", "1"}};  // prefix check is case-insensitive, the key is hashed as written
     CHECK(tierFingerprint(p) != base);
@@ -466,6 +563,7 @@ static void testSupersede() {
 }
 
 int main() {
+    whirl::test::clearWhirlEnv();  // FR-TEST P3-11
     testHelpers();
     testMatchSlot();
     testCkptSlotFor();
@@ -474,6 +572,12 @@ int main() {
     testTier();
     testLcpTarget();
     testFingerprint();
+    try {
+        testServerFingerprintInputs();
+    } catch (const std::exception& e) {  // e.g. a field the assembly no longer fills: report, do not abort
+        std::printf("testServerFingerprintInputs threw: %s\n", e.what());
+        CHECK(false);
+    }
     testSupersede();
     std::printf("cache tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

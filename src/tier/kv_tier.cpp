@@ -1127,6 +1127,53 @@ std::vector<std::uint64_t> Tier::dependentClosure(const Entry* e) const {
     return seen;
 }
 
+// DEDUP-INV: startWrite references only entries already on the SSD and not busy. Entries that become
+// due in the same pass (the graceful shutdown flush starts every write on one tick; in `always` mode
+// several sessions can pass the write delay together) would each write the common prefix (a shared
+// system prompt) in full. The later ones wait while an in-flight write of another entry would give
+// them more whole shared blocks than the files already on disk. Writes run one at a time on the IO
+// thread, so the wait costs about one tick. No wait cycle: only entries not yet started wait, and only
+// for writes already submitted (which always finish). Entries that depend on e are not bases (cycles).
+bool Tier::waitForDedupBase(const Entry* e) const {
+    if (!cfg.dedup || lay.page_tokens == 0 || e->n_tok == 0) return false;
+    const auto blocksOf = [&](std::size_t l) {
+        return static_cast<std::uint64_t>(l / lay.page_tokens) * lay.page_bytes / block_bytes;
+    };
+    const auto common = [&](const std::vector<std::uint32_t>& bt) {
+        const std::size_t lim = std::min<std::size_t>(bt.size(), e->n_tok);
+        std::size_t l = 0;
+        while (l < lim && bt[l] == e->tokens[l]) l += 1;
+        return l;
+    };
+    std::size_t on_disk = 0, in_flight = 0;
+    std::optional<std::vector<std::uint64_t>> dep;
+    for (const Entry* b : entries) {
+        if (b == e) continue;
+        const std::vector<std::uint32_t>* bt = nullptr;
+        bool flight = false;
+        if (b->io_busy) {
+            for (const Job* j : jobs_)
+                if (j->kind == JobKind::write && j->entry_id == b->id && !j->finished.load(std::memory_order_acquire) && j->snap) {
+                    bt = &j->snap->tokens;
+                    break;
+                }
+            if (bt == nullptr && b->ssd && !b->ssd_stale) bt = &b->ssd->tokens;  // a read: usable once it ends
+            flight = bt != nullptr;
+        } else if (b->ssd && !b->ssd_stale && !b->ssd->tbl.empty()) {
+            bt = &b->ssd->tokens;
+        }
+        if (bt == nullptr) continue;
+        const std::size_t l = common(*bt);
+        if (blocksOf(l) <= blocksOf(flight ? in_flight : on_disk)) continue;
+        if (e->ssd) {
+            if (!dep) dep = dependentClosure(e);
+            if (std::find(dep->begin(), dep->end(), b->id) != dep->end()) continue;
+        }
+        (flight ? in_flight : on_disk) = l;
+    }
+    return blocksOf(in_flight) > blocksOf(on_disk);
+}
+
 namespace {
 bool jobRefs(const Job* j, std::uint64_t id) {
     if (j->kind != JobKind::write || j->finished.load(std::memory_order_acquire)) return false;
@@ -1793,6 +1840,10 @@ bool Tier::tick() {
                 delay_wait = true;
                 const auto due = e->t_mod + std::chrono::milliseconds(cfg.ssd_delay_ms);
                 if (!next_due_ || due < *next_due_) next_due_ = due;
+                continue;
+            }
+            if (waitForDedupBase(e)) {  // DEDUP-INV: share the prefix another entry is writing now
+                busy = true;
                 continue;
             }
             try {

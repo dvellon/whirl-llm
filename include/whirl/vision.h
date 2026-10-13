@@ -112,6 +112,12 @@ struct Hparams {
     SizeOpt sizeOpt() const;
 };
 
+// Content key of an image's embeddings (Prepared::hash, set by Vision::prepareRgb; the embedding cache
+// and the prefix cache key on it): SHA-256 over a tag, the mmproj identity, the source width / height,
+// the target size, the token limits and the pixels (FIX-TEST-A, FR-TEST P3-1: a free function so the
+// tests can check every field is part of it).
+std::array<std::uint8_t, 32> imageKey(std::uint64_t mmproj_id, const Hparams& hp, const Rgb& src);
+
 // A device region lent to the encoder for the duration of one encode.
 struct Region {
     DevPtr ptr = 0;

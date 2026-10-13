@@ -6,6 +6,7 @@
 // Usage: whirl-tier-tests [temp dir for the SSD tier]
 //   (default: %WHIRL_TEST_TMP%\tier_test_tmp, else %TEMP%\whirl-tests\tier_test_tmp)
 
+#include "../test_env.h"
 #include "tier/kv_tier.h"
 #include "tier/ram_size.h"
 #include "cache/prefix_cache.h"
@@ -1208,8 +1209,19 @@ static void testOwnerRewrite(MockDeviceOps& ops, const fs::path& dir) {
     a.toks.insert(a.toks.end(), ta.begin(), ta.end());
     spillSess(*t, a, 1000);
     CHECK(tickIdle(*t));
-    CHECK(t->dependentsOf(a.e).empty());
-    CHECK(b.e->ssd.has_value());  // written again (own blocks)
+    CHECK(b.e->ssd.has_value());  // written again
+    // DEDUP-INV: b's write waits for a's rewrite and then shares only what a still has in common
+    // (tokens [0, 1000): 3 pages = 2 whole blocks), never a changed block
+    if (b.e->ssd && a.e->ssd) {
+        const std::uint32_t a_lb0 = static_cast<std::uint32_t>(a.e->ssd->nck * kLay.ckStride() / block_bytes);
+        std::size_t refs_a = 0, bad = 0;
+        for (const BlkRef& r : b.e->ssd->tbl) {
+            if (r.owner == 0) continue;
+            bad += r.owner != a.id || r.owner_lb >= a_lb0 + 2 ? 1 : 0;
+            refs_a += r.owner == a.id ? 1 : 0;
+        }
+        CHECK(bad == 0 && refs_a <= 2);
+    }
     CHECK(restoreMatches(*t, ops, a.e, a));
     const std::uint64_t id_b = b.id;
     t.reset();
@@ -1962,6 +1974,76 @@ static void testShutdownFlush(MockDeviceOps& ops, const fs::path& dir) {
     }
 }
 
+
+// DEDUP-INV: entries that become due for a write in the same pass (the graceful shutdown flush writes every
+// session at once; in `always` mode several sessions can pass the write delay on one tick) still share their
+// common prefix: an entry whose prefix another entry is writing right now waits for that write instead of
+// writing its own copy. Before the fix every startWrite of the pass saw no SSD base (the first file was still
+// in flight) and the system prompt was written once per session.
+static void testFlushDedup(MockDeviceOps& ops, const fs::path& dir) {
+    for (int mode = 0; mode < 2; ++mode) {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        SsdEnv env{dir};
+        const std::uint64_t fp = hashStr(0xcbf29ce484222325ull, "flushdedup");
+        std::uint64_t seed = 3700 + static_cast<std::uint64_t>(mode) * 10;
+        const auto sys = freshToks(2560, seed);  // 10 pages = 7 whole blocks
+        Sess s0(ops, 24), s1(ops, 24), s2(ops, 24), u(ops, 24);
+        Sess* fam[3] = {&s0, &s1, &s2};
+        for (Sess* s : fam) {
+            s->toks = sys;
+            auto tail = freshToks(600 + 300 * static_cast<std::size_t>(s - &s0), seed);
+            s->toks.insert(s->toks.end(), tail.begin(), tail.end());
+        }
+        u.toks = freshToks(2000, seed);  // unrelated: shares nothing, written alongside
+        std::uint64_t ids[3] = {};
+        {
+            auto t = Tier::create(ops, 256ull << 20, 37, 0);
+            Config c = env.cfg(4ull << 30);
+            c.ssd_delay_ms = mode == 0 ? 600000 : 200;
+            c.ssd_shutdown_only = mode == 0;
+            t->start(c, kLay, fp);
+            for (Sess* s : fam) spillSess(*t, *s, 0);
+            spillSess(*t, u, 0);
+            for (int i = 0; i < 3; ++i) ids[i] = fam[i]->id;
+            t->tick();
+            CHECK(t->stats.ssd_writes == 0);
+            if (mode == 0) {
+                t->flushing = true;
+                t->cfg.ssd_delay_ms = 0;
+            } else {
+                sleepMs(250);  // all four pass the write delay on the same tick
+            }
+            CHECK(tickIdle(*t));
+            CHECK(t->stats.ssd_writes == 4);
+            std::size_t refs = 0;
+            for (std::uint64_t id : ids) {
+                const Entry* e = t->find(id);
+                CHECK(e != nullptr && e->ssd.has_value());
+                if (e && e->ssd)
+                    for (const BlkRef& r : e->ssd->tbl) refs += r.owner != 0 ? 1 : 0;
+            }
+            std::printf("flush dedup (%s): %zu shared block refs, %.0f MiB shared, %.1f MiB written\n",
+                        mode == 0 ? "shutdown flush" : "always, same tick", refs, t->stats.ssd_dedup_bytes / 1048576.0,
+                        t->stats.ssd_write_bytes / 1048576.0);
+            CHECK(refs == 14);  // two of the three store the 7 system-prompt blocks as references
+            CHECK(t->stats.ssd_dedup_bytes == 14 * block_bytes);
+        }
+        {
+            // restart: all indexed, references verified, every session restores byte-exact
+            auto t = Tier::create(ops, 256ull << 20, 38, 0);
+            t->start(env.cfg(4ull << 30), kLay, fp);
+            CHECK(t->ssdEntries() == 4);
+            for (int i = 0; i < 3; ++i) {
+                Entry* e = t->find(ids[i]);
+                CHECK(e != nullptr);
+                if (e) CHECK(restoreMatches(*t, ops, e, *fam[i]));
+                CHECK(tickIdle(*t));
+            }
+        }
+        fs::remove_all(dir, ec);
+    }
+}
 
 // Graceful flush order: most recently used first (a restore counts as use), so when the time bound runs
 // out the oldest sessions are the ones not written. Writes run in submission order on the IO thread.
@@ -3373,13 +3455,18 @@ static void testTokCapRestart(MockDeviceOps& ops, const fs::path& dir) {
     fs::remove_all(dir, ec);
 }
 
-// WHIRL_TIER_ONLY=<test name>: run only that test (regression proofs)
+// WHIRL_TIER_ONLY=<test name>: run only that test (regression proofs). A name that matches no test is
+// a usage error (exit 2; FIX-TEST-A, FR-TEST P3-3: a typo used to run 1 check in main and pass).
+static int g_only_matched = 0;
 static bool want(const char* name) {
     const char* only = std::getenv("WHIRL_TIER_ONLY");
-    return only == nullptr || *only == 0 || std::strcmp(only, name) == 0;
+    const bool all = only == nullptr || *only == 0;
+    if (!all && std::strcmp(only, name) == 0) ++g_only_matched;
+    return all || std::strcmp(only, name) == 0;
 }
 
 int main(int argc, char** argv) {
+    whirl::test::clearWhirlEnv({L"WHIRL_TIER_ONLY", L"WHIRL_TIER_AMP"});  // FR-TEST P3-11
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // default: WHIRL_TEST_TMP, else %TEMP%\whirl-tests; this test uses <base>\tier_test_tmp
     fs::path base;
@@ -3472,6 +3559,10 @@ int main(int argc, char** argv) {
         std::printf("-- %s\n", "testShutdownFlush");
         testShutdownFlush(ops, dir);
     }
+    if (want("testFlushDedup")) {
+        std::printf("-- %s\n", "testFlushDedup");
+        testFlushDedup(ops, dir);
+    }
     if (want("testFlushOrder")) {
         std::printf("-- %s\n", "testFlushOrder");
         testFlushOrder(ops, dir);
@@ -3545,5 +3636,13 @@ int main(int argc, char** argv) {
         testPowerLoss(ops, dir);
     }
     std::printf("tier tests: %d passed, %d failed\n", g_pass, g_fail);
+    if (const char* only = std::getenv("WHIRL_TIER_ONLY"); only && *only && g_only_matched == 0) {
+        std::printf("tier tests: WHIRL_TIER_ONLY=%s matches no test\n", only);
+        return 2;
+    }
+    if (g_pass + g_fail == 0) {
+        std::printf("tier tests: 0 checks ran: refusing to report success\n");
+        return 2;
+    }
     return g_fail == 0 ? 0 : 1;
 }

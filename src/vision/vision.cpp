@@ -319,11 +319,11 @@ Prepared Vision::prepare(std::span<const std::uint8_t> bytes) const {
     return prepareRgb(src);
 }
 
-Prepared Vision::prepareRgb(const Rgb& src) const {
+std::array<std::uint8_t, 32> imageKey(std::uint64_t mmproj_id, const Hparams& hp, const Rgb& src) {
     const auto ts = targetSize(src.w, src.h, hp.sizeOpt());
     std::uint8_t hdr[32];
     auto put32 = [&](int at, u32 x) { std::memcpy(hdr + at, &x, 4); };
-    std::memcpy(hdr, &id, 8);
+    std::memcpy(hdr, &mmproj_id, 8);
     put32(8, src.w);
     put32(12, src.h);
     put32(16, ts[0]);
@@ -333,10 +333,15 @@ Prepared Vision::prepareRgb(const Rgb& src) const {
     static const char tag[] = "whirl-vis-1";
     const std::span<const std::uint8_t> parts[3] = {
         {reinterpret_cast<const std::uint8_t*>(tag), sizeof(tag) - 1}, {hdr, 32}, {src.px.data(), src.px.size()}};
+    return sha256(parts);
+}
+
+Prepared Vision::prepareRgb(const Rgb& src) const {
+    const auto ts = targetSize(src.w, src.h, hp.sizeOpt());
     Prepared p;
     p.nx = ts[0] / 32;
     p.ny = ts[1] / 32;
-    p.hash = sha256(parts);
+    p.hash = imageKey(id, hp, src);
     p.rgb = resizePadCeil(src, ts[0], ts[1]);
     return p;
 }

@@ -24,7 +24,8 @@
 // WHIRL_* variable except WHIRL_DEVICE, WHIRL_VRAM_LIMIT_MB and WHIRL_MODE; a suite's own settings win), e.g.
 // WHIRL_KV_RAM_MB=8192 to turn the host tiers on for an integrated GPU (Radeon 8060S),
 // whose servers default to no tiers. --kv: the KV format the sys / restore_conc / vis
-// suites pin (default q8v; gfx1151 has no q8v kernels: use f16 or q8 there; auto = no pin).
+// suites pin (default auto = no pin: the format each mode ships, fixed at load by mode and model type;
+// FR-TEST P2-5: the old default q8v is a format no mode ships; gfx1151 has no q8v kernels).
 // --images = WHIRL_GATE_IMAGES (no default; only suite vis needs it).
 
 #include "http_client.h"
@@ -48,6 +49,7 @@
 #include <optional>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -71,7 +73,7 @@ struct Opts {
     std::string mmproj;
     std::string images;  // empty: WHIRL_GATE_IMAGES
     std::map<std::string, std::string> server_env;  // --server-env
-    std::string kv_pin = "q8v";                     // --kv
+    std::string kv_pin = "auto";                    // --kv (FIX-TEST-A: shipped formats by default)
 } g;
 
 // KV-format pin of the suites that compare servers with different free memory
@@ -409,6 +411,17 @@ bool concSame(const std::vector<ChatResult>& res, const std::vector<ChatResult>&
     return same;
 }
 
+// FIX-TEST-A (FR-TEST P2-2): a concurrency check must compare cold prefills: every reply answered and
+// cached == 0 ("cached" lists the cached counts in d)
+bool allCold(const std::vector<ChatResult>& res, std::string& d) {
+    bool cold = !res.empty();
+    for (const auto& r : res) {
+        cold = cold && r.status == 200 && r.cached == 0;
+        d += std::to_string(r.cached) + " ";
+    }
+    return cold;
+}
+
 // Do the servers run with relaxed acceptance (fast mode's relaxacc)? From WHIRL_MODE / WHIRL_RELAX as
 // the servers see them (--server-env, else this process's environment).
 bool relaxAccOn(const std::optional<std::string>& mode, const std::optional<std::string>& relax) {
@@ -638,6 +651,14 @@ std::optional<std::string> cliRun(const std::string& prompt, bool think, int max
                        L" --max-tokens " + std::to_wstring(max_tokens) + L" --no-stream";
     SetEnvironmentVariableW(L"WHIRL_THINK", think ? L"1" : L"0");
     SetEnvironmentVariableW(L"WHIRL_R9700_LOCK_HELD", std::to_wstring(GetCurrentProcessId()).c_str());
+    // FIX-TEST-A: the CLI reference runs in the servers' configuration (--server-env, e.g. WHIRL_MODE=precise);
+    // without it a precise server was compared with a default-mode (balance) CLI
+    std::map<std::string, std::optional<std::string>> env_before;
+    for (const auto& [k, v] : g.server_env) {
+        const char* old = std::getenv(k.c_str());
+        env_before[k] = old ? std::optional<std::string>(old) : std::nullopt;
+        SetEnvironmentVariableW(widen(k).c_str(), widen(v).c_str());
+    }
     SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
     HANDLE oh = CreateFileW(widen(out).c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, 0, nullptr);
     STARTUPINFOW si{};
@@ -653,6 +674,7 @@ std::optional<std::string> cliRun(const std::string& prompt, bool think, int max
     CloseHandle(oh);
     if (!ok) {
         g_lock.release();
+        for (const auto& [k, v] : env_before) SetEnvironmentVariableW(widen(k).c_str(), v ? widen(*v).c_str() : nullptr);
         return std::nullopt;
     }
     WaitForSingleObject(pi.hProcess, 900000);
@@ -660,6 +682,7 @@ std::optional<std::string> cliRun(const std::string& prompt, bool think, int max
     CloseHandle(pi.hThread);
     g_lock.release();
     SetEnvironmentVariableW(L"WHIRL_THINK", nullptr);
+    for (const auto& [k, v] : env_before) SetEnvironmentVariableW(widen(k).c_str(), v ? widen(*v).c_str() : nullptr);
     std::string s = readFile(out);
     std::string t;
     for (char c : s)
@@ -810,26 +833,43 @@ void suiteBasic() {
         }
         check("basic: multi-turn reuses the whole previous conversation", ok, detail);
     }
-    // concurrency: 4 different prompts at once == solo. Fast mode with relaxed acceptance only
+    // concurrency: different prompts at once == solo. Fast mode with relaxed acceptance only
     // guarantees quality within its gate, not concurrent == solo text (the draft cadence depends on
     // the load), so there the relax-on comparison is informational and the gated check runs a
     // server with WHIRL_RELAX=0 (it then tests the kernels' batch invariance).
-    auto concCheck = [&](const std::string& name, bool gated) {
-        const std::vector<std::string> ps = {"Explain a hash map in two sentences.", "What is RAII? Two sentences.",
-                                             "Write a Python one-liner that reverses a string.", P_ZH};
-        std::vector<ChatResult> alone;
-        for (const auto& p : ps) alone.push_back(chat(arr({msg("user", p)}), greedy(96) + thinkKw(false)));
+    // FIX-TEST-A (FR-TEST P2-2): the gated check runs on its own server without the prefix cache and
+    // the host tiers, and asserts cached == 0 for every request (alone and concurrent): with the cache on,
+    // the concurrent round re-sent the same prompts, hit the prompt-end checkpoints and so only compared
+    // concurrent decode, never concurrent (grouped / segmented) prefill. The prompts differ in length and one
+    // is longer than a server prefill chunk (1024), so the batched prefill crosses a chunk boundary.
+    const std::vector<std::string> conc_ps = {"Explain a hash map in two sentences.", "What is RAII? Two sentences.",
+                                              "Write a Python one-liner that reverses a string.", P_ZH,
+                                              codeText(6000, 5) + "\n\nWhat does the code above do? One sentence."};
+    auto concRound = [&](std::vector<ChatResult>& alone, std::vector<ChatResult>& res) {
+        alone.clear();
+        for (const auto& p : conc_ps) alone.push_back(chat(arr({msg("user", p)}), greedy(64) + thinkKw(false)));
         std::vector<std::function<ChatResult()>> jobs;
-        for (const auto& p : ps) jobs.push_back([&, p] { return chat(arr({msg("user", p)}), greedy(96) + thinkKw(false)); });
-        auto res = parallel(jobs);
+        for (const auto& p : conc_ps) jobs.push_back([&, p] { return chat(arr({msg("user", p)}), greedy(64) + thinkKw(false)); });
+        res = parallel(jobs);
+    };
+    auto concCheck = [&](const std::string& name, bool gated) {
+        std::vector<ChatResult> alone, res;
+        concRound(alone, res);
         std::string d;
         const bool same = concSame(res, alone, d);
-        if (gated)
-            for (std::size_t i = 0; i < ps.size(); ++i) record(std::format("basic/conc{}", i), alone[i].text());
-        if (gated)
-            check(name, same, d);
-        else
+        if (!gated) {
             logLine(std::format("INFO {}: {} ({}; not a gate)", name, same ? "equal" : "differs", d));
+            return;
+        }
+        for (std::size_t i = 0; i < conc_ps.size(); ++i) record(std::format("basic/conc{}", i), alone[i].text());
+        std::string cd;
+        const bool cold = allCold(alone, cd) && allCold(res, cd);
+        check(name + " (cold: cached == 0)", same && cold,
+              std::format("{}; cached {}; prompts {}", d, cd, [&] {
+                  std::string p;
+                  for (const auto& r : alone) p += std::to_string(r.prompt) + " ";
+                  return p;
+              }()));
     };
     auto envOf = [](const char* name) -> std::optional<std::string> {
         auto it = g.server_env.find(name);
@@ -837,14 +877,13 @@ void suiteBasic() {
         if (const char* m = std::getenv(name)) return std::string(m);
         return std::nullopt;
     };
-    if (relaxAccOn(envOf("WHIRL_MODE"), envOf("WHIRL_RELAX"))) {
-        concCheck("basic: 4 concurrent requests == each alone (fast, relaxacc on)", false);
-        s_opt.reset();
-        ServerLease s2("basic_norelax", {}, {{"WHIRL_RELAX", "0"}});
-        concCheck("basic: 4 concurrent requests == each alone (WHIRL_RELAX=0)", true);
-    } else {
-        concCheck("basic: 4 concurrent requests == each alone", true);
-    }
+    const bool relax = relaxAccOn(envOf("WHIRL_MODE"), envOf("WHIRL_RELAX"));
+    if (relax) concCheck("basic: concurrent requests == each alone (fast, relaxacc on)", false);
+    s_opt.reset();
+    std::map<std::string, std::string> cold_env = {{"WHIRL_NO_PREFIX_CACHE", "1"}};
+    if (relax) cold_env["WHIRL_RELAX"] = "0";
+    ServerLease s2("basic_cold", {"--kv-ram-mb", "0"}, cold_env);
+    concCheck(relax ? "basic: 5 concurrent requests == each alone (WHIRL_RELAX=0)" : "basic: 5 concurrent requests == each alone", true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,10 +1295,22 @@ void suiteSys() {
         check("sys: 4 concurrent sessions == cold, all reuse", ok, d);
         std::this_thread::sleep_for(std::chrono::seconds(3));
         s->waitTierIdle(60);  // pending SSD writes done before the stop
-        // CACHE-1 block dedup: sessions sharing the system prompt store its KV once
-        check("sys: SSD entries share the system prompt's KV blocks (dedup)",
-              s->logCount(R"(MiB, [1-9]\d* MiB shared with other entries)") >= 1,
-              std::format("{} SSD writes with shared blocks", s->logCount(R"(MiB, [1-9]\d* MiB shared with other entries)")));
+    }
+    {
+        // CACHE-1 block dedup: sessions sharing the system prompt store its KV once. Counted in the sys_tier log
+        // after its graceful stop (the default SSD mode writes at shutdown only; the always mode skips these
+        // one-shot sessions). DEDUP-INV: every session above shares the system prompt, so every SSD write but
+        // the first must reference its blocks (the flush used to write it in full each time: 0 shared).
+        const std::regex shared(R"(MiB, [1-9]\d* MiB shared with other entries)"), written(R"(written to SSD: )");
+        std::size_t n = 0, w = 0;
+        std::string line;
+        std::istringstream in(readFile(g.work + "\\server_sys_tier.log"));
+        while (std::getline(in, line)) {
+            if (std::regex_search(line, written)) ++w;
+            if (std::regex_search(line, shared)) ++n;
+        }
+        check("sys: SSD entries share the system prompt's KV blocks (dedup, written at shutdown)", w >= 2 && n + 1 >= w,
+              std::format("{} of {} SSD writes with shared blocks", n, w));
     }
     {
         auto env = kv;
@@ -1704,6 +1755,15 @@ int selfTest() {
     check("selftest: sameText of two failed requests -> false", !sameText(err, err4));
     check("selftest: sameText of a reasoning-only reply with itself -> true", sameText(think, think));
     check("selftest: sameText of different answers -> false", !sameText(ok, ok2));
+    {
+        ChatResult c0 = ok, c1 = ok;
+        c1.cached = 34;
+        std::string cd;
+        check("selftest: allCold of two cached == 0 replies -> true", allCold({c0, c0}, cd), cd);
+        check("selftest: allCold with one cached > 0 reply -> false (a warm round tests decode only)", !allCold({c0, c1}, cd), cd);
+        check("selftest: allCold of a failed request -> false", !allCold({err}, cd), cd);
+        check("selftest: allCold of no replies -> false", !allCold({}, cd), cd);
+    }
     using OS = std::optional<std::string>;
     check("selftest: WHIRL_MODE=fast -> relaxacc on", relaxAccOn(OS("fast"), std::nullopt));
     check("selftest: WHIRL_MODE=FAST / ' fast ' -> relaxacc on (the server parses case-insensitively)",
@@ -1784,7 +1844,7 @@ int wmain(int argc, wchar_t** wargv) {
                      "usage: whirl-server-gate --exe PATH --kind whirl|proto --model GGUF --suite basic,mt_cache,pool,tier,sys,restore_conc,vis,fast_stream\n"
                      "                         [--work DIR] [--port N] [--results OUT.json] [--compare REF.json] [--cli EXE] [--no-lock]\n"
                      "                         [--mmproj MMPROJ.gguf] [--images DIR]   (suite vis)\n"
-                     "                         [--server-env NAME=VALUE ...] [--kv q8v|q8|f16|auto]   (default q8v)\n"
+                     "                         [--server-env NAME=VALUE ...] [--kv q8v|q8|f16|auto]   (default auto)\n"
                      "  env: WHIRL_GATE_TEXT_ROOT (required), WHIRL_GATE_WORK, WHIRL_GATE_IMAGES, WHIRL_GPU_LOCK\n"
                      "       whirl-server-gate --results A.json --compare B.json   (compare two result files only)\n");
         return 2;

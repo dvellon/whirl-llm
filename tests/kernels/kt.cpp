@@ -69,7 +69,34 @@ void Report::add(Result r) {
 
 void Report::skip(const std::string& fam, const std::string& name, const std::string& why) {
     skipped_.push_back(fam + " " + name + ": " + why);
-    if (verbose) std::printf("  [skip] %s %s: %s\n", fam.c_str(), name.c_str(), why.c_str());
+    skips_.push_back({fam, name, why});
+    // always printed (FIX-TEST-A, FR-TEST P3-4: a skip is not a pass and must be visible in the log)
+    std::printf("  [SKIP] %s %s: %s\n", fam.c_str(), name.c_str(), why.c_str());
+}
+
+bool skipIsMissingKernel(const std::string& why) {
+    for (const char* k : {"not in this code object", "kernel not present", "kernels not available", "no precise MoE expert kernel"})
+        if (why.find(k) != std::string::npos) return true;
+    return false;
+}
+
+std::optional<bool> requiredKernelAbsentOk(const std::string& arch, const std::string& key) {
+    // kernels absent by design on each arch (a prefix of "family name"); anything else missing fails
+    static const std::vector<std::pair<std::string, std::vector<std::string>>> lists = {
+        // gfx1201: the 8060S grouped expert GEMMs; no precise MoE expert kernel for f32 / f16 experts
+        {"gfx1201", {"moe gemm_moegu", "moemx gemm_moegu", "moef gemm_moegu", "moef moe_gu_f_f32", "moef moe_gu_f_f16"}},
+        // gfx1151 (from the 8060S runs of attndq4,moef,misc; the other families were not run there in
+        // FIX-TEST-A, extend this list from a full 8060S run): no fp8 path, no gfx1201 precise MoE prefill
+        // GEMMs, no precise MoE expert kernel for f32 / f16 experts
+        {"gfx1151", {"fp8 ", "moe gemmr_moe", "moemx gemmr_moe", "moef gemmr_moe", "moef moe_gu_f_f32", "moef moe_gu_f_f16"}},
+    };
+    for (const auto& [a, keys] : lists) {
+        if (arch.rfind(a, 0) != 0) continue;
+        for (const auto& k : keys)
+            if (key.rfind(k, 0) == 0) return true;
+        return false;
+    }
+    return std::nullopt;
 }
 
 int Report::summary() const {

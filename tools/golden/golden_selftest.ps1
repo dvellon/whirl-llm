@@ -7,6 +7,9 @@
 #   - a run with only "G header" + "G info" (no step lines): exit 2, against any reference
 #   - a reference with only model + header + info lines: exit 2 (it has no step lines)
 #   - a record run where one case fails: exit 2 and no reference / models.txt is written
+#   - in-run cross-checks (FIX-TEST-A, FR-TEST P2-7): the real gfx1201 dense references pass xcheck; a run
+#     whose seg prefill lh differs from solo, or whose MTP stream is not an extension of the plain stream,
+#     is an error (exit 2) and record writes nothing; xcheck on such a reference tree exits 2
 $ErrorActionPreference = "Stop"
 $gate = Join-Path $PSScriptRoot "golden.ps1"
 $fake = Join-Path $PSScriptRoot "fake_whirl.cmd"
@@ -19,13 +22,13 @@ $env:WHIRL_GOLDEN_DENSE = $model
 $bad = 0
 
 function RunGate([string]$action, [string]$root, [hashtable]$fakeEnv) {
-    foreach ($k in @("FAKEGOLD_FAIL_SUITE", "FAKEGOLD_NOSTEPS")) { [Environment]::SetEnvironmentVariable($k, $null) }
+    foreach ($k in @("FAKEGOLD_FAIL_SUITE", "FAKEGOLD_NOSTEPS", "FAKEGOLD_DIR")) { [Environment]::SetEnvironmentVariable($k, $null) }
     foreach ($k in $fakeEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $fakeEnv[$k]) }
     $env:WHIRL_GOLDEN_DENSE = $model
     $out = & pwsh -NoProfile -File $gate $action -Models dense -Modes precise -Suites "single,pair" -Exe $fake `
         -GoldenRoot $root -Out (Join-Path $tmp "out") 2>&1 | ForEach-Object { "$_" }
     $rc = $LASTEXITCODE
-    foreach ($k in @("FAKEGOLD_FAIL_SUITE", "FAKEGOLD_NOSTEPS")) { [Environment]::SetEnvironmentVariable($k, $null) }
+    foreach ($k in @("FAKEGOLD_FAIL_SUITE", "FAKEGOLD_NOSTEPS", "FAKEGOLD_DIR")) { [Environment]::SetEnvironmentVariable($k, $null) }
     return @{ rc = $rc; out = $out }
 }
 function Expect([string]$name, $r, [int]$want, [scriptblock]$extra = { $true }) {
@@ -57,6 +60,39 @@ try {
     $r = RunGate "record" $g2 @{ FAKEGOLD_FAIL_SUITE = "pair" }
     Expect "record with a failing case writes no reference and no models.txt" $r 2 {
         -not (Test-Path (Join-Path $g2 "gfx1201\dense\precise_single.txt")) -and -not (Test-Path (Join-Path $g2 "models.txt")) }
+    # 5) in-run cross-checks with the real dense precise references as the fake run's output
+    $realRoot = Join-Path $PSScriptRoot "..\..\tests\golden"
+    $r = @{ out = @(& pwsh -NoProfile -File $gate xcheck -Arch gfx1201 -GoldenRoot $realRoot 2>&1 | ForEach-Object { "$_" }); rc = $LASTEXITCODE }
+    Expect "xcheck of the committed gfx1201 references" $r 0
+    $fd = Join-Path $tmp "fake_out"
+    New-Item -ItemType Directory -Force $fd | Out-Null
+    foreach ($s in @("single", "pair")) {
+        $l = @(Get-Content (Join-Path $realRoot "gfx1201\dense\precise_$s.txt"))
+        [System.IO.File]::WriteAllLines((Join-Path $fd "$s.txt"), [string[]]@($l[1..($l.Count - 1)]))  # drop "G model"
+    }
+    $g3 = Join-Path $tmp "g3"
+    $r = RunGate "record" $g3 @{ FAKEGOLD_DIR = $fd }
+    Expect "record of a consistent run (real references as output)" $r 0
+    $pf = Join-Path $fd "pair.txt"
+    $pl = @(Get-Content $pf)
+    $pl = @($pl | ForEach-Object { if ($_ -like "G seg0.prefill *") { $_ -replace "lh=[0-9a-f]+", "lh=0000000000000000" } else { $_ } })
+    [System.IO.File]::WriteAllLines($pf, [string[]]$pl)
+    $g4 = Join-Path $tmp "g4"
+    $r = RunGate "record" $g4 @{ FAKEGOLD_DIR = $fd }
+    Expect "record of a run with seg0 lh != solo0 lh is an error and writes nothing" $r 2 {
+        -not (Test-Path (Join-Path $g4 "gfx1201\dense\precise_pair.txt")) -and ($r.out -match "solo0.prefill lh != seg0.prefill") }
+    $r = RunGate "check" $g3 @{ FAKEGOLD_DIR = $fd }
+    Expect "check of a run with seg0 lh != solo0 lh is an error" $r 2
+    $sf = Join-Path $fd "single.txt"
+    $sl = @(Get-Content $sf)
+    $sl = @($sl | ForEach-Object { if ($_ -like "G mtp.stream *") { $_ -replace "ids=(\d+),", 'ids=1$1,' } else { $_ } })
+    [System.IO.File]::WriteAllLines($sf, [string[]]$sl)
+    $r = RunGate "check" $g3 @{ FAKEGOLD_DIR = $fd }
+    Expect "check of a run whose MTP stream differs from the plain stream is an error" $r 2 { $r.out -match "MTP != plain" }
+    # xcheck on a reference tree holding the broken pair file
+    Copy-Item $pf (Join-Path $g3 "gfx1201\dense\precise_pair.txt") -Force
+    $r = @{ out = @(& pwsh -NoProfile -File $gate xcheck -Arch gfx1201 -Models dense -Modes precise -Suites pair -GoldenRoot $g3 2>&1 | ForEach-Object { "$_" }); rc = $LASTEXITCODE }
+    Expect "xcheck of a reference with seg0 lh != solo0 lh" $r 2
 } finally {
     $env:WHIRL_GOLDEN_DENSE = $savedDense
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
