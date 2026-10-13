@@ -2015,13 +2015,17 @@ int cmdSeqtest(const Args& a) {
         std::vector<P> ps;
         for (u32 n : sched_lens) ps.push_back({fmt("no-think, %u tokens", n), goldenLongIds(tok, n)});
         {
-            std::string doc;
-            for (int i = 1; i < 5; ++i) doc += fmt("Section %d.\n", i) + std::string(k_bench_text) + "\n";
-            ps.push_back({"thinking mode (think-open split)", tok.encode(chatWrap("Summarize these notes.\n\n" + doc + doc, true))});
+            // (k sections of the bench text, ~140 tokens each: thinking ~5k tokens; system message ~2.7k
+            // tokens (>= sys_min, so the server splits there) + a ~1.7k-token user turn)
+            auto doc = [](int k) {
+                std::string d;
+                for (int i = 1; i <= k; ++i) d += fmt("Section %d.\n", i) + std::string(k_bench_text) + "\n";
+                return d;
+            };
+            ps.push_back({"thinking mode (think-open split)", tok.encode(chatWrap("Summarize these notes.\n\n" + doc(36), true))});
             ps.push_back({"long system message (system split)",
-                          tok.encode("<|im_start|>system\nYou are a careful assistant. Reference notes:\n" + doc + doc + doc +
-                                     "<|im_end|>\n<|im_start|>user\nList the three most important points.<|im_end|>\n<|im_start|>assistant\n"
-                                     "<think>\n\n</think>\n\n")});
+                          tok.encode("<|im_start|>system\nYou are a careful assistant. Reference notes:\n" + doc(19) + "<|im_end|>\n<|im_start|>user\n" +
+                                     doc(12) + "List the three most important points.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")});
         }
         const bool has_mtp = m.mtp.has_value();
         for (const P& pp : ps) {
@@ -2035,6 +2039,13 @@ int cmdSeqtest(const Args& a) {
             }
             const std::size_t th = tok.thinkOpenSplit(pp.ids);
             const std::size_t sy = sched::sysSplit(sched::sysBoundary(ids, tok.im_start, tok.system, tok.im_end, tok.newline), n, sched::sys_min_default);
+            // the split prompts must really split (else the case is vacuous)
+            if ((pp.name.rfind("thinking", 0) == 0 && th == 0) || (pp.name.rfind("long system", 0) == 0 && sy == 0)) {
+                out(fmt("    CLI-SCHED %-36s: no forced split in the prompt (N %zu) (FAIL)\n", pp.name.c_str(), n));
+                ++cli_bad;
+                ++cli_total;
+                continue;
+            }
             std::vector<std::size_t> st;
             if (n >= sched::tail_ck_min_default) {
                 const std::size_t t = sched::tailPoint(n, sy, th, noimg);
