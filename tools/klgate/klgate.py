@@ -1,11 +1,26 @@
 #!/usr/bin/env python3
-# KL gate (FIX-TEST-B, MOE-BAL): balance and fast against precise, on a fixed corpus, at fixed context lengths.
+# KL gate (FIX-TEST-B, MOE-BAL, KL-ROBUST): balance and fast against precise, on a fixed corpus, at fixed context lengths.
 # SPDX-License-Identifier: Apache-2.0
 #
 # For every model x prompt x mode, one `whirl chat` run prefills the whole prompt (raw, no MTP) and
-# dumps the teacher-forced next-token logits of the --rows (default 512) positions before each length
-# in --lengths (WHIRL_DUMP_LOGITS + WHIRL_DUMP_AT; 16-row forwards, every row computed: d61f6df). Per
-# window it computes KL(precise || mode) (mean over the rows) and the top-1 agreement with precise.
+# dumps the teacher-forced next-token logits of --positions (default 3) windows of --rows (default 512)
+# positions near each length in --lengths (WHIRL_DUMP_LOGITS + WHIRL_DUMP_AT; 16-row forwards, every
+# row computed: d61f6df). Per window it computes KL(precise || mode) (mean over the rows) and the top-1
+# agreement with precise.
+# Window positions (KL-ROBUST, audit/KL-ROBUST.md): a window's bits depend on how the tokens before it
+# were split into forwards (the chunked DeltaNet prefill runs in 64-row chunks counted from each
+# forward's start, and the tool prefills in max_batch = 4096-row forwards from the previous window's
+# end), so one window per length mixed sampling error with chunk-schedule jitter (MoE balance passed
+# at 512 rows and failed at 256: audit/MOE-BAL.md). Each length L now has windows ending at L - o for
+# o in OFFSETS, all in the same run (ascending):
+#   o = 1216: window [L-1728, L-1216), right after the long 4096-row prefill, which ends on a 64-row
+#             chunk boundary (the old single window's situation);
+#   o =  592: window [L-1104, L-592), after an 112-row forward (one 64-row chunk + a 48-row partial);
+#   o =    0: window [L-512, L) (the old window's rows), after an 80-row forward (64 + a 16-row partial).
+# So the three windows follow three different chunk phases (0 / 48 / 16 rows into a DeltaNet chunk)
+# and three different last-forward sizes, with 3 x 512 distinct rows per length. The MoE noise run
+# uses the same windows. Every window is judged on its own (the per-window limits apply to each); the
+# MoE mean limit is over all windows. --positions 1 is the old single-window layout.
 # Limits (MOE-BAL, owner decision 2026-10-13):
 #   dense models (absolute, per window):
 #     balance: KL <= 0.005 and top-1 >= 98%      fast: KL <= 0.03 and top-1 >= 93%
@@ -14,8 +29,9 @@
 #     the prefill split, so a window's numbers carry chunk-schedule jitter: audit/MOE-BAL.md)
 #   MoE models (arch *moe): relative to the noise floor N measured in the same gate run = precise vs
 #     precise with the sequential DeltaNet prefill (WHIRL_GDN_SEQ=1, an equally exact f32 path), same
-#     windows; N = the mean of the noise run's window KLs, N_top1(w) = its top-1 in window w:
-#     balance: mean KL over the windows <= 2 N, each window KL <= 3 N, top-1(w) >= N_top1(w) - 2.4 points
+#     windows; N = the mean of the noise run's window KLs (all lengths x positions), N_top1(w) = its
+#     top-1 in window w:
+#     balance: mean KL over all windows <= 2 N, each window KL <= 3 N, top-1(w) >= N_top1(w) - 2.4 points
 #     fast:    mean KL <= 8 N, each window KL <= 12 N, top-1(w) >= N_top1(w) - 8 points
 #     (two equally exact paths of a 256-expert top-8 router already differ by KL 0.002-0.006 on
 #     these prompts, above the dense balance limit; see audit/MOE-KL.md)
@@ -30,6 +46,7 @@
 # usage: python klgate.py --exe build\Release\whirl.exe --model dense=Q.gguf --model moe=M.gguf
 #            --corpus DIR [--device r9700|8060s] [--lengths 8192,32768,98304,131072] [--modes balance,fast]
 #            [--report out.json] [--work DIR] [--wrap "python gpu_lock.py --"] [--only dense:code] [--rows 512]
+#            [--positions 3]
 
 import argparse
 import hashlib
@@ -47,6 +64,9 @@ LIMITS = {"balance": (0.005, 0.98), "fast": (0.03, 0.93)}  # dense: absolute (KL
 # MoE: (mean KL <= k_mean * N, window KL <= k_win * N, top-1(w) >= N_top1(w) - drop)
 MOE_LIMITS = {"balance": (2.0, 3.0, 0.024), "fast": (8.0, 12.0, 0.08)}
 ROWS = 512
+# window end offsets before each length, earliest first (see the header): chunk phases 0 / 48 / 16
+OFFSETS = (1216, 592, 0)
+POSITIONS = 3
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -98,13 +118,13 @@ def ntokens(exe, model, prompt):
     return ids[-1].count(",") + 1
 
 
-def run_dump(exe, model, prompt, mode, ends, n, dump, logf, wrap, device, extra=None):
+def run_dump(exe, model, prompt, mode, ends, n, dump, logf, wrap, device, extra=None, mode_arg=None):
     env = clean_env()
     env.update(extra or {})
     env.update({"WHIRL_MTP": "0", "WHIRL_DUMP_LOGITS": dump, "WHIRL_DUMP_AT": ",".join(map(str, ends)), "WHIRL_DUMP_ROWS": str(ROWS),
                 "AMD_LOG_LEVEL": "1"})
     ctx = (n + 1 + 255) // 256 * 256 + 256
-    args = wrap + [exe, "chat", model, "@" + prompt, "--raw", "--max-tokens", "1", "--ctx", str(ctx), "--" + mode]
+    args = wrap + [exe, "chat", model, "@" + prompt, "--raw", "--max-tokens", "1", "--ctx", str(ctx), mode_arg or "--" + mode]
     if device:
         args += ["--device", device]
     t0 = time.time()
@@ -156,7 +176,7 @@ def compare(ref, test):
 
 
 def judge_moe(res, noise, md):
-    """MoE limits relative to the noise floor. res = [(length, zero_rows, kl, p99, max, top1)] per window,
+    """MoE limits relative to the noise floor. res = [(end, zero_rows, kl, p99, max, top1)] per window,
     noise = {"n_mean": N, "windows": [{"top1": ...}, ...]}. Returns (window cases, mean case) as dicts."""
     k_mean, k_win, drop = MOE_LIMITS[md]
     nm = noise["n_mean"]
@@ -172,7 +192,7 @@ def judge_moe(res, noise, md):
 
 
 def main():
-    global ROWS
+    global ROWS, POSITIONS
     ap = argparse.ArgumentParser(description="KL gate: balance / fast vs precise")
     ap.add_argument("--exe", required=True)
     ap.add_argument("--model", action="append", required=True, help="NAME=PATH (repeat)")
@@ -186,8 +206,18 @@ def main():
     ap.add_argument("--only", default="", help="MODEL:PROMPT[,...] subset")
     ap.add_argument("--keep", action="store_true", help="keep the logits dumps")
     ap.add_argument("--rows", type=int, default=ROWS, help=f"rows per window (default {ROWS})")
+    ap.add_argument("--as", dest="as_", action="append", default=[], metavar="MODE=ARG",
+                    help="negative test: run MODE with the CLI argument ARG (e.g. balance=--balance=fp8,moefp8,gdnwmma,h16,specsample), "
+                         "judged by MODE's limits; the report never passes (pass false), so it cannot feed golden record")
+    ap.add_argument("--positions", type=int, default=POSITIONS, choices=[1, 2, 3],
+                    help=f"windows per length (default {POSITIONS}; 1 = the single window before each length)")
     a = ap.parse_args()
     ROWS = a.rows
+    POSITIONS = a.positions
+    offsets = OFFSETS[len(OFFSETS) - POSITIONS:]
+    if POSITIONS > 1 and ROWS > 512:
+        print("klgate: --rows > 512 with several positions: the windows would overlap (the offsets assume 512)")
+        return 2
 
     exe = os.path.abspath(a.exe)
     if not os.path.isfile(exe):
@@ -205,6 +235,13 @@ def main():
         if md not in LIMITS:
             print(f"klgate: unknown mode {md}")
             return 2
+    mode_args = {}
+    for x in a.as_:
+        md, _, arg = x.partition("=")
+        if md not in modes or not arg.startswith("--"):
+            print(f"klgate: bad --as {x} (MODE must be in --modes, ARG a CLI flag)")
+            return 2
+        mode_args[md] = arg
     lengths = sorted(int(x) for x in a.lengths.split(","))
     corpus = load_corpus(a.corpus)
     only = set(x for x in a.only.split(",") if x)
@@ -212,10 +249,10 @@ def main():
     work = os.path.abspath(a.work or os.path.join(os.path.dirname(exe), "klgate_work"))
     os.makedirs(work, exist_ok=True)
     rep = {"exe": exe, "exe_sha256": sha256(exe), "device": a.device or "default", "limits": LIMITS, "moe_limits": MOE_LIMITS,
-           "rows": ROWS, "lengths": lengths, "modes": modes, "models": {k: os.path.basename(v) for k, v in models.items()},
+           "rows": ROWS, "positions": POSITIONS, "offsets": list(offsets), "mode_args": mode_args, "lengths": lengths, "modes": modes, "models": {k: os.path.basename(v) for k, v in models.items()},
            "corpus": {k: sha256(v) for k, v in corpus.items()}, "started": time.strftime("%Y-%m-%d %H:%M:%S"), "cases": [],
-           "noise": [], "numerics": {}, "errors": []}
-    log(f"klgate: exe {exe} sha256 {rep['exe_sha256'][:16]} device {rep['device']} rows {ROWS}")
+           "noise": [], "by_length": [], "numerics": {}, "errors": []}
+    log(f"klgate: exe {exe} sha256 {rep['exe_sha256'][:16]} device {rep['device']} rows {ROWS} positions {POSITIONS} (offsets {list(offsets)})")
 
     for mname, mpath in models.items():
         for pname, ppath in corpus.items():
@@ -227,16 +264,20 @@ def main():
                 rep["errors"].append(f"{mname}:{pname}: {e}")
                 log(f"ERROR {mname}:{pname}: {e}")
                 continue
-            # the windows end at each length (the longest: the prompt end if the prompt is shorter;
-            # it must be within 4% of the length, so the corpus really reaches it)
-            ends = []
+            # the windows end at each length minus the offsets (the longest length: the prompt end if the
+            # prompt is shorter; it must be within 4% of the length, so the corpus really reaches it)
+            ends, groups, poss = [], [], []  # window end, its length group (the group's last end), position
             for L in lengths:
                 e = min(L, n)
                 if e < L * 0.96:
                     rep["errors"].append(f"{mname}:{pname}: prompt has {n} tokens, too short for {L}")
                     continue
-                if not ends or e - ends[-1] >= ROWS:
-                    ends.append(e)
+                if e - offsets[0] - ROWS < (ends[-1] if ends else 0):
+                    continue  # would overlap the previous length's windows
+                for p, o in enumerate(offsets):
+                    ends.append(e - o)
+                    groups.append(e)
+                    poss.append(p)
             if not ends:
                 continue
             log(f"{mname}:{pname}: {n} tokens, windows end at {ends}")
@@ -252,7 +293,7 @@ def main():
                 for w, e in enumerate(ends):
                     s = slice(w * ROWS, (w + 1) * ROWS)
                     zt = int((np.abs(t[s]).max(1) == 0).sum())
-                    out.append((e, zt) + compare(ref[s], t[s]))
+                    out.append((e, zt) + compare(ref[s], t[s]))  # (end, zero rows, kl, p99, max, top1)
                 return out
 
             while ri < len(runs):
@@ -263,7 +304,7 @@ def main():
                 logf = os.path.join(work, tag + ".log")
                 # the MoE noise floor: precise with the sequential f32 DeltaNet prefill
                 extra = {"WHIRL_GDN_SEQ": "1"} if md == "noise" else None
-                rc, wall = run_dump(exe, mpath, ppath, "precise" if md == "noise" else md, ends, n, dump, logf, wrap, a.device, extra)
+                rc, wall = run_dump(exe, mpath, ppath, "precise" if md == "noise" else md, ends, n, dump, logf, wrap, a.device, extra, mode_args.get(md))
                 log(f"  run {tag}: exit {rc}, {wall:.0f} s")
                 if rc != 0 or not os.path.isfile(dump):
                     rep["errors"].append(f"{tag}: exit {rc} (log {logf})")
@@ -307,7 +348,8 @@ def main():
                 nw = res_by["noise"]
                 n_mean = float(np.mean([x[2] for x in nw]))
                 noise = {"model": mname, "prompt": pname, "n_mean": n_mean,
-                         "windows": [{"length": x[0], "kl_mean": x[2], "kl_p99": x[3], "kl_max": x[4], "top1": x[5]} for x in nw]}
+                         "windows": [{"length": x[0], "group": groups[w], "pos": poss[w], "kl_mean": x[2], "kl_p99": x[3], "kl_max": x[4],
+                                      "top1": x[5]} for w, x in enumerate(nw)]}
                 rep["noise"].append(noise)
                 log(f"  noise  {mname:6s} {pname:5s}: N = {n_mean:.5f}  (" +
                     ", ".join(f"{x[0]}: KL {x[2]:.5f} top1 {x[5] * 100:.2f}%" for x in nw) + ")")
@@ -322,9 +364,10 @@ def main():
                 if moe:
                     wins, mcase = judge_moe(res, noise, md)
                     k_mean, k_win, _ = MOE_LIMITS[md]
-                    for c in wins:
+                    for w, c in enumerate(wins):
+                        c.update(group=groups[w], pos=poss[w])
                         rep["cases"].append({**base, **c})
-                        log(f"  {'PASS' if c['pass'] else 'FAIL'} {mname:6s} {pname:5s} {md:8s} {c['length']:7d}: KL mean {c['kl_mean']:.5f} "
+                        log(f"  {'PASS' if c['pass'] else 'FAIL'} {mname:6s} {pname:5s} {md:8s} {c['length']:7d}/p{poss[w]}: KL mean {c['kl_mean']:.5f} "
                             f"= {c['x_noise']:.2f} N (limit {k_win:g} N) p99 {c['kl_p99']:.4f} max {c['kl_max']:.4f}  top1 {c['top1'] * 100:.2f}% "
                             f"(limit {c['top1_limit'] * 100:.2f}%)" + (f"  zero rows {c['zero_rows']}" if c["zero_rows"] else ""))
                     rep["cases"].append({**base, **mcase})
@@ -332,22 +375,32 @@ def main():
                         f"{mcase['x_noise']:.2f} N (limit {k_mean:g} N = {mcase['kl_limit']:.5f})")
                 else:
                     kl_max, top1_min = LIMITS[md]
-                    for e, zt, kl, p99, mx, top1 in res:
+                    for w, (e, zt, kl, p99, mx, top1) in enumerate(res):
                         ok = zt == 0 and kl <= kl_max and top1 >= top1_min
-                        rep["cases"].append({**base, "length": e, "kl_mean": kl, "kl_p99": p99, "kl_max": mx, "top1": top1, "zero_rows": zt,
-                                             "rule": "dense-abs", "kl_limit": kl_max, "top1_limit": top1_min, "pass": ok})
-                        log(f"  {'PASS' if ok else 'FAIL'} {mname:6s} {pname:5s} {md:8s} {e:7d}: KL mean {kl:.5f} p99 {p99:.4f} max {mx:.4f}  top1 {top1 * 100:.2f}%"
+                        rep["cases"].append({**base, "length": e, "group": groups[w], "pos": poss[w], "kl_mean": kl, "kl_p99": p99, "kl_max": mx,
+                                             "top1": top1, "zero_rows": zt, "rule": "dense-abs", "kl_limit": kl_max, "top1_limit": top1_min, "pass": ok})
+                        log(f"  {'PASS' if ok else 'FAIL'} {mname:6s} {pname:5s} {md:8s} {e:7d}/p{poss[w]}: KL mean {kl:.5f} p99 {p99:.4f} max {mx:.4f}  top1 {top1 * 100:.2f}%"
                             + (f"  zero rows {zt}" if zt else ""))
+                # information (not judged): the spread of the positions per length
+                for g in sorted(set(groups)):
+                    ix = [w for w in range(len(res)) if groups[w] == g]
+                    kls = [res[w][2] for w in ix]
+                    t1s = [res[w][5] for w in ix]
+                    rep["by_length"].append({**base, "group": g, "kl_mean": float(np.mean(kls)), "kl_min": min(kls), "kl_max": max(kls),
+                                             "top1_mean": float(np.mean(t1s)), "top1_min": min(t1s), "top1_max": max(t1s)})
+                    if len(ix) > 1:
+                        log(f"  info {mname:6s} {pname:5s} {md:8s} {g:7d}: positions KL mean {np.mean(kls):.5f} (min {min(kls):.5f} max {max(kls):.5f}) "
+                            f"top1 mean {np.mean(t1s) * 100:.2f}% (min {min(t1s) * 100:.2f}% max {max(t1s) * 100:.2f}%)")
 
     npass = sum(1 for c in rep["cases"] if c["pass"])
     nfail = len(rep["cases"]) - npass
     rc = 2 if rep["errors"] or not rep["cases"] else (1 if nfail else 0)
     rep["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    rep["pass"] = rc == 0
+    rep["pass"] = rc == 0 and not mode_args  # a negative test (--as) never passes
     rep["summary"] = f"{npass} passed, {nfail} failed, {len(rep['errors'])} errors"
     for e in rep["errors"]:
         log("ERROR " + e)
-    log(f"klgate: {rep['summary']} -> {'PASS' if rc == 0 else 'FAIL'} (exit {rc})")
+    log(f"klgate: {rep['summary']} -> {'PASS' if rc == 0 else 'FAIL'} (exit {rc})" + (f"  [negative test, modes run as {mode_args}]" if mode_args else ""))
     if a.report:
         with open(a.report, "w", encoding="utf-8") as f:
             json.dump(rep, f, indent=1)
