@@ -219,6 +219,7 @@ void benchAttnWs4(Ctx& c);  // "ws4bench": timing only, on request
 void testAttnWs4g(Ctx& c);   // "ws4g": gfx1151 attn_ws4g multi-row verify bitwise == single-row
 void benchAttnWs4g(Ctx& c);  // "ws4gbench": timing only, on request
 void testGdn(Ctx& c);
+void testVision(Ctx& c);  // "vision": encoder kernels (own code object) vs CPU
 void testMoe(Ctx& c);
 void testMoeMx(Ctx& c);
 void testMoeF(Ctx& c);  // "moef": precise MoE decode experts moe_gu_f_* / moe_down_f_*

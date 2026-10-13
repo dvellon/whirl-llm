@@ -180,8 +180,8 @@ The `gfx1151` branch adds a kernel set for the Radeon 8060S (Ryzen AI Max+ 395 i
 **correct but not tuned yet**: the kernel tests pass on it, MTP / MTP + n-gram output equals plain
 greedy on the three models in the table below, and the server gates pass. Builds contain both kernel sets; the
 R9700 is the default device when present, otherwise the 8060S (`whirl devices` shows which;
-`--device 8060s` / `WHIRL_DEVICE=8060s` selects it). Not yet on the 8060S: image input, the `q8v` /
-`q8h` KV formats, fp8 prefill (MXFP4 prefill uses f16 activations). Unified memory: the server's
+`--device 8060s` / `WHIRL_DEVICE=8060s` selects it). Image input (`--mmproj`) works on the 8060S since 0.2.0
+([vision.md](docs/guide/en/vision.md#gfx1151)). Not yet on the 8060S: the `q8v` / `q8h` KV formats, fp8 prefill (MXFP4 prefill uses f16 activations). Unified memory: the server's
 default KV pool is 262,144 tokens and the RAM / SSD tiers are off unless `--kv-ram-mb` is given.
 
 | Radeon 8060S, greedy, **untuned** — WHIRL vs llama.cpp (ratio) | Ornith-1.5-35B-A3B MXFP4 (MoE) | Swift-1.5 27B MXFP4-A (dense) | Qwen3.8-27B UD-Q4_K_M (dense) |

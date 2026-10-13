@@ -7,7 +7,7 @@
 // Exit: 0 pass, 1 a failing check (or, with --require-all, a kernel missing that the arch requires),
 // 2 usage error: unknown --only family, a given model path that does not exist, 0 checks run, or
 // --require-all on an arch without a required-kernel list (FIX-TEST-A, FR-TEST P3-3 / P3-4).
-// families: quant gemv gemm attn gdn moe moemx misc
+// families: quant gemv gemm attn attndq4 gdn moe moemx moef misc gemvh dflash ws4 ws4g vision
 
 #include <chrono>
 #include <cstdlib>
@@ -29,7 +29,7 @@ std::string envOr(const char* name) {
 
 int usage() {
     std::printf(
-        "usage: whirl-kernel-test [--device SPEC] [--only quant,gemv,gemm,attn,attndq4,gdn,moe,moemx,moef,misc,dflash,gemvh] [--quick] [-v]\n"
+        "usage: whirl-kernel-test [--device SPEC] [--only quant,gemv,gemm,attn,attndq4,gdn,moe,moemx,moef,misc,dflash,gemvh,ws4,ws4g,vision] [--quick] [-v]\n"
         "                         [--q4 GGUF] [--mx GGUF] [--moe GGUF] [--moemx GGUF]\n"
         "  --require-all  a kernel missing from the code object fails unless the arch lacks it by design\n"
         "  --device  index, gfx arch, name substring, r9700 or 8060s (default: WHIRL_DEVICE, else the\n"
@@ -143,7 +143,8 @@ int main(int argc, char** argv) {
                         {"moemx", kt::testMoeMx}, {"moef", kt::testMoeF}, {"misc", kt::testMisc},   {"attnbench", kt::benchAttn},
                         {"gemvh", kt::testGemvh}, {"gemvhbench", kt::benchGemvh}, {"dflash", kt::testDflash},
                         {"ws4", kt::testAttnWs4}, {"ws4bench", kt::benchAttnWs4},
-                        {"ws4g", kt::testAttnWs4g}, {"ws4gbench", kt::benchAttnWs4g}};
+                        {"ws4g", kt::testAttnWs4g}, {"ws4gbench", kt::benchAttnWs4g},
+                        {"vision", kt::testVision}};
     for (const Fam& f : fams) {
         if (!only.empty() && !only.count(f.name)) continue;
         if (only.empty() && (std::string(f.name) == "attnbench" || std::string(f.name) == "gemvhbench" || std::string(f.name) == "ws4bench" || std::string(f.name) == "ws4gbench")) continue;  // timing only, on request

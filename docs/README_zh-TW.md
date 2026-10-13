@@ -179,7 +179,7 @@ WHIRL 領先**不多**的地方：dense 模型的一般 decode（不開 MTP）�
 `gfx1151` 分支為 Radeon 8060S（Ryzen AI Max+ 395 內顯）加上一套 kernel。它**結果正確但還沒調校**：kernel 測試在
 8060S 上全過，下列三個模型的 MTP / MTP + n-gram 輸出都與 plain greedy 相同，server gate 也通過。建置同時包含兩套
 kernel；有 R9700 時預設用 R9700，否則用 8060S（`whirl devices` 會標示；`--device 8060s` / `WHIRL_DEVICE=8060s`
-可指定）。8060S 上尚未支援：圖片輸入、`q8v` / `q8h` KV 格式、fp8 prefill（MXFP4 prefill 用 f16 activation）。
+可指定）。圖片輸入（`--mmproj`）從 0.2.0 起也能在 8060S 上使用（[vision.md](guide/zh-TW/vision.md#gfx1151)）。8060S 上尚未支援：`q8v` / `q8h` KV 格式、fp8 prefill（MXFP4 prefill 用 f16 activation）。
 統一記憶體：server 預設 KV pool 為 262,144 token，RAM / SSD 層預設關閉，給 `--kv-ram-mb` 才會開。
 
 | Radeon 8060S，greedy，**尚未調校**——WHIRL 對 llama.cpp（倍數） | Ornith-1.5-35B-A3B MXFP4（MoE） | Swift-1.5 27B MXFP4-A（dense） | Qwen3.8-27B UD-Q4_K_M（dense） |

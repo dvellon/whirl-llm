@@ -213,6 +213,7 @@ private:
     MergerOff mo_;
     std::uint64_t layer0_ = 0, merger_ = 0, total_ = 0;
     hip::Module module_;
+    std::uint32_t attn_threads_ = 128;  // vis_attn2 block: 128 (gfx1201), 256 (gfx1151: 8 waves x 16 queries)
     Funcs f_;
     DevPtr resident_ = 0;
     hip::Stream copy_stream_ = nullptr;
@@ -241,7 +242,8 @@ std::vector<std::uint32_t> expand(std::span<const std::uint32_t> tokens, std::ui
 // name): standalone encoder test; prints the prototype-style report. Returns the exit code.
 int cliVisEncode(std::span<const std::string> args);
 
-// The vision code object embedded for gfx1201 (empty span if not built).
-std::span<const std::uint8_t> kernelImage();
+// The vision code object embedded for `arch` (gfx1201, gfx1151; empty span if that
+// architecture was not built).
+std::span<const std::uint8_t> kernelImage(hip::Arch arch);
 
 }  // namespace whirl::vision

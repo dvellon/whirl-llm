@@ -4,7 +4,8 @@
 
 > **Status.** Image input is in WHIRL 0.1.0 for gfx1201 (`whirl chat --mmproj … --image …`, server
 > `--mmproj` with OpenAI `image_url` parts). On our test images the C++ encoder's embeddings are
-> bit-identical to the research build's. Not available on gfx1151 yet. Options:
+> bit-identical to the research build's. Since 0.2.0 also on gfx1151 (Radeon 8060S), see
+> [§7](#gfx1151). Options:
 > [usage.md](../../usage.md#serve).
 
 **Who this helps:** anyone adding a vision encoder to a memory-constrained text server — how to add
@@ -103,4 +104,52 @@ system-checkpoint and restore gates, vision gate dense + MXFP4.
 - Done: the encoder, the scheduler integration and the gate are in the C++ engine (`src/vision/`,
   `kernels/vision/`, `whirl-server-gate --suite vis`).
 - Confirm the cause of the MTP acceptance drop (§4.2).
-- gfx1151: multi-section RoPE kernel and encoder kernels.
+- Done (0.2.0): gfx1151 multi-section RoPE kernels and encoder kernels (§7).
+- gfx1151: encoder speed (§7: attention and GEMM run at a fraction of the WMMA peak).
+
+## <a id="gfx1151"></a>7. Radeon 8060S (gfx1151)
+
+Since 0.2.0 image input also runs on the 8060S (`--device 8060s`, same flags). What was missing:
+the gfx1151 kernel set had no multi-section RoPE attention prep (`attn_prep_m*`, `set_rpos`), so the
+server refused `--mmproj`, and the encoder code object existed for gfx1201 only. The encoder is now
+one source (`kernels/vision/vision.hip`) built per architecture. Only the two WMMA kernels differ:
+on gfx11 a lane holds all 16 k values of an A / B fragment (gfx12: 8) and accumulator element v is row
+`2v + lane / 16` (gfx12: `v + 8 * (lane / 16)`); attention runs 8 waves x 16 queries per block (32
+queries per wave spilled on gfx11). The arithmetic is unchanged: f16 inputs, f32 accumulation, no
+fp8. The R9700 code object disassembles identically and its embeddings are bit-identical to before.
+
+| Check (Qwen3.8-27B mmproj F16) | Result |
+|---|---|
+| `whirl-kernel-test --only vision` (all 8 encoder kernels vs CPU references), `attn_prep_m*` / `set_rpos` checks | pass on both GPUs |
+| 8060S embeddings vs f32 numpy reference, 4 images | relative L2 0.16–0.30%, minimum cosine ≥ 0.9995 (R9700: 0.16–0.31%) |
+| 8060S vs R9700 embeddings, 7 images (220–2,040 tokens) | relative L2 0.09–0.23%, minimum cosine ≥ 0.9995 |
+| Server, `--precise`, temperature 0, 8 image requests (one or two images, English / Chinese questions, up to 1080p) | answers text-identical on both GPUs; same image again fully cached on both |
+
+Encode time on the 8060S (`whirl-vis vis-encode`, weights resident, third run):
+
+| Image (tokens) | 8060S | R9700 |
+|---|---|---|
+| 640x352 (220) | 54 ms | 17 ms |
+| 512x512 (256) | 59 ms | 18 ms |
+| 1024x672 (672) | 219 ms | 52 ms |
+| 1280x736 (920) | 314 ms | 78 ms |
+| 1024x1024 (1,024) | 332 ms | 92 ms |
+| 1920x1088 (2,040) | 934 ms (attention 532, GEMM 303) | 253 ms |
+
+`whirl-server-gate --suite vis` on the 8060S (`--kv auto`): 16 of 18 checks pass, including image
+cache reuse, the image-end checkpoint (2,045 of 2,066 tokens reused), concurrency with text requests and
+the SSD restore. The two VRAM checks are dGPU criteria: on unified memory `hipMemGetInfo` drops by
+1,775 MiB (twice the 887 MiB pinned mmproj copy) at mmproj load although the KV pool (262,144 tokens)
+is unchanged, and the idle release returned within 4.8 / 8.8 MiB (limit 8 MiB).
+
+Streamed weights cost about the same on the 8060S (949 ms for 1080p): host memory and the GPU share
+the same DRAM. The encoder reaches roughly 10–17 TFLOPS on the 8060S, a fraction of its WMMA peak;
+tuning is open (§6).
+
+#### Bug found during the port: a cross-lane read of inactive lanes
+
+The first gfx11 attention returned 0 for head dim 71 only. Its epilogue exchanged accumulator values
+between the two half-waves (`permlanex16`) before the per-lane `d < 72` / `q < N` checks, but the
+compiler placed the exchange after them; for dims 72–79 the partner lanes were inactive, and
+`permlanex16` reads an inactive lane as 0. Fix: per-element stores without a cross-lane step in
+epilogues. The kernel test caught it (exactly one dim per head wrong).

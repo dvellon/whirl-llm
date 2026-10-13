@@ -5,6 +5,12 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## Unreleased (0.2.0)
 
+### Image input on the Radeon 8060S (VIS-8S)
+
+- `--mmproj` / `image_url` parts now work on gfx1151 (Radeon 8060S); the server used to refuse with `MropeUnsupported`. The gfx1151 code object gains the multi-section RoPE attention prep (`attn_prep_m`, `_q8`, `_q8h`, `_q8v`, `_q4`) and `set_rpos`; the vision encoder (`kernels/vision/vision.hip`) is built per architecture, with gfx11 WMMA fragment layouts for its GEMM and attention kernels (f16 inputs, f32 accumulation as on the R9700; no fp8 is involved).
+- Accuracy: 8060S embeddings vs an f32 numpy reference, relative L2 0.16-0.30%, minimum cosine >= 0.9995 on 4 images (R9700: 0.16-0.31%); vs the R9700, relative L2 0.09-0.23%. Server end to end (`--precise`, temperature 0, 8 image requests incl. two images and 1080p): answers text-identical to the R9700. R9700 vision output unchanged (embeddings bit-identical to before; its vision code object disassembles identically).
+- New `whirl-kernel-test --only vision`: every encoder kernel against a CPU reference (both GPUs). `audit/VIS-8S.md`.
+
 ### DFlash2 speculative decoding (`--draft dflash`, opt-in)
 
 - `--draft mtp|dflash` for `whirl chat` / `whirl bench` / `whirl-server` (default `mtp`). With

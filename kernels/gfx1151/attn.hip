@@ -445,9 +445,14 @@ extern "C" __global__ void attn_combine(const float *part_ml, const float *part_
 // order), so the results are unchanged; 5 launches per attention layer -> 1.
 // grid = (n_head + n_kv, n_tok), 256 threads, hd <= 512.
 // ---------------------------------------------------------------------------
-template <int Q8, bool ROT = false>
+// MR (vision): multi-section RoPE for image prompts, as kernels/attn.hip (ggml
+// GGML_ROPE_TYPE_IMROPE): rotary pair i takes the h position when i % 3 == 1 and
+// i < 3 * s1, the w position when i % 3 == 2 and i < 3 * s2, else t. rpos = [row][3]
+// {t, h, w}; rpos == nullptr: all three = pos[t] - rdelta. The KV row stays pos[t].
+template <int Q8, bool ROT = false, bool MR = false>
 __device__ __forceinline__ void attn_prep_impl(float *qf, float *kk, const float *vv, const float *qw, const float *kw, const KvArgs &kv,
-              const int *pos, int n_head, int n_kv, int hd, int n_rot, float theta_scale, float eps) {
+              const int *pos, int n_head, int n_kv, int hd, int n_rot, float theta_scale, float eps,
+              const int *rpos = nullptr, int rdelta = 0, int s1 = 0, int s2 = 0) {
     __shared__ float nv[512];
     const int hb = blockIdx.x, t = blockIdx.y;
     const bool isq = hb < n_head;
@@ -461,6 +466,26 @@ __device__ __forceinline__ void attn_prep_impl(float *qf, float *kk, const float
     for (int i = threadIdx.x; i < hd; i += blockDim.x) nv[i] = xv[i] * r * w[i];
     __syncthreads();
     const int half = n_rot / 2;
+    if constexpr (MR) {
+        int pt, ph, pw;
+        if (rpos != nullptr) {
+            pt = rpos[3 * t];
+            ph = rpos[3 * t + 1];
+            pw = rpos[3 * t + 2];
+        } else {
+            pt = ph = pw = pos[t] - rdelta;
+        }
+        for (int i = threadIdx.x; i < half; i += blockDim.x) {
+            const int sec = i % 3;
+            const int pi = (sec == 1 && i < 3 * s1) ? ph : (sec == 2 && i < 3 * s2) ? pw : pt;
+            const float theta = (float)pi * powf(theta_scale, (float)i);
+            float s, c;
+            sincosf(theta, &s, &c);
+            const float x0 = nv[i], x1 = nv[i + half];
+            nv[i] = x0 * c - x1 * s;
+            nv[i + half] = x0 * s + x1 * c;
+        }
+    } else {
     const float p = (float)pos[t];
     for (int i = threadIdx.x; i < half; i += blockDim.x) {
         const float theta = p * powf(theta_scale, (float)i);
@@ -469,6 +494,7 @@ __device__ __forceinline__ void attn_prep_impl(float *qf, float *kk, const float
         const float x0 = nv[i], x1 = nv[i + half];
         nv[i] = x0 * c - x1 * s;
         nv[i + half] = x0 * s + x1 * c;
+    }
     }
     __syncthreads();
     if constexpr (ROT) {  // in-place fast Walsh-Hadamard transform, hd a power of 2 (as kernels/attn.hip)
@@ -516,6 +542,24 @@ extern "C" __global__ void __launch_bounds__(256)
 ATTN_PREP_ENTRY(attn_prep_q8h, 1, true)
 ATTN_PREP_ENTRY(attn_prep_q8v, 2, false)  // K f16 (not rotated), V int8
 ATTN_PREP_ENTRY(attn_prep_q4, 3, true)
+
+// vision: the same five with multi-section RoPE positions (see attn_prep_impl MR);
+// argument ABI as kernels/attn.hip ATTN_PREP_M (s0 unused)
+#define ATTN_PREP_M(NAME, Q8, ROT)                                                                                            extern "C" __global__ void __launch_bounds__(256)                                                                         NAME(float *qf, float *kk, const float *vv, const float *qw, const float *kw, KvArgs kv, const int *pos,                        int n_head, int n_kv, int hd, int n_rot, float theta_scale, float eps, const int *rpos, int rdelta,                        int s0, int s1, int s2) {                                                                                                (void)s0;                                                                                                                 attn_prep_impl<Q8, ROT, true>(qf, kk, vv, qw, kw, kv, pos, n_head, n_kv, hd, n_rot, theta_scale, eps, rpos,                                             rdelta, s1, s2);                                                                        }
+ATTN_PREP_M(attn_prep_m, 0, false)
+ATTN_PREP_M(attn_prep_m_q8, 1, false)
+ATTN_PREP_M(attn_prep_m_q8h, 1, true)
+ATTN_PREP_M(attn_prep_m_q8v, 2, false)
+ATTN_PREP_M(attn_prep_m_q4, 3, true)
+
+// vision: rows' multi-section RoPE positions {t, h, w} for a small batch (by value)
+struct Rpos16 {
+    int v[48];
+};
+extern "C" __global__ void set_rpos(int *rpos, Rpos16 tab, int n) {
+    const int i = threadIdx.x;
+    if (i < 3 * n) rpos[i] = tab.v[i];
+}
 
 // attn_combine + the int8 copy of its output for the o-projection GEMV
 // (same values as quantize_q8 over out); needs blockDim == head_dim, a
