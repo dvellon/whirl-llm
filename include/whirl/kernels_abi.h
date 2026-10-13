@@ -476,6 +476,8 @@ struct KernelTable {
     F attn_decode{}, kv_store{}, attn_split{}, attn_combine{}, attn_prep{}, attn_combine_q8{};
     F attn_wsplit1{}, attn_wsplit2{}, attn_prefill_wmma{}, attn_kx{};
     F attn_dq4{};  // q4 KV decode / verify (gfx1151 / gfx1201; null if not built): attn_wsplit1 arguments, 256 threads
+    F attn_ws4{};  // gfx1151 4-wave pipelined attn_wsplit1 (same arguments / bits, one query per group): decode rows (WHIRL_ATTN_WS4=0: old path)
+    F attn_ws4g[3]{};  // gfx1151 multi-row verify, CG 1..3 tiles (attn_ws4g{1,2,3}[_q8]; 256 threads, grid.x = n_kv x column groups)
     F attn_kg6{}, attn_kg4{}, attn_kg2{};  // f16 / q8 / q8h / q8v KV (null if not built)
     // q8 / q8h KV prefill (Q8P): kv_dq_rows + the f16 attn_kg variants (null otherwise)
     F kv_dq_rows{}, attn_kgf6{}, attn_kgf4{}, attn_kgf2{};

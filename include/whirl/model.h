@@ -525,6 +525,11 @@ public:
     // q4 KV decode / verify attention through attn_dq4 when the code object has it (fast mode on
     // the 8060S; WHIRL_ATTN_DQ4=0: attn_wsplit1_q4 as before)
     bool attn_dq4 = true;
+    // gfx1151 f16 / int8 KV decode and verify attention through attn_ws4 (single-row groups) and
+    // attn_ws4g (multi-row verify groups, one KV read per split for up to 8 rows) when the code
+    // object has them; same partial bits as attn_wsplit1 one-query groups (DES-ATTN-8S T2 / T3).
+    // WHIRL_ATTN_WS4=0: the old attn_wsplit1 one-query groups (debug fallback, logged as override)
+    bool attn_ws4 = true;
     // batched verify of more than 16 rows (WHIRL_WIDE_VERIFY=0: at most 16 as before)
     bool wide_verify = true;
     // wide verify on MoE models (balance / fast; WHIRL_MOE_WIDE=1): 17..32-row verify batches take

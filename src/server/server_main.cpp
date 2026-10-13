@@ -817,6 +817,7 @@ int serveMain(int argc, char** argv, const char* program) {
         if (use_mtp && envOn("MTP_Q4", true)) model.requantMtpQ4();
         if (!envOn("ATTN_WIDE", true)) model.attn_wide = false;
         if (!envOn("ATTN_DQ4", true)) model.attn_dq4 = false;
+        if (!envOn("ATTN_WS4", true)) model.attn_ws4 = false;
         if (use_mtp && !env("MTP_FULLHEAD")) {
             const bool q4 = env("DRAFT_HEAD").value_or("") == "q4";
             model.buildDraftHeadEx(q4 ? qwen35::Model::DraftHeadKind::q4 : qwen35::Model::DraftHeadKind::d2);

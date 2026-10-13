@@ -5,6 +5,8 @@
 
 #include "whirl/model.h"
 
+#include "../../kernels/gfx1151/attn_ws4_index.h"  // ws4::block_range (attn_ws4 / attn_ws4g split rule)
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -701,9 +703,56 @@ void Model::attnBlock(const AttnW& a, const KvLayer& lkv, u32 n) {
     if (n <= small_max) {
         // flash-decoding; grid.z = query (speculative verify), query t sees
         // positions up to pos_buf[t]
-        const u32 n_split = std::min(fd_splits, (max_ctx + fd_chunk - 1) / fd_chunk);
         const u32 grp_q = cfg.n_head / cfg.n_head_kv;
-        if (k.attn_wsplit1 != nullptr && hd == 256 && grp_q <= 16 && (dbg_flags & 2) == 0) {
+        // gfx1151, f16 / int8 KV: attn_ws4 (groups of one row) and attn_ws4g (multi-row verify
+        // groups; DES-ATTN-8S T2 / T3). Every row's partials are bitwise those of an attn_wsplit1
+        // one-query group whenever a group's rows share the split ranges, so the grouping that
+        // caps.attn_group1 forbids for attn_wsplit1 is safe here. The split rule is the constant
+        // ws4::kNs (64): the ranges depend on n_pos (and the draft window) only, WHIRL_FD_SPLITS
+        // does not apply. WHIRL_ATTN_WS4=0: the old path below.
+        const bool ws4_path = attn_ws4 && k.attn_ws4 != nullptr && k.attn_ws4g[0] != nullptr && k.attn_ws4g[1] != nullptr &&
+                              k.attn_ws4g[2] != nullptr && k.attn_wsplit1 != nullptr && !kv_q4 && hd == ws4::kD && grp_q <= 16 &&
+                              (dbg_flags & 2) == 0;
+        const u32 n_split = ws4_path ? std::min<u32>(ws4::kNs, (max_ctx + fd_chunk - 1) / fd_chunk)
+                                     : std::min(fd_splits, (max_ctx + fd_chunk - 1) / fd_chunk);
+        if (ws4_path) {
+            // groups: consecutive rows of one sequence at consecutive positions whose split ranges
+            // (per and draft-window ranges, ws4::block_range of their n_pos) are the same
+            const i32 win = kva.win;
+            auto key = [&](i32 p) {
+                const i32 np = p + 1;
+                const ws4::Range r0 = ws4::block_range(np, 0, ws4::kNs, win);
+                return std::array<i32, 3>{r0.b1 == ws4::kSink ? r0.b0 - 1 : 0, ws4::block_range(np, 1, ws4::kNs, win).b0,
+                                          ws4::block_range(np, 2, ws4::kNs, win).b0};
+            };
+            const bool known = row_n == n && n > 1 && (dbg_flags & 4) == 0;
+            AwGroups groups;
+            u32 ng = 0, r = 0, widest = 1;
+            while (r < n) {
+                u32 c = 1;
+                if (known) {
+                    const auto k0 = key(row_pos[r]);
+                    while (r + c < n && c < static_cast<u32>(kernels::kMaxVerifyRows) && row_base[r + c] == row_base[r] &&
+                           row_pos[r + c] == row_pos[r] + static_cast<i32>(c) && key(row_pos[r + c]) == k0)
+                        c += 1;
+                }
+                groups.first[ng] = static_cast<i32>(r);
+                groups.count[ng] = static_cast<i32>(c);
+                widest = std::max(widest, c);
+                ng += 1;
+                r += c;
+            }
+            if (widest == 1) {
+                hip::launch(k.attn_ws4, D(cfg.n_head_kv, n_split, ng), D(128), 0, stream, qf, kva, part_ml, part_acc, I(cfg.n_head), I(cfg.n_head_kv),
+                            I(2 * hd), pos_buf, scale, gate, groups);
+            } else {
+                // CG 16-column tiles per block (<= 3: 8 rows x 6 heads), more rows in column-group blocks on grid.x
+                const u32 cg = std::min<u32>(3, (widest * grp_q + 15) / 16);
+                const u32 rpb = static_cast<u32>(ws4::rows_per_block(static_cast<int>(cg), static_cast<int>(grp_q)));
+                hip::launch(k.attn_ws4g[cg - 1], D(cfg.n_head_kv * ((widest + rpb - 1) / rpb), n_split, ng), D(256), 0, stream, qf, kva, part_ml,
+                            part_acc, I(cfg.n_head), I(cfg.n_head_kv), I(2 * hd), pos_buf, scale, gate, groups);
+            }
+        } else if (k.attn_wsplit1 != nullptr && hd == 256 && grp_q <= 16 && (dbg_flags & 2) == 0) {
             // query groups: consecutive rows of one sequence whose split size
             // `per` (a function of the position) matches, <= 16 columns each
             // (attn_wsplit1) or <= 32 (attn_wsplit2: one K/V pass for up to 32 / grp_q rows)

@@ -317,6 +317,9 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
     }
     const char* kvs = kv == KvFormat::q8v ? "_q8v" : kv == KvFormat::q4 ? "_q4" : kv == KvFormat::f16 ? "" : "_q8";
     k.attn_kx = L.opt(std::string("attn_kx") + kvs);
+    k.attn_ws4 = L.opt(std::string("attn_ws4") + kvs);  // gfx1151 only (no q8v variant)
+    if (kv == KvFormat::f16 || kv == KvFormat::q8 || kv == KvFormat::q8h)  // gfx1151 only (f16 / int8 K/V)
+        for (int cg = 1; cg <= 3; ++cg) k.attn_ws4g[cg - 1] = L.opt(std::string("attn_ws4g") + std::to_string(cg) + (kv == KvFormat::f16 ? "" : "_q8"));
     {
         // q8 and q8h share the int8 K/V layout, so both use the _q8 variants.
         const std::string s = kvs;

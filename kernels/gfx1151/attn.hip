@@ -566,6 +566,74 @@ struct AwGroups {  // kMaxVerifyRows (32) groups, as include/whirl/kernels_abi.h
     int count[32];
 };
 
+// Per-column math of attn_wsplit_impl, shared with attn_ws4 (kernels/gfx1151/attn_ws4.hip) so
+// both run the same operation graph per column (bitwise identical by construction).
+// QK chain of one 16-key tile: sc = WMMA(A(st), Q^T fragment st, sc) for st 0..15 in order;
+// qrow = this lane's Qs row (column lane % 16), afrag(st) = K rows' values [16 st, 16 st + 16).
+template <class FA> __device__ __forceinline__ float8 aw_qk_chain(float8 sc, const _Float16 *qrow, FA afrag) {
+#pragma clang fp contract(off)
+#pragma unroll
+    for (int st = 0; st < AW_D / 16; ++st) {
+        const half16 qb = ld_frag16(qrow + 16 * st);
+        const half16 a = afrag(st);
+        sc = WMMA16(a, qb, sc);
+    }
+    return sc;
+}
+// Online-softmax step of one 32-key chunk for this lane's column: mask (key <= my_pos, key < b1),
+// scale, chunk max over both half-waves, rescale factor alpha, p (f16) and the row sum in the
+// fixed order (kt outer, v inner, then lane ^ 16); updates m, l; returns alpha.
+__device__ __forceinline__ float aw_softmax_step(float8 (&sc)[AW_K / 16], half8 (&pt)[AW_K / 16], int k0, int lane, int my_pos, int b1,
+                                                 float scale, float &m, float &l) {
+#pragma clang fp contract(off)
+    float mx = -INFINITY;
+#pragma unroll
+    for (int kt = 0; kt < AW_K / 16; ++kt)
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            const int key = k0 + kt * 16 + CROW(lane, v);
+            const float x = (key <= my_pos && key < b1) ? sc[kt][v] * scale : -INFINITY;
+            sc[kt][v] = x;
+            mx = fmaxf(mx, x);
+        }
+    mx = fmaxf(mx, __shfl_xor(mx, 16, WARP));
+    const float m_new = fmaxf(m, mx);
+    const float alpha = (m == -INFINITY) ? 0.f : __expf(m - m_new);
+    float rs = 0.f;
+#pragma unroll
+    for (int kt = 0; kt < AW_K / 16; ++kt)
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            const float p = (sc[kt][v] == -INFINITY) ? 0.f : __expf(sc[kt][v] - m_new);
+            rs += p;
+            pt[kt][v] = (_Float16)p;
+        }
+    rs += __shfl_xor(rs, 16, WARP);
+    l = __builtin_fmaf(l, alpha, rs);
+    m = m_new;
+    return alpha;
+}
+// P.V of one chunk for NDT 16-dim tiles of this lane's column: o *= alpha, then per tile
+// o = WMMA(V^T tile kt0, p kt0, o), WMMA(.. kt1, p kt1, o); vfrag(j, kt) = V^T fragment of tile j.
+template <int NDT, class FV>
+__device__ __forceinline__ void aw_pv(float8 (&o)[NDT], float alpha, const half8 (&pt)[AW_K / 16], int lane, FV vfrag) {
+#pragma clang fp contract(off)
+#pragma unroll
+    for (int dt = 0; dt < NDT; ++dt)
+#pragma unroll
+        for (int v = 0; v < 8; ++v) o[dt][v] *= alpha;
+    half16 pb[AW_K / 16];
+#pragma unroll
+    for (int kt = 0; kt < AW_K / 16; ++kt) pb[kt] = join_halves(pt[kt], lane);
+#pragma unroll
+    for (int dt = 0; dt < NDT; ++dt)
+#pragma unroll
+        for (int kt = 0; kt < AW_K / 16; ++kt) {
+            const half16 a = vfrag(dt, kt);
+            o[dt] = WMMA16(a, pb[kt], o[dt]);
+        }
+}
+
 template <int CG, int Q8>
 __device__ __forceinline__ void attn_wsplit_impl(const float *q, const KvArgs &kv, float *part_ml, float *part_acc, int n_head, int n_kv,
                 int q_stride, const int *pos, float scale, const int *skip, AwGroups groups) {
@@ -676,53 +744,12 @@ __device__ __forceinline__ void attn_wsplit_impl(const float *q, const KvArgs &k
         for (int kt = 0; kt < AW_K / 16; ++kt) {
             const int krow = min(k0 + kt * 16 + lane % 16, b1 - 1);  // clamp (masked below)
             const size_t kr = ((size_t)(krow + dl) * n_kv + g) * AW_D;
-#pragma unroll
-            for (int st = 0; st < AW_D / 16; ++st) {
-                const half16 qb = ld_frag16(&Qs[wid * 16 + lane % 16][16 * st]);
-                const half16 a = kv_ld16<kv_kf(Q8)>(kv.k, kv.ks, kr + 16 * st);
-                sc[kt] = WMMA16(a, qb, sc[kt]);
-            }
+            sc[kt] = aw_qk_chain(sc[kt], &Qs[wid * 16 + lane % 16][0],
+                                 [&](int st) { return kv_ld16<kv_kf(Q8)>(kv.k, kv.ks, kr + 16 * st); });
         }
-        float mx = -INFINITY;
-#pragma unroll
-        for (int kt = 0; kt < AW_K / 16; ++kt)
-#pragma unroll
-            for (int v = 0; v < 8; ++v) {
-                const int key = k0 + kt * 16 + CROW(lane, v);
-                const float x = (key <= my_pos && key < b1) ? sc[kt][v] * scale : -INFINITY;
-                sc[kt][v] = x;
-                mx = fmaxf(mx, x);
-            }
-        mx = fmaxf(mx, __shfl_xor(mx, 16, WARP));
-        const float m_new = fmaxf(m, mx);
-        const float alpha = (m == -INFINITY) ? 0.f : __expf(m - m_new);
-        float rs = 0.f;
         half8 pt[AW_K / 16];
-#pragma unroll
-        for (int kt = 0; kt < AW_K / 16; ++kt)
-#pragma unroll
-            for (int v = 0; v < 8; ++v) {
-                const float p = (sc[kt][v] == -INFINITY) ? 0.f : __expf(sc[kt][v] - m_new);
-                rs += p;
-                pt[kt][v] = (_Float16)p;
-            }
-        rs += __shfl_xor(rs, 16, WARP);
-        l = __builtin_fmaf(l, alpha, rs);
-        m = m_new;
-#pragma unroll
-        for (int dt = 0; dt < AW_D / 16; ++dt)
-#pragma unroll
-            for (int v = 0; v < 8; ++v) o[dt][v] *= alpha;
-        half16 pb[AW_K / 16];
-#pragma unroll
-        for (int kt = 0; kt < AW_K / 16; ++kt) pb[kt] = join_halves(pt[kt], lane);
-#pragma unroll
-        for (int dt = 0; dt < AW_D / 16; ++dt)
-#pragma unroll
-            for (int kt = 0; kt < AW_K / 16; ++kt) {
-                const half16 a = ld_frag16(&Vt[dt * 16 + lane % 16][kt * 16]);
-                o[dt] = WMMA16(a, pb[kt], o[dt]);
-            }
+        const float alpha = aw_softmax_step(sc, pt, k0, lane, my_pos, b1, scale, m, l);
+        aw_pv<AW_D / 16>(o, alpha, pt, lane, [&](int dt, int kt) { return ld_frag16(&Vt[dt * 16 + lane % 16][kt * 16]); });
     }
     if (!cvalid) return;
     if (lane < 16) {

@@ -84,7 +84,9 @@ std::optional<bool> requiredKernelAbsentOk(const std::string& arch, const std::s
     // kernels absent by design on each arch (a prefix of "family name"); anything else missing fails
     static const std::vector<std::pair<std::string, std::vector<std::string>>> lists = {
         // gfx1201: the 8060S grouped expert GEMMs; no precise MoE expert kernel for f32 / f16 experts
-        {"gfx1201", {"moe gemm_moegu", "moemx gemm_moegu", "moef gemm_moegu", "moef moe_gu_f_f32", "moef moe_gu_f_f16"}},
+        // and the gfx1151-only 4-wave attention (attn8s: attn_ws4 / attn_ws4g*)
+        {"gfx1201", {"moe gemm_moegu", "moemx gemm_moegu", "moef gemm_moegu", "moef moe_gu_f_f32", "moef moe_gu_f_f16", "ws4 attn_ws4",
+                     "ws4g attn_ws4g"}},
         // gfx1151 (from the 8060S runs of attndq4,moef,misc; the other families were not run there in
         // FIX-TEST-A, extend this list from a full 8060S run): no fp8 path, no gfx1201 precise MoE prefill
         // GEMMs, no precise MoE expert kernel for f32 / f16 experts

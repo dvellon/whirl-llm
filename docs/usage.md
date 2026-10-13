@@ -596,6 +596,7 @@ Alternatives kept for A/B tests and numerics comparisons. The lossy ones are the
 | `WHIRL_MOE_BN=32\|64` | grouped expert GEMM token tile |
 | `WHIRL_DBG=BITS` | 1 = no gdn_abconv merge, 2 = scalar split attention, 4 = one query per attention group |
 | `WHIRL_ATTN_WIDE=0` | verify attention groups of at most 16 columns (`attn_wsplit1`) instead of up to 32 (`attn_wsplit2`) |
+| `WHIRL_ATTN_WS4=0` | gfx1151 (8060S), f16 / q8h KV: the old one-row-per-group decode / verify attention (`attn_wsplit1`) instead of `attn_ws4` / `attn_ws4g` (same output bits, slower at long context; debug fallback) |
 | `WHIRL_ATTN_DQ4=0` | q4 KV: decode / verify attention through `attn_wsplit1_q4` (slower; before 0.2.0) instead of `attn_dq4` |
 
 ### <a id="env-debug"></a>7.7 Diagnostics and debugging
@@ -604,7 +605,7 @@ Alternatives kept for A/B tests and numerics comparisons. The lossy ones are the
 |---|---|
 | `WHIRL_KV=f16\|q8\|q8h\|q8v\|q4` | *(debug)* force a KV cache format instead of the mode's ([numerics modes](#modes)); `auto` or unset = the mode decides. A forced format skips the fit check (the pool is sized from what is free) and in precise mode a quantized value is logged as a user-requested lossy override. A format the GPU has no kernels for is refused. See [kv-and-caching.md](guide/en/kv-and-caching.md#formats) |
 | `WHIRL_FD_SPLITS=64\|128\|192\|256` | *(debug)* split count of the decode / verify attention (default 64, q4 KV 256). Another value changes the attention's partial sums, so output bits differ from the default |
-| `WHIRL_FD_SPLITS`, `WHIRL_GEMV_MAX`, `WHIRL_GV_NMAX`, `WHIRL_GV_GROUP`, `WHIRL_NO_FUSE`, `WHIRL_FLOAT_GEMV`, `WHIRL_GDN_SEQ`, `WHIRL_NAIVE_ATTN`, `WHIRL_DBG`, `WHIRL_ATTN_WIDE`, `WHIRL_ATTN_DQ4`, `WHIRL_MOE_BN` | A/B switches that pick other kernel paths. Any of them set is logged at start-up as an override and the mode label becomes `MODE+overrides` (also in `GET /props`): the run is not the mode's tested path, and e.g. `WHIRL_GEMV_MAX=8` in balance makes 9–16-row verifies take another GEMM than 1-token decode, so MTP is no longer equal to plain decode |
+| `WHIRL_FD_SPLITS`, `WHIRL_GEMV_MAX`, `WHIRL_GV_NMAX`, `WHIRL_GV_GROUP`, `WHIRL_NO_FUSE`, `WHIRL_FLOAT_GEMV`, `WHIRL_GDN_SEQ`, `WHIRL_NAIVE_ATTN`, `WHIRL_DBG`, `WHIRL_ATTN_WIDE`, `WHIRL_ATTN_DQ4`, `WHIRL_ATTN_WS4`, `WHIRL_MOE_BN` | A/B switches that pick other kernel paths. Any of them set is logged at start-up as an override and the mode label becomes `MODE+overrides` (also in `GET /props`): the run is not the mode's tested path, and e.g. `WHIRL_GEMV_MAX=8` in balance makes 9–16-row verifies take another GEMM than 1-token decode, so MTP is no longer equal to plain decode |
 | `WHIRL_TOKENIZE_ONLY=1` | print the prompt token ids and stop |
 | `WHIRL_PRINT_IDS=1` | print the generated token ids and their FNV-1a hash |
 | `WHIRL_PROFILE=1` | per-op-class GPU time; distorts speed numbers (`whirl bench`: per prefill size; server: 1 or 2) |
