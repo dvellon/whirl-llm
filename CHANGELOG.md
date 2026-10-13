@@ -9,6 +9,10 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 - `whirl chat` now prefills on the server's chunk schedule (same forced splits and forwards, `include/whirl/prefill_schedule.h`), so the CLI and the server give bit-identical output for the same prompt; before, prompts of 4096·k plus a few tokens or with a 2048+ token system message could differ in the last bits (`whirl seqtest` CLI-SCHED gate; audit/CLI-SCHED.md).
 
+### SSD tier: shutdown mode never writes a one-shot prompt (CLOSE-REUSED)
+
+- `--kv-ssd-mode shutdown` (default) now writes only reused entries, in every case: when WHIRL is closed (Ctrl+C, console window closed, logoff, OS shutdown), on RAM eviction, and after about 5 minutes idle; a one-shot prompt is never written to the SSD (the close flush used to write it too). `always` mode is unchanged (audit/CLOSE-REUSED.md).
+
 ### SSD tier: shutdown mode also writes reused entries after about 5 minutes idle (TIER-IDLE)
 
 - `--kv-ssd-mode shutdown` (default) writes when WHIRL is closed (Ctrl+C, console window closed, logoff, OS shutdown), plus reused entries that RAM must evict, plus, after about 5 minutes with no request, reused entries in the background (one at a time; a new request stops it; one-shot prompts are never written while running); console close, logoff and OS shutdown allow only about 5 s, so Ctrl+C is the way to guarantee a full write (audit/TIER-IDLE.md).

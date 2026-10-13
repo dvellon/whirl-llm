@@ -12,8 +12,8 @@
 //          ends the period (the next idle period may fire again). Never in --kv-ssd-mode always (entries
 //          are written after their delay there) or off.
 //   what:  the eviction-write rule of evict_policy.h in shutdown mode: reused, not demoted, >= min_tokens,
-//          not already current on SSD. A one-shot prompt is never written (the close flush still writes
-//          it when WHIRL is closed).
+//          not already current on SSD. A one-shot prompt is never written (nor by the flush when WHIRL is
+//          closed: CLOSE-REUSED).
 //   how:   one write at a time, and a request that arrives stops the pass (Tier::idle_writing cleared):
 //          a new request waits on at most the one write already running on the IO thread.
 //

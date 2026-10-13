@@ -1293,6 +1293,22 @@ void suiteSys() {
             d += std::format("C{} {} ", i, res[i].cached);
         }
         check("sys: 4 concurrent sessions == cold, all reuse", ok, d);
+        {
+            // CLOSE-REUSED: shutdown mode writes only reused entries, also when WHIRL is closed, so the sessions
+            // above (one-shot) are no longer written at the stop. Session D (a file in its user message, long
+            // enough for a tail checkpoint past the system prompt) resumes for a second turn: its entry becomes
+            // reused, so the stop still writes a session next to the system checkpoint and the dedup check below
+            // has two entries sharing the system prompt's blocks.
+            const std::string du = codeText(12000, 21) + "\n\nIn one sentence, what does this file do?";
+            const std::string tools = ",\"tools\":" + sysTools();
+            auto d1 = chat(arr({msg("system", SYS1), msg("user", du)}), greedy(48) + thinkKw(false) + tools);
+            auto d2 = chat(arr({msg("system", SYS1), msg("user", du), msg("assistant", d1.content),
+                                msg("user", "Name one function in that file, in one sentence.")}),
+                           greedy(48) + thinkKw(false) + tools);
+            check("sys: session D resumed (turn 2 continues its turn 1 past the system prompt)",
+                  B && d2.cached > *B + 1024 && !d2.text().empty(),
+                  std::format("cached {} (boundary {}, turn 1 prompt {})", d2.cached, B ? *B : -1, d1.prompt));
+        }
         std::this_thread::sleep_for(std::chrono::seconds(3));
         s->waitTierIdle(60);  // pending SSD writes done before the stop
     }

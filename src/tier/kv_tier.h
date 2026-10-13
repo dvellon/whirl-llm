@@ -46,6 +46,7 @@
 #pragma once
 
 #include "device_ops.h"
+#include "evict_policy.h"
 
 #include <array>
 #include <atomic>
@@ -152,9 +153,9 @@ struct Config {
     // entry changes or is restored from RAM; 5 min: a conversation that continues within it is
     // served from RAM and never costs a disk write)
     std::uint64_t ssd_delay_ms = 300000;
-    // --kv-ssd-mode shutdown: entries stay in RAM and are written only while
-    // `flushing` is set (graceful shutdown), except a reused entry (Entry::reused) that RAM
-    // pressure has to evict: written then (asynchronously) instead of dropped (TIER-EVICT)
+    // --kv-ssd-mode shutdown: only reused entries (Entry::reused) are ever written: while
+    // `flushing` is set (when WHIRL is closed, CLOSE-REUSED), when RAM pressure has to evict one
+    // (TIER-EVICT), or after the server sat idle (TIER-IDLE); a one-shot prompt never is
     bool ssd_shutdown_only = false;
     // `always` mode: an entry is written (delay expired, RAM pressure, flush) only if it was reused
     // (its prefix was restored at least once) or is a session that was resumed (grew by appending);
@@ -516,9 +517,11 @@ private:
     std::uint64_t foreignFiles_() const { return foreign_.size(); }
     std::chrono::steady_clock::time_point next_expiry_{};
     bool seenOk(const Entry* e) const { return cfg.ssd_shutdown_only || !cfg.ssd_seen_filter || e->reused; }
+    EvictFacts evictFacts(const Entry* v) const;
     bool evictWanted(const Entry* v) const;
     bool evictWrite(Entry* v);
     bool idleWanted(const Entry* v) const;
+    bool closeWanted(const Entry* v) const;
     // TIER-IDLE pass state
     bool idle_writing_ = false;
     std::vector<std::uint64_t> idle_skip_;  // entries whose write could not start in this pass (not retried)

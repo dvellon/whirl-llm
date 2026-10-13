@@ -226,8 +226,9 @@ balance, 128k session): cold prefill 537 s, RAM-tier restore 0.34 s, SSD-tier re
 2 s, decode speed unchanged. Size rule, from the OS-visible RAM only (not the 128 GB total):
 `clamp(OS-visible RAM / 8, one max-context entry (about 6 GiB for 27B at 262k), 16 GiB)`, at most 1/4
 of the RAM available at startup, off under 32 GB of OS-visible RAM; 8 GiB on a 64 GB machine. The
-startup log prints the size and the reason. The SSD tier runs in `shutdown` mode (no writes while
-running, except reused entries that RAM has to evict and, after about 5 minutes idle, reused entries in the background). `--kv-ram-mb N` / `WHIRL_KV_RAM_MB` are used as given, `--kv-ram-mb 0` turns both host tiers
+startup log prints the size and the reason. The SSD tier runs in `shutdown` mode (only reused entries
+are ever written: when WHIRL is closed, when RAM has to evict them, and after about 5 minutes idle in the
+background; a one-shot prompt never is). `--kv-ram-mb N` / `WHIRL_KV_RAM_MB` are used as given, `--kv-ram-mb 0` turns both host tiers
 off, `--kv-ssd-gb 0` or `--kv-ssd-mode off` only the SSD tier. Decided from the
 capability `DeviceInfo::integrated`, not the architecture.
 
@@ -456,7 +457,10 @@ then KV page j at `nck × ck_stride + j × page_bytes` (13.0 MiB per page for q8
   is written (`--kv-ssd-mode always` only; the default `shutdown` writes when WHIRL is closed: Ctrl+C, console window closed, logoff, OS shutdown; the last three allow only about 5 s, Ctrl+C a full flush) after it has been
   unchanged for `--kv-ssd-delay` seconds (default 300), and only if it was reused or resumed at least once (a
   one-shot prompt is never written); a graceful stop writes the most recently used entries first. Shutdown
-  mode writes nothing while running, except that reused entries that RAM must evict are also written: a reused entry (restored,
+  mode writes only reused entries, ever — when WHIRL is closed, on RAM eviction and after about 5 minutes
+  idle; a one-shot prompt is never written in any of these cases. The close flush writes every reused entry
+  not yet current on the SSD (the eviction rule, except that a demoted reused entry is written too: the
+  close is its last chance). On RAM eviction: a reused entry (restored,
   resumed, or a shared system-message checkpoint that requests attached) of at least 2048 tokens that RAM
   pressure pushes out is written in the background instead of dropped (size cap and dedup apply as for any
   write; the spill that needed the room is retried when the write is done). After about 5 minutes with no request (none running, none arriving), the reused entries not yet current on the SSD are also written in the background, one at a time; a request that arrives stops it (it waits at most for the one write already running), and nothing more is written while the server stays idle. Console close, logoff and OS shutdown allow only about 5 s, so Ctrl+C is the way to guarantee a full write. The idle rule is the eviction rule (reused, not demoted, at least 2048 tokens, not already current on the SSD), with the same crash-safe header protocol, cap, LRU and 7-day expiry as any write.

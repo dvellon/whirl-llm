@@ -1056,6 +1056,13 @@ static bool spillSess(Tier& t, Sess& s, std::size_t changed_from) {
     return fresh;
 }
 
+// What a restore or a resumed turn does to an entry (Tier restore, Engine::spillSlot): marks it reused. In
+// shutdown mode only reused entries are written, also by the flush when WHIRL is closed (CLOSE-REUSED), so
+// tests of that flush mark the sessions they expect on the SSD.
+static void reuse(Tier& t, const Sess& s) {
+    if (Entry* e = t.find(s.id)) e->reused = true;
+}
+
 // what Engine::supersedeOld does after a new entry's first spill
 static std::uint64_t supersede(Tier& t, const Entry* x, std::size_t sys) {
     std::uint64_t freed = 0;
@@ -1299,7 +1306,7 @@ static void testModesLock(MockDeviceOps& ops, const fs::path& dir) {
     SsdEnv env{dir};
     std::uint64_t seed = 990;
     {
-        // shutdown mode: nothing written until flushing
+        // shutdown mode: nothing written until flushing (a reused entry: the only kind the close flush writes)
         auto t = Tier::create(ops, 128ull << 20, 13, 0);
         Config c = env.cfg(4ull << 30);
         c.ssd_shutdown_only = true;
@@ -1307,6 +1314,7 @@ static void testModesLock(MockDeviceOps& ops, const fs::path& dir) {
         Sess a(ops, 24);
         a.toks = freshToks(3000, seed);
         spillSess(*t, a, 0);
+        reuse(*t, a);
         CHECK(tickIdle(*t));
         CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);
         // a second server on the same directory: SSD tier off
@@ -1998,8 +2006,9 @@ static void testEvictionWriteSsdFull(MockDeviceOps& ops, const fs::path& dir) {
     }
 }
 
-// Shutdown mode: no write while running even with delay 0, a flush writes everything; always mode: the
-// flush (delay forced to 0 like Engine::flushTierOnStop) does not wait for the delay either.
+// Shutdown mode: no write while running even with delay 0, a flush writes every reused entry (CLOSE-REUSED:
+// only those; a one-shot prompt is not written, testCloseReusedTier); always mode: the flush (delay forced to
+// 0 like Engine::flushTierOnStop) does not wait for the delay either.
 static void testShutdownFlush(MockDeviceOps& ops, const fs::path& dir) {
     for (int mode = 0; mode < 2; ++mode) {
         std::error_code ec;
@@ -2016,6 +2025,8 @@ static void testShutdownFlush(MockDeviceOps& ops, const fs::path& dir) {
         b.toks = freshToks(3000, seed);
         spillSess(*t, a, 0);
         spillSess(*t, b, 0);
+        reuse(*t, a);
+        reuse(*t, b);
         t->tick();
         sleepMs(50);
         t->tick();
@@ -2059,9 +2070,12 @@ static void testFlushDedup(MockDeviceOps& ops, const fs::path& dir) {
             Config c = env.cfg(4ull << 30);
             c.ssd_delay_ms = mode == 0 ? 600000 : 200;
             c.ssd_shutdown_only = mode == 0;
+            c.min_tokens = 1024;  // u has 2000 tokens (the shutdown-mode close flush applies min_tokens: CLOSE-REUSED)
             t->start(c, kLay, fp);
             for (Sess* s : fam) spillSess(*t, *s, 0);
             spillSess(*t, u, 0);
+            for (Sess* s : fam) reuse(*t, *s);  // sessions worth keeping (shutdown mode writes only reused ones)
+            reuse(*t, u);
             for (int i = 0; i < 3; ++i) ids[i] = fam[i]->id;
             t->tick();
             CHECK(t->stats.ssd_writes == 0);
@@ -2128,6 +2142,8 @@ static void testFlushOrder(MockDeviceOps& ops, const fs::path& dir) {
     sleepMs(5);
     s0.toks.push_back(99);
     spillSess(*t, s0, s0.toks.size() - 1);
+    reuse(*t, s2);  // s0 (resumed) and s1 (restored) are reused already; the close flush writes only reused ones
+    reuse(*t, s3);  // (the flag does not change the use order)
     t->tick();
     CHECK(t->stats.ssd_writes == 0);
     t->flushing = true;
@@ -2149,8 +2165,8 @@ static void testFlushOrder(MockDeviceOps& ops, const fs::path& dir) {
 }
 
 // `always` mode seen-once filter: only entries whose prefix was reused (restored) or that were resumed
-// (updated in place) are written; a stream of distinct one-shot prompts writes nothing. Shutdown mode writes
-// everything on the flush.
+// (updated in place) are written; a stream of distinct one-shot prompts writes nothing. Shutdown mode's flush
+// (when WHIRL is closed) writes only the reused entries too (CLOSE-REUSED; it used to write everything).
 static void testSeenOnce(MockDeviceOps& ops, const fs::path& dir) {
     std::error_code ec;
     fs::remove_all(dir, ec);
@@ -2228,7 +2244,8 @@ static void testSeenOnce(MockDeviceOps& ops, const fs::path& dir) {
         t.reset();
         fs::remove_all(dir, ec);
     }
-    // 3. shutdown mode: the flush writes everything in RAM, seen or not
+    // 3. shutdown mode: the flush writes only the reused entry (a restored), not the one-shot b (CLOSE-REUSED;
+    //    before, it wrote everything in RAM, seen or not)
     {
         auto t = mk(256ull << 20, 600000, true);
         Sess a(ops, 24), b(ops, 24);
@@ -2236,12 +2253,14 @@ static void testSeenOnce(MockDeviceOps& ops, const fs::path& dir) {
         b.toks = freshToks(3000, seed);
         spillSess(*t, a, 0);
         spillSess(*t, b, 0);
+        CHECK(restoreMatches(*t, ops, t->find(a.id), a));
         t->tick();
         CHECK(t->stats.ssd_writes == 0);
         t->flushing = true;
         t->cfg.ssd_delay_ms = 0;
         CHECK(tickIdle(*t));
-        CHECK(t->stats.ssd_writes == 2 && countFiles(dir) == 2);
+        CHECK(t->stats.ssd_writes == 1 && countFiles(dir) == 1);
+        CHECK(t->find(a.id)->ssd.has_value() && !t->find(b.id)->ssd.has_value());
         t.reset();
         fs::remove_all(dir, ec);
     }
@@ -2536,6 +2555,7 @@ static void testRamUsePersisted(MockDeviceOps& ops, const fs::path& dir) {
             t->start(cfg(), kLay, 77);
             spillSess(*t, a, 0);
             id_a = a.id;
+            reuse(*t, a);  // a shared prefix used by others (shutdown mode's close flush writes only reused entries)
             t->flushing = true;
             CHECK(tickIdle(*t));
             CHECK(countFiles(dir) == 1);
@@ -2786,6 +2806,132 @@ static void testIdleFlushPolicy() {
     CHECK(!idleWriteWanted(f));
     f.dirty = true;  // changed since its write (resumed): written again
     CHECK(idleWriteWanted(f));
+}
+
+// CLOSE-REUSED: the close-flush rule (evict_policy.h closeWriteWanted) is the shutdown-mode eviction rule,
+// except that a demoted reused entry is still written (the close flush is its last chance).
+static void testClosePolicy() {
+    EvictFacts b;  // a reused, never-written 4096-token entry, SSD tier on, shutdown mode
+    b.ssd_on = true;
+    b.shutdown_only = true;
+    b.seen_filter = true;
+    b.reused = true;
+    b.n_tok = 4096;
+    b.min_tokens = 2048;
+    CHECK(closeWriteWanted(b));
+    EvictFacts f = b;
+    f.reused = false;  // one-shot prompt: never, whatever the seen filter says
+    CHECK(!closeWriteWanted(f));
+    f.seen_filter = false;
+    CHECK(!closeWriteWanted(f));
+    f.shutdown_only = false;  // the rule is the shutdown one even if the caller passed always-mode facts
+    CHECK(!closeWriteWanted(f));
+    f = b;
+    f.demoted = true;  // demoted but reused: written at close (not on eviction / idle)
+    CHECK(closeWriteWanted(f) && !evictWriteWanted(f) && !idleWriteWanted(f));
+    f.reused = false;  // demoted one-shot: never
+    CHECK(!closeWriteWanted(f));
+    f = b;
+    f.ssd_on = false;
+    CHECK(!closeWriteWanted(f));
+    f = b;
+    f.n_tok = 2047;
+    CHECK(!closeWriteWanted(f));
+    f = b;
+    f.on_ssd = true;  // current on SSD: not rewritten; dirty since: rewritten
+    CHECK(!closeWriteWanted(f));
+    f.dirty = true;
+    CHECK(closeWriteWanted(f));
+}
+
+// CLOSE-REUSED in the Tier: shutdown mode, the flush when WHIRL is closed (flushing, delay 0 like
+// Engine::flushTierOnStop) writes the reused entries (restored, resumed, and a demoted reused one) and never
+// the one-shot prompt; a restart restores the reused ones bit-exactly and has no trace of the one-shot one.
+// Always mode keeps its seen-once filter at the flush (the one-shot one is written with the filter off).
+static void testCloseReusedTier(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    std::uint64_t seed = 9700;
+    const std::uint64_t fp = 97;
+    std::vector<std::string> logs;
+    Sess a(ops, 24), b(ops, 24), d(ops, 24), r(ops, 24);
+    a.toks = freshToks(3000, seed);
+    b.toks = freshToks(3000, seed);
+    d.toks = freshToks(3000, seed);
+    r.toks = freshToks(3000, seed);
+    std::uint64_t id_a = 0, id_b = 0, id_d = 0, id_r = 0;
+    auto mkcfg = [&] {
+        Config c = env.cfg(4ull << 30);
+        c.ssd_seen_filter = true;
+        c.ssd_shutdown_only = true;
+        c.ssd_delay_ms = 600000;
+        return c;
+    };
+    {
+        auto t = Tier::create(ops, 256ull << 20, 97, 0);
+        t->log_fn = [&](std::string_view s) { logs.emplace_back(s); };
+        t->start(mkcfg(), kLay, fp);
+        spillSess(*t, a, 0);
+        id_a = a.id;
+        spillSess(*t, b, 0);
+        id_b = b.id;
+        spillSess(*t, d, 0);
+        id_d = d.id;
+        spillSess(*t, r, 0);
+        id_r = r.id;
+        CHECK(restoreMatches(*t, ops, t->find(id_a), a));  // a: restored (reused)
+        auto more = freshToks(500, seed);                  // r: resumed in place (reused)
+        r.toks.insert(r.toks.end(), more.begin(), more.end());
+        spillSess(*t, r, 3000);
+        CHECK(t->find(id_r) != nullptr && t->find(id_r)->reused);
+        CHECK(restoreMatches(*t, ops, t->find(id_d), d));  // d: reused, then demoted
+        t->demote(t->find(id_d));
+        CHECK(!t->find(id_b)->reused);  // b: one-shot
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 0 && countFiles(dir) == 0);  // nothing while running
+        t->flushing = true;
+        t->cfg.ssd_delay_ms = 0;
+        CHECK(tickIdle(*t));
+        t->flushing = false;
+        CHECK(t->stats.ssd_writes == 3 && countFiles(dir) == 3);
+        CHECK(t->find(id_a)->ssd.has_value() && t->find(id_r)->ssd.has_value() && t->find(id_d)->ssd.has_value());
+        CHECK(!t->find(id_b)->ssd.has_value());  // the one-shot prompt is not written when WHIRL is closed
+    }
+    {
+        // restart: the reused entries restore bit-exactly; the one-shot one is gone
+        auto t = Tier::create(ops, 256ull << 20, 98, 0);
+        t->start(mkcfg(), kLay, fp);
+        CHECK(t->ssdEntries() == 3);
+        CHECK(t->find(id_b) == nullptr);
+        for (auto [id, s] : {std::pair<std::uint64_t, const Sess*>{id_a, &a}, {id_r, &r}, {id_d, &d}}) {
+            Entry* e = t->find(id);
+            CHECK(e != nullptr && !e->in_ram);
+            if (e) CHECK(restoreMatches(*t, ops, e, *s));
+        }
+        CHECK(tickIdle(*t));
+    }
+    fs::remove_all(dir, ec);
+    for (int filter = 1; filter >= 0; --filter) {
+        // always mode: unchanged, the flush applies the seen-once filter
+        auto t = Tier::create(ops, 256ull << 20, 99 + filter, 0);
+        Config c = env.cfg(4ull << 30);
+        c.ssd_seen_filter = filter == 1;
+        c.ssd_shutdown_only = false;
+        c.ssd_delay_ms = 600000;
+        t->start(c, kLay, fp);
+        Sess x(ops, 24);
+        x.toks = freshToks(3000, seed);
+        spillSess(*t, x, 0);
+        CHECK(tickIdle(*t));
+        t->flushing = true;
+        t->cfg.ssd_delay_ms = 0;
+        CHECK(tickIdle(*t));
+        t->flushing = false;
+        CHECK(t->stats.ssd_writes == (filter == 1 ? 0u : 1u));
+        t.reset();
+        fs::remove_all(dir, ec);
+    }
 }
 
 // TIER-IDLE in the Tier: shutdown mode writes nothing while running; Tier::beginIdleWrite (the engine's idle
@@ -3570,6 +3716,8 @@ static void testCapTightRamEntries(MockDeviceOps& ops, const fs::path& dir) {
         if (mode == 0) CHECK(tickIdle(*t));
         sleepMs(5);
         spillSess(*t, b, 0);
+        reuse(*t, a);  // the shutdown-mode close flush writes only reused entries (CLOSE-REUSED)
+        reuse(*t, b);
         if (mode == 1) t->flushing = true;
         const bool idle = tickIdle(*t, 3000);
         CHECK(idle);
@@ -3915,6 +4063,14 @@ int main(int argc, char** argv) {
     if (want("testIdleWriteTier")) {
         std::printf("-- %s\n", "testIdleWriteTier");
         testIdleWriteTier(ops, dir);
+    }
+    if (want("testClosePolicy")) {
+        std::printf("-- %s\n", "testClosePolicy");
+        testClosePolicy();
+    }
+    if (want("testCloseReusedTier")) {
+        std::printf("-- %s\n", "testCloseReusedTier");
+        testCloseReusedTier(ops, dir);
     }
     if (want("testShutdownEvictReused")) {
         std::printf("-- %s\n", "testShutdownEvictReused");

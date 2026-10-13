@@ -2968,9 +2968,10 @@ void Engine::logTier() {
 }
 
 // Shutdown (stop()): finished sessions still waiting for their spill go to the RAM
-// tier, and every RAM entry not yet on the SSD tier (new or updated in place) is
-// written now instead of after the usual delay, so a graceful stop (Ctrl+C,
-// Ctrl+Break, console close) does not lose the last turns. Bounded by
+// tier, and the RAM entries not yet current on the SSD tier are written now instead
+// of after the usual delay (shutdown mode: reused entries only, CLOSE-REUSED -- the
+// rule lives in Tier::tick / evict_policy.h; always mode: its seen-once filter), so a
+// graceful stop (Ctrl+C, Ctrl+Break, console close) does not lose the last turns. Bounded by
 // shutdown_flush_ms; runs on the engine thread like every other tier step.
 void Engine::flushTierOnStop() {
     tier::Tier* t = tier_;

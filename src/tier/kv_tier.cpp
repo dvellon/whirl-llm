@@ -583,7 +583,7 @@ bool Tier::evictable(Entry* e, Entry* keep) {
 // RAM pressure on an entry whose SSD write is not due yet: it is written now (asynchronously;
 // its RAM blocks are freed by a later pass) if the policy in evict_policy.h says it is worth a disk
 // write; else it is dropped (older consistent SSD copy, or gone: a cold prefill later).
-bool Tier::evictWanted(const Entry* v) const {
+EvictFacts Tier::evictFacts(const Entry* v) const {
     EvictFacts f;
     f.ssd_on = ssd_dir_w_.has_value();
     f.shutdown_only = cfg.ssd_shutdown_only;
@@ -594,8 +594,10 @@ bool Tier::evictWanted(const Entry* v) const {
     f.min_tokens = cfg.min_tokens;
     f.on_ssd = v->ssd.has_value();
     f.dirty = f.on_ssd && v->hasDirty();
-    return evictWriteWanted(f);
+    return f;
 }
+
+bool Tier::evictWanted(const Entry* v) const { return evictWriteWanted(evictFacts(v)); }
 
 bool Tier::evictWrite(Entry* v) {
     if (!evictWanted(v)) return false;
@@ -614,19 +616,10 @@ bool Tier::evictWrite(Entry* v) {
 }
 
 // TIER-IDLE: the same facts, judged by the idle-write rule (idle_flush.h).
-bool Tier::idleWanted(const Entry* v) const {
-    EvictFacts f;
-    f.ssd_on = ssd_dir_w_.has_value();
-    f.shutdown_only = true;
-    f.seen_filter = cfg.ssd_seen_filter;
-    f.demoted = v->demoted;
-    f.reused = v->reused;
-    f.n_tok = v->n_tok;
-    f.min_tokens = cfg.min_tokens;
-    f.on_ssd = v->ssd.has_value();
-    f.dirty = f.on_ssd && v->hasDirty();
-    return idleWriteWanted(f);
-}
+bool Tier::idleWanted(const Entry* v) const { return idleWriteWanted(evictFacts(v)); }
+
+// CLOSE-REUSED: the same facts, judged by the close-flush rule (evict_policy.h closeWriteWanted).
+bool Tier::closeWanted(const Entry* v) const { return closeWriteWanted(evictFacts(v)); }
 
 std::size_t Tier::beginIdleWrite() {
     if (idle_writing_ || !cfg.ssd_shutdown_only || !ssd_dir_w_) return 0;
@@ -1916,7 +1909,9 @@ bool Tier::tick() {
                 continue;
             }
             if (!e->hasDirty() && e->ssd) continue;
-            if (!seenOk(e)) continue;  // one-shot prompt, never reused: not worth a disk write
+            // one-shot prompt, never reused: not worth a disk write (shutdown mode: the close flush writes only
+            // what the eviction rule writes, CLOSE-REUSED; always mode: the seen-once filter)
+            if (cfg.ssd_shutdown_only ? !closeWanted(e) : !seenOk(e)) continue;
             const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - e->t_mod).count();
             const std::uint64_t age_ms = age > 0 ? static_cast<std::uint64_t>(age) : 0;
             if (age_ms < cfg.ssd_delay_ms) {

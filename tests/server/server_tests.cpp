@@ -2430,6 +2430,80 @@ void testIdleWrite() {
     std::filesystem::remove_all(dir, ec);
 }
 
+// CLOSE-REUSED (owner decision): in --kv-ssd-mode shutdown the flush when WHIRL is closed (graceful stop) writes
+// only reused entries, like the RAM-eviction and idle writes: a one-shot prompt never reaches the SSD. Mock engine
+// end to end: one one-shot prompt + a 2-turn session, idle write off; on the graceful stop only the session is
+// written; the restart restores it from SSD and the one-shot prompt is a cold prefill (exact output both times).
+void testCloseReused() {
+    std::filesystem::path base;
+    if (const char* t = std::getenv("WHIRL_TEST_TMP"); t && *t) base = std::filesystem::path(widen(t));
+    else base = std::filesystem::temp_directory_path() / L"whirl-tests";
+    const std::string dir = narrow((base / L"server_test_ssd_close").wstring());
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    ServerSetup su = baseSetup();
+    su.mc.parallel = 1;
+    su.mc.slot_ctx = 8192;
+    su.mc.pool_tokens = 8192;
+    su.tier = true;
+    su.ssd_dir = dir;
+    su.tier_min = 512;
+    su.tier_shutdown = true;
+    su.tier_ram_mb = 256;
+    su.eo.kv_idle_flush_ms = 0;  // no idle write: only the close flush writes
+    auto ask = [](TestServer& srv, const std::vector<std::uint32_t>& p) {
+        auto r = srv.post("/v1/completions", completionBody(p, 16));
+        CHECK_EQ(completionText(r), decode(srv.model().greedyReference(p, 16, true)));
+        return r;
+    };
+    const auto p0 = makePrompt(3000, 701);      // one-shot
+    const auto p1 = makePrompt(3000, 702);      // a session: turn 1 ...
+    const auto p2 = makePrompt(3300, 703, p1);  // ... turn 2 resumes it (reused)
+    std::uint64_t sess_id = 0, one_id = 0;
+    {
+        TestServer srv(su);
+        tier::Tier* t = srv.tierp();
+        g_log.clear();
+        ask(srv, p0);
+        ask(srv, p1);
+        ask(srv, p2);
+        for (const tier::Entry* e : t->entries) {
+            if (e->tokens.size() >= p2.size() && std::equal(p2.begin(), p2.end(), e->tokens.begin())) sess_id = e->id;
+            if (e->tokens.size() >= p0.size() && std::equal(p0.begin(), p0.end(), e->tokens.begin())) one_id = e->id;
+        }
+        CHECK(sess_id != 0 && one_id != 0);
+        CHECK_EQ(t->stats.ssd_writes, 0u);  // nothing while running
+        srv.stopEngine();                   // graceful stop: Engine::flushTierOnStop
+        const tier::Entry* sess = t->find(sess_id);
+        const tier::Entry* one = t->find(one_id);
+        CHECK(sess != nullptr && one != nullptr);
+        if (sess) CHECK(sess->reused && sess->ssd.has_value() && !sess->hasDirty());
+        if (one) CHECK(!one->reused && !one->ssd.has_value());  // the one-shot prompt is not written at close
+        for (const tier::Entry* e : t->entries)
+            if (!e->reused) CHECK(!e->ssd.has_value());
+        CHECK_EQ(t->stats.ssd_writes, 1u);
+        CHECK_EQ(t->ssdEntries(), 1u);
+        CHECK(g_log.count("shutdown: tier writes done") >= 1);
+    }
+    {
+        TestServer srv(su);
+        tier::Tier* t = srv.tierp();
+        g_log.clear();
+        CHECK_EQ(t->ssdEntries(), 1u);
+        CHECK(t->find(sess_id) != nullptr);
+        CHECK(t->find(one_id) == nullptr);
+        const auto p3 = makePrompt(3600, 704, p2);
+        auto r = ask(srv, p3);
+        CHECK(cachedTokens(r) >= p2.size());  // the reused session comes back from SSD
+        CHECK(t->stats.restores_ssd >= 1);
+        auto r0 = ask(srv, p0);  // the one-shot prompt: cold, same output
+        CHECK_EQ(cachedTokens(r0), 0u);
+        CHECK_EQ(srv.model().poison(), 0u);
+    }
+    std::filesystem::remove_all(dir, ec);
+}
+
 // FIX-CACHE P2-4 (FR-CACHE), the agent pattern on one slot: the main agent's long session goes idle while a
 // subagent with the same system prompt (another task) runs two turns; then the main agent resumes.
 // supersede 1: before, the subagent's second turn cut the idle main entry to the system prompt (verified:
@@ -3494,6 +3568,7 @@ int main(int argc, char** argv) {
         {"tiers", testTiers},
         {"shutdown_evict_sys", testShutdownEvictSys},
         {"idle_write", testIdleWrite},
+        {"close_reused", testCloseReused},
         {"restore_conc", testRestoreConcurrent},
         {"restore_throws", testRestoreThrows},
         {"tier_inplace", testTierInPlaceRegen},

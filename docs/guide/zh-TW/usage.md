@@ -194,7 +194,7 @@ whirl serve  MODEL.gguf [選項]      （同一支程式）
 | `--kv-ram-mb N` | 前綴快取的主記憶體層，單位 MiB 的 pinned 記憶體（預設：實體記憶體的 1/4，至少 8 GiB 或一個完整長度 session（若更大；27B 模型約 9 GiB），最多 32 GiB，且不超過啟動時可用記憶體的一半；64 GB 的電腦為 16 GiB；整合式 GPU（Radeon 8060S）：作業系統可見記憶體的 1/8，下限為一個最大 context 的條目（27B 模型在 262k 約 6 GiB），上限 16 GiB，且不超過啟動時可用記憶體的 1/4；作業系統可見記憶體低於 32 GB 則關閉（BIOS 的 VRAM 保留區不計；64 GB 的電腦為 8 GiB））。啟動日誌會印出選定的大小與原因。閒置 session 會複製到這裡，下次直接還原而不必重新 prefill。`0` 會關閉兩個 host 層。**Radeon 8060S**（內顯）：預設開啟，大小如上（KV pool 是 BIOS 保留區，主記憶體層是另外 pin 住的作業系統記憶體；128k 的 session 從 RAM 還原 0.3 s、從 SSD 還原 2 s，而重新 prefill 要 537 s）；`--kv-ram-mb 0` 關閉兩個 host 層，`--kv-ssd-gb 0` / `--kv-ssd-mode off` 只關 SSD 層 |
 | `--kv-ssd-dir PATH` | SSD 層目錄（預設 `%LOCALAPPDATA%\whirl\kvcache`） |
 | `--kv-ssd-gb N` | SSD 層容量上限，GiB（預設 64；`0` = 不用 SSD 層） |
-| `--kv-ssd-mode M` | SSD 層何時寫入：`shutdown`（預設；留在主記憶體，關閉 WHIRL 時寫入：Ctrl+C、關閉主控台視窗、登出、作業系統關機，後三者只有約 5 秒；主記憶體層必須擠出的重用過的項目，以及閒置約 5 分鐘後的重用過的項目，也會寫入）、`always`（閒置超過 `--kv-ssd-delay` 後寫入）、`off`（不寫 SSD 檔案）。見[SSD 層如何儲存 session](#ssd-tier) |
+| `--kv-ssd-mode M` | SSD 層何時寫入：`shutdown`（預設；只寫重用過的項目：關閉 WHIRL 時——Ctrl+C、關閉主控台視窗、登出、作業系統關機，後三者只有約 5 秒——、主記憶體層必須擠出時，以及閒置約 5 分鐘後；一次性的 prompt 永遠不寫）、`always`（閒置超過 `--kv-ssd-delay` 後寫入）、`off`（不寫 SSD 檔案）。見[SSD 層如何儲存 session](#ssd-tier) |
 | `--kv-ssd-delay SEC` | `--kv-ssd-mode always`：session 連續 SEC 秒沒有變動才寫入 SSD（預設 300）。在這之前又被使用的 session 直接從主記憶體服務，不會寫入 |
 | `--mmproj FILE` | 視覺編碼器（Qwen3-VL 形式的 mmproj GGUF，F16 / BF16）。`image_url` 內容（base64 PNG / JPEG 等的 `data:` URL）會變成圖片 token。權重放在 pinned 主記憶體，收到圖片之前不占 VRAM |
 | `--vis-idle-s N` | N 秒沒有圖片就釋放視覺編碼器（預設 60） |
@@ -276,11 +276,15 @@ DeltaNet 層只能從伺服器存過**檢查點**的位置接著跑（細節：[
 
 ### <a id="ssd-tier"></a>SSD 層如何儲存 session
 
-- **何時寫入。** `--kv-ssd-mode shutdown`（預設）：session 留在主記憶體層，在關閉 WHIRL 時寫入（Ctrl+C、關閉主控台視窗、登出、
-  作業系統關機），下次啟動即可使用。Ctrl+C 會完整寫完（最多 60 秒）；關閉主控台視窗、登出、Windows 關機只有約 5 秒
-  （之後 Windows 會強制結束行程），待寫的量大時可能只寫入一部分。執行中不寫 SSD，但主記憶體層必須擠出的「重用過的項目」也會寫入。主記憶體層滿了時，重用過的項目（前綴至少被還原過一次、被後續回合接續過的 session，
-  或其他請求共用過的 system 訊息 checkpoint）若有至少 2048 token，會在背景寫進 SSD 而不是直接丟掉（受下面的容量上限限制）；
-  一次性的 prompt 直接丟棄，永遠不寫。伺服器約 5 分鐘沒有請求（沒有執行中、也沒有新來的）時，SSD 上還不是最新的重用過的項目也會在背景寫入，一次寫一筆；新請求一到就停止（最多只等已經在寫的那一筆），持續閒置期間不會再寫。關閉主控台視窗、登出、作業系統關機只有約 5 秒，要保證完整寫完請用 Ctrl+C。當機時只在主記憶體裡的內容會遺失。`always`：項目連續 `--kv-ssd-delay` 秒（預設 300，即 5 分鐘）沒有變動後才寫入。
+- **何時寫入。** `--kv-ssd-mode shutdown`（預設）：只有「重用過的項目」才會寫進 SSD——前綴至少被還原過一次、
+  被後續回合接續過的 session，或其他請求共用過的 system 訊息 checkpoint，且至少 2048 token。寫入時機有三種：
+  關閉 WHIRL 時（Ctrl+C、關閉主控台視窗、登出、作業系統關機），下次啟動即可使用；主記憶體層滿了必須擠出它時
+  （在背景寫入而不是直接丟掉，受下面的容量上限限制）；伺服器約 5 分鐘沒有請求（沒有執行中、也沒有新來的）時，
+  在背景一次寫一筆——新請求一到就停止（最多只等已經在寫的那一筆），持續閒置期間不會再寫。一次性的 prompt
+  在以上任何情況都不會寫入：它只留在主記憶體層，重啟後就沒了。Ctrl+C 會完整寫完（最多 60 秒）；關閉主控台視窗、
+  登出、Windows 關機只有約 5 秒（之後 Windows 會強制結束行程），待寫的量大時可能只寫入一部分——要保證完整寫完請用
+  Ctrl+C。當機時只在主記憶體裡的內容會遺失。
+  `always`：項目連續 `--kv-ssd-delay` 秒（預設 300，即 5 分鐘）沒有變動後才寫入。
   對話在這段時間內又來了下一個請求，就直接從主記憶體服務，不產生任何磁碟寫入；主記憶體吃緊時，還沒到時間的項目若有至少 2048 token
   就先寫入，否則直接丟棄。`always` 只寫值得保留的 session：前綴至少被重用（還原）過一次，或已被後續回合接續過；沒有人再回來用的一次性 prompt 不會寫入（benchmark 連續送不同 prompt 幾乎不寫）。正常關閉時由最近使用的 session 開始寫。`off`：完全不寫 SSD 檔案（主記憶體層照常運作）。原因：benchmark 或 agent 連續送出大量不同的長 prompt 時，
   每個請求會寫數 GB，幾分鐘就是數百 GB，會損耗 SSD。
@@ -317,8 +321,9 @@ DeltaNet 層只能從伺服器存過**檢查點**的位置接著跑（細節：[
 
 1. 新的與排隊中的請求回應 HTTP 503；
 2. 執行中的請求跑完；
-3. 已完成的 session 複製到主記憶體層，主記憶體層中尚未寫入 SSD 的項目立刻寫入——預設 `--kv-ssd-mode shutdown`
-   最多 60 秒（新的內容都在這時寫入），`always` 最多 10 秒（log 會出現 `shutdown: tier writes done …`）。
+3. 已完成的 session 複製到主記憶體層，主記憶體層中 SSD 上還不是最新的項目立刻寫入——預設 `--kv-ssd-mode shutdown`
+   寫所有重用過的項目（一次性的 prompt 不寫），最多 60 秒；`always` 寫它的「看過一次」過濾留下的項目，最多 10 秒
+   （log 會出現 `shutdown: tier writes done …`）。
 
 因此下次啟動時，最近的對話會從 SSD 還原，不必重新 prefill。再按一次 Ctrl+C 會立即結束。關閉主控台視窗、登出或 Windows 關機時，
 不論是否做完，Windows 約 5 秒後都會結束行程，只寫得完這幾秒內的量（Ctrl+C 才會完整寫完）。直接強制結束行程（工作管理員、`taskkill /F`）會跳過以上全部
