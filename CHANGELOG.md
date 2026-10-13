@@ -28,6 +28,9 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
   The MoE margins are thin, and a first 256-row run failed (MoE zh balance 2.04 N, dense zh 8k
   balance 97.27% / fast 92.97%): the window start moves where the prefill is split, so window numbers
   carry chunk-schedule jitter besides sampling noise (audit/MOE-BAL.md).
+  Radeon 8060S (same exe, 512 rows): 36 / 36 pass; Ornith balance 1.75 N (code) / 1.82 N (zh), fast
+  5.42 N / 5.39 N; the code 96k window that failed the old absolute limit (KL 0.0121 at 128 rows) is
+  0.0047 = 2.86 N; dense balance top-1 >= 98.05%, dense fast top-1 >= 94.73%.
 - gfx1201 golden references: only `moe/balance_single` and `moe/balance_pair` changed (re-recorded
   after the passing gate on the same exe); dense and MoE precise / fast references are bit-identical,
   `moe/balance_ngram` unchanged. gfx1151 references unchanged (its MoE balance table did not change).
