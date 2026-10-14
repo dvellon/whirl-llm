@@ -91,7 +91,7 @@ Items (pick a subset with `--balance=fp8,kvq8` or `--fast=...`; `WHIRL_MODE=bala
 | `kvq4` | fast | 4-bit KV (int4 + one f16 scale per 32 values, Hadamard-rotated q / k); on the 8060S decode attention reads it through `attn_dq4` (~180 GB/s): Ornith-1.5-35B-A3B MXFP4 decode at 128k 58.5 tok/s (f16 KV 32.7), at 64k 67.0 (46.4); on the R9700 (FAST-1c) Swift-1.5 27B decode at 131k plain 30.98 tok/s (f16 KV 25.08), MTP 68.79 (63.12), prefill 128k −1.9%; KL vs f16 0.002–0.010 | dense and MoE | dense and MoE |
 | `relaxacc` | fast | Relaxed speculative acceptance (MTP drafts; n-gram drafts stay exact). A relaxed acceptance is refused when it would end in a 6-gram already among the last 4096 tokens (repetition guard). Greedy: a draft that is not the verify row's argmax is still kept when it is among the row's top `WHIRL_RELAX_K` tokens (default 4) and p(draft) >= `WHIRL_RELAX_ALPHA` x p(argmax) (default 0.1); the token after the last kept draft is always the target's own argmax. Temperature > 0: typical acceptance (Medusa): keep the draft when p(draft) >= min(`WHIRL_RELAX_EPS` 0.09, `WHIRL_RELAX_DELTA` 0.3 x exp(-entropy)) on the request's filtered distribution (`specsample` is not used then). **Changes greedy output**: fast greedy is not plain greedy and MTP != plain; it stays deterministic for the same prompt, seed and settings (the draft-count policy then uses a fixed synthetic cycle cost, not wall-clock times; concurrent requests share draft counts and can change each other's output). `WHIRL_RELAX=0` turns it off; MoE models skip it (one MTP draft per cycle, no measured gain; `WHIRL_RELAX=1` forces it) | dense MTP models | dense MTP models |
 | `headq`, `moeskip`, `a8`, `a4` | fast | low-bit output head, MoE expert skipping, W4A8 / W4A4 prefill | not yet implemented | not yet implemented |
-| `q8dec` | balance, fast | int8 activations (one f32 scale per 32 values, as llama.cpp's q8_1) in the decode / verify GEMV (always part of balance and fast) | on | on |
+| `q8dec` | balance (dense models), fast | int8 activations (one f32 scale per 32 values, as llama.cpp's q8_1) in the decode / verify GEMV (part of dense balance and of fast; MoE balance uses f16 decode activations since MOE-BAL-2) | on | on |
 
 What balance and fast change, by model type (R9700; the Radeon 8060S has no fp8 WMMA, so `fp8` /
 `moefp8` are skipped there in every mode):
@@ -99,18 +99,21 @@ What balance and fast change, by model type (R9700; the Radeon 8060S has no fp8 
 | Mode | Dense models (Qwen3.8-27B Q4_K_M, MXFP4 dense) | MoE models (Ornith-1.5-35B-A3B MXFP4) |
 |---|---|---|
 | precise | f16 / f32 everywhere, f16 KV | f16 / f32 everywhere, f16 KV |
-| balance | `fp8` (MXFP4 files only), `gdnwmma`, `h16`, `kvq8` (q8h KV), `specsample`, `q8dec` | `gdnwmma`, `h16`, `specsample`, `q8dec`, f16 KV. **No `fp8` / `moefp8`** (since MOE-BAL): with fp8 activations in front of the 256-expert router the MoE balance output was 3.3-3.6x the model's own KL noise floor N (two equally exact precise paths); without them about 1.9x N on the KL gate corpus (code and zh, R9700, docs/dev/testing.md) |
-| fast | balance + `kvq4` (q4 KV) + `relaxacc` | balance + `fp8` + `moefp8` + `kvq4` (q4 KV); `relaxacc` skipped |
+| balance | `fp8` (MXFP4 files only), `gdnwmma`, `h16`, `kvq8` (q8h KV), `specsample`, `q8dec` | `gdnwmma`, `h16`, `specsample`, f16 decode / verify activations, f16 KV. **No `fp8` / `moefp8`** (since MOE-BAL): with fp8 activations in front of the 256-expert router the MoE balance output was 3.3-3.6x the model's own KL noise floor N (two equally exact precise paths). **No `q8dec`** (since MOE-BAL-2): with int8 decode activations MoE balance sat on the KL gate's top-1 floor (zh 8k 93.88% vs 94.00%); quality first, `--fast` for speed |
+| fast | balance + `kvq4` (q4 KV) + `relaxacc` | balance + `fp8` + `moefp8` + `q8dec` + `kvq4` (q4 KV); `relaxacc` skipped |
 
-The MoE change costs MoE balance prefill on the R9700 (about -11% at 128k to -26% at 8k, decode
-unchanged); `--fast` keeps the fp8 prefill speed, and `--balance=fp8,moefp8,gdnwmma,h16,specsample`
-(an explicit list is used as given) restores the old MoE balance.
+The MoE changes cost MoE balance speed: prefill on the R9700 about -11% at 128k to -26% at 8k
+(no fp8, MOE-BAL), decode about -20% to -28% (no q8dec, MOE-BAL-2; measured numbers in
+CHANGELOG / audit/MOE-BAL-2.md). `--fast` keeps both speeds. An explicit list is used as given and
+keeps `q8dec`: `--balance=gdnwmma,h16,specsample` is the MOE-BAL table (with int8 decode),
+`--balance=fp8,moefp8,gdnwmma,h16,specsample` the one before it; `WHIRL_Q8DEC=1` in MoE balance is
+logged as a lossy user override (`balance+overrides`).
 
-In precise mode `q8dec` is off: every matmul of a decode step, an MTP / n-gram verify or a concurrent
+In precise mode (and in MoE balance) `q8dec` is off: every matmul of a decode step, an MTP / n-gram verify or a concurrent
 batch takes f16 activations into the f16 WMMA GEMM (weights decoded from the GGUF type to f16, f32
 accumulation, a fixed per-row reduction order), so each row gets the same bits whatever the batch
 size; a GPU whose kernels lack this path for one of the model's weight types refuses to load the
-model in precise mode instead of falling back to int8. Items that do not apply to the GPU or model are logged as skipped (never an error). The
+model in precise mode (MoE balance: refuses and points to `--fast`) instead of falling back to int8. Items that do not apply to the GPU or model are logged as skipped (never an error). The
 start-up log shows one line, e.g.
 
 ```
@@ -590,7 +593,7 @@ Alternatives kept for A/B tests and numerics comparisons. The lossy ones are the
 
 | Variable | Meaning |
 |---|---|
-| `WHIRL_Q8DEC=0\|1` | decode / verify activations: `1` int8 (item `q8dec`, default in balance / fast; in precise a lossy override), `0` f16 into the f16 GEMM (default in precise) |
+| `WHIRL_Q8DEC=0\|1` | decode / verify activations: `1` int8 (item `q8dec`, default in dense balance and fast; in precise and MoE balance a lossy override), `0` f16 into the f16 GEMM (default in precise and MoE balance) |
 | `WHIRL_FP8=0\|1` | MXFP4 prefill with fp8 activations (item `fp8`; default: on in balance / fast, on MoE models in fast only). `0` also turns `WHIRL_MOE_FP8` off |
 | `WHIRL_FP8_MASK=BITS` | matmul classes that use fp8 activations (default 7) |
 | `WHIRL_G8T=0` | row-major fp8 GEMM instead of the fragment-tiled one (same bits) |
