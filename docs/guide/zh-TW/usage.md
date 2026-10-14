@@ -91,7 +91,7 @@ balance 與 fast 依模型類型開了什麼（R9700；Radeon 8060S 沒有 fp8 W
 | balance | `fp8`（只限 MXFP4 檔）、`gdnwmma`、`h16`、`kvq8`（q8h KV）、`specsample`、`q8dec` | `gdnwmma`、`h16`、`specsample`，f16 decode / verify activation，f16 KV。**不開 `fp8` / `moefp8`**（MOE-BAL 起）：256 選 8 的 router 前面用了 fp8 activation 時，MoE balance 的 KL 是此模型自身噪音底線 N（兩條同樣精確的 precise 路徑之差）的 3.3–3.6 倍。**不開 `q8dec`**（MOE-BAL-2 起）：用 int8 decode activation 時 MoE balance 的 top-1 貼在 KL gate 下限上（zh 8k 93.88% 對 94.00%）；品質優先，要速度用 `--fast` |
 | fast | balance + `kvq4`（q4 KV）+ `relaxacc` | balance + `fp8` + `moefp8` + `q8dec` + `kvq4`（q4 KV）；`relaxacc` 略過 |
 
-這些 MoE 改動的代價是 MoE balance 的速度：R9700 prefill 128k 約 −11% 到 8k 約 −26%（拿掉 fp8，MOE-BAL），decode 約 −20% 到 −28%（拿掉 q8dec，MOE-BAL-2；實測數字見 CHANGELOG / audit/MOE-BAL-2.md）。`--fast` 兩種速度都保有。
+這些 MoE 改動的代價是 MoE balance 的速度：R9700 prefill 128k 約 −11% 到 8k 約 −26%（拿掉 fp8，MOE-BAL），decode 在 R9700 −13% 到 −24%、Radeon 8060S −7% 到 −17%（拿掉 q8dec，MOE-BAL-2；仍比 llama.cpp b11214 快 66–75% / 29–39%，見 CHANGELOG）。8060S 上 MoE balance 現在與 precise 給出相同的 logits（fp8 / moefp8 / gdnwmma 在那裡本來就略過）。`--fast` 兩種速度都保有。
 明確列出的項目照用，而且保留 `q8dec`：`--balance=gdnwmma,h16,specsample` 是 MOE-BAL 的表（含 int8 decode），`--balance=fp8,moefp8,gdnwmma,h16,specsample` 是更早的；MoE balance 下設 `WHIRL_Q8DEC=1` 會記為有損的使用者覆寫（`balance+overrides`）。
 
 precise 模式（以及 MoE balance）關閉 `q8dec`：decode、MTP / n-gram 驗證與並發 batch 的每個 matmul 都用 f16 activation 進 f16 WMMA GEMM（權重從 GGUF 型別解成 f16、f32 累加、每列加總順序固定），所以每一列不論 batch 大小都得到相同的位元；如果 GPU 的 kernel 對模型某種權重型別缺少這條路徑，precise 模式會拒絕載入（MoE balance 則拒絕並建議 `--fast`），不會退回 int8。

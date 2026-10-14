@@ -103,8 +103,9 @@ What balance and fast change, by model type (R9700; the Radeon 8060S has no fp8 
 | fast | balance + `kvq4` (q4 KV) + `relaxacc` | balance + `fp8` + `moefp8` + `q8dec` + `kvq4` (q4 KV); `relaxacc` skipped |
 
 The MoE changes cost MoE balance speed: prefill on the R9700 about -11% at 128k to -26% at 8k
-(no fp8, MOE-BAL), decode about -20% to -28% (no q8dec, MOE-BAL-2; measured numbers in
-CHANGELOG / audit/MOE-BAL-2.md). `--fast` keeps both speeds. An explicit list is used as given and
+(no fp8, MOE-BAL), decode -13% to -24% on the R9700 and -7% to -17% on the Radeon 8060S
+(no q8dec, MOE-BAL-2; still +66-75% / +29-39% over llama.cpp b11214; CHANGELOG). On the 8060S
+MoE balance now gives the same logits as precise (fp8 / moefp8 / gdnwmma are skipped there). `--fast` keeps both speeds. An explicit list is used as given and
 keeps `q8dec`: `--balance=gdnwmma,h16,specsample` is the MOE-BAL table (with int8 decode),
 `--balance=fp8,moefp8,gdnwmma,h16,specsample` the one before it; `WHIRL_Q8DEC=1` in MoE balance is
 logged as a lossy user override (`balance+overrides`).
