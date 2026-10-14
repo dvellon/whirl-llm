@@ -96,38 +96,54 @@ any reference without a passing KL gate report of the same executable (`-KlRepor
 
 `tools/klgate/klgate.py` measures what the golden hashes cannot: how far balance and fast are from
 precise. For every model x prompt x mode one `whirl chat` run prefills a fixed prompt (raw, no MTP)
-and dumps the teacher-forced logits of the 512 positions (`--rows`; 128 before MOE-BAL) before
-8,192 / 32,768 / 98,304 / 131,072 tokens (`WHIRL_DUMP_LOGITS` + `WHIRL_DUMP_AT`, 16-row forwards; the
-zh prompt has 129,297 tokens, so its last window ends there). Per window it takes the mean
-KL(precise || mode) and the top-1 agreement with precise. The limits depend on the model type (the
-`arch` line of the precise run's log; owner decision 2026-10-13, audit/MOE-KL.md, audit/MOE-BAL.md):
+and dumps the teacher-forced logits of 3 windows of 512 positions (`--rows`; 128 before MOE-BAL)
+near each of 8,192 / 32,768 / 98,304 / 131,072 tokens (`WHIRL_DUMP_LOGITS` + `WHIRL_DUMP_AT`, 16-row
+forwards; the zh prompt has 129,297 tokens, so its last windows end there). The 3 windows per length
+L end at L - 1216, L - 592 and L (`--positions`, default 3; KL-ROBUST): each follows a different
+forward split and DeltaNet chunk phase (0 / 48 / 16 rows into a 64-row chunk). Per window it takes
+the mean KL(precise || mode) and the top-1 agreement with precise.
 
-Dense models (`qwen35`), absolute, every window:
+**Judging (KL-ROBUST-2, owner decision 2026-10-14): per length the 3 positions are averaged first,
+and the per-window limits apply to that per-length average.** A single window's KL moves by
++-20-35% and its top-1 by about 1.6 points just from how the prompt before it was split into
+forwards (the same 512 tokens after an 80-row instead of a 4096-row forward: audit/KL-ROBUST.md), and
+the noise floor jitters the same way, while the mean over positions is stable. The report prints
+every position (not judged alone), each length's average, and the number each limit was applied to.
+The limit values are unchanged. They depend on the model type (the `arch` line of the precise run's
+log; owner decision 2026-10-13, audit/MOE-KL.md, audit/MOE-BAL.md):
 
-| Mode | KL mean (per 512-row window) | top-1 agreement |
+Dense models (`qwen35`), absolute, on each length's 3-position average:
+
+| Mode | KL mean (3 x 512-row windows) | top-1 agreement |
 |---|---|---|
 | balance | <= 0.005 | >= 98% |
 | fast | <= 0.03 | >= 93% |
 
 MoE models (`qwen35moe`), relative to the noise floor **N** measured in the same gate run: one more
 run per prompt, precise with the sequential DeltaNet prefill (`WHIRL_GDN_SEQ=1`, an equally exact
-f32 path), compared with precise on the same windows. N = the mean of its window KLs; N_top1(w) =
-its top-1 agreement in window w. Two equally exact paths through a 256-expert top-8 router already
+f32 path), compared with precise on the same windows. N = the mean of its window KLs (all lengths x
+positions); N_top1 = its top-1 agreement averaged over all its windows (KL-ROBUST-2: not the same
+window, since both sides carry the split jitter). Two equally exact paths through a 256-expert top-8 router already
 differ by KL 0.002-0.006 on these prompts (near-tied 8th experts flip), more than the dense balance
 limit, so an absolute limit cannot tell a real regression from the model's own sensitivity:
 
-| Mode | mean KL over the 4 windows | KL of each window | top-1 of each window |
+| Mode | mean KL over all windows (4 lengths x 3) | KL of each length's average | top-1 of each length's average |
 |---|---|---|---|
-| balance | <= 2 N | <= 3 N | >= N_top1(w) - 2.4 points |
-| fast | <= 8 N | <= 12 N | >= N_top1(w) - 8 points |
+| balance | <= 2 N | <= 3 N | >= N_top1 - 2.4 points |
+| fast | <= 8 N | <= 12 N | >= N_top1 - 8 points |
 
 The fast multipliers were set from the measured fast numbers as a regression guard, not as a quality
 claim. 512 rows per window: with 128 rows one row is 0.78 points of top-1 (dense fast zh 8k once
 missed 93% by a single row); the limits were not relaxed for it. A 256-row run still failed (dense zh
 8k balance 97.27% / fast 92.97%, MoE zh balance 2.04 N): the window start also moves where the
 prefill is split into forwards, so the bits of a window - and its KL / top-1 - change with the window
-size as well as by sampling (audit/MOE-BAL.md). The tool keeps one precise dump in memory (1 GB at
-512 rows) and compares every other run right after it finishes.
+size as well as by sampling (audit/MOE-BAL.md). That is why the gate now measures 3 positions per
+length and judges their average (KL-ROBUST, KL-ROBUST-2); judged window by window, the 3-position run
+failed MoE balance on single windows that the average passes. The tool keeps one precise dump in
+memory (3 GB at 3 x 512 rows) and compares every other run right after it finishes.
+`tools/klgate/test_klgate_judge.py` unit-tests the judging rule (no GPU). `--as MODE=ARG` runs MODE
+with another CLI argument and judges it by MODE's limits (a negative test: its report never passes).
+`golden.ps1 record` refuses a report with fewer than 3 positions.
 
 Exit 0 only when every case ran and passed; 1 when a limit failed; 2 on a failed run, a missing or
 changed corpus file (`tools/klgate/corpus.sha256`), a too-short prompt or 0 cases. The corpus is two
@@ -140,7 +156,7 @@ python tools/klgate/klgate.py --exe build\Release\whirl.exe --corpus <corpus dir
     [--device 8060s] --report kl_<arch>.json
 ```
 
-R9700: 14 runs (2 models x 2 prompts x precise / balance / fast, + the MoE noise run per prompt), about 35 minutes; take the R9700
+R9700: 14 runs (2 models x 2 prompts x precise / balance / fast, + the MoE noise run per prompt), about 30 minutes; take the R9700
 lock around the whole run. 8060S: pass `--wrap "python <gpu_lock.py> --max-min 30 --"` so each run
 takes the shared lock on its own. Required: before any golden re-record (above), after a change to
 a numerics item or a default KV format, and before an rc merge / release on both GPUs.

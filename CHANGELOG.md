@@ -5,6 +5,10 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## Unreleased (0.2.0)
 
+### KL gate measures 3 window positions per length and judges their average (KL-ROBUST-2)
+
+- KL gate measures 3 window positions per length and judges their average: `tools/klgate/klgate.py` dumps 3 windows of 512 rows per length (ending at L - 1216, L - 592, L) and applies the per-window limits to each length's 3-position average; the MoE top-1 floor is the noise run's top-1 averaged over all windows; limit values unchanged (a single window's KL moved +-20-35% with the forward split before it; audit/KL-ROBUST.md, audit/KL-ROBUST-2.md).
+
 ### CLI and server give identical output for the same prompt (CLI-SCHED)
 
 - `whirl chat` now prefills on the server's chunk schedule (same forced splits and forwards, `include/whirl/prefill_schedule.h`), so the CLI and the server give bit-identical output for the same prompt; before, prompts of 4096·k plus a few tokens or with a 2048+ token system message could differ in the last bits (`whirl seqtest` CLI-SCHED gate; audit/CLI-SCHED.md).

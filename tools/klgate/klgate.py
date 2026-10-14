@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KL gate (FIX-TEST-B, MOE-BAL, KL-ROBUST): balance and fast against precise, on a fixed corpus, at fixed context lengths.
+# KL gate (FIX-TEST-B, MOE-BAL, KL-ROBUST, KL-ROBUST-2): balance and fast against precise, on a fixed corpus, at fixed context lengths.
 # SPDX-License-Identifier: Apache-2.0
 #
 # For every model x prompt x mode, one `whirl chat` run prefills the whole prompt (raw, no MTP) and
@@ -19,20 +19,22 @@
 #   o =    0: window [L-512, L) (the old window's rows), after an 80-row forward (64 + a 16-row partial).
 # So the three windows follow three different chunk phases (0 / 48 / 16 rows into a DeltaNet chunk)
 # and three different last-forward sizes, with 3 x 512 distinct rows per length. The MoE noise run
-# uses the same windows. Every window is judged on its own (the per-window limits apply to each); the
-# MoE mean limit is over all windows. --positions 1 is the old single-window layout.
-# Limits (MOE-BAL, owner decision 2026-10-13):
-#   dense models (absolute, per window):
+# uses the same windows. --positions 1 is the old single-window layout.
+# Judging (KL-ROBUST-2, owner decision 2026-10-14, audit/KL-ROBUST-2.md): a single window's numbers
+# jitter by +-20-35% KL / +-1.6 points top-1 with the forward split in front of it, while the mean over
+# positions is stable. So per length the positions are AVERAGED FIRST (KL mean and top-1), and the
+# per-window limits apply to that per-length average; the MoE mean limit stays on the mean over all
+# windows. The report prints every position (not judged alone), the per-length average and the
+# number each limit was applied to. Limit values are unchanged (MOE-BAL, owner decision 2026-10-13):
+#   dense models (absolute, per-length average):
 #     balance: KL <= 0.005 and top-1 >= 98%      fast: KL <= 0.03 and top-1 >= 93%
-#     (512 rows per window since MOE-BAL: with 128 rows one row is 0.78 points of top-1 and dense
-#     fast zh 8k missed 93% by one row; a 256-row run still failed it, and the window start also moves
-#     the prefill split, so a window's numbers carry chunk-schedule jitter: audit/MOE-BAL.md)
+#     (512 rows per window since MOE-BAL: with 128 rows one row is 0.78 points of top-1)
 #   MoE models (arch *moe): relative to the noise floor N measured in the same gate run = precise vs
 #     precise with the sequential DeltaNet prefill (WHIRL_GDN_SEQ=1, an equally exact f32 path), same
-#     windows; N = the mean of the noise run's window KLs (all lengths x positions), N_top1(w) = its
-#     top-1 in window w:
-#     balance: mean KL over all windows <= 2 N, each window KL <= 3 N, top-1(w) >= N_top1(w) - 2.4 points
-#     fast:    mean KL <= 8 N, each window KL <= 12 N, top-1(w) >= N_top1(w) - 8 points
+#     windows; N = the mean of the noise run's window KLs (all lengths x positions), N_top1 = the noise
+#     run's top-1 averaged over ALL its windows (KL-ROBUST-2: not the same window, both sides jitter):
+#     balance: mean KL over all windows <= 2 N, each length's average KL <= 3 N, its average top-1 >= N_top1 - 2.4 points
+#     fast:    mean KL <= 8 N, each length's average KL <= 12 N, average top-1 >= N_top1 - 8 points
 #     (two equally exact paths of a 256-expert top-8 router already differ by KL 0.002-0.006 on
 #     these prompts, above the dense balance limit; see audit/MOE-KL.md)
 # Exit 0 only when every case ran and passed; 1 = a limit failed; 2 = a run / input error or 0 cases.
@@ -60,8 +62,8 @@ import time
 
 import numpy as np
 
-LIMITS = {"balance": (0.005, 0.98), "fast": (0.03, 0.93)}  # dense: absolute (KL max, top-1 min) per window
-# MoE: (mean KL <= k_mean * N, window KL <= k_win * N, top-1(w) >= N_top1(w) - drop)
+LIMITS = {"balance": (0.005, 0.98), "fast": (0.03, 0.93)}  # dense: absolute (KL max, top-1 min) per length average
+# MoE: (mean KL over all windows <= k_mean * N, per-length average KL <= k_win * N, its top-1 >= N_top1(all windows) - drop)
 MOE_LIMITS = {"balance": (2.0, 3.0, 0.024), "fast": (8.0, 12.0, 0.08)}
 ROWS = 512
 # window end offsets before each length, earliest first (see the header): chunk phases 0 / 48 / 16
@@ -175,20 +177,75 @@ def compare(ref, test):
     return float(kl.mean()), float(np.quantile(kl, 0.99)), float(kl.max()), float(top1)
 
 
-def judge_moe(res, noise, md):
-    """MoE limits relative to the noise floor. res = [(end, zero_rows, kl, p99, max, top1)] per window,
-    noise = {"n_mean": N, "windows": [{"top1": ...}, ...]}. Returns (window cases, mean case) as dicts."""
-    k_mean, k_win, drop = MOE_LIMITS[md]
-    nm = noise["n_mean"]
-    wins = []
-    for w, (e, zt, kl, p99, mx, top1) in enumerate(res):
-        nt1 = noise["windows"][w]["top1"]
-        ok = zt == 0 and kl <= k_win * nm and top1 >= nt1 - drop - 1e-9
-        wins.append({"length": e, "kl_mean": kl, "kl_p99": p99, "kl_max": mx, "top1": top1, "zero_rows": zt, "rule": "moe-window",
-                     "kl_limit": k_win * nm, "top1_limit": nt1 - drop, "x_noise": kl / nm, "pass": ok})
-    mean = float(np.mean([x[2] for x in res]))
-    mcase = {"length": 0, "kl_mean": mean, "rule": "moe-mean", "kl_limit": k_mean * nm, "x_noise": mean / nm, "pass": mean <= k_mean * nm}
-    return wins, mcase
+def length_groups(groups):
+    """The distinct length groups in order of first appearance, each with its window indices."""
+    out = {}
+    for w, g in enumerate(groups):
+        out.setdefault(g, []).append(w)
+    return list(out.items())
+
+
+def judge(res, groups, poss, md, moe, noise=None):
+    """Judge one model x prompt x mode (KL-ROBUST-2, owner decision 2026-10-14).
+
+    res = [(end, zero_rows, kl, p99, max, top1)] per window; groups[w] = the length group of window w;
+    poss[w] = its position; noise = {"n_mean": N, "windows": [{"top1": ...}, ...]} (MoE only).
+    Per length the positions are averaged FIRST (KL mean and top-1), and the per-window limits apply to
+    that per-length average: dense absolute (KL <= kl_max, top-1 >= top1_min); MoE KL <= k_win * N and
+    top-1 >= N_top1 - drop, where N_top1 = the noise run's top-1 averaged over ALL its windows (not the
+    same window: both sides carry chunk-schedule jitter). The MoE mean limit stays on the mean over all
+    windows (k_mean * N). A window with all-zero rows fails its length. Returns the judged cases: one
+    per length (rule dense-length / moe-length, with the per-position values under "positions") and,
+    for MoE, one moe-mean case."""
+    cases = []
+    if moe:
+        k_mean, k_win, drop = MOE_LIMITS[md]
+        nm = noise["n_mean"]
+        nt1 = float(np.mean([x["top1"] for x in noise["windows"]]))
+        kl_lim, t1_lim = k_win * nm, nt1 - drop
+    else:
+        kl_lim, t1_lim = LIMITS[md]
+    for g, ix in length_groups(groups):
+        kl = float(np.mean([res[w][2] for w in ix]))
+        top1 = float(np.mean([res[w][5] for w in ix]))
+        zt = sum(res[w][1] for w in ix)
+        ok = zt == 0 and kl <= kl_lim + 1e-12 and top1 >= t1_lim - 1e-9
+        pos = [{"pos": poss[w], "end": res[w][0], "kl_mean": res[w][2], "kl_p99": res[w][3], "kl_max": res[w][4], "top1": res[w][5],
+                "zero_rows": res[w][1]} for w in ix]
+        c = {"length": g, "group": g, "rule": "moe-length" if moe else "dense-length", "kl_mean": kl, "top1": top1, "zero_rows": zt,
+             "kl_limit": kl_lim, "top1_limit": t1_lim, "kl_p99": max(p["kl_p99"] for p in pos), "kl_max": max(p["kl_max"] for p in pos),
+             "positions": pos, "pass": ok}
+        if moe:
+            c.update(x_noise=kl / nm, noise_top1=nt1)
+        cases.append(c)
+    if moe:
+        mean = float(np.mean([x[2] for x in res]))
+        cases.append({"length": 0, "rule": "moe-mean", "kl_mean": mean, "kl_limit": k_mean * nm, "x_noise": mean / nm,
+                      "pass": mean <= k_mean * nm + 1e-12})
+    return cases
+
+
+def case_lines(mname, pname, md, c, noise=None):
+    """Report lines for one judged case: every position's values, the per-length average and the
+    number each limit was applied to."""
+    hd = f"{mname:6s} {pname:5s} {md:8s}"
+    verdict = "PASS" if c["pass"] else "FAIL"
+    if c["rule"] == "moe-mean":
+        return [f"  {verdict} {hd}    mean over all windows: KL {c['kl_mean']:.5f} = {c['x_noise']:.2f} N "
+                f"<= {c['kl_limit']:.5f} ({c['kl_limit'] / noise['n_mean']:g} N)?"]
+    out = []
+    nm = noise["n_mean"] if noise else None
+    for p in c["positions"]:
+        out.append(f"    pos  {hd} {c['length']:7d}/p{p['pos']} (end {p['end']}): KL {p['kl_mean']:.5f}"
+                   + (f" = {p['kl_mean'] / nm:.2f} N" if nm else "") + f" p99 {p['kl_p99']:.4f} max {p['kl_max']:.4f}"
+                   f"  top1 {p['top1'] * 100:.2f}%" + (f"  zero rows {p['zero_rows']}" if p["zero_rows"] else "") + "  (not judged alone)")
+    kl_s = f"KL {c['kl_mean']:.5f}" + (f" = {c['x_noise']:.2f} N" if nm else "")
+    kl_l = f"{c['kl_limit']:.5f}" + (f" ({c['kl_limit'] / nm:g} N)" if nm else "")
+    t1_l = f"{c['top1_limit'] * 100:.2f}%" + (f" (noise top1 all-window mean {c['noise_top1'] * 100:.2f}% - "
+                                              f"{(c['noise_top1'] - c['top1_limit']) * 100:.1f}pt)" if nm else "")
+    out.append(f"  {verdict} {hd} {c['length']:7d} avg of {len(c['positions'])} positions: {kl_s} <= {kl_l}?  "
+               f"top1 {c['top1'] * 100:.2f}% >= {t1_l}?" + (f"  zero rows {c['zero_rows']}" if c["zero_rows"] else ""))
+    return out
 
 
 def main():
@@ -251,7 +308,7 @@ def main():
     rep = {"exe": exe, "exe_sha256": sha256(exe), "device": a.device or "default", "limits": LIMITS, "moe_limits": MOE_LIMITS,
            "rows": ROWS, "positions": POSITIONS, "offsets": list(offsets), "mode_args": mode_args, "lengths": lengths, "modes": modes, "models": {k: os.path.basename(v) for k, v in models.items()},
            "corpus": {k: sha256(v) for k, v in corpus.items()}, "started": time.strftime("%Y-%m-%d %H:%M:%S"), "cases": [],
-           "noise": [], "by_length": [], "numerics": {}, "errors": []}
+           "judge": "length-average", "noise": [], "numerics": {}, "errors": []}
     log(f"klgate: exe {exe} sha256 {rep['exe_sha256'][:16]} device {rep['device']} rows {ROWS} positions {POSITIONS} (offsets {list(offsets)})")
 
     for mname, mpath in models.items():
@@ -351,7 +408,8 @@ def main():
                          "windows": [{"length": x[0], "group": groups[w], "pos": poss[w], "kl_mean": x[2], "kl_p99": x[3], "kl_max": x[4],
                                       "top1": x[5]} for w, x in enumerate(nw)]}
                 rep["noise"].append(noise)
-                log(f"  noise  {mname:6s} {pname:5s}: N = {n_mean:.5f}  (" +
+                log(f"  noise  {mname:6s} {pname:5s}: N = {n_mean:.5f}, top1 all-window mean "
+                    f"{np.mean([x[5] for x in nw]) * 100:.2f}%  (" +
                     ", ".join(f"{x[0]}: KL {x[2]:.5f} top1 {x[5] * 100:.2f}%" for x in nw) + ")")
                 if n_mean <= 0:
                     rep["errors"].append(f"{mname}:{pname}: noise floor N = 0 (WHIRL_GDN_SEQ=1 did not change the bits)")
@@ -361,36 +419,10 @@ def main():
                     continue
                 res = res_by[md]
                 base = {"model": mname, "prompt": pname, "mode": md}
-                if moe:
-                    wins, mcase = judge_moe(res, noise, md)
-                    k_mean, k_win, _ = MOE_LIMITS[md]
-                    for w, c in enumerate(wins):
-                        c.update(group=groups[w], pos=poss[w])
-                        rep["cases"].append({**base, **c})
-                        log(f"  {'PASS' if c['pass'] else 'FAIL'} {mname:6s} {pname:5s} {md:8s} {c['length']:7d}/p{poss[w]}: KL mean {c['kl_mean']:.5f} "
-                            f"= {c['x_noise']:.2f} N (limit {k_win:g} N) p99 {c['kl_p99']:.4f} max {c['kl_max']:.4f}  top1 {c['top1'] * 100:.2f}% "
-                            f"(limit {c['top1_limit'] * 100:.2f}%)" + (f"  zero rows {c['zero_rows']}" if c["zero_rows"] else ""))
-                    rep["cases"].append({**base, **mcase})
-                    log(f"  {'PASS' if mcase['pass'] else 'FAIL'} {mname:6s} {pname:5s} {md:8s}    mean: KL {mcase['kl_mean']:.5f} = "
-                        f"{mcase['x_noise']:.2f} N (limit {k_mean:g} N = {mcase['kl_limit']:.5f})")
-                else:
-                    kl_max, top1_min = LIMITS[md]
-                    for w, (e, zt, kl, p99, mx, top1) in enumerate(res):
-                        ok = zt == 0 and kl <= kl_max and top1 >= top1_min
-                        rep["cases"].append({**base, "length": e, "group": groups[w], "pos": poss[w], "kl_mean": kl, "kl_p99": p99, "kl_max": mx,
-                                             "top1": top1, "zero_rows": zt, "rule": "dense-abs", "kl_limit": kl_max, "top1_limit": top1_min, "pass": ok})
-                        log(f"  {'PASS' if ok else 'FAIL'} {mname:6s} {pname:5s} {md:8s} {e:7d}/p{poss[w]}: KL mean {kl:.5f} p99 {p99:.4f} max {mx:.4f}  top1 {top1 * 100:.2f}%"
-                            + (f"  zero rows {zt}" if zt else ""))
-                # information (not judged): the spread of the positions per length
-                for g in sorted(set(groups)):
-                    ix = [w for w in range(len(res)) if groups[w] == g]
-                    kls = [res[w][2] for w in ix]
-                    t1s = [res[w][5] for w in ix]
-                    rep["by_length"].append({**base, "group": g, "kl_mean": float(np.mean(kls)), "kl_min": min(kls), "kl_max": max(kls),
-                                             "top1_mean": float(np.mean(t1s)), "top1_min": min(t1s), "top1_max": max(t1s)})
-                    if len(ix) > 1:
-                        log(f"  info {mname:6s} {pname:5s} {md:8s} {g:7d}: positions KL mean {np.mean(kls):.5f} (min {min(kls):.5f} max {max(kls):.5f}) "
-                            f"top1 mean {np.mean(t1s) * 100:.2f}% (min {min(t1s) * 100:.2f}% max {max(t1s) * 100:.2f}%)")
+                for c in judge(res, groups, poss, md, moe, noise):
+                    rep["cases"].append({**base, **c})
+                    for line in case_lines(mname, pname, md, c, noise):
+                        log(line)
 
     npass = sum(1 for c in rep["cases"] if c["pass"])
     nfail = len(rep["cases"]) - npass
