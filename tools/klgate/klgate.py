@@ -25,7 +25,8 @@
 # positions is stable. So per length the positions are AVERAGED FIRST (KL mean and top-1), and the
 # per-window limits apply to that per-length average; the MoE mean limit stays on the mean over all
 # windows. The report prints every position (not judged alone), the per-length average and the
-# number each limit was applied to. Limit values are unchanged (MOE-BAL, owner decision 2026-10-13):
+# number each limit was applied to. Limit values (MOE-BAL, owner decision 2026-10-13; MoE balance top-1
+# drop 2.4 -> 3.0 points in MOE-BAL-3, owner decision 2026-10-14 23:36):
 #   dense models (absolute, per-length average):
 #     balance: KL <= 0.005 and top-1 >= 98%      fast: KL <= 0.03 and top-1 >= 93%
 #     (512 rows per window since MOE-BAL: with 128 rows one row is 0.78 points of top-1)
@@ -33,10 +34,12 @@
 #     precise with the sequential DeltaNet prefill (WHIRL_GDN_SEQ=1, an equally exact f32 path), same
 #     windows; N = the mean of the noise run's window KLs (all lengths x positions), N_top1 = the noise
 #     run's top-1 averaged over ALL its windows (KL-ROBUST-2: not the same window, both sides jitter):
-#     balance: mean KL over all windows <= 2 N, each length's average KL <= 3 N, its average top-1 >= N_top1 - 2.4 points
+#     balance: mean KL over all windows <= 2 N, each length's average KL <= 3 N, its average top-1 >= N_top1 - 3.0 points
 #     fast:    mean KL <= 8 N, each length's average KL <= 12 N, average top-1 >= N_top1 - 8 points
 #     (two equally exact paths of a 256-expert top-8 router already differ by KL 0.002-0.006 on
-#     these prompts, above the dense balance limit; see audit/MOE-KL.md)
+#     these prompts, above the dense balance limit; see audit/MOE-KL.md). The 3.0-point top-1 drop
+#     admits int8 decode activations (q8dec: the q8_1 scheme llama.cpp itself uses for decode, the
+#     same numeric level as llama.cpp); the KL limits are unchanged (audit/MOE-BAL-3.md).
 # Exit 0 only when every case ran and passed; 1 = a limit failed; 2 = a run / input error or 0 cases.
 # The JSON report (--report) holds the exe's SHA-256: tools/golden/golden.ps1 record requires a
 # passing report for the same exe before it writes fast / balance references.
@@ -64,7 +67,7 @@ import numpy as np
 
 LIMITS = {"balance": (0.005, 0.98), "fast": (0.03, 0.93)}  # dense: absolute (KL max, top-1 min) per length average
 # MoE: (mean KL over all windows <= k_mean * N, per-length average KL <= k_win * N, its top-1 >= N_top1(all windows) - drop)
-MOE_LIMITS = {"balance": (2.0, 3.0, 0.024), "fast": (8.0, 12.0, 0.08)}
+MOE_LIMITS = {"balance": (2.0, 3.0, 0.030), "fast": (8.0, 12.0, 0.08)}
 ROWS = 512
 # window end offsets before each length, earliest first (see the header): chunk phases 0 / 48 / 16
 OFFSETS = (1216, 592, 0)

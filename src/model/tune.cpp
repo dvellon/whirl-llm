@@ -912,8 +912,8 @@ void loadOrTune(Model& m, const std::string& model_path, std::string& log) {
         else if (relaxed) nu::applyOverride(p, nu::Item::h16, "Q4_RELAXED", *relaxed_env, m.ffn_h16, true);
         if (const auto v = envGet("KV"); v && !v->empty() && *v != "auto")
             nu::applyOverride(p, *v == "q4" ? nu::Item::kvq4 : nu::Item::kvq8, "KV", *v, *v != "f16", !t.moe || *v != "f16");
-        // decode / verify activations (P-8): precise and MoE balance (MOE-BAL-2) -> f16 activations
-        // on the f16 GEMM (f32 accumulation), dense balance / fast -> int8 (q8_1 class)
+        // decode / verify activations (P-8): precise -> f16 activations on the f16 GEMM (f32
+        // accumulation), balance / fast -> int8 (q8_1 class) on dense and MoE models (MOE-BAL-3)
         // (nu::q8decDefault, in the plan). WHIRL_Q8DEC=0|1 overrides.
         m.prec_dec = !p.q8dec_default;
         const auto q8dec_env = envGet("Q8DEC");
@@ -923,10 +923,10 @@ void loadOrTune(Model& m, const std::string& model_path, std::string& log) {
             const std::string miss = m.precMissing();
             if (!miss.empty())
                 throw ModelError("PreciseKernels",
-                                 std::string(rq.mode == nu::Mode::precise ? "precise mode" : "f16 decode activations (MoE balance)") +
+                                 std::string(rq.mode == nu::Mode::precise ? "precise mode" : "f16 decode activations (WHIRL_Q8DEC=0)") +
                                      ": this GPU's kernels have no " + miss +
                                      ", and the mode never falls back to int8 decode activations. Use " +
-                                     (rq.mode == nu::Mode::precise ? "--balance" : "--fast") +
+                                     (rq.mode == nu::Mode::precise ? "--balance" : "WHIRL_Q8DEC unset") +
                                      " (int8 decode / verify activations, as llama.cpp's q8_1)");
         }
         if (const auto v = envGet("RELAX"); v && !v->empty())

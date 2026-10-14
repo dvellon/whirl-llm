@@ -129,9 +129,12 @@ limit, so an absolute limit cannot tell a real regression from the model's own s
 
 | Mode | mean KL over all windows (4 lengths x 3) | KL of each length's average | top-1 of each length's average |
 |---|---|---|---|
-| balance | <= 2 N | <= 3 N | >= N_top1 - 2.4 points |
+| balance | <= 2 N | <= 3 N | >= N_top1 - 3.0 points |
 | fast | <= 8 N | <= 12 N | >= N_top1 - 8 points |
 
+The MoE balance top-1 drop was 2.4 points until MOE-BAL-3 (owner decision 2026-10-14): 3.0 points
+admits int8 decode activations (`q8dec`, the q8_1 scheme llama.cpp itself uses for decode, i.e. the
+same numeric level as llama.cpp); the KL limits are unchanged (audit/MOE-BAL-3.md).
 The fast multipliers were set from the measured fast numbers as a regression guard, not as a quality
 claim. 512 rows per window: with 128 rows one row is 0.78 points of top-1 (dense fast zh 8k once
 missed 93% by a single row); the limits were not relaxed for it. A 256-row run still failed (dense zh

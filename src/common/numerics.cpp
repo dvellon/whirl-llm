@@ -31,7 +31,6 @@ constexpr std::array<ItemInfo, n_items> k_items = {{
 }};
 
 constexpr const char* k_q8dec = "q8dec (int8 activations in the decode / verify GEMV, as llama.cpp's q8_1)";
-constexpr const char* k_q8dec_moe = "MoE: fast only (int8 decode activations put MoE balance at the KL gate's top-1 floor; --fast turns it on)";
 constexpr const char* k_f16dec = "f16 decode / verify activations into the f16 GEMM, f32 accumulation (no int8)";
 
 std::string lower(std::string_view s) {
@@ -176,13 +175,12 @@ Request forModel(const Request& r, bool moe) {
     if (moe && r.mode == Mode::balance && !r.custom) {
         o.moved |= o.items & moe_fast_items;
         o.items &= ~moe_fast_items;
-        o.q8dec_moved = true;
     }
     return o;
 }
 
-bool q8decDefault(const Request& r, bool moe) {
-    return r.mode != Mode::precise && !forModel(r, moe).q8dec_moved;
+bool q8decDefault(const Request& r, [[maybe_unused]] bool moe) {
+    return r.mode != Mode::precise;  // MOE-BAL-3: the same for dense and MoE models
 }
 
 Plan plan(const Request& r_in, const Target& t) {
@@ -192,7 +190,6 @@ Plan plan(const Request& r_in, const Target& t) {
     p.source = r.source;
     p.q8dec = q8decDefault(r, t.moe);  // the loader confirms (setQ8dec: WHIRL_Q8DEC, kernels)
     p.q8dec_default = p.q8dec;
-    p.q8dec_moved = r.q8dec_moved;
     for (std::size_t i = 0; i < n_items; ++i) {
         const Item it = static_cast<Item>(i);
         ItemState& s = p.items[i];
@@ -321,7 +318,6 @@ std::string logLine(const Plan& p) {
         if (s.enabled) en += std::format("{}{}{}", en.empty() ? "" : ", ", itemName(s.item), s.note.empty() ? "" : " (" + s.note + ")");
         else if (s.requested || s.moved) sk += std::format("{}{} ({})", sk.empty() ? "" : ", ", itemName(s.item), s.note);
     }
-    if (p.q8dec_moved && !p.q8dec) sk += std::format("{}q8dec ({})", sk.empty() ? "" : ", ", k_q8dec_moe);
     std::string l = "numerics: " + modeLabel(p);
     if (p.mode == Mode::precise && en.empty())
         l += std::string(" - f16/f32 prefill activations, ") + (p.q8dec ? "" : "f16 decode / verify activations, ") + "f32 DeltaNet, f16 KV";
@@ -359,12 +355,6 @@ std::string propsJson(const Plan& p, std::string_view kv) {
         jsonStr(b, itemName(s.item));
         b += ",\"reason\":";
         jsonStr(b, s.note);
-        b += '}';
-    }
-    if (p.q8dec_moved && !p.q8dec) {
-        if (!first) b += ',';
-        b += "{\"item\":\"q8dec\",\"reason\":";
-        jsonStr(b, k_q8dec_moe);
         b += '}';
     }
     b += "],\"overrides\":[";

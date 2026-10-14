@@ -81,20 +81,22 @@ whirl-server --help | --version
 | `kvq4` | fast | 4-bit KV（int4，每 32 個值一個 f16 scale，q / k 先做 Hadamard 旋轉）；8060S 的 decode attention 用 `attn_dq4` 讀取（約 180 GB/s）：Ornith-1.5-35B-A3B MXFP4 decode 128k 58.5 tok/s（f16 KV 32.7）、64k 67.0（46.4）；R9700（FAST-1c）Swift-1.5 27B 在 131k 的 decode：plain 30.98 tok/s（f16 KV 25.08）、MTP 68.79（63.12），128k prefill −1.9%；對 f16 的 KL 0.002–0.010 | dense 與 MoE | dense 與 MoE |
 | `relaxacc` | fast | 寬鬆推測接受（只對 MTP draft；n-gram draft 維持精確接受）。放寬接受若會讓結尾的 6-gram 與最近 4096 個 token 內重複，就不接受（重複防護）。greedy：draft 不是驗證列的 argmax 時，只要它在該列前 `WHIRL_RELAX_K` 名（預設 4）且 p(draft) >= `WHIRL_RELAX_ALPHA` × p(argmax)（預設 0.1）就保留；最後一個保留的 draft 之後那個 token 一定是目標模型自己的 argmax。temperature > 0：typical acceptance（Medusa）：在請求過濾後的分布上 p(draft) >= min(`WHIRL_RELAX_EPS` 0.09, `WHIRL_RELAX_DELTA` 0.3 × exp(−熵)) 就保留（此時不用 `specsample`）。**會改變 greedy 輸出**：fast 的 greedy 不等於 plain greedy，MTP ≠ plain；同樣的 prompt、seed、設定仍是確定的（此時 draft 數量策略改用固定的合成週期成本，不看牆鐘時間；並發請求共用 draft 數量，可能互相影響輸出）。`WHIRL_RELAX=0` 關閉；MoE 模型略過（每輪只有一個 MTP draft，量不到收益；`WHIRL_RELAX=1` 強制開） | dense MTP 模型 | dense MTP 模型 |
 | `headq`、`moeskip`、`a8`、`a4` | fast | 低位元輸出頭、略過 MoE 專家、W4A8 / W4A4 prefill | 尚未實作 | 尚未實作 |
-| `q8dec` | balance（dense 模型）、fast | decode / verify GEMV 的 activation 用 int8（每 32 個值一個 f32 scale，同 llama.cpp 的 q8_1；dense balance 與 fast 包含；MoE balance 自 MOE-BAL-2 起改用 f16 decode activation） | 開 | 開 |
+| `q8dec` | balance、fast | decode / verify GEMV 的 activation 用 int8（每 32 個值一個 f32 scale，同 llama.cpp 的 q8_1；balance 與 fast 一律包含） | 開 | 開 |
 
 balance 與 fast 依模型類型開了什麼（R9700；Radeon 8060S 沒有 fp8 WMMA，所以 `fp8` / `moefp8` 在任何模式都略過）：
 
 | 模式 | dense 模型（Qwen3.8-27B Q4_K_M、MXFP4 dense） | MoE 模型（Ornith-1.5-35B-A3B MXFP4） |
 |---|---|---|
 | precise | 全程 f16 / f32，f16 KV | 全程 f16 / f32，f16 KV |
-| balance | `fp8`（只限 MXFP4 檔）、`gdnwmma`、`h16`、`kvq8`（q8h KV）、`specsample`、`q8dec` | `gdnwmma`、`h16`、`specsample`，f16 decode / verify activation，f16 KV。**不開 `fp8` / `moefp8`**（MOE-BAL 起）：256 選 8 的 router 前面用了 fp8 activation 時，MoE balance 的 KL 是此模型自身噪音底線 N（兩條同樣精確的 precise 路徑之差）的 3.3–3.6 倍。**不開 `q8dec`**（MOE-BAL-2 起）：用 int8 decode activation 時 MoE balance 的 top-1 貼在 KL gate 下限上（zh 8k 93.88% 對 94.00%）；品質優先，要速度用 `--fast` |
-| fast | balance + `kvq4`（q4 KV）+ `relaxacc` | balance + `fp8` + `moefp8` + `q8dec` + `kvq4`（q4 KV）；`relaxacc` 略過 |
+| balance | `fp8`（只限 MXFP4 檔）、`gdnwmma`、`h16`、`kvq8`（q8h KV）、`specsample`、`q8dec` | `gdnwmma`、`h16`、`specsample`、`q8dec`，f16 KV。**不開 `fp8` / `moefp8`**（MOE-BAL 起）：256 選 8 的 router 前面用了 fp8 activation 時，MoE balance 的 KL 是此模型自身噪音底線 N（兩條同樣精確的 precise 路徑之差）的 3.3–3.6 倍；拿掉後在 KL gate 語料上約 1.9 N（code 與 zh，R9700，docs/dev/testing.md） |
+| fast | balance + `kvq4`（q4 KV）+ `relaxacc` | balance + `fp8` + `moefp8` + `kvq4`（q4 KV）；`relaxacc` 略過 |
 
-這些 MoE 改動的代價是 MoE balance 的速度：R9700 prefill 128k 約 −11% 到 8k 約 −26%（拿掉 fp8，MOE-BAL），decode 在 R9700 −13% 到 −24%、Radeon 8060S −7% 到 −17%（拿掉 q8dec，MOE-BAL-2；仍比 llama.cpp b11214 快 66–75% / 29–39%，見 CHANGELOG）。8060S 上 MoE balance 現在與 precise 給出相同的 logits（fp8 / moefp8 / gdnwmma 在那裡本來就略過）。`--fast` 兩種速度都保有。
-明確列出的項目照用，而且保留 `q8dec`：`--balance=gdnwmma,h16,specsample` 是 MOE-BAL 的表（含 int8 decode），`--balance=fp8,moefp8,gdnwmma,h16,specsample` 是更早的；MoE balance 下設 `WHIRL_Q8DEC=1` 會記為有損的使用者覆寫（`balance+overrides`）。
+這個 MoE 改動的代價是 R9700 上 MoE balance 的 prefill（128k 約 −11% 到 8k 約 −26%，decode 不變）；`--fast` 保有 fp8 的 prefill 速度，
+`--balance=fp8,moefp8,gdnwmma,h16,specsample`（明確列出的項目照用）可回到舊的 MoE balance。
 
-precise 模式（以及 MoE balance）關閉 `q8dec`：decode、MTP / n-gram 驗證與並發 batch 的每個 matmul 都用 f16 activation 進 f16 WMMA GEMM（權重從 GGUF 型別解成 f16、f32 累加、每列加總順序固定），所以每一列不論 batch 大小都得到相同的位元；如果 GPU 的 kernel 對模型某種權重型別缺少這條路徑，precise 模式會拒絕載入（MoE balance 則拒絕並建議 `--fast`），不會退回 int8。
+MoE balance 保留 `q8dec`（decode / verify 用 int8 activation，即 llama.cpp 自己的 q8_1 做法；MOE-BAL-3，2026-10-15）：KL gate 對 MoE balance 的 top-1 容許比噪音底線低 3.0 個百分點（原為 2.4）：llama.cpp 本身 decode 就是用 int8（q8_1）activation，所以這與 llama.cpp 是同一個數值等級；KL 限制（全窗平均 ≤ 2 N、每長度 ≤ 3 N）不變。短暫存在的 MOE-BAL-2 表（不含 `q8dec`）讓 R9700 上 MoE balance 的 decode 慢約 20%。`WHIRL_Q8DEC=0` 可改用 f16 decode activation。
+
+precise 模式關閉 `q8dec`：decode、MTP / n-gram 驗證與並發 batch 的每個 matmul 都用 f16 activation 進 f16 WMMA GEMM（權重從 GGUF 型別解成 f16、f32 累加、每列加總順序固定），所以每一列不論 batch 大小都得到相同的位元；如果 GPU 的 kernel 對模型某種權重型別缺少這條路徑，precise 模式會拒絕載入，不會退回 int8。
 不適用於該 GPU 或模型的項目會記錄為略過（不會出錯）。啟動 log 會有一行，例如
 
 ```
@@ -468,7 +470,7 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 | `WHIRL_FP8_MASK=BITS` | 使用 fp8 activation 的矩陣乘法類別（預設 7） |
 | `WHIRL_G8T=0` | fp8 GEMM 改用列優先版本，不用 fragment 排列版本（位元相同） |
 | `WHIRL_GDN_WMMA=0\|1` | DeltaNet prefill 區塊用 f16 WMMA（項目 `gdnwmma`；balance / fast 下 MXFP4 模型，以及 R9700 上任何格式的 dense 模型預設開啟） |
-| `WHIRL_Q8DEC=0\|1` | decode / verify activation：`1` 用 int8（項目 `q8dec`，dense balance 與 fast 預設；precise 與 MoE balance 下屬於有損覆寫），`0` 用 f16 進 f16 GEMM（precise 與 MoE balance 預設） |
+| `WHIRL_Q8DEC=0\|1` | decode / verify activation：`1` 用 int8（項目 `q8dec`，balance / fast 預設；precise 下屬於有損覆寫），`0` 用 f16 進 f16 GEMM（precise 預設） |
 | `WHIRL_FFN_H16=0\|1` | GEMM 以 f16 輸出給逐元素運算（項目 `h16`；balance / fast 下 MXFP4 模型，以及 R9700 上任何格式的 dense 模型預設開啟） |
 | `WHIRL_Q4_RELAXED=1` | 原本略過的模型（非 MXFP4 的 MoE、Radeon 8060S）也套用 balance 模式的 prefill 開關（`gdnwmma`、`h16`） |
 | `WHIRL_ACT_FUSE=0` | prefill 不融合 activation（位元相同） |

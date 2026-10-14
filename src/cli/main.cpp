@@ -80,9 +80,9 @@ const char* k_help_main =
 #define WHIRL_HELP_MODES                                                                            \
     "  --precise | --balance | --fast\n"                                                            \
     "                             numerics mode (default balance: dense fp8 MXFP4 prefill, q8h KV,\n" \
-    "                             int8 decode activations; MoE no fp8, f16 decode activations, f16 KV;\n" \
-    "                             --precise: f16/f32 activations, f16 KV; --fast: balance + 4-bit KV,\n" \
-    "                             relaxed MTP acceptance, MoE fp8 + int8 decode). --balance=fp8,kvq8 picks\n" \
+    "                             int8 decode activations; MoE no fp8, f16 KV; --precise: f16/f32\n" \
+    "                             activations, f16 KV; --fast: balance + 4-bit KV, relaxed MTP\n" \
+    "                             acceptance, MoE fp8). --balance=fp8,kvq8 picks\n" \
     "                             items; --mode M also works; env WHIRL_MODE\n"
 
 const char* k_help_chat =

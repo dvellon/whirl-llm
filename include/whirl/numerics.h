@@ -8,12 +8,12 @@
 //    stops with a message pointing to --balance / a shorter context.
 //  - balance: the speed-oriented defaults (MXFP4 fp8 prefill activations, f16-WMMA DeltaNet,
 //    f16 GEMM intermediates); KV q8h on dense models, f16 on MoE models. MoE models (MOE-BAL,
-//    2026-10-13): fp8 and moefp8 are fast-only (forModel); MOE-BAL-2 (2026-10-14): q8dec too, so
-//    MoE balance = gdnwmma + h16 with f16 decode / verify activations and f16 KV: with fp8 in front
-//    of the router MoE balance was 3.3-3.6x its own noise floor, and with q8dec its zh 8k top-1
-//    sat on the KL gate's floor (KL-ROBUST-2). Dense balance keeps q8dec.
+//    2026-10-13): fp8 and moefp8 are fast-only (forModel), so MoE balance = gdnwmma + h16 + q8dec
+//    with f16 KV: with fp8 in front of the router, MoE balance was 3.3-3.6x its own noise floor.
+//    MOE-BAL-3 (2026-10-15): q8dec stays in MoE balance (int8 activations, as llama.cpp's q8_1);
+//    MOE-BAL-2 had moved it to fast, which cost ~20% decode on the R9700.
 //  - fast: balance plus aggressive gated items (4-bit KV, relaxed speculative acceptance, ...);
-//    on MoE models fast also turns fp8, moefp8 and q8dec on.
+//    on MoE models fast also turns fp8 and moefp8 on.
 //    Implemented: kvq4 (4-bit KV where the code object has it: Radeon 8060S; elsewhere fast keeps
 //    f16 KV until there are q4 kernels) and relaxacc. The others are listed as skipped.
 // KV format: fixed per mode and model type (chooseKv), never switched by what fits: a format that
@@ -75,7 +75,6 @@ struct Request {
     bool custom = false;      // an explicit item list (--balance=fp8,kvq8)
     std::string source = "default";
     std::uint32_t moved = 0;  // items the mode would request but forModel moved to fast for this model
-    bool q8dec_moved = false; // MoE balance (MOE-BAL-2): q8dec is fast-only, decode / verify use f16 activations
     bool has(Item it) const { return (items & bit(it)) != 0; }
 };
 
@@ -83,12 +82,12 @@ struct Request {
 // --balance= / --fast= flags is split off by the caller). Throws std::invalid_argument.
 Request parseMode(std::string_view spec, std::string source);
 // The request for a model type (MOE-BAL): balance (no explicit item list) on a MoE model drops
-// moe_fast_items (recorded in `moved`, reported as skipped) and q8dec (MOE-BAL-2: `q8dec_moved`).
-// Precise, fast, custom lists and dense models are unchanged. Idempotent; the loader applies it
+// moe_fast_items (recorded in `moved`, reported as skipped). Precise, fast, custom lists and dense
+// models are unchanged. Idempotent; the loader applies it
 // once the model type is known.
 Request forModel(const Request& r, bool moe);
 // The mode's default decode / verify / small-batch activation form for a model type: true = int8
-// (q8dec). precise -> f16; MoE balance (no explicit item list) -> f16 (MOE-BAL-2); else int8.
+// (q8dec). precise -> f16; balance and fast -> int8 on dense and MoE models alike (MOE-BAL-3).
 bool q8decDefault(const Request& r, bool moe);
 // Command line (flags already collected: --mode V / --precise / --balance[=items] / --fast[=items];
 // several flags -> invalid_argument) first, else WHIRL_MODE, else precise.
@@ -131,11 +130,10 @@ struct Plan {
     std::array<ItemState, n_items> items{};
     std::vector<std::string> overrides;  // per-item environment variables that changed the mode's choice
     bool lossy_override = false;         // an override made precise lossy
-    // decode / verify / small-batch matmul activations: int8 (q8_1 class; dense balance, fast) or
-    // f16 into the f16 GEMM with f32 accumulation (precise, MoE balance). Set by the loader (setQ8dec).
+    // decode / verify / small-batch matmul activations: int8 (q8_1 class; balance, fast) or f16
+    // into the f16 GEMM with f32 accumulation (precise). Set by the loader (setQ8dec).
     bool q8dec = true;
     bool q8dec_default = true;  // the mode's choice (q8decDefault) before WHIRL_Q8DEC
-    bool q8dec_moved = false;   // MoE balance: q8dec is fast-only (reported as skipped)
     bool on(Item it) const { return items[static_cast<std::size_t>(it)].enabled; }
 };
 
@@ -147,7 +145,7 @@ void applyOverride(Plan& p, Item it, const char* var, const std::string& value, 
 
 // The decode activation form actually used: q8 = int8 (default: q8dec_default). env = the
 // WHIRL_Q8DEC value ("" = unset); a value that changes the mode's default is recorded as an
-// override (int8 in precise or MoE balance: lossy, user-requested).
+// override (int8 in precise: lossy, user-requested).
 void setQ8dec(Plan& p, bool q8, const std::string& env);
 
 // An item the run cannot use after all (e.g. relaxacc with --draft dflash): skipped with `why`.

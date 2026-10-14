@@ -803,9 +803,9 @@ void testNumerics() {
         const nu::Plan p = nu::plan(bal, swift);
         CHECK(p.on(Item::fp8) && !p.on(Item::moefp8) && p.on(Item::gdnwmma) && p.on(Item::h16) && p.on(Item::kvq8));
         CHECK(p.items[static_cast<std::size_t>(Item::moefp8)].note == "dense model");
-        const nu::Plan po = nu::plan(bal, ornith);  // MOE-BAL(-2): MoE balance = gdnwmma + h16, f16 decode, f16 KV
+        const nu::Plan po = nu::plan(bal, ornith);  // MOE-BAL / MOE-BAL-3: MoE balance = gdnwmma + h16 + q8dec, f16 KV
         CHECK(!po.on(Item::fp8) && !po.on(Item::moefp8) && po.on(Item::gdnwmma) && po.on(Item::h16) && !po.on(Item::kvq8));
-        CHECK(po.on(Item::specsample) && !po.q8dec && po.q8dec_moved);
+        CHECK(po.on(Item::specsample) && po.q8dec && po.q8dec_default);
         const nu::Plan pq = nu::plan(bal, q4);
         CHECK(!pq.on(Item::fp8) && pq.on(Item::gdnwmma) && pq.on(Item::h16) && pq.on(Item::kvq8));  // KG-1: dense Q4_K_M on the R9700
         CHECK(pq.items[static_cast<std::size_t>(Item::fp8)].note.find("no MXFP4") != std::string::npos);
@@ -910,8 +910,8 @@ void testNumerics() {
         CHECK(pb.items[static_cast<std::size_t>(Item::moefp8)].note.find("MoE: fast only") == 0);
         const std::string l = nu::logLine(pb);
         CHECK(l.find("numerics: balance - enabled: gdnwmma") == 0 && l.find("skipped: fp8 (MoE: fast only") != std::string::npos &&
-              l.find("moefp8 (MoE: fast only") != std::string::npos && l.find("decode: f16 decode / verify") != std::string::npos &&
-              l.find("q8dec (MoE: fast only") != std::string::npos);
+              l.find("moefp8 (MoE: fast only") != std::string::npos && l.find("decode: q8dec") != std::string::npos &&
+              l.find("q8dec (MoE") == std::string::npos && l.find("f16 decode / verify") == std::string::npos);
         const std::string j = nu::propsJson(pb, "f16");
         CHECK(j.find("\"enabled\":[\"gdnwmma\",\"h16\",\"specsample\"]") != std::string::npos &&
               j.find("{\"item\":\"fp8\",\"reason\":\"MoE: fast only") != std::string::npos);
@@ -951,46 +951,44 @@ void testNumerics() {
             if (p8.items[i].enabled) en_new |= 1u << i;
         }
         CHECK(en_old == en_new);
-        CHECK(!p8.q8dec && p8.q8dec_moved && !p8o.q8dec_moved && p8o.q8dec);  // MOE-BAL-2: q8dec off on the 8060S too
+        CHECK(p8.q8dec && p8o.q8dec);  // MOE-BAL-3: q8dec on in 8060S MoE balance too (as before MOE-BAL-2)
     }
-    // MOE-BAL-2 (2026-10-14): q8dec is fast-only on MoE models; dense balance, fast and custom lists keep it
+    // MOE-BAL-3 (2026-10-15): q8dec back in MoE balance (MOE-BAL-2 had made it fast-only); the
+    // decode activation form depends only on the mode, never on the model type
     {
         CHECK(!nu::q8decDefault(pre, false) && !nu::q8decDefault(pre, true));
-        CHECK(nu::q8decDefault(bal, false) && !nu::q8decDefault(bal, true));
+        CHECK(nu::q8decDefault(bal, false) && nu::q8decDefault(bal, true));
         CHECK(nu::q8decDefault(fast, false) && nu::q8decDefault(fast, true));
-        const nu::Request cust = nu::parseMode("balance:fp8,moefp8,gdnwmma,h16,specsample", "t");  // the old MoE balance
-        CHECK(nu::q8decDefault(cust, true) && !nu::forModel(cust, true).q8dec_moved);
-        CHECK(nu::forModel(bal, true).q8dec_moved && !nu::forModel(bal, false).q8dec_moved && !nu::forModel(fast, true).q8dec_moved);
-        CHECK(nu::q8decDefault(nu::forModel(bal, true), true) == false);  // idempotent
-        CHECK(nu::forModel(nu::forModel(bal, true), true).q8dec_moved);
-        // dense balance (MXFP4 dense, Q4_K_M, 8060S): unchanged, int8 decode, nothing about q8dec skipped
-        for (const nu::Target& t : {swift, q4, s8060}) {
-            const nu::Plan pd = nu::plan(bal, t);
-            CHECK(pd.q8dec && pd.q8dec_default && !pd.q8dec_moved && nu::logLine(pd).find("decode: q8dec") != std::string::npos);
-            CHECK(nu::logLine(pd).find("q8dec (MoE") == std::string::npos && nu::propsJson(pd, "q8h").find("\"decode\":\"q8dec\"") != std::string::npos);
-        }
-        // MoE fast (R9700 and 8060S): int8 decode as before
+        CHECK(nu::q8decDefault(nu::forModel(bal, true), true));  // after the loader's forModel too
+        const nu::Request cust = nu::parseMode("balance:fp8,moefp8,gdnwmma,h16,specsample", "t");
+        CHECK(nu::q8decDefault(cust, true));
         nu::Target s8m = s8060;
         s8m.moe = s8m.moe_mxfp4 = true;
+        // dense and MoE, R9700 and 8060S, balance and fast: int8 decode, nothing about q8dec skipped
+        for (const nu::Target& t : {swift, q4, s8060, ornith, s8m}) {
+            for (const nu::Request& r : {bal, fast}) {
+                const nu::Plan p = nu::plan(r, t);
+                CHECK(p.q8dec && p.q8dec_default && nu::logLine(p).find("decode: q8dec") != std::string::npos);
+                CHECK(nu::logLine(p).find("q8dec (MoE") == std::string::npos && nu::logLine(p).find("f16 decode / verify") == std::string::npos);
+                const std::string j = nu::propsJson(p, t.moe ? "f16" : "q8h");
+                CHECK(j.find("\"decode\":\"q8dec\",\"always_on\":[{\"item\":\"q8dec\"") != std::string::npos &&
+                      j.find("{\"item\":\"q8dec\",\"reason\"") == std::string::npos);
+                CHECK(json::parse(j).isObject());
+                CHECK(nu::modeLabel(p) == (r.mode == nu::Mode::balance ? "balance" : "fast"));
+            }
+            const nu::Plan pp = nu::plan(pre, t);
+            CHECK(!pp.q8dec && !pp.q8dec_default);
+        }
         for (const nu::Target& t : {ornith, s8m}) {
-            const nu::Plan pf = nu::plan(fast, t);
-            CHECK(pf.q8dec && !pf.q8dec_moved && nu::logLine(pf).find("decode: q8dec") != std::string::npos);
             const nu::Plan pb = nu::plan(bal, t);
-            CHECK(!pb.q8dec && !pb.q8dec_default && pb.q8dec_moved);
-            const std::string j = nu::propsJson(pb, "f16");
-            CHECK(j.find("\"decode\":\"f16\",\"always_on\":[]") != std::string::npos &&
-                  j.find("{\"item\":\"q8dec\",\"reason\":\"MoE: fast only") != std::string::npos);
-            CHECK(json::parse(j).isObject());
-            CHECK(nu::modeLabel(pb) == "balance");
-            // WHIRL_Q8DEC=1 in MoE balance: the old (lossy) table, a user override
-            nu::Plan po = pb;
-            nu::setQ8dec(po, true, "1");
-            CHECK(po.q8dec && po.lossy_override && nu::modeLabel(po) == "balance+overrides");
-            CHECK(nu::logLine(po).find("WHIRL_Q8DEC=1: q8dec on (lossy, user-requested)") != std::string::npos &&
-                  nu::logLine(po).find("q8dec (MoE") == std::string::npos && nu::logLine(po).find("decode: q8dec") != std::string::npos);
-            nu::Plan pn = pb;
-            nu::setQ8dec(pn, false, "0");  // same as the default: no override
-            CHECK(pn.overrides.empty() && nu::modeLabel(pn) == "balance");
+            // WHIRL_Q8DEC=0 in MoE balance: f16 decode, a (non-lossy) override
+            nu::Plan p0 = pb;
+            nu::setQ8dec(p0, false, "0");
+            CHECK(!p0.q8dec && !p0.lossy_override && p0.overrides.size() == 1 && nu::modeLabel(p0) == "balance");
+            CHECK(nu::logLine(p0).find("WHIRL_Q8DEC=0") != std::string::npos);
+            nu::Plan p1 = pb;
+            nu::setQ8dec(p1, true, "1");  // same as the default: no override
+            CHECK(p1.overrides.empty() && nu::modeLabel(p1) == "balance");
         }
         // dense balance WHIRL_Q8DEC=0: off, not lossy (unchanged)
         nu::Plan pd = nu::plan(bal, swift);

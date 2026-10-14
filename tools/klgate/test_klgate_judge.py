@@ -97,13 +97,13 @@ class MoE(unittest.TestCase):
     def test_top1_floor_is_all_window_noise_mean(self):
         nz = noise(self.N_KL, self.N_T1)
         allmean = sum(self.N_T1) / 6
-        # 8192 average top-1 0.951 < all-window floor 0.97667 - 0.024 = 0.95267 -> fail
-        # (the 8192-only noise mean 0.97333 - 0.024 = 0.94933 would have passed)
-        res = [win(1, 0.002, .951)] * 3 + [win(4, 0.002, .97)] * 3
+        # 8192 average top-1 0.945 < all-window floor 0.97667 - 0.030 = 0.94667 -> fail
+        # (the 8192-only noise mean 0.97333 - 0.030 = 0.94333 would have passed)
+        res = [win(1, 0.002, .945)] * 3 + [win(4, 0.002, .97)] * 3
         ln = by_rule(klgate.judge(res, GROUPS, POSS, "balance", True, nz), "moe-length")
         self.assertAlmostEqual(ln[0]["noise_top1"], allmean)
-        self.assertAlmostEqual(ln[0]["top1_limit"], allmean - 0.024)
-        self.assertAlmostEqual(ln[1]["top1_limit"], allmean - 0.024)  # the same floor for every length
+        self.assertAlmostEqual(ln[0]["top1_limit"], allmean - 0.030)
+        self.assertAlmostEqual(ln[1]["top1_limit"], allmean - 0.030)  # the same floor for every length
         self.assertFalse(ln[0]["pass"])
         self.assertTrue(ln[1]["pass"])
         # the reverse: a length whose own noise top-1 is high does not get a stricter floor
@@ -114,10 +114,27 @@ class MoE(unittest.TestCase):
 
     def test_top1_boundary(self):
         nz = noise([0.002] * 3, [0.97] * 3)
-        at = klgate.judge([win(1, 0.002, 0.97 - 0.024)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz)
-        under = klgate.judge([win(1, 0.002, 0.97 - 0.0241)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz)
+        at = klgate.judge([win(1, 0.002, 0.97 - 0.030)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz)
+        under = klgate.judge([win(1, 0.002, 0.97 - 0.0301)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz)
         self.assertTrue(by_rule(at, "moe-length")[0]["pass"])
         self.assertFalse(by_rule(under, "moe-length")[0]["pass"])
+
+    def test_balance_top1_drop_is_3_points(self):
+        # MOE-BAL-3 (owner decision 2026-10-14 23:36): MoE balance top-1 drop 2.4 -> 3.0 points; the KL
+        # multipliers (2 N mean, 3 N per length), fast and the dense absolute limits are unchanged
+        self.assertEqual(klgate.MOE_LIMITS["balance"], (2.0, 3.0, 0.030))
+        self.assertEqual(klgate.MOE_LIMITS["fast"], (8.0, 12.0, 0.08))
+        self.assertEqual(klgate.LIMITS, {"balance": (0.005, 0.98), "fast": (0.03, 0.93)})
+        # the measured case that failed the 2.4-point floor: R9700 MoE zh 8k with q8dec, 93.88% vs the
+        # noise all-window mean 96.40% (-2.52 points), 2.35 N -> passes now
+        nz = noise([0.00597] * 3, [0.9640] * 3)
+        cs = klgate.judge([win(1, 0.01400, 0.9388)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz)
+        ln = by_rule(cs, "moe-length")[0]
+        self.assertTrue(ln["pass"])
+        self.assertAlmostEqual(ln["top1_limit"], 0.9340)
+        # -3.1 points still fails; KL over 3 N still fails whatever the top-1
+        self.assertFalse(by_rule(klgate.judge([win(1, 0.002, 0.9330)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz), "moe-length")[0]["pass"])
+        self.assertFalse(by_rule(klgate.judge([win(1, 0.0180, 0.9640)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz), "moe-length")[0]["pass"])
 
     def test_kl_boundary(self):
         nz = noise([0.002] * 3, [0.97] * 3)
