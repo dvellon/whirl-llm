@@ -1076,6 +1076,34 @@ void testKvChoice() {
     // custom item lists: kvq8 decides for balance, kvq4 for fast
     CHECK(nu::chooseKv(nu::parseMode("balance:fp8", "t"), false, r9700, std::nullopt).kv == K::f16);
     CHECK(nu::chooseKv(nu::parseMode("fast:kvq8", "t"), false, s8060, std::nullopt).kv == K::q8h);
+    // RC6: gfx1151 (fast_q8h) fast on a dense model -> q8h; MoE keeps q4; the R9700 keeps q4; WHIRL_KV still wins
+    {
+        const nu::KvCaps s8060f{true, true, true, true};
+        CHECK(nu::chooseKv(fast, false, s8060f, std::nullopt).kv == K::q8h);
+        CHECK(nu::chooseKv(fast, false, s8060f, std::nullopt).why == "fast, dense model: q8h (Radeon 8060S: faster decode than q4)");
+        CHECK(nu::chooseKv(fast, true, s8060f, std::nullopt).kv == K::q4);
+        CHECK(nu::chooseKv(bal, false, s8060f, std::nullopt).kv == K::q8h);
+        CHECK(nu::chooseKv(pre, false, s8060f, std::nullopt).kv == K::f16);
+        CHECK(nu::chooseKv(fast, false, s8060f, K::q4).kv == K::q4);
+        CHECK(nu::chooseKv(fast, false, nu::KvCaps{false, true, true, true}, std::nullopt).kv == K::q4);  // no q8h kernels: q4
+        nu::Target t8;
+        t8.gfx1151 = true;
+        t8.k_kv_q8h = true;
+        t8.k_kv_q4 = true;
+        t8.fast_kv_q8h = true;
+        const nu::Plan pd = nu::plan(fast, t8);
+        CHECK(!pd.on(nu::Item::kvq4));
+        CHECK(nu::logLine(pd).find("kvq4 (Radeon 8060S dense models: q8h KV") != std::string::npos);
+        t8.moe = true;
+        CHECK(nu::plan(nu::forModel(fast, true), t8).on(nu::Item::kvq4));
+        // GDN-8S default: gdnwmma reported enabled when the strix prefill runs
+        nu::Target tg;
+        tg.gfx1151 = true;
+        tg.gdn_strix = true;
+        CHECK(nu::plan(bal, tg).on(nu::Item::gdnwmma));
+        tg.gdn_strix = false;
+        CHECK(!nu::plan(bal, tg).on(nu::Item::gdnwmma));
+    }
     // WHIRL_KV: debug override, any mode
     const nu::KvChoice o = nu::chooseKv(pre, false, r9700, K::q8v);
     CHECK(o.kv == K::q8v && o.debug && o.why.find("WHIRL_KV=q8v") != std::string::npos);

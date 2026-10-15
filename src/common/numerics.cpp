@@ -210,6 +210,10 @@ Plan plan(const Request& r_in, const Target& t) {
                 else if (!t.k_gemm8_moe) why = t.gfx1151 ? "no fp8 WMMA on this GPU (gfx1151)" : "no fp8 expert GEMM kernels on this GPU";
                 break;
             case Item::gdnwmma:
+                if (t.gdn_strix) {
+                    note = "strix-llama.cpp chunks on this GPU";
+                    break;
+                }
                 if (!t.k_gdn_wmma) why = "no WMMA DeltaNet kernels on this GPU";
                 else if (!t.has_mxfp4 && !denseQuantRelaxed(t)) why = "MoE: MXFP4 experts only for now (WHIRL_Q4_RELAXED=1 forces it)";
                 break;
@@ -232,6 +236,7 @@ Plan plan(const Request& r_in, const Target& t) {
                 if (!t.k_kv_q4)
                     why = t.gfx1151 ? "no q4 KV kernels in this code object" : "no 4-bit KV kernels on this GPU yet (Radeon 8060S only): f16 KV";
                 else if (t.kv_explicit) why = "WHIRL_KV picks the KV format";
+                else if (t.fast_kv_q8h && !t.moe) why = "Radeon 8060S dense models: q8h KV (faster decode than q4)";
                 else note = "q4: int4 + f16 scale / 32, Hadamard-rotated q/k";
                 break;
             case Item::relaxacc:
@@ -404,6 +409,13 @@ KvChoice chooseKv(const Request& r, bool moe, const KvCaps& caps, std::optional<
     // int8 with rotation where the code object has it, else plain int8 (every code object has q8)
     const KvKind q8 = caps.q8h ? KvKind::q8h : KvKind::q8;
     if (r.has(Item::kvq4)) {
+        if (caps.fast_q8h && caps.q8h && !moe) {
+            // RC6 (FAST-8S, 3-run means on the Radeon 8060S): q8h decodes +7/+19/+14% faster than q4 at
+            // 32k/64k/128k, prefill within noise, KL error 4-10x smaller
+            c.kv = KvKind::q8h;
+            c.why = std::format("{}, {}: q8h (Radeon 8060S: faster decode than q4)", modeName(r.mode), model);
+            return c;
+        }
         if (caps.q4) {
             c.kv = KvKind::q4;
             c.why = std::format("{}, {}: q4", modeName(r.mode), model);

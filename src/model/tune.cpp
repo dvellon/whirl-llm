@@ -878,18 +878,21 @@ void loadOrTune(Model& m, const std::string& model_path, std::string& log) {
     if (h16_env) m.ffn_h16 = *h16_env != "0";
     m.h16_dq = m.ffn_h16 && dense_q;
     if (m.gdn_wmma && m.gdn_chunked && m.k.gdn_wprep != nullptr) log += "  DeltaNet prefill: f16 WMMA chunks\n";
-    // GDN-8S: the gfx1151 f16-WMMA chunked prefill (strix-llama.cpp, MIT) behind WHIRL_GDN_STRIX=1. It follows the
+    // GDN-8S: the gfx1151 f16-WMMA chunked prefill (strix-llama.cpp, MIT). RC6: default on for dense models (full
+    // KL gate on the 8060S, dense balance / fast); MoE models only with WHIRL_GDN_STRIX=1 until their KL gate has
+    // run (MoE balance sits at 1.97 N of its 2 N limit). WHIRL_GDN_STRIX=0 turns it off. It follows the
     // gdn_wmma mode policy (numerics item gdnwmma: balance / fast, never precise; dense or MXFP4 models, the
     // condition gdn_wmma has on the R9700) and only exists where gdn_wmma's kernels do not (gfx1151).
     // WHIRL_GDN_STRIX_MIN sets the row threshold (default 256, strix's GGML_GDN_CHUNK_MIN).
     m.gdn_strix = false;
-    if (envGet("GDN_STRIX").value_or("0") == "1" && m.arch == hip::Arch::gfx1151 && m.k.gdn_sx_prep != nullptr &&
+    const auto sx_env = envGet("GDN_STRIX");
+    if ((sx_env ? *sx_env != "0" : !m.cfg.moe) && m.arch == hip::Arch::gfx1151 && m.k.gdn_sx_prep != nullptr &&
         m.k.gdn_sx_scan != nullptr && m.gdn_chunked && (has_mx || !m.cfg.moe) && rq.has(nu::Item::gdnwmma) && m.cfg.d_state == 128 &&
         m.cfg.headV() == 128 && m.cfg.n_k_heads > 0 && m.cfg.n_v_heads % m.cfg.n_k_heads == 0 && m.cfg.n_v_heads / m.cfg.n_k_heads <= 4) {
         m.gdn_strix = true;
         if (auto v = envGet("GDN_STRIX_MIN"))
             m.gdn_strix_min = static_cast<std::uint32_t>(std::max<unsigned long>(32, std::strtoul(v->c_str(), nullptr, 10)));
-        log += fmt("  DeltaNet prefill: f16 WMMA chunks (strix-llama.cpp, WHIRL_GDN_STRIX=1, runs >= %u rows)\n", m.gdn_strix_min);
+        log += fmt("  DeltaNet prefill: f16 WMMA chunks (strix-llama.cpp, runs >= %u rows; WHIRL_GDN_STRIX=0 turns it off)\n", m.gdn_strix_min);
     }
     {
         // numerics mode: capability table, per-item environment overrides, one log line
@@ -912,6 +915,8 @@ void loadOrTune(Model& m, const std::string& model_path, std::string& log) {
         t.k_spec_sample = m.k.draft_sample_rows != nullptr;
         t.k_kv_q4 = m.k.caps.kv_q4;
         t.kv_explicit = m.kv_mode != KvMode::automatic;
+        t.fast_kv_q8h = t.gfx1151 && t.k_kv_q8h;
+        t.gdn_strix = m.gdn_strix;
         nu::Plan p = nu::plan(rq, t);
         if (fp8_env) nu::applyOverride(p, nu::Item::fp8, "FP8", *fp8_env, m.fp8_prefill, t.has_mxfp4 && t.k_gemm8);
         const bool moe_ok = t.moe && t.moe_mxfp4 && t.k_gemm8_moe;

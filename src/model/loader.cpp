@@ -477,7 +477,7 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
         // and never switched afterwards (no fallback to a lower-precision format when it does
         // not fit: the context shrinks or the load stops, below / in the server).
         const kernels::Caps caps = kernels::Caps::probe(m.module);
-        m.kv_choice = numerics::chooseKv(opt.numerics, cfg.moe, numerics::KvCaps{caps.kv_q8h, caps.kv_q8v, caps.kv_q4}, kvKindOf(kvm));
+        m.kv_choice = numerics::chooseKv(opt.numerics, cfg.moe, numerics::KvCaps{caps.kv_q8h, caps.kv_q8v, caps.kv_q4, m.arch == hip::Arch::gfx1151}, kvKindOf(kvm));
         const numerics::KvKind kv = m.kv_choice.kv;
         m.kv_q8 = kv != numerics::KvKind::f16;
         m.kv_rot = kv == numerics::KvKind::q8h || kv == numerics::KvKind::q4;

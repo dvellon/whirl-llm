@@ -110,6 +110,8 @@ struct Target {
     bool k_spec_sample = true;       // draft_sample_rows kernel present
     bool k_kv_q4 = false;      // q4 KV kernels present (gfx1151)
     bool kv_explicit = false;  // WHIRL_KV set to a format (the KV items then do not choose)
+    bool fast_kv_q8h = false;  // fast takes q8h for kvq4 on dense models (KvCaps::fast_q8h, gfx1151)
+    bool gdn_strix = false;    // gdnwmma runs as the gfx1151 strix-llama.cpp chunked prefill (GDN-8S)
 };
 
 // gdnwmma / h16 for a model without MXFP4 tensors (KG-1): dense models on the R9700 only
@@ -175,6 +177,9 @@ struct KvCaps {
     bool q8h = false;
     bool q8v = false;
     bool q4 = false;
+    // RC6: this GPU's fast mode takes q8h instead of q4 KV on dense models (gfx1151: the q8h decode
+    // attention is faster than q4's at 32k-128k and the error 4-10x smaller, FAST-8S; the R9700 keeps q4)
+    bool fast_q8h = false;
 };
 struct KvChoice {
     KvKind kv = KvKind::f16;
@@ -182,7 +187,8 @@ struct KvChoice {
     std::string why;     // "balance, dense model: q8h"
 };
 // The request's KV format: WHIRL_KV (forced) wins; else kvq4 -> q4 (where the kernels exist,
-// else f16: R9700 has no q4 KV kernels yet, and int8 is no stand-in), dense and MoE; else kvq8 on
+// else f16: R9700 has no q4 KV kernels yet, and int8 is no stand-in), dense and MoE, except a dense
+// model where caps.fast_q8h (gfx1151) -> q8h; else kvq8 on
 // a dense model -> q8h (q8 where the code object has no q8h kernels);
 // else f16 (precise, MoE in balance). Independent of free memory and card size.
 KvChoice chooseKv(const Request& r, bool moe, const KvCaps& caps, std::optional<KvKind> forced);
