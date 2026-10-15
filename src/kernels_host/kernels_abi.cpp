@@ -287,6 +287,8 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
         {&KernelTable::moe_tiles, "moe_tiles"},
         {&KernelTable::gdn_wprep, "gdn_wprep"},
         {&KernelTable::gdn_wscan8, "gdn_wscan8"},
+        {&KernelTable::gdn_sx_prep, "gdn_sx_prep"},
+        {&KernelTable::gdn_sx_scan, "gdn_sx_scan"},
         {&KernelTable::rmsnorm_x8, "rmsnorm_x8"},
         {&KernelTable::rmsnorm_x16, "rmsnorm_x16"},
         {&KernelTable::silu_mul_x8, "silu_mul_x8"},

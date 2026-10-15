@@ -577,9 +577,14 @@ public:
     whirl::numerics::KvChoice kv_choice;
     DevPtr w16 = 0;
     DevPtr gc_w = 0, gc_u = 0, gc_m = 0, gc_g = 0;
+    std::uint64_t gc_w_bytes = 0, gc_u_bytes = 0, gc_m_bytes = 0;  // (GDN-8S scratch bound checks)
     std::uint32_t fwd_pos0 = 0;
     bool gdn_chunked = true;
     bool gdn_wmma = false;
+    // GDN-8S (opt-in, WHIRL_GDN_STRIX=1, gfx1151): strix-llama.cpp's f16-WMMA chunked prefill (gdn_sx_prep /
+    // gdn_sx_scan) for runs of >= gdn_strix_min rows; same precision class and mode policy as gdn_wmma
+    bool gdn_strix = false;
+    std::uint32_t gdn_strix_min = 256;
     bool act_fuse = true;
     bool attn_kx_on = true;
     bool gdn_ba_on = true;   // n>16 GDN prefill: one [beta; alpha] GEMM + gdn_gates_ba (WHIRL_GDN_BA=0 off)

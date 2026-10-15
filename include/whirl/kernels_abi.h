@@ -103,6 +103,9 @@
 //   gdn_wprep(qkv, gl, beta, f16* TM, G, n_tok, nkh, nvh, qkv_stride)
 //   gdn_wscan8(qkv, const f16* TM, G, beta, state, out, n_tok, nkh, nvh,
 //            qkv_stride, scale)
+//   gdn_sx_prep(conv, gl, beta, f16* Tb, f16* Pb, float2* Gb, f16* Qh, f16* Kh, f16* Vh, H, Hk, n_tok,
+//            nch32, conv_stride, scale); gdn_sx_scan(Qh, Kh, Vh, state_in, out, state_out, Tb, Pb, Gb, H, Hk,
+//            n_tok, nch32, scale, on_w, on_z, on_out, u16* on_out16, on_eps, bool on_silu): gfx1151 f16-WMMA chunked prefill (strix-llama.cpp, MIT; GDN-8S, optional)
 //   gdn_gated_norm(o, z, w, dv, eps)
 //   gdn_ab_<T>(Wb, Wa, rb, xq, xd, beta, g, dt, A, ncols, nh)
 //   gdn_abconv_<T>(... gdn_ab args ..., int n_ab, xin, w, out, ch,
@@ -489,7 +492,7 @@ struct KernelTable {
     F attn_pwf{}, attn_pws{};
     F gdn_conv_seq{}, gdn_gates{}, gdn_gates_ba{}, gdn_seq_128{}, f32_to_f16{}, gdn_gated_norm{};
     F argmax{}, quantize_q8{};
-    F gdn_chunk_prep{}, gdn_chunk_scan{}, gdn_wprep{}, gdn_wscan8{};
+    F gdn_chunk_prep{}, gdn_chunk_scan{}, gdn_wprep{}, gdn_wscan8{}, gdn_sx_prep{}, gdn_sx_scan{};
     F rmsnorm_x8{}, rmsnorm_x16{}, silu_mul_x8{}, silu_mul_x16{}, gated_norm_x8{}, gated_norm_x16{};
     F gdn_conv_par{}, gdn_conv_state{}, rmsnorm_q8{}, silu_mul_q8{}, gdn_ab_q8_0{};
     F gdn_conv_l2{}, gdn_step_norm{}, requant_q6k_q4k{}, requant_q6k_d2{}, requant_q80_q4k{};

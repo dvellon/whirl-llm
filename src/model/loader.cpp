@@ -675,6 +675,9 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
         m.gc_w = m.alloc(n_chunks * heads * 64 * 128 * 4);
         m.gc_u = m.alloc(n_chunks * heads * 64 * 128 * 4);
         m.gc_m = m.alloc(n_chunks * heads * 64 * 64 * 4);
+        m.gc_w_bytes = n_chunks * heads * 64 * 128 * 4;
+        m.gc_u_bytes = m.gc_w_bytes;
+        m.gc_m_bytes = n_chunks * heads * 64 * 64 * 4;
         m.gc_g = m.alloc(n_chunks * heads * 64 * 4);
     }
     // widest decode matmul input: FFN, DeltaNet / attention output, MTP eh_proj

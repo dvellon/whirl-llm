@@ -1729,6 +1729,20 @@ GdnSegs Model::gdnSegsSingle(std::size_t i, bool conv, u32 n) const {
 void Model::gdnChunked(std::size_t i, DevPtr conv_o, DevPtr alpha_b, DevPtr beta_b, DevPtr out, u32 n, float scale) {
     const u32 ch = cfg.convCh();
     const u32 n_chunks = (n + 63) / 64;
+    if (gdn_strix && n >= gdn_strix_min) {
+        // GDN-8S: strix-llama.cpp chunks (CL = 32) on the existing scratch: T' | P in gc_m, Vh in gc_w,
+        // Qh | Kh | gate factors in gc_u (each fits when n <= the batch the gc_* buffers were sized for)
+        const u64 H = cfg.n_v_heads, Hk = cfg.n_k_heads, nch = (n + 31) / 32;
+        const u64 tp = H * nch * 32 * 32 * 2, qk = Hk * n * 128 * 2, vh = H * n * 128 * 2, gb = H * nch * 32 * 8;
+        if (2 * tp <= gc_m_bytes && vh <= gc_w_bytes && 2 * qk + gb <= gc_u_bytes) {
+            hip::launch(k.gdn_sx_prep, D(Hk, nch), D(256), 0, stream, conv_o, alpha_b, beta_b, gc_m, gc_m + tp, gc_u + 2 * qk, gc_u, gc_u + qk,
+                        gc_w, I(H), I(Hk), I(n), I(nch), I(ch), scale);
+            // state in place (curr_state == state); no fused output norm (on_* = null)
+            hip::launch(k.gdn_sx_scan, D(H), D(256), 0, stream, gc_u, gc_u + qk, gc_w, ssm_state[i], out, ssm_state[i], gc_m, gc_m + tp,
+                        gc_u + 2 * qk, I(H), I(Hk), I(n), I(nch), scale, u64(0), u64(0), u64(0), u64(0), 0.0f, false);
+            return;
+        }
+    }
     if (gdn_wmma && k.gdn_wprep != nullptr && k.gdn_wscan8 != nullptr) {
         hip::launch(k.gdn_wprep, D(cfg.n_v_heads, n_chunks), D(256), 0, stream, conv_o, alpha_b, beta_b, gc_w, gc_g, I(n), I(cfg.n_k_heads),
                     I(cfg.n_v_heads), I(ch));

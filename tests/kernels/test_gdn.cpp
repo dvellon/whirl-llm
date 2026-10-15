@@ -325,6 +325,32 @@ void testGdn(Ctx& c) {
             c.rep.add(tolRms("gdn_wprep + gdn_wscan8 (f16 WMMA) out vs CPU", dout.down<float>(out.size()), out, 2e-2));
             c.rep.add(tolRms("gdn_wscan8 final state vs CPU", dst.down<float>(st.size()), st, 2e-2));
         }
+        if (c.k.gdn_sx_prep && c.k.gdn_sx_scan) {
+            // GDN-8S (gfx1151): strix-llama.cpp f16-WMMA chunks, CL = 32, same tolerance class as gdn_wscan8
+            const int n32 = (n + 31) / 32;
+            Buf T(static_cast<std::size_t>(kNv) * n32 * 32 * 32 * 2), P(static_cast<std::size_t>(kNv) * n32 * 32 * 32 * 2),
+                Gb(static_cast<std::size_t>(kNv) * n32 * 32 * 8), Qh(static_cast<std::size_t>(kNk) * n * 128 * 2),
+                Kh(static_cast<std::size_t>(kNk) * n * 128 * 2), Vh(static_cast<std::size_t>(kNv) * n * 128 * 2);
+            std::vector<float> o1, s1;
+            for (int rep = 0; rep < 2; ++rep) {
+                Buf dst(state0), dout(out.size() * 4);
+                hip::launch(c.k.gdn_sx_prep, {kNk, static_cast<unsigned>(n32), 1}, {256, 1, 1}, 0, c.s, dq.p(), dg.p(), db.p(), T.p(), P.p(),
+                            Gb.p(), Qh.p(), Kh.p(), Vh.p(), kNv, kNk, n, n32, kCh, kScale);
+                hip::launch(c.k.gdn_sx_scan, {kNv, 1, 1}, {256, 1, 1}, 0, c.s, Qh.p(), Kh.p(), Vh.p(), dst.p(), dout.p(), dst.p(), T.p(), P.p(),
+                            Gb.p(), kNv, kNk, n, n32, kScale, DevPtr{0}, DevPtr{0}, DevPtr{0}, DevPtr{0}, 0.0f, false);
+                c.sync();
+                const std::vector<float> o = dout.down<float>(out.size()), s = dst.down<float>(st.size());
+                if (rep == 0) {
+                    c.rep.add(tolRms("gdn_sx_prep + gdn_sx_scan (strix f16 WMMA) out vs CPU", o, out, 2e-2));
+                    c.rep.add(tolRms("gdn_sx_scan final state vs CPU", s, st, 2e-2));
+                    o1 = o;
+                    s1 = s;
+                } else {
+                    c.rep.add(cmpExact("gdn_sx_prep + gdn_sx_scan run-to-run out (bitwise)", o, o1));
+                    c.rep.add(cmpExact("gdn_sx_scan run-to-run final state (bitwise)", s, s1));
+                }
+            }
+        }
     }
 
     // ---- gated norm
