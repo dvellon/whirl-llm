@@ -50,7 +50,7 @@ HW = {
                bw_prac=238e9,  # hipMalloc copy measured (audit/KGAP-1.md); rocm_bandwidth_test 212 GB/s (llm-tracker)
                f16=59.4e12,   # 40 CU x 2.9 GHz x 512 FLOP/clk (llm-tracker Strix Halo page)
                f16_prac=25.0e12,  # hipBLASLt 1.2.2 on this box, WHIRL shapes: 19.5-25.0 TFLOPS (audit/PEAK-1.md)
-               f16_rgp=43.7e12,  # FAST-0 register peak, unthrottled: the f16 ceiling at the peak clocks RGP forces
+               f16_rgp=22e12,  # practical f16 ceiling (KLIB-1 2026-10-15): hipBLASLt sustains 20-25, strix/llama.cpp FA 18-21 TF/s even at RGP clocks; FAST-0 register peak 43.7 overstated headroom ~2x
                iu8=59.4e12),  # iu8 = f16 speed on RDNA3.5 (PEAK-1: hipBLASLt int8 18-34 TOPS = f16)
     "r97": dict(name="Radeon AI PRO R9700 (gfx1201)",
                 bw=640e9,       # 20 Gbps GDDR6 x 256 bit
