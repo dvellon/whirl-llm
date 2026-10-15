@@ -209,3 +209,21 @@ template <> struct MRD<QT_Q6_K> {
         }
     }
 };
+
+// KLIB-1 (opt-in, WHIRL_Q3K_U16=1): Q3_K llama.cpp-split units (QD<QT_Q3_K_U16> in gemv_q.hip), R rows per wave
+// sharing the int8 x loads. Per (row, token): the same q3u_dec / q3u_tok as gemvq_q3_k16 / gemvq_nt*_q3_k16, same
+// lane -> unit mapping and order, so the results equal them bit for bit.
+template <> struct MRD<QT_Q3_K_U16> {
+    static constexpr int per_sb = QD<QT_Q3_K_U16>::per_sb;
+    template <int NT, int R>
+    static __device__ __forceinline__ void step(const uint8_t *const *wr, int u, const int8_t *xq, const float *xd,
+                                                int ncols, float (*acc)[NT]) {
+        Q3uW w[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) w[r] = q3u_dec(wr[r], u);
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[r][t] += q3u_tok(w[r], xq + (size_t)t * ncols, xd + (size_t)t * (ncols / 32));
+    }
+};

@@ -246,6 +246,55 @@ template <> struct QD<QT_Q3_K> {
     }
 };
 
+// KLIB-1 (opt-in, WHIRL_Q3K_U16=1): Q3_K with the unit split of llama.cpp's vec_dot_q3_K_q8_1 (ggml-cuda/vecdotq.cuh,
+// MIT, Copyright (c) 2023-2026 The ggml authors). Unit = (superblock b, iqs 0..15): one 4-byte qs word (4 positions x
+// 4 two-bit planes) and one 4-byte hmask word give 16 weights; plane i is 32-group 4 (iqs / 8) + i, positions
+// 4 (iqs % 8) .. +3. The QD<QT_Q3_K> unit above decodes 8 weights of one plane from 16 bytes (each qs byte read by four
+// units). Different summation order than QD<QT_Q3_K> (not bit-identical to it); the 1-token and multi-token
+// entries share q3u_tok, so verify == decode bit for bit within this variant.
+#define QT_Q3_K_U16 1011
+struct Q3uW {
+    int vl[4], vh[4], sc[4];
+    float d;
+    int base;
+};
+__device__ __forceinline__ Q3uW q3u_dec(const uint8_t *row, int u) {
+    const int b = u >> 4, iqs = u & 15, n = iqs >> 3, l4 = iqs & 7;
+    const uint8_t *blk = row + (size_t)b * 110;
+    const uint32_t ql = ld32u(blk + 32 + 4 * iqs);
+    const uint32_t qh = ~ld32u(blk + 4 * l4) >> (4 * n);
+    const uint8_t *scales = blk + 96;
+    Q3uW w;
+    w.d = h2f(blk + 108);
+    w.base = b * 256 + 128 * n + 4 * l4;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int isc = 8 * n + (l4 >> 2) + 2 * i;
+        const int lo = (scales[isc & 7] >> (4 * (isc >> 3))) & 0xF;
+        const int hi = ((scales[8 + (isc & 3)] >> (2 * (isc >> 2))) & 3) << 4;
+        w.sc[i] = (lo | hi) - 32;
+        w.vl[i] = (int)((ql >> (2 * i)) & 0x03030303u);
+        w.vh[i] = (int)(((qh >> i) << 2) & 0x04040404u);
+    }
+    return w;
+}
+__device__ __forceinline__ float q3u_tok(const Q3uW &w, const int8_t *xq, const float *xd) {
+    float sumf = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int e = w.base + 32 * i;
+        const int x = *(const int *)(xq + e);
+        sumf += xdv(xd + (e >> 5)) * (float)((dp4(w.vl[i], x, 0) - dp4(w.vh[i], x, 0)) * w.sc[i]);
+    }
+    return w.d * sumf;
+}
+template <> struct QD<QT_Q3_K_U16> {
+    static constexpr int per_sb = 16, sb = 256, bytes = 110;
+    static __device__ __forceinline__ float dot(const uint8_t *row, int u, const int8_t *xq, const float *xd) {
+        return q3u_tok(q3u_dec(row, u), xq, xd);
+    }
+};
+
 // IQ3_S unit = (superblock, ib32 0..7, l 0..3): 8 values from two grid entries.
 template <> struct QD<QT_IQ3_S> {
     static constexpr int per_sb = 32, sb = 256, bytes = 110;
@@ -277,6 +326,16 @@ template <int T> struct QDN {
                                                float *acc) {
 #pragma unroll
         for (int t = 0; t < NT; ++t) acc[t] += QD<T>::dot(row, u, xq + (size_t)t * ncols, xd + (size_t)t * (ncols / 32));
+    }
+};
+
+template <> struct QDN<QT_Q3_K_U16> {
+    template <int NT>
+    static __device__ __forceinline__ void dot(const uint8_t *row, int u, const int8_t *xq, const float *xd, int ncols,
+                                               float *acc) {
+        const Q3uW w = q3u_dec(row, u);
+#pragma unroll
+        for (int t = 0; t < NT; ++t) acc[t] += q3u_tok(w, xq + (size_t)t * ncols, xd + (size_t)t * (ncols / 32));
     }
 };
 

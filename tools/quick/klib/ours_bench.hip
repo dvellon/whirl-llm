@@ -82,8 +82,9 @@ int main(int argc, char **argv) {
     };
     // ---------------- Q3_K GEMV ----------------
     std::printf("## gemv q3_k (ours), us per call over %d back-to-back calls, same buffers\n", iters);
-    std::printf("| kernel | rows x cols | tokens | us | weight GB/s | %% of 256 GB/s | bits stable |\n|---|---|---:|---:|---:|---:|---|\n");
-    hipFunction_t g1 = fn("gemvq_q3_k"), g4 = fn("gemvq_nt4_q3_k");
+    std::printf("| kernel | rows x cols | tokens | us | weight GB/s | %% of 256 GB/s | bits stable | NMSE vs CPU (64 rows) | n=1 == nt4 token 0 |\n|---|---|---:|---:|---:|---:|---|---:|---|\n");
+    std::vector<std::string> sfx = {"q3_k"};
+    if (std::getenv("Q3U")) sfx.push_back("q3_k16");  // KLIB-1 variant (WHIRL_Q3K_U16 kernels)
     for (auto [nrows, ncols] : {std::pair{17408, 5120}, std::pair{5120, 17408}}) {
         const uint64_t rb = (uint64_t)ncols / 256 * 110;
         std::vector<uint8_t> w(rb * nrows);
@@ -97,6 +98,32 @@ int main(int argc, char **argv) {
         for (auto &x : xq) x = (int8_t)((int)(rng() % 255) - 127);
         std::vector<float> xd((size_t)4 * ncols / 32);
         for (auto &x : xd) x = 0.01f + 0.001f * (float)(rng() % 100);
+        // CPU reference (double) of the int8 product, tokens 0..3, rows 0..63 (ggml Q3_K dequantization)
+        std::vector<double> ref((size_t)4 * 64);
+        for (int r = 0; r < 64; ++r)
+            for (int b = 0; b < ncols / 256; ++b) {
+                const uint8_t *blk = &w[r * rb + b * 110];
+                uint16_t dh;
+                std::memcpy(&dh, blk + 108, 2);
+                const double d = (double)(float)(*(_Float16 *)&dh);
+                for (int e = 0; e < 256; ++e) {
+                    const int n = e / 128, j = (e % 128) / 32, l = e % 32, is = e / 16;
+                    const int q = (blk[32 + 32 * n + l] >> (2 * j)) & 3;
+                    const int hb = (blk[l] >> (4 * n + j)) & 1;
+                    const int lo = is < 8 ? (blk[96 + is] & 0xF) : (blk[96 + is - 8] >> 4);
+                    const int hi = (blk[104 + (is % 4)] >> (2 * (is / 4))) & 3;
+                    const double wv = d * (double)((lo | (hi << 4)) - 32) * (double)(q - (hb ? 0 : 4));
+                    for (int t = 0; t < 4; ++t) {
+                        const size_t xi = (size_t)t * ncols + b * 256 + e;
+                        uint32_t pb;  // xd is packed (gfx1151 common.hip pk_make): d = bits >> 13 << 12
+                        std::memcpy(&pb, &xd[xi / 32], 4);
+                        pb = (pb >> 13) << 12;
+                        float dd;
+                        std::memcpy(&dd, &pb, 4);
+                        ref[t * 64 + r] += wv * (double)xq[xi] * (double)dd;
+                    }
+                }
+            }
         uint8_t *dw;
         int8_t *dxq;
         float *dxd, *dy;
@@ -110,27 +137,65 @@ int main(int argc, char **argv) {
         const unsigned nb = (nrows + 7) / 8;
         int nc = ncols, nr = nrows, acc = 0;
         int *skip = nullptr;
-        auto l1 = [&]() {
-            GvArgs g{dw, nullptr, nullptr, dy, nullptr, nullptr, rb, 0, 0, nr, 0, 0, (int)nb, (int)nb};
-            void *args[] = {&g, &dxq, &dxd, &nc, &acc, &skip};
-            CK(hipModuleLaunchKernel(g1, nb, 1, 1, 256, 1, 1, 0, 0, args, nullptr));
-        };
-        auto l4 = [&]() {
+        for (const std::string &sf : sfx) {
+            hipFunction_t g1 = fn(("gemvq_" + sf).c_str()), g4 = fn(("gemvq_nt4_" + sf).c_str());
+            auto l1 = [&]() {
+                GvArgs g{dw, nullptr, nullptr, dy, nullptr, nullptr, rb, 0, 0, nr, 0, 0, (int)nb, (int)nb};
+                void *args[] = {&g, &dxq, &dxd, &nc, &acc, &skip};
+                CK(hipModuleLaunchKernel(g1, nb, 1, 1, 256, 1, 1, 0, 0, args, nullptr));
+            };
+            auto l4 = [&]() {
+                uint64_t rbv = rb;
+                void *args[] = {&dw, &rbv, &dxq, &dxd, &dy, &nc, &nr, &acc, &skip};
+                CK(hipModuleLaunchKernel(g4, nb, 1, 1, 256, 1, 1, 0, 0, args, nullptr));
+            };
+            std::vector<float> y1tok;
+            for (int t : {1, 4}) {
+                auto f = [&]() { t == 1 ? l1() : l4(); };
+                f();
+                CK(hipDeviceSynchronize());
+                std::vector<float> y1((size_t)t * nrows), y2(y1.size());
+                CK(hipMemcpy(y1.data(), dy, y1.size() * 4, hipMemcpyDeviceToHost));
+                const double us = time_us(f, iters);
+                CK(hipMemcpy(y2.data(), dy, y2.size() * 4, hipMemcpyDeviceToHost));
+                const double gbs = (double)w.size() / us / 1e3;
+                double e2 = 0, r2 = 0;
+                for (int tt = 0; tt < t; ++tt)
+                    for (int r = 0; r < 64; ++r) {
+                        const double a = y1[(size_t)tt * nrows + r], b = ref[tt * 64 + r];
+                        e2 += (a - b) * (a - b);
+                        r2 += b * b;
+                    }
+                std::string same = "-";
+                if (t == 1) y1tok = y1;
+                else same = std::memcmp(y1tok.data(), y1.data(), (size_t)nrows * 4) == 0 ? "yes" : "NO";
+                std::printf("| %s%s | %d x %d | %d | %.1f | %.0f | %.0f%% | %s | %.2e | %s |\n", t == 1 ? "gemvq_" : "gemvq_nt4_", sf.c_str(), nrows,
+                            ncols, t, us, gbs, gbs / 2.56, std::memcmp(y1.data(), y2.data(), y1.size() * 4) == 0 ? "yes" : "NO", e2 / r2,
+                            same.c_str());
+            }
+        }
+        if (std::getenv("Q3U")) {  // multi-row variants of q3_k16 (R rows per wave), 4 tokens; must equal gemvq_nt4_q3_k16
+            hipFunction_t g4 = fn("gemvq_nt4_q3_k16");
             uint64_t rbv = rb;
-            void *args[] = {&dw, &rbv, &dxq, &dxd, &dy, &nc, &nr, &acc, &skip};
-            CK(hipModuleLaunchKernel(g4, nb, 1, 1, 256, 1, 1, 0, 0, args, nullptr));
-        };
-        for (int t : {1, 4}) {
-            auto f = [&]() { t == 1 ? l1() : l4(); };
-            f();
+            void *a0[] = {&dw, &rbv, &dxq, &dxd, &dy, &nc, &nr, &acc, &skip};
+            CK(hipModuleLaunchKernel(g4, nb, 1, 1, 256, 1, 1, 0, 0, a0, nullptr));
             CK(hipDeviceSynchronize());
-            std::vector<float> y1((size_t)t * nrows), y2(y1.size());
-            CK(hipMemcpy(y1.data(), dy, y1.size() * 4, hipMemcpyDeviceToHost));
-            const double us = time_us(f, iters);
-            CK(hipMemcpy(y2.data(), dy, y2.size() * 4, hipMemcpyDeviceToHost));
-            const double gbs = (double)w.size() / us / 1e3;
-            std::printf("| %s | %d x %d | %d | %.1f | %.0f | %.0f%% | %s |\n", t == 1 ? "gemvq_q3_k" : "gemvq_nt4_q3_k", nrows, ncols, t, us, gbs,
-                        gbs / 2.56, std::memcmp(y1.data(), y2.data(), y1.size() * 4) == 0 ? "yes" : "NO");
+            std::vector<float> yb((size_t)4 * nrows), ym(yb.size());
+            CK(hipMemcpy(yb.data(), dy, yb.size() * 4, hipMemcpyDeviceToHost));
+            for (int R : {2, 4}) {
+                hipFunction_t gm = fn(("gemvq_nt4r" + std::to_string(R) + "_q3_k16").c_str());
+                const unsigned nbm = (nrows + 8 * R - 1) / (8 * R);
+                auto f = [&]() {
+                    void *args[] = {&dw, &rbv, &dxq, &dxd, &dy, &nc, &nr, &acc, &skip};
+                    CK(hipModuleLaunchKernel(gm, nbm, 1, 1, 256, 1, 1, 0, 0, args, nullptr));
+                };
+                f();
+                CK(hipDeviceSynchronize());
+                CK(hipMemcpy(ym.data(), dy, ym.size() * 4, hipMemcpyDeviceToHost));
+                const double us = time_us(f, iters), gbs = (double)w.size() / us / 1e3;
+                std::printf("| gemvq_nt4r%d_q3_k16 | %d x %d | 4 | %.1f | %.0f | %.0f%% | - | - | == nt4_q3_k16: %s |\n", R, nrows, ncols, us, gbs,
+                            gbs / 2.56, std::memcmp(yb.data(), ym.data(), ym.size() * 4) == 0 ? "yes" : "NO");
+            }
         }
         CK(hipFree(dw)); CK(hipFree(dxq)); CK(hipFree(dxd)); CK(hipFree(dy));
     }

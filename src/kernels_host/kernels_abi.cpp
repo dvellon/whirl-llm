@@ -190,6 +190,21 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
             }
         }
     }
+    // KLIB-1 (opt-in A/B, WHIRL_Q3K_U16=1, gfx1151 code object only): Q3_K int8 GEMV with llama.cpp's
+    // vec_dot_q3_K_q8_1 unit split (16 weights per 8 loaded bytes), the 1-token, multi-token and multi-row
+    // entries of that variant (verify == decode bit for bit within it; NOT bit-identical to the default q3_k).
+    if (getEnv("Q3K_U16").value_or("0") == "1" && L.opt("gemvq_q3_k16") != nullptr) {
+        const int i = ti(QType::q3_k);
+        k.gemvq[i] = L.req("gemvq_q3_k16");
+        for (int nt = 2; nt <= kMaxSmallBatch; ++nt) {
+            k.gemvq_nt[nt - 2][i] = L.req("gemvq_nt" + std::to_string(nt) + "_q3_k16");
+            k.gemvq_nt_g[nt - 2][i] = L.opt("ggemvq_nt" + std::to_string(nt) + "_q3_k16");
+            for (int ri = 0; ri < 2; ++ri) {
+                k.gemvq_mr[ri][nt - 2][i] = L.opt("gemvq_nt" + std::to_string(nt) + "r" + std::to_string(ri == 0 ? 2 : 4) + "_q3_k16");
+                k.gemvq_mr_g[ri][nt - 2][i] = nullptr;
+            }
+        }
+    }
     const std::string vx_var = getEnv("GEMVX_VARIANT").value_or("v5");
     for (QType t : {QType::q4_k, QType::q5_k, QType::iq4_xs, QType::q6_k, QType::mxfp4})
         k.gemvx[ti(t)] = L.opt("gemvx_" + vx_var + "_" + sfx(t));

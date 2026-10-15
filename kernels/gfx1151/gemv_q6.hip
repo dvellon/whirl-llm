@@ -251,6 +251,7 @@ __device__ void gemvq_mr_impl(const uint8_t *__restrict__ W, uint64_t row_bytes,
     GEMVQ_NT_ENTRY(NT, iq4_nl, QT_IQ4_NL) \
     GEMVQ_NT_ENTRY(NT, q8_0, QT_Q8_0)     \
     GEMVQ_NT_ENTRY(NT, q3_k, QT_Q3_K)     \
+    GEMVQ_NT_ENTRY(NT, q3_k16, QT_Q3_K_U16) \
     GEMVQ_NT_ENTRY(NT, iq3_s, QT_IQ3_S)   \
     GGEMVW_ENTRY(ggemvq_nt##NT##_q4_k, QT_Q4_K, NT, 1, true)     \
     GGEMVW_ENTRY(ggemvq_nt##NT##_q5_k, QT_Q5_K, NT, 1, true)     \
@@ -260,6 +261,7 @@ __device__ void gemvq_mr_impl(const uint8_t *__restrict__ W, uint64_t row_bytes,
     GGEMVQ_NT_ENTRY(NT, iq4_nl, QT_IQ4_NL) \
     GGEMVQ_NT_ENTRY(NT, q8_0, QT_Q8_0)     \
     GGEMVQ_NT_ENTRY(NT, q3_k, QT_Q3_K)     \
+    GGEMVQ_NT_ENTRY(NT, q3_k16, QT_Q3_K_U16) \
     GGEMVQ_NT_ENTRY(NT, iq3_s, QT_IQ3_S)
 
 GEMV1S_ENTRY(q4_k, QT_Q4_K)
@@ -274,6 +276,7 @@ extern "C" __global__ void __launch_bounds__(256)
 GEMVQ_ENTRY(iq4_nl, QT_IQ4_NL)
 GEMVQ_ENTRY(q8_0, QT_Q8_0)
 GEMVQ_ENTRY(q3_k, QT_Q3_K)
+GEMVQ_ENTRY(q3_k16, QT_Q3_K_U16)
 GEMVQ_ENTRY(iq3_s, QT_IQ3_S)
 GEMVQ_NT_TYPES(2)
 GEMVQ_NT_TYPES(3)
@@ -340,3 +343,21 @@ GEMVQ_MR_TYPES(15, 2)
 GEMVQ_MR_TYPES(15, 4)
 GEMVQ_MR_TYPES(16, 2)
 GEMVQ_MR_TYPES(16, 4)
+
+// KLIB-1 (opt-in, WHIRL_Q3K_U16=1): multi-row entries of the Q3_K llama.cpp-split variant
+#define GEMVQ_MR_Q3U(NT) GEMVQ_MR_ENTRY(NT, 2, q3_k16, QT_Q3_K_U16) GEMVQ_MR_ENTRY(NT, 4, q3_k16, QT_Q3_K_U16)
+GEMVQ_MR_Q3U(2)
+GEMVQ_MR_Q3U(3)
+GEMVQ_MR_Q3U(4)
+GEMVQ_MR_Q3U(5)
+GEMVQ_MR_Q3U(6)
+GEMVQ_MR_Q3U(7)
+GEMVQ_MR_Q3U(8)
+GEMVQ_MR_Q3U(9)
+GEMVQ_MR_Q3U(10)
+GEMVQ_MR_Q3U(11)
+GEMVQ_MR_Q3U(12)
+GEMVQ_MR_Q3U(13)
+GEMVQ_MR_Q3U(14)
+GEMVQ_MR_Q3U(15)
+GEMVQ_MR_Q3U(16)
