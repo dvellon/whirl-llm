@@ -123,6 +123,38 @@ def ntokens(exe, model, prompt):
     return ids[-1].count(",") + 1
 
 
+def truncated_prompt(exe, model, prompt, n, want, work):
+    """A copy of the prompt cut at a line end after at least want tokens (whose first want tokens are the
+    original's, checked on the token ids); returns (path, tokens)."""
+    text = open(prompt, encoding="utf-8").read()
+    cut = int(len(text) * want / n * 1.02)
+    full_ids = None
+    for _ in range(8):
+        end = text.find("\n", cut)
+        end = len(text) if end < 0 else end + 1
+        out = os.path.join(work, "trunc_" + os.path.basename(prompt))
+        with open(out, "w", encoding="utf-8", newline="") as f:
+            f.write(text[:end])
+        m = ntokens(exe, model, out)
+        if m >= want:
+            if full_ids is None:
+                full_ids = token_ids(exe, model, prompt)
+            if token_ids(exe, model, out)[:want] != full_ids[:want]:
+                raise RuntimeError(f"truncated prompt {out}: first {want} tokens differ from the full file")
+            return out, m
+        cut = int(cut * 1.05) + 1000
+    return prompt, n
+
+
+def token_ids(exe, model, prompt):
+    env = clean_env()
+    env["WHIRL_TOKENIZE_ONLY"] = "1"
+    r = subprocess.run([exe, "chat", model, "@" + prompt, "--raw", "--max-tokens", "1"], env=env, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    ids = [l for l in r.stdout.splitlines() if l and l[0].isdigit()]
+    return ids[-1].split(",")
+
+
 def run_dump(exe, model, prompt, mode, ends, n, dump, logf, wrap, device, extra=None, mode_arg=None):
     env = clean_env()
     env.update(extra or {})
@@ -269,6 +301,8 @@ def main():
     ap.add_argument("--as", dest="as_", action="append", default=[], metavar="MODE=ARG",
                     help="negative test: run MODE with the CLI argument ARG (e.g. balance=--balance=fp8,moefp8,gdnwmma,h16,specsample), "
                          "judged by MODE's limits; the report never passes (pass false), so it cannot feed golden record")
+    ap.add_argument("--truncate", action="store_true",
+                    help="prefill each prompt only up to the longest length (quick checks; same window numbers)")
     ap.add_argument("--positions", type=int, default=POSITIONS, choices=[1, 2, 3],
                     help=f"windows per length (default {POSITIONS}; 1 = the single window before each length)")
     a = ap.parse_args()
@@ -320,6 +354,12 @@ def main():
                 continue
             try:
                 n = ntokens(exe, mpath, ppath)
+                if a.truncate and n > lengths[-1] + 64:
+                    # FASTLANE kl_quick: prefill only up to the longest length (the whole corpus file is 129k+
+                    # tokens). The windows' bits do not depend on the tokens after the last window (the forward
+                    # split before each window is counted from the previous window's end), so the numbers are
+                    # those of the full-file run.
+                    ppath, n = truncated_prompt(exe, mpath, ppath, n, lengths[-1] + 64, work)
             except Exception as e:
                 rep["errors"].append(f"{mname}:{pname}: {e}")
                 log(f"ERROR {mname}:{pname}: {e}")
