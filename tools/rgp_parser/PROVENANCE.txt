@@ -1,0 +1,1 @@
+source: https://github.com/ROCm/hip-ep tools/rgp_parser @ 0b9c2a7d47ff2e76bca6d39a90ac2bba3d8d7cc0 (MIT), fetched 2026-10-15 04:08
