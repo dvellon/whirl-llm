@@ -43,6 +43,10 @@ def main():
     ap.add_argument("--mode", default="balance")
     ap.add_argument("--gate", default="", help="whirl-server-gate suites to run on the tiny model")
     ap.add_argument("--compare-27b", action="store_true")
+    ap.add_argument("--ssd", action="store_true", help="leave the SSD tier on (suites tier / sys / restore_conc test it; "
+                    "the suites use their own SSD dirs under the work dir, deleted afterwards)")
+    ap.add_argument("--skip-smoke", action="store_true")
+    ap.add_argument("--only-27b", action="store_true", help="--gate on the real model only")
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
     pfile = os.path.join(OUT, "prompt.txt")
@@ -50,7 +54,7 @@ def main():
     res = {}
     ok_all = True
     with qlib.GpuLock():
-        for m in a.models.split(","):
+        for m in ([] if a.skip_smoke else a.models.split(",")):
             r = res.setdefault(m, {})
             outs = []
             for i in range(2):
@@ -83,11 +87,11 @@ def main():
         if a.gate:
             gexe = os.path.join(os.path.dirname(a.exe), "whirl-server-gate.exe")
             sexe = os.path.join(os.path.dirname(a.exe), "whirl-server.exe")
-            runs = [("tiny", TINYM[m]) for m in a.models.split(",")[:1]] + ([("27b", REAL[a.models.split(",")[0]])] if a.compare_27b else [])
+            runs = ([] if a.only_27b else [("tiny", TINYM[m]) for m in a.models.split(",")[:1]]) +                 ([("27b", REAL[a.models.split(",")[0]])] if a.compare_27b or a.only_27b else [])
             for tag, model in runs:
                 work = os.path.join(OUT, f"gate_{tag}")
                 cmd = [gexe, "--exe", sexe, "--kind", "whirl", "--model", model, "--suite", a.gate, "--port", "8197", "--work", work,
-                       "--kv", "auto", "--server-env", f"WHIRL_MODE={a.mode}", "--server-env", "WHIRL_KV_SSD_MODE=off"]
+                       "--kv", "auto", "--server-env", f"WHIRL_MODE={a.mode}"] + ([] if a.ssd else ["--server-env", "WHIRL_KV_SSD_MODE=off"])
                 if a.device == "8s":
                     cmd += ["--server-env", "WHIRL_DEVICE=8060s", "--server-env", "WHIRL_KV_RAM_MB=8192"]
                 env = dict(os.environ, WHIRL_GATE_TEXT_ROOT=r"C:\ClaudeWorkspace\refsrc\llama.cpp")
