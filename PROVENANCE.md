@@ -149,6 +149,8 @@ see "gfx1151 (Radeon 8060S)" below).
 | res/whirl.rc.in, res/whirl.manifest | new | VERSIONINFO / icon resource template; application manifest (asInvoker, Windows 10/11, UTF-8 active code page, long paths) |
 | tools/gen-icon/main.cpp | new | renders the WHIRL icon (original abstract vortex design) as a multi-size .ico at build time |
 | tools/package_release.ps1 | new | release zip packaging (version / import checks, user documentation, README_FIRST.txt, SHA-256) |
+| tools/rgp_parser/* | adapted from ROCm/hip-ep `tools/rgp_parser` @0b9c2a7 under MIT | developer tool (RGP capture reader), not in any binary; `struct/sqtt_decode.py` gains a gfx12 token path ported from ROCm/rocm-systems rocprof-trace-decoder (MIT); see tools/rgp_parser/PROVENANCE.txt and THIRD_PARTY_NOTICES.md |
+| tools/quick/rgp_capture.py | new | RGP capture driver; uses the in-repo tools/rgp_parser |
 | cmake/release.cmake | new | |
 | CMakeLists.txt | changed | `project(whirl VERSION 0.1.0)` (single version source), RC language, static C++ runtime, includes cmake/release.cmake |
 | src/cli/main.cpp | changed | per-command `--help` texts, `--version`, `help env`, GPU pre-flight, model-file check, plain-language errors with exit codes; `devices` marks GPUs without kernels in the build |

@@ -24,7 +24,8 @@ Every entry here is also listed in PROVENANCE.md.
     kernels/vision/vision.hip and the attn_prep_m kernels of kernels/attn.hip),
     and the M-RoPE image token positions (tools/mtmd/mtmd.cpp
     MTMD_POS_TYPE_MROPE) in include/whirl/vismap.h.
-  - the opt-in gfx1151 chunked Gated DeltaNet prefill (GDN-8S, `WHIRL_GDN_STRIX=1`)
+  - the gfx1151 chunked Gated DeltaNet prefill (GDN-8S; default on for dense and
+    MXFP4 MoE models on the Radeon 8060S, `WHIRL_GDN_STRIX=0` turns it off)
     in kernels/gfx1151/gdn_strix.hip, adapted from `gdn_chunk_prep_kernel` /
     `gdn_chunk_scan_kernel` (ggml/src/ggml-cuda/gated_delta_net.cu) of the
     strix-llama.cpp fork (https://github.com/asf0/strix-llama.cpp, rdna35-perf
@@ -41,6 +42,43 @@ Every entry here is also listed in PROVENANCE.md.
 MIT License
 
 Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## ROCm hip-ep rgp_parser and rocprof-trace-decoder (developer tool only)
+
+- Used for: tools/rgp_parser, a Python reader for Radeon GPU Profiler (.rgp)
+  captures used by tools/quick/rgp_capture.py. Not part of any WHIRL binary.
+  - tools/rgp_parser is vendored from ROCm/hip-ep `tools/rgp_parser` at commit
+    0b9c2a7d47ff2e76bca6d39a90ac2bba3d8d7cc0 (https://github.com/ROCm/hip-ep).
+  - tools/rgp_parser/rgp_parser/struct/sqtt_decode.py was modified to add a gfx12
+    (RDNA4) SQTT token path ported from ROCm/rocm-systems
+    `projects/rocprof-trace-decoder` source/gfx12 (gfx12token.cpp, gfx12parser.h,
+    gfx12token.h) (https://github.com/ROCm/rocm-systems).
+  - Details in tools/rgp_parser/PROVENANCE.txt; license text in tools/rgp_parser/LICENSE.
+- License: MIT (both sources), Copyright (c) Advanced Micro Devices, Inc.
+
+```
+MIT License
+
+Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -581,8 +581,9 @@ public:
     std::uint32_t fwd_pos0 = 0;
     bool gdn_chunked = true;
     bool gdn_wmma = false;
-    // GDN-8S (opt-in, WHIRL_GDN_STRIX=1, gfx1151): strix-llama.cpp's f16-WMMA chunked prefill (gdn_sx_prep /
-    // gdn_sx_scan) for runs of >= gdn_strix_min rows; same precision class and mode policy as gdn_wmma
+    // GDN-8S (gfx1151, default on for dense and MXFP4 MoE models since rc6 / rc7; WHIRL_GDN_STRIX=0 turns it
+    // off): strix-llama.cpp's f16-WMMA chunked prefill (gdn_sx_prep / gdn_sx_scan) for runs of >= gdn_strix_min
+    // rows; same precision class and mode policy as gdn_wmma
     bool gdn_strix = false;
     std::uint32_t gdn_strix_min = 256;
     bool act_fuse = true;
