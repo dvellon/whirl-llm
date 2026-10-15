@@ -671,18 +671,20 @@ int serveMain(int argc, char** argv, const char* program) {
                      "(at least {} needed); the model may not fit this GPU",
                      plan.need_fixed / g, plan.pool_tokens, av / g, fi.pool_hard_min);
         }
-        std::size_t prefill_exec = 2048;
+        std::optional<std::size_t> exec_req;  // unset = the device default (prefillExecDefault, after the load)
         if (auto v = env("PREFILL_CHUNK")) {
             try {
-                prefill_exec = std::stoul(*v);
+                exec_req = std::stoul(*v);
             } catch (const std::exception&) {
             }
-            logI("prefill forward up to {} rows requested (WHIRL_PREFILL_CHUNK)", prefill_exec);
+            logI("prefill forward up to {} rows requested (WHIRL_PREFILL_CHUNK)", exec_req.value_or(0));
         }
-        // whole schedule chunks, and a forward (+ the merged tail) must fit the prefill batch
-        prefill_exec = prefillExecFor(prefill_exec, lo.max_batch);
         std::unique_ptr<qwen35::Model> mp = qwen35::Model::load(f, 0, stats, lo);
         qwen35::Model& model = *mp;
+        // whole schedule chunks that fit the prefill batch (a forward never exceeds the batch:
+        // Engine::chunkLen caps it); default 2048 rows, gfx1151 4096 (SRV-PP)
+        const bool g1151 = model.arch == hip::Arch::gfx1151;
+        const std::size_t prefill_exec = prefillExecFor(exec_req.value_or(prefillExecDefault(g1151)), lo.max_batch, g1151);
         {
             std::string tl;
             qwen35::loadOrTune(model, opt.path, tl);

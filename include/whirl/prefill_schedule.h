@@ -29,11 +29,22 @@ inline std::size_t prefillChunkLen(std::size_t remaining) {
     return remaining <= prefill_chunk + prefill_merge ? remaining : prefill_chunk;
 }
 
+// Default forward size of a solo prefill (WHIRL_PREFILL_CHUNK unset): 2048 rows; gfx1151 (Radeon 8060S,
+// SRV-PP) 4096 = the whole default prefill batch: Ornith MoE 128k +3.6% over 2048 (CLI on the server's
+// schedule, real 131k prompt: 983 -> 1018 tok/s, the bench's speed). No extra memory (the prefill
+// buffers are sized for the batch either way). Same bits (whole-chunk grouping, section 7 of
+// docs/guide/en/kv-and-caching.md; seqtest gates it). gfx1201 keeps 2048 until measured there.
+inline constexpr std::size_t prefill_exec_default = 2048;
+inline constexpr std::size_t prefill_exec_default_gfx1151 = 4096;
+inline constexpr std::size_t prefillExecDefault(bool gfx1151) { return gfx1151 ? prefill_exec_default_gfx1151 : prefill_exec_default; }
+
 // EngineOptions::prefill_exec for a prefill batch: whole schedule chunks, and a forward (+ the merged
 // tail) must fit the batch; never below one chunk (the batch is >= prefill_chunk + prefill_merge,
-// vram::min_prefill_batch). `requested`: WHIRL_PREFILL_CHUNK, default 2048.
-inline std::size_t prefillExecFor(std::size_t requested, std::uint32_t max_batch) {
-    const std::size_t mb = max_batch > prefill_merge ? max_batch - prefill_merge : 0;
+// vram::min_prefill_batch). fill (gfx1151, SRV-PP): whole chunks up to the batch itself; the forward
+// is then capped at the batch by execLen max_rows (a merged tail that does not fit after `exec` rows
+// runs as the next forward). `requested`: WHIRL_PREFILL_CHUNK, default prefillExecDefault.
+inline std::size_t prefillExecFor(std::size_t requested, std::uint32_t max_batch, bool fill = false) {
+    const std::size_t mb = fill ? max_batch : max_batch > prefill_merge ? max_batch - prefill_merge : 0;
     return std::max(prefill_chunk, std::min(requested / prefill_chunk * prefill_chunk, mb / prefill_chunk * prefill_chunk));
 }
 
@@ -69,17 +80,19 @@ inline std::size_t tailPoint(std::size_t n, std::size_t sys, std::size_t think, 
     return n == 0 ? 0 : schedFloor(n, sys, think, imgs, n - 1);
 }
 
-// rows of the forward that starts at cur: whole chunks up to exec (+ merged tail), not past the next
-// forced split, never across a stop (a kept checkpoint); exec <= prefill_chunk = one chunk per forward
+// rows of the forward that starts at cur: whole chunks up to exec (+ merged tail), at most max_rows
+// rows (the prefill batch; 0 = exec + prefill_merge), not past the next forced split, never across a
+// stop (a kept checkpoint); exec <= prefill_chunk = one chunk per forward
 inline std::size_t execLen(std::size_t n, std::size_t sys, std::size_t think, std::span<const std::uint32_t> imgs, std::size_t cur,
-                           std::size_t exec, std::span<const std::size_t> stops) {
+                           std::size_t exec, std::span<const std::size_t> stops, std::size_t max_rows = 0) {
     const std::size_t lim = schedNext(n, sys, think, imgs, cur);
     std::size_t len = prefillChunkLen(lim - cur);
+    const std::size_t cap = max_rows > 0 ? std::min(max_rows, exec + prefill_merge) : exec + prefill_merge;
     if (exec > prefill_chunk)
         while (cur + len < lim) {
             if (std::find(stops.begin(), stops.end(), cur + len) != stops.end()) break;
             const std::size_t nx = prefillChunkLen(lim - cur - len);
-            if (len + nx > exec + prefill_merge) break;
+            if (len + nx > cap) break;
             len += nx;
         }
     // a kept checkpoint is a forward end (stops are schedule points, so this only bites if one is not:
@@ -91,10 +104,10 @@ inline std::size_t execLen(std::size_t n, std::size_t sys, std::size_t think, st
 
 // the forward ends of a prefill of n tokens that starts (or resumes) at `from` (a schedule point)
 inline std::vector<std::size_t> forwardEnds(std::size_t n, std::size_t sys, std::size_t think, std::span<const std::uint32_t> imgs,
-                                            std::size_t from, std::size_t exec, std::span<const std::size_t> stops) {
+                                            std::size_t from, std::size_t exec, std::span<const std::size_t> stops, std::size_t max_rows = 0) {
     std::vector<std::size_t> ends;
     for (std::size_t cur = from; cur < n;) {
-        cur += execLen(n, sys, think, imgs, cur, exec, stops);
+        cur += execLen(n, sys, think, imgs, cur, exec, stops, max_rows);
         ends.push_back(cur);
     }
     return ends;
@@ -154,14 +167,14 @@ inline std::vector<std::uint32_t> imageSplits(std::span<const std::uint32_t> tok
 // `from` (0 = cold): forwardEnds with the TAIL-CK stop (tail_min > 0, n >= tail_min, the tail point is
 // not already a forced split). `whirl chat` / bench / golden run exactly these forwards.
 inline std::vector<std::size_t> soloForwardEnds(std::size_t n, std::size_t sys, std::size_t think, std::span<const std::uint32_t> imgs,
-                                                std::size_t from, std::size_t exec, std::size_t tail_min) {
+                                                std::size_t from, std::size_t exec, std::size_t tail_min, std::size_t max_rows = 0) {
     std::vector<std::size_t> stops;
     if (tail_min > 0 && n >= tail_min) {
         const std::size_t t = tailPoint(n, sys, think, imgs);
         if (t > from && t != sys && t != think && std::find(imgs.begin(), imgs.end(), static_cast<std::uint32_t>(t)) == imgs.end())
             stops.push_back(t);
     }
-    return forwardEnds(n, sys, think, imgs, from, exec, stops);
+    return forwardEnds(n, sys, think, imgs, from, exec, stops, max_rows);
 }
 
 }  // namespace whirl::sched

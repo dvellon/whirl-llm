@@ -1206,7 +1206,32 @@ void testPrefillSchedule() {
     CHECK(tailPoint(8232, 0, 0, noimg) == 7168);  // 8232 = 7168 + 1064: the tail merges, 8192 is not a chunk start
     CHECK(!onSchedule(8232, 0, 0, noimg, 8192));
     CHECK_EQ(prefillExecFor(2048, 4096), std::size_t{2048});
-    CHECK_EQ(prefillExecFor(16384, 4096), std::size_t{3072});
+    // SRV-PP (gfx1151, fill): exec may fill the batch; the forward is capped at the batch (max_rows), so a merged tail
+    // that does not fit after 4 chunks runs as its own forward
+    CHECK_EQ(prefillExecFor(16384, 4096), std::size_t{3072});  // gfx1201: unchanged
+    CHECK_EQ(prefillExecFor(prefillExecDefault(false), 4096), std::size_t{2048});
+    CHECK_EQ(prefillExecFor(prefillExecDefault(false), 2048), std::size_t{1024});
+    CHECK_EQ(prefillExecFor(16384, 4096, true), std::size_t{4096});
+    CHECK_EQ(prefillExecFor(prefillExecDefault(true), 4096, true), std::size_t{4096});
+    CHECK_EQ(prefillExecFor(4096, 1280, true), std::size_t{1024});
+    CHECK_EQ(prefillExecFor(4096, 4352, true), std::size_t{4096});
+    for (std::size_t n : {std::size_t{4100}, std::size_t{8232}, std::size_t{9500}, std::size_t{32777}, std::size_t{131087}}) {
+        for (std::uint32_t mb : {1280u, 2048u, 3000u, 4096u, 4352u, 8192u}) {
+            const std::size_t ex = prefillExecFor(prefillExecDefault(true), mb, true);
+            const std::array<std::size_t, 1> st = {tailPoint(n, 0, 0, noimg)};
+            const std::vector<std::size_t> e = forwardEnds(n, 0, 0, noimg, 0, ex, st, mb);
+            std::size_t prev = 0;
+            for (std::size_t x : e) {
+                CHECK(x > prev && x - prev <= mb && onSchedule(n, 0, 0, noimg, x));
+                prev = x;
+            }
+            CHECK(!e.empty() && e.back() == n);
+        }
+    }
+    // 4096-row forwards, the tail (7168 .. 8232, 1064 rows) after them; without the cap 3 chunks + tail
+    CHECK((forwardEnds(8232, 0, 0, noimg, 0, 4096, {}, 4096) == std::vector<std::size_t>{4096, 7168, 8232}));
+    CHECK((forwardEnds(8232, 0, 0, noimg, 0, 4096, {}, 4352) == std::vector<std::size_t>{4096, 8232}));
+    CHECK((forwardEnds(8232, 0, 0, noimg, 0, 4096, {}) == std::vector<std::size_t>{4096, 8232}));
 }
 
 // CLI-SCHED: the forced-split helpers the CLI shares with the engine (sysBoundary / sysSplit /

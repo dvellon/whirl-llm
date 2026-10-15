@@ -381,7 +381,8 @@ Ornith-1.5-35B-A3B MXFP4, precise / balance / fast, 9,500-token prompt; `whirl s
   remainder of up to 1280 rows merged into the last chunk, forced splits at the system boundary
   B >= 2048, the think-open split and image ends; `include/whirl/prefill_schedule.h`). Every forward
   the engine runs ends at a schedule point: forwards of 1 chunk (decode floor engaged), 2 chunks
-  (default) or 3 chunks (`WHIRL_PREFILL_CHUNK` / `WHIRL_PREFILL_BATCH`), with or without the TAIL-CK
+  (`WHIRL_PREFILL_CHUNK=2048`, the default before SRV-PP), 3 or 4 chunks (4 = the default since SRV-PP: 8060S Ornith MoE 128k
+  983 -> 1018 tok/s; a forward never exceeds the prefill batch), with or without the TAIL-CK
   tail checkpoint (which stops merging there), all give the same last-row logits bits. Checkpoints
   are kept and reused only at schedule points (`onSchedule`), so a resume from the tail checkpoint,
   a `prefix` or `system` checkpoint, or a RAM / SSD restore of one, is such a split and gives the

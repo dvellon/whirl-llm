@@ -1396,7 +1396,7 @@ std::size_t Engine::chunkLen(const Slot& sl) const {
             if (&o != &sl && o.phase == Phase::decode) exec = prefill_chunk;
     // a shared-prefix checkpoint / the TAIL-CK tail checkpoint is kept there: no forward crosses it
     const std::array<std::size_t, 2> stops = {sl.lcp_ck, sl.tail_ck};
-    return sched::execLen(N, sl.sys_split, sl.pf_split, imgs, cur, exec, stops);
+    return sched::execLen(N, sl.sys_split, sl.pf_split, imgs, cur, exec, stops, m_.maxBatch());
 }
 
 void Engine::maybeSplitCkpt(Slot& sl, DevPtr hid_row) {

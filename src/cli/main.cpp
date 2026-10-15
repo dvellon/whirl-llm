@@ -418,21 +418,21 @@ struct Tok {
 // The server's knobs apply here too: WHIRL_PREFILL_CHUNK, WHIRL_SYS_MIN, WHIRL_VIS_CKPT_MIN,
 // WHIRL_TAIL_CK=0.
 // (image ends: the ids >= image_id_base exist only in a prompt with images)
-std::vector<std::size_t> serverForwardEnds(const Tok& tok, std::span<const u32> ids, u32 max_batch) {
+std::vector<std::size_t> serverForwardEnds(const Tok& tok, std::span<const u32> ids, u32 max_batch, bool gfx1151) {
     const std::size_t n = ids.size();
     const std::size_t sys = sched::sysSplit(sched::sysBoundary(ids, tok.im_start, tok.system, tok.im_end, tok.newline), n,
                                             envU32("SYS_MIN").value_or(sched::sys_min_default));
     const std::vector<std::uint32_t> imgs =
         sched::imageSplits(ids, q::image_id_base, tok.vision_end, envU32("VIS_CKPT_MIN").value_or(sched::img_split_min_default));
-    const std::size_t exec = sched::prefillExecFor(envU32("PREFILL_CHUNK").value_or(2048), max_batch);
+    const std::size_t exec = sched::prefillExecFor(envU32("PREFILL_CHUNK").value_or(sched::prefillExecDefault(gfx1151)), max_batch, gfx1151);
     const std::size_t tail_min = envFlag("TAIL_CK", true) ? sched::tail_ck_min_default : 0;
-    return sched::soloForwardEnds(n, sys, tok.thinkOpenSplit(ids), imgs, 0, exec, tail_min);
+    return sched::soloForwardEnds(n, sys, tok.thinkOpenSplit(ids), imgs, 0, exec, tail_min, max_batch);
 }
 
 // the CLI prefill of ids from position 0 on the server's forwards (with the MTP block over the prompt: mtp)
 void prefillLikeServer(q::Model& m, const Tok& tok, std::span<const u32> ids, bool mtp) {
     std::size_t off = 0;
-    for (const std::size_t e : serverForwardEnds(tok, ids, m.max_batch)) {
+    for (const std::size_t e : serverForwardEnds(tok, ids, m.max_batch, m.arch == hip::Arch::gfx1151)) {
         if (mtp)
             m.prefillMtpChunk(ids, 0, off, e - off, std::nullopt);
         else
@@ -1389,7 +1389,7 @@ int cmdChat(const Args& a) {
         std::vector<std::uint16_t> dump;
         std::vector<float> row_f32(dump_path ? static_cast<std::size_t>(q::max_small_batch) * model.cfg.n_vocab : 0);
         const double p0 = nowMs();
-        const std::vector<std::size_t> ends = dump_path ? std::vector<std::size_t>{} : serverForwardEnds(tok, ids, model.max_batch);
+        const std::vector<std::size_t> ends = dump_path ? std::vector<std::size_t>{} : serverForwardEnds(tok, ids, model.max_batch, model.arch == hip::Arch::gfx1151);
         std::size_t off = 0, ei = 0;
         while (off < ids.size()) {
             bool dumping = false;
@@ -1924,15 +1924,15 @@ int cmdSeqtest(const Args& a) {
             }
             return rowHash(m, 0);
         };
-        auto cold = [&](std::size_t exec, std::span<const std::size_t> stops) { return sched::forwardEnds(N, 0, th, noimg, 0, exec, stops); };
+        auto cold = [&](std::size_t exec, std::span<const std::size_t> stops) { return sched::forwardEnds(N, 0, th, noimg, 0, exec, stops, m.max_batch); };
         // resume at a schedule point r: the run that kept the checkpoint there (no forward crosses r),
         // then the resumed request's own forwards from r (the state at r is what the checkpoint holds)
         auto resumed = [&](std::size_t r, std::size_t exec) {
             const std::array<std::size_t, 1> st = {r};
-            std::vector<std::size_t> e = sched::forwardEnds(N, 0, th, noimg, 0, exec, st);
+            std::vector<std::size_t> e = sched::forwardEnds(N, 0, th, noimg, 0, exec, st, m.max_batch);
             e.erase(std::upper_bound(e.begin(), e.end(), r), e.end());
             if (e.empty() || e.back() != r) e.push_back(r);  // the checkpoint holds the state after a forward that ended at r
-            const std::vector<std::size_t> e2 = sched::forwardEnds(N, 0, th, noimg, r, exec, {});
+            const std::vector<std::size_t> e2 = sched::forwardEnds(N, 0, th, noimg, r, exec, {}, m.max_batch);
             e.insert(e.end(), e2.begin(), e2.end());
             return e;
         };
@@ -1941,7 +1941,9 @@ int cmdSeqtest(const Args& a) {
             for (std::size_t x : e) r += (r.empty() ? "" : ",") + std::to_string(x);
             return r;
         };
-        const std::size_t ex = sched::prefillExecFor(2048, m.max_batch), ex_big = sched::prefillExecFor(16384, m.max_batch);
+        const bool g1151 = m.arch == hip::Arch::gfx1151;
+        const std::size_t ex = sched::prefillExecFor(sched::prefillExecDefault(g1151), m.max_batch, g1151),
+                          ex_big = sched::prefillExecFor(16384, m.max_batch, g1151), ex2 = sched::prefillExecFor(2048, m.max_batch);
         const std::array<std::size_t, 1> tail_stop = {tail};
         const std::size_t mid = sched::schedFloor(N, 0, th, noimg, N / 3);  // a prefix checkpoint inside the prompt
         const std::vector<std::size_t> ref_ends = cold(ex, tail_stop);
@@ -1955,6 +1957,7 @@ int cmdSeqtest(const Args& a) {
         const Var vars[] = {
             {"cold, no tail checkpoint (parallel > 4)", cold(ex, {})},
             {"cold, 1-chunk forwards (decode floor)", cold(sched::prefill_chunk, tail_stop)},
+            {"cold, 2-chunk forwards (WHIRL_PREFILL_CHUNK=2048)", cold(ex2, tail_stop)},
             {"cold, largest forwards (WHIRL_PREFILL_CHUNK)", cold(ex_big, tail_stop)},
             {"resume at the tail checkpoint", resumed(tail, ex)},
             {"resume at a prefix checkpoint", resumed(mid, ex)},
@@ -1996,7 +1999,8 @@ int cmdSeqtest(const Args& a) {
     {
         m.selectSeq(0);
         const std::span<const std::uint32_t> noimg;
-        const std::size_t ex = sched::prefillExecFor(2048, m.max_batch);
+        const bool g1151 = m.arch == hip::Arch::gfx1151;
+        const std::size_t ex = sched::prefillExecFor(sched::prefillExecDefault(g1151), m.max_batch, g1151);
         auto runEndsMtp = [&](std::span<const u32> ids, const std::vector<std::size_t>& ends, bool mtp) {
             m.reset();
             std::size_t cur = 0;
@@ -2052,7 +2056,7 @@ int cmdSeqtest(const Args& a) {
                 const std::size_t t = sched::tailPoint(n, sy, th, noimg);
                 if (t > 0 && t != sy && t != th) st.push_back(t);
             }
-            const std::vector<std::size_t> srv_ends = sched::forwardEnds(n, sy, th, noimg, 0, ex, st);
+            const std::vector<std::size_t> srv_ends = sched::forwardEnds(n, sy, th, noimg, 0, ex, st, m.max_batch);
             // the CLI before CLI-SCHED: max_batch forwards, the think-open token as its own step
             std::vector<std::size_t> old_ends;
             for (std::size_t off = 0; off < n;) {

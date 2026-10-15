@@ -58,6 +58,8 @@ using sched::prefill_merge;
 constexpr std::size_t tail_ck_slots = cache::ckpt_keep_prefix_min;
 using sched::prefillChunkLen;
 using sched::prefillExecFor;
+using sched::prefill_exec_default;
+using sched::prefillExecDefault;
 
 // Connection writer (buffered; errors make it "gone").
 class Conn {
@@ -353,7 +355,7 @@ struct EngineOptions {
     std::uint32_t tail_ck_min = sched::tail_ck_min_default;
     std::size_t n_spe = 2;
     bool ckpt_host = false;
-    std::size_t prefill_exec = 2048;
+    std::size_t prefill_exec = prefill_exec_default;
     std::uint64_t seed = 0;
     // numerics item specsample (balance / fast): temperature > 0 requests sample by a race keyed by
     // (seed, output index, token) and draw MTP drafts from the draft head's filtered distribution q
