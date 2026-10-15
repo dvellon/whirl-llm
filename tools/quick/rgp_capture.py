@@ -32,7 +32,13 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qlib  # noqa: E402
 
-RDTS = r"C:\ClaudeWorkspace\tools\rdts\RadeonDeveloperToolSuite-2026-05-28-1806"
+RDTS_OLD = r"C:\ClaudeWorkspace\tools\rdts\RadeonDeveloperToolSuite-2026-05-28-1806"  # RDP 3.5.0 / RGP 2.7.0
+RDTS_NEW = r"C:\ClaudeWorkspace\tools\rdts\RadeonDeveloperToolSuite-2026-10-02-1872"  # RDP 3.5.1 / RGP 2.7.1
+RDTS = RDTS_NEW if os.path.isdir(RDTS_NEW) else RDTS_OLD
+# R9700 (gfx1201): the HIP process dies with 0xC0000005 inside amdhip64_7.dll the moment the SQTT trace starts (null
+# pointer read at +0x80 in the runtime's RGP/PAL trace path). Same with a 20-line HIP loop, both RDTS versions, the
+# 26.10 driver runtime and the ROCm 7.2 / 7.1 SDK runtimes; the 8060S works with the same DLL. AMD bug, see
+# audit/RGP-R97.md: --device r97 stops unless --force-r97 (retest after a driver / runtime update).
 PARSER = r"C:\ClaudeWorkspace\tools\rgp_parser"
 HIP_INDEX = {"8s": "0", "r97": "1"}  # `whirl devices` order on this machine (device 0 8060S, device 1 R9700)
 PARSER_PY = os.path.join(PARSER, r".venv\Scripts\python.exe")
@@ -127,7 +133,9 @@ def capture(a, ph, tag, ta, tb):
             env.update(dict(kv.split("=", 1) for kv in a.env.split(";") if kv))
             slog = os.path.join(a.out, f"{tag}_{ph}.server.log")
             t_srv = time.time()
-            with qlib.Server(a.exe, a.device, a.mode, a.ctx + 4096 + 512, slog, env=env) as s:
+            srv = qlib.Server(a.exe, a.device, a.mode, a.ctx + 4096 + 512, slog, env=env)
+            out["server"] = srv
+            with srv as s:
                 qlib.log(f"[{ph}] server up in {s.t_load:.0f} s; request A ({a.ctx} tokens); capture arms ~{delay_s:.0f} s after connect")
                 t = time.time()
                 r = s.complete(ta, 1)
@@ -163,6 +171,16 @@ def capture(a, ph, tag, ta, tb):
                     f = wait_file(os.path.join(a.out, f"{tag}_{ph}*.rgp"), before, 120)
                 qlib.log(f"[{ph}] rgp {f} ({os.path.getsize(f) / 1e6:.1f} MB)" if f else f"[{ph}] NO rgp file")
                 out["rgp"] = f
+        except OSError as e:  # the server vanished mid-request (R9700: AMD runtime crash at trace start)
+            out["error"] = repr(e)
+            srv = out.get("server")
+            try:
+                rc = srv.p.wait(15) if srv is not None and srv.p is not None else None
+            except Exception:
+                rc = None
+            if rc is not None:
+                out["server_exit"] = f"0x{rc & 0xffffffff:08X}"  # 0xC0000005 = the R9700 trace-start crash
+            qlib.log(f"[{ph}] server died: {out['error']}, exit code {out.get('server_exit')}")
         finally:
             try:
                 cli.stdin.write("q\n")
@@ -173,11 +191,13 @@ def capture(a, ph, tag, ta, tb):
             if cli.poll() is None:
                 cli.kill()  # our own PID only
             qlib.drop_pid("fl1a", cli.pid)
+    out.pop("server", None)
     out["capture_wall_s"] = round(time.time() - tw, 1)
     return out
 
 
 def main():
+    global RDTS
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", choices=["r97", "8s"], required=True)
     ap.add_argument("--phase", choices=["decode", "prefill", "both"], default="both")
@@ -193,7 +213,14 @@ def main():
     ap.add_argument("--env", default="", help="extra server env K=V;K2=V2 (e.g. HIP_VISIBLE_DEVICES=0)")
     ap.add_argument("--reserve-mb", type=int, default=6144, help="WHIRL_POOL_RESERVE_MB for the server (room for SQTT)")
     ap.add_argument("--keep-big", action="store_true", help="keep .rgp files over 200 MB")
+    ap.add_argument("--force-r97", action="store_true", help="try the R9700 anyway (known AMD crash, audit/RGP-R97.md)")
+    ap.add_argument("--rdts", default=RDTS, help="Radeon Developer Tool Suite folder (default: newest present)")
     a = ap.parse_args()
+    if a.device == "r97" and not a.force_r97:
+        print("rgp_capture: R9700 RGP capture crashes inside AMD's HIP runtime at trace start (audit/RGP-R97.md); "
+              "use --force-r97 to retest after a driver/runtime update", file=sys.stderr)
+        return 2
+    RDTS = a.rdts
     os.makedirs(a.out, exist_ok=True)
     tw0 = time.time()
     tag = f"{time.strftime('%Y%m%d-%H%M%S')}_{a.device}_{a.mode}_ctx{a.ctx}"
