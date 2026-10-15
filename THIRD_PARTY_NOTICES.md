@@ -24,6 +24,11 @@ Every entry here is also listed in PROVENANCE.md.
     kernels/vision/vision.hip and the attn_prep_m kernels of kernels/attn.hip),
     and the M-RoPE image token positions (tools/mtmd/mtmd.cpp
     MTMD_POS_TYPE_MROPE) in include/whirl/vismap.h.
+  - the opt-in gfx1151 chunked Gated DeltaNet prefill (GDN-8S, `WHIRL_GDN_STRIX=1`)
+    in kernels/gfx1151/gdn_strix.hip, adapted from `gdn_chunk_prep_kernel` /
+    `gdn_chunk_scan_kernel` (ggml/src/ggml-cuda/gated_delta_net.cu) of the
+    strix-llama.cpp fork (https://github.com/asf0/strix-llama.cpp, rdna35-perf
+    branch, same MIT license and copyright).
 - Test-only (not part of any WHIRL binary or source tree): the chat-template
   oracle in tests/template_oracle compiles llama.cpp's `common/jinja` and
   `common/json.cpp` (with the vendored nlohmann/json, MIT) from an external
