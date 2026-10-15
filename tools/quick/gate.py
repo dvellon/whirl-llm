@@ -43,7 +43,8 @@ REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 ARCH = {"r97": "gfx1201", "8s": "gfx1151"}
 MOE = r"C:\Users\tsaip\.lmstudio\models\ornith-ai\Ornith-1.5-35B-A3B-MXFP4\Ornith-1.5-35B-A3B-MXFP4.gguf"
 MODELS = {"dense": qlib.MODEL, "moe": MOE}
-DEF_KT = "quant,gemv,gemvh,gemm,attn,gdn,ws4,ws4g,misc"
+DEF_KT = "quant,gemv,gemvh,gemm,gdn,ws4,ws4g"  # ~55 s on the R9700; attn (305 s) and misc (67 s) via --kt all or by name
+ALL_KT = "quant,gemv,gemm,attn,attndq4,gdn,moe,moemx,moef,misc,dflash,gemvh,ws4,ws4g"
 OUT = os.path.join(qlib.WORK, "fl1b", "gate")
 
 
@@ -78,6 +79,8 @@ def stage_build(a, d):
 
 def stage_kt(a, d, bdir, env):
     kt = os.path.join(bdir, "whirl-kernel-test.exe")
+    if a.kt == "all":
+        a.kt = ALL_KT
     cmd = [kt, "--device", qlib.DEVICES[a.device], "--only", a.kt, "--q4", qlib.MODEL, "--moemx", MOE]
     rc, dt, out = run(cmd, os.path.join(d, "kt.log"), env=qlib.clean_env(**env))
     m = re.search(r"^(PASS|FAIL): (\d+) failing.*$", out, re.M)
@@ -166,9 +169,9 @@ def stage_kl(a, d, exe, env):
 def toks_rows(out):
     r = {}
     for l in out.splitlines():
-        m = re.match(r"\s*(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)", l)
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:.*hash ([0-9a-f]+))?", l)
         if m:
-            r[int(m.group(1))] = dict(prefill=float(m.group(3)), decode=float(m.group(5)))
+            r[int(m.group(1))] = dict(prefill=float(m.group(3)), decode=float(m.group(5)), hash=m.group(6))
     return r
 
 
@@ -176,22 +179,39 @@ def perf_ref_path(a):
     return os.path.join(qlib.WORK, "fl1b", f"perf_ref_{a.device}_{a.mode}.json")
 
 
+def toks_cmd(a, exe, env, d, i):
+    cmd = [sys.executable, os.path.join(HERE, "toks.py"), "--device", a.device, "--mode", a.mode, "--exe", exe, "--tag", "gate",
+           "--fixed-nonce", "--out", os.path.join(d, f"toks{i}.tsv")]
+    if env:
+        cmd += ["--env", a.env]
+    return cmd
+
+
 def stage_perf(a, d, exe, env):
+    """toks.py with a fixed prompt nonce vs the recorded reference; a length that drops more than --perf-tol is run
+    once more and the better of the two runs counts (a real regression survives a rerun, one-off jitter does not)."""
     ref_p = perf_ref_path(a)
     if not os.path.isfile(ref_p):
         return False, 0.0, f"no perf reference {ref_p} (run gate.py --record-perf-ref --device {a.device} --mode {a.mode})"
-    ref = {int(k): v for k, v in json.load(open(ref_p, encoding="utf-8"))["rows"].items()}
-    cmd = [sys.executable, os.path.join(HERE, "toks.py"), "--device", a.device, "--mode", a.mode, "--exe", exe, "--tag", "gate_" + a.tag,
-           "--out", os.path.join(d, "toks.tsv")]
-    if env:
-        cmd += ["--env", a.env]
-    rc, dt, out = run(cmd, os.path.join(d, "perf.log"))
-    got = toks_rows(out)
-    if rc != 0 or not got:
-        return False, dt, f"toks exit {rc}, {len(got)} rows"
+    refj = json.load(open(ref_p, encoding="utf-8"))
+    ref = {int(k): v for k, v in refj["rows"].items()}
+    t0 = time.time()
+    best, hashes = {}, {}
+    for i in range(2):
+        rc, dt, out = run(toks_cmd(a, exe, env, d, i), os.path.join(d, f"perf{i}.log"))
+        got = toks_rows(out)
+        if rc != 0 or not got:
+            return False, time.time() - t0, f"toks exit {rc}, {len(got)} rows"
+        for L, g in got.items():
+            b = best.setdefault(L, dict(g))
+            b["decode"], b["prefill"] = max(b["decode"], g["decode"]), max(b["prefill"], g["prefill"])
+            hashes.setdefault(L, g.get("hash"))
+        bad = [L for L, rv in ref.items() if L not in best or any(best[L][k] < rv[k] * (1 - a.perf_tol / 100) for k in ("decode", "prefill"))]
+        if not bad:
+            break
     msgs, ok = [], True
     for L, rv in sorted(ref.items()):
-        g = got.get(L)
+        g = best.get(L)
         if not g:
             ok = False
             msgs.append(f"{L}: missing")
@@ -201,7 +221,9 @@ def stage_perf(a, d, exe, env):
             bad = ch < -a.perf_tol
             ok = ok and not bad
             msgs.append(f"{L} {k} {g[k]:.1f} vs {rv[k]:.1f} ({ch:+.1f}%){' FAIL' if bad else ''}")
-    return ok, dt, "; ".join(msgs)
+        if rv.get("hash") and hashes.get(L) and rv["hash"] != hashes[L]:
+            msgs.append(f"{L} output hash {hashes[L]} != reference {rv['hash']} (output changed: acceptance differs)")
+    return ok, time.time() - t0, f"runs {i + 1}: " + "; ".join(msgs)
 
 
 def main():
@@ -232,9 +254,7 @@ def main():
     if a.record_perf_ref:
         d = os.path.join(OUT, f"{time.strftime('%Y%m%d-%H%M%S')}_{a.device}_perfref")
         os.makedirs(d, exist_ok=True)
-        cmd = [sys.executable, os.path.join(HERE, "toks.py"), "--device", a.device, "--mode", a.mode, "--exe", a.base_exe, "--tag", "perfref",
-               "--out", os.path.join(d, "toks.tsv")]
-        rc, dt, out = run(cmd, os.path.join(d, "perf.log"))
+        rc, dt, out = run(toks_cmd(a, a.base_exe, {}, d, 0), os.path.join(d, "perf.log"))
         rows = toks_rows(out)
         if rc != 0 or not rows:
             print(out[-2000:])

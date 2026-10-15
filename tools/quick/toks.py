@@ -31,7 +31,13 @@ def main():
     ap.add_argument("--tag", default="")
     ap.add_argument("--env", default="", help="extra env for the server, K=V;K2=V2 (e.g. WHIRL_KV=q8h)")
     ap.add_argument("--out", default=os.path.join(qlib.WORK, "fl1a", "toks.tsv"))
+    ap.add_argument("--fixed-nonce", action="store_true",
+                    help="same first prompt line every run (FL-1b gate): a bitwise-equal candidate generates the same tokens, "
+                         "so MTP acceptance (the main decode jitter) and the output hash match the reference run")
     a = ap.parse_args()
+    if a.fixed_nonce:
+        orig = rc5.doc_prompt
+        rc5.doc_prompt = lambda n, kind, nonce: orig(n, kind, f"fl-fixed-{n}")
     env = dict(kv.split("=", 1) for kv in a.env.split(";") if kv)
     lens = [int(x) for x in a.lengths.split(",")]
     tw0 = time.time()

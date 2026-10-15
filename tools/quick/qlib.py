@@ -148,11 +148,11 @@ def http(url, body=None, timeout=3600):
 class Server:
     """whirl-server for one device / mode (--kv-ssd-mode off, one slot); kill-by-PID on exit (only our PID)."""
 
-    def __init__(self, exe, dev, mode, ctx, log_path, task="fl1a", env=None, extra=()):
+    def __init__(self, exe, dev, mode, ctx, log_path, task="fl1a", env=None, extra=(), model=None):
         self.exe = os.path.join(os.path.dirname(exe), "whirl-server.exe")
         self.port = PORTS[dev]
         self.url = f"http://127.0.0.1:{self.port}"
-        self.args = [self.exe, MODEL, "--port", str(self.port), "--log-file", log_path, "--kv-ssd-mode", "off", "-np", "1",
+        self.args = [self.exe, model or MODEL, "--port", str(self.port), "--log-file", log_path, "--kv-ssd-mode", "off", "-np", "1",
                      "--ctx-per-slot", str(ctx), "--device", DEVICES[dev], "--" + mode] + list(extra)
         self.env = clean_env(**(env or {}))
         self.task, self.p = task, None
