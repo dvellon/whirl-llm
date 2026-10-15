@@ -158,6 +158,59 @@ _LOOKUP = _build_lookup()
 _TS36 = (1 << 36) - 1
 
 
+def _build_lookup_gfx12():
+    """gfx12 (RDNA4, SQTT header version 4) table = gfx11 table + gfx12 overrides.
+
+    Port of rocprof-trace-decoder source/gfx12/gfx12token.cpp
+    (ROCm/rocm-systems projects/rocprof-trace-decoder, MIT).
+    """
+    tbl = list(_LOOKUP)
+
+    def add(typ, pattern, plen, length, tb, te):
+        info = (typ, length, tb, te)
+        for i in range(pattern, 256, 1 << plen):
+            tbl[i] = info
+
+    add(INST, 0b010, 3, 20, 3, 6)
+    add(SHADER_DATA, 0b0000110, 7, 56, 7, 10)
+    add(SHADER_DATA_SHORT, 0b1000110, 7, 32, 7, 10)
+    add(EXEC_POPCOUNT1, 0b1100110, 7, 24, 7, 10)
+    add(EXEC_POPCOUNT3, 0b010110, 6, 48, 6, 9)
+    add(NEW_PC_GFX12, 0b0100001, 7, 72, 8, 11)
+    add(WAVE_START_EXT, 0b11100, 5, 40, 5, 7)
+    add(WAVE_ALLOC, 0b00101, 5, 24, 5, 8)
+    add(TIMESTAMP, 0b0000001, 7, 64, 12, 64)
+    return tbl
+
+
+_LOOKUP12 = _build_lookup_gfx12()
+_TS52 = (1 << 52) - 1
+_HEADER_PATTERN = 0b0010001
+
+
+def peek_tt_version(blob) -> int:
+    """SQTT header version from the stream's leading HEADER token (bits 7..12).
+
+    3 = gfx11 (RDNA3 / gfx1151), 4 = gfx12 (RDNA4 / gfx1201). The HEADER encoding
+    (7-bit 0b0010001, 64 bits) is identical across gfx10..gfx12, so it can be read
+    before choosing a token table. Leading NOP nibbles are skipped. Returns 3 when
+    no header is found (the decoder's historical gfx11 behaviour).
+    """
+    b = bytes(blob[:64])
+    nbits = len(b) * 8
+    v = int.from_bytes(b, "little")
+    pos = 0
+    while pos + 64 <= nbits:
+        c = (v >> pos) & MASK64
+        if c & 0xF == 0:  # NOP
+            pos += 4
+            continue
+        if c & 0x7F == _HEADER_PATTERN:
+            return (c >> 7) & 0x3F
+        return 3
+    return 3
+
+
 class TokenGen:
     """gfx11 token generator: bit reader + lookahead time-reorder (rdna_sqtt).
 
@@ -293,6 +346,89 @@ class TokenGen:
         return (0, 0, TIMESTAMP)  # sentinel
 
 
+class TokenGen12(TokenGen):
+    """gfx12 token generator (port of gfx12::TokenGenerator::next).
+
+    Differences from gfx11: no lookahead time-reorder; TIMESTAMP is 64 bits with
+    rt@bit7, pl@bit8, 52-bit time@bit12; a WAVE_START_EXT may be followed by an
+    8-bit extension (consumed when the next window's bit0 is set); NEW_PC_GFX12 is
+    72 bits (longer than the 64-bit window -- consuming 72 bits is equivalent).
+    """
+
+    __slots__ = ("is_ext",)
+
+    def __init__(self, blob):
+        super().__init__(blob)
+        self.lookup = _LOOKUP12
+        self.is_ext = False
+
+    def next_valid(self):
+        return self.buffer_padded() or self.current != 0
+
+    def _time12(self, info):
+        c = self.current
+        if info[0] == TIMESTAMP:
+            rt = (c >> 7) & 1
+            pl = (c >> 8) & 1
+            tm = (c >> 12) & _TS52
+            if pl and not rt:
+                self.packetlost = True
+            if rt == 0:
+                self.globaltime += tm
+                return 0
+            return tm if pl == 0 else 0
+        tb = info[2]
+        mask = (1 << (info[3] - tb)) - 1
+        self.globaltime += ((c >> tb) & mask) + (4 if info[0] == TIME else 0)
+        return 0
+
+    def next(self):
+        lookup = self.lookup
+        # padded region (dedup realtime via _add_realtime, as gfx12 C++ does)
+        while self.buffer_padded():
+            self._reload()
+            if self.is_ext and (self.current & 1):
+                self.bits_toread = 8
+                continue
+            info = lookup[self.current & 0xFF]
+            typ = info[0]
+            if typ == NOP:
+                self.bits_toread = 4
+                continue
+            self.bits_toread = info[1]
+            self.is_ext = typ == WAVE_START_EXT
+            real = self._time12(info)
+            if typ == TIMESTAMP or typ == TIME:
+                if real != 0:
+                    self._add_realtime(real)
+                continue
+            return (self.globaltime, self.current, typ)
+        # tail region (direct realtime append)
+        while self.buffer_valid_unsafe():
+            self._reload()
+            if self.is_ext and (self.current & 1):
+                self.bits_toread = 8
+                continue
+            info = lookup[self.current & 0xFF]
+            typ = info[0]
+            self.bits_toread = info[1]
+            if self.bit_ptr + self.bits_toread > self.nbits + 64:
+                break
+            if typ == NOP:
+                self.bits_toread = 4
+                continue
+            self.is_ext = typ == WAVE_START_EXT
+            real = self._time12(info)
+            if typ == TIMESTAMP or typ == TIME:
+                if real != 0:
+                    self.realtime.append((self.globaltime, real))
+                continue
+            return (self.globaltime, self.current, typ)
+        self.current = 0
+        self.bit_ptr = self.nbits + 64
+        return (0, 0, TIMESTAMP)  # sentinel
+
+
 class CSRegister:
     """Compute-shader register state -> dispatch snapshot (PopulateDispatch)."""
 
@@ -386,7 +522,8 @@ def parse_se(blob, se_index, collect_de):
     collected: a list of [time, start, cu, simd, wid, me, pipe, pc] in the exact
     delivery order (synthetic pre-capture starts pushed to the front).
     """
-    gen = TokenGen(blob)
+    v12 = peek_tt_version(blob) >= 4
+    gen = TokenGen12(blob) if v12 else TokenGen(blob)
     cs = CSRegister()
     running = {}  # gpu_location -> start pc
     saved = {}
@@ -424,10 +561,16 @@ def parse_se(blob, se_index, collect_de):
         elif typ == WAVE_START or typ == WAVE_START_EXT:
             sa = (c >> 7) & 1
             simd = (c >> 8) & 3
-            wgp = (c >> 10) & 7
-            wid = (c >> 13) & 0x1F
-            pipe = (c >> 21) & 3
-            me = (c >> 23) & 1
+            if v12:  # gfx12::wstart_type
+                wgp = (c >> 10) & 0xF
+                wid = (c >> 15) & 0x1F
+                pipe = (c >> 20) & 3
+                me = (c >> 22) & 1
+            else:
+                wgp = (c >> 10) & 7
+                wid = (c >> 13) & 0x1F
+                pipe = (c >> 21) & 3
+                me = (c >> 23) & 1
             count = (c >> 25) & 0x7F
             sacu = (sa << 7) + (wgp & 0x7F)
             loc = (sacu << 7) | (simd << 5) | wid
@@ -452,7 +595,7 @@ def parse_se(blob, se_index, collect_de):
         elif typ == WAVE_END:
             sa = (c >> 8) & 1
             simd = (c >> 9) & 3
-            wgp = (c >> 11) & 7
+            wgp = (c >> 11) & (0xF if v12 else 7)  # gfx12::wend_type wgp is 4 bits
             wid = (c >> 15) & 0x1F
             sacu = (sa << 7) + (wgp & 0x7F)
             loc = (sacu << 7) | (simd << 5) | wid
