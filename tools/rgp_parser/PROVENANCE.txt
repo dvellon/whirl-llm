@@ -1,0 +1,5 @@
+source: https://github.com/ROCm/hip-ep tools/rgp_parser @ 0b9c2a7d47ff2e76bca6d39a90ac2bba3d8d7cc0 (MIT), fetched 2026-10-15 04:08
+modified 2026-10-16 (WHIRL RGP97-TIME): struct/sqtt_decode.py gains a gfx12 (RDNA4, SQTT header version 4) token path,
+ported from ROCm/rocm-systems projects/rocprof-trace-decoder source/gfx12/{gfx12token.cpp,gfx12parser.h,gfx12token.h}
+(MIT): gfx12 lookup-table overrides, 64-bit TIMESTAMP (rt@7 pl@8 time52@12), WAVE_START_EXT 8-bit extension, no lookahead,
+gfx12 wstart/wend field layouts. Selected per stream from the leading HEADER token; gfx11 (version 3) path unchanged.

@@ -39,9 +39,11 @@ RDTS = RDTS_NEW if os.path.isdir(RDTS_NEW) else RDTS_OLD
 # pointer read at +0x80 in the runtime's RGP/PAL trace path). Same with a 20-line HIP loop, both RDTS versions, the
 # 26.10 driver runtime and the ROCm 7.2 / 7.1 SDK runtimes; the 8060S works with the same DLL. AMD bug, see
 # audit/RGP-R97.md: --device r97 stops unless --force-r97 (retest after a driver / runtime update).
-PARSER = r"C:\ClaudeWorkspace\tools\rgp_parser"
+# Parser code: in-repo tools/rgp_parser (ROCm/hip-ep rgp_parser + gfx12/RDNA4 SQTT token support, RGP97-TIME).
+# The python env (zstandard, pyelftools) is still the external venv under C:\ClaudeWorkspace\tools\rgp_parser.
+PARSER = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rgp_parser"))
 HIP_INDEX = {"8s": "0", "r97": "1"}  # `whirl devices` order on this machine (device 0 8060S, device 1 R9700)
-PARSER_PY = os.path.join(PARSER, r".venv\Scripts\python.exe")
+PARSER_PY = os.path.join(r"C:\ClaudeWorkspace\tools\rgp_parser", r".venv\Scripts\python.exe")
 
 
 def wait_file(pattern, before, timeout):
