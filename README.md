@@ -278,7 +278,7 @@ MoE decode: llama.cpp plain decoding (as shipped; its MTP was slower than plain 
 
 ### <a id="swift-mxfp4"></a>Swift-1.5 27B MXFP4 (our dense quant)
 
-Our own MXFP4 quantization of the dense 27B (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`, variant A), same prompts and flags as above, measured with the 0.2.0 release candidate later the same day. On the R9700 WHIRL's MXFP4 prefill path is much faster than its Q4_K_M path, so the prefill lead is larger than on Q4_K_M: +115% to +166% over llama.cpp ROCm and +194% to +296% over Vulkan; decode +50% to +75% / +43% to +78%. On the 8060S: prefill +56% to +62% / +87% to +207%, decode +27% to +48% / +24% to +116%.
+Our own MXFP4 quantization of the dense 27B (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`, variant A), same prompts and flags as above, measured with the 0.2.0 release candidate later the same day. On the R9700 WHIRL's MXFP4 prefill path is much faster than its Q4_K_M path, so the prefill lead is larger than on Q4_K_M: +115% to +166% over llama.cpp ROCm and +194% to +296% over Vulkan; decode +50% to +75% / +43% to +78%. On the 8060S: prefill +56% to +62% / +87% to +207%, decode +27% to +48% / +24% to +107%.
 
 **R9700** (single run per cell; llama.cpp prefill shows the faster of its plain and MTP + n-gram runs):
 
@@ -306,7 +306,7 @@ Our own MXFP4 quantization of the dense 27B (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ
 | 128k | **49.8** | 33.2 (MTP+n-gram) | 34.8 (MTP+n-gram) | +50% | +43% |
 <!-- /gen -->
 
-**Radeon 8060S**, max power (80 W), ASUS ROG Flow Z13 (prompt lengths 2k, 32k and 128k only; ¹ single run, read as "about"; other cells median of 2 or 3 runs; llama.cpp MTP + n-gram):
+**Radeon 8060S**, max power (80 W), ASUS ROG Flow Z13 (each cell median of 2 or 3 runs; llama.cpp MTP + n-gram):
 
 <!-- gen:s8.swift.pp.en -->
 #### Swift-1.5-Qwen3.8-27B MXFP4-A (dense 27B): Prefill tok/s
@@ -314,8 +314,10 @@ Our own MXFP4 quantization of the dense 27B (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ
 | Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
 |---|---|---|---|---|---|
 | 2k | **500.9** | 310.1 | 162.9 | +62% | +207% |
-| 32k | **414.9** | 265.1 | 221.6 | +56% | +87% |
-| 128k | **289.8¹** | 181.1¹ | 127.9¹ | +60% | +127% |
+| 32k | **414.9** | 266.2 | 221.6 | +56% | +87% |
+| 64k | **368.1** | 230.9 | 177.3 | +59% | +108% |
+| 96k | **324.2** | 203.3 | 149.0 | +59% | +118% |
+| 128k | **290.6** | 180.8 | 127.8 | +61% | +128% |
 <!-- /gen -->
 
 <!-- gen:s8.swift.tg.en -->
@@ -324,8 +326,10 @@ Our own MXFP4 quantization of the dense 27B (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ
 | Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
 |---|---|---|---|---|---|
 | 2k | **31.0** | 24.5 | 25.1 | +27% | +24% |
-| 32k | **29.0** | 22.2 | 17.0 | +31% | +71% |
-| 128k | **24.2¹** | 16.3¹ | 11.2¹ | +48% | +116% |
+| 32k | **29.0** | 22.7 | 17.0 | +28% | +71% |
+| 64k | **24.9** | 18.4 | 18.0 | +35% | +38% |
+| 96k | **23.6** | 17.9 | 16.6 | +32% | +42% |
+| 128k | **24.0** | 16.2 | 11.6 | +48% | +107% |
 <!-- /gen -->
 
 **Chinese coding chat** (512 tokens, the hard case for drafts: all newly written, nothing to copy):

@@ -278,7 +278,7 @@ MoE decode：llama.cpp 用一般解碼（出廠設定；它的 MTP 在 12 個 Mo
 
 ### <a id="swift-mxfp4"></a>Swift-1.5 27B MXFP4（我們的稠密量化）
 
-我們自己製作的稠密 27B MXFP4 量化（`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`，變體 A），提示與旗標同上，同一天稍晚用 0.2.0 候選版量測。R9700 上 WHIRL 的 MXFP4 prefill 路徑比 Q4_K_M 快很多，所以 prefill 領先比 Q4_K_M 大：對 llama.cpp ROCm +115% 到 +166%、對 Vulkan +194% 到 +296%；decode +50% 到 +75%／+43% 到 +78%。8060S：prefill +56% 到 +62%／+87% 到 +207%，decode +27% 到 +48%／+24% 到 +116%。
+我們自己製作的稠密 27B MXFP4 量化（`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`，變體 A），提示與旗標同上，同一天稍晚用 0.2.0 候選版量測。R9700 上 WHIRL 的 MXFP4 prefill 路徑比 Q4_K_M 快很多，所以 prefill 領先比 Q4_K_M 大：對 llama.cpp ROCm +115% 到 +166%、對 Vulkan +194% 到 +296%；decode +50% 到 +75%／+43% 到 +78%。8060S：prefill +56% 到 +62%／+87% 到 +207%，decode +27% 到 +48%／+24% 到 +107%。
 
 **R9700**（每格單次量測；llama.cpp prefill 取它一般與 MTP + n-gram 兩次量測中較快者）：
 
@@ -306,7 +306,7 @@ MoE decode：llama.cpp 用一般解碼（出廠設定；它的 MTP 在 12 個 Mo
 | 128k | **49.8** | 33.2 (MTP+n-gram) | 34.8 (MTP+n-gram) | +50% | +43% |
 <!-- /gen -->
 
-**Radeon 8060S**，最大功率（80 W），ASUS ROG Flow Z13（只量了 2k、32k、128k 的提示長度；¹ 只量一次，請當作「約」；其他格為 2 或 3 次中位數；llama.cpp 用 MTP + n-gram）：
+**Radeon 8060S**，最大功率（80 W），ASUS ROG Flow Z13（每格為 2 或 3 次中位數；llama.cpp 用 MTP + n-gram）：
 
 <!-- gen:s8.swift.pp.zh -->
 #### Swift-1.5-Qwen3.8-27B MXFP4-A（稠密 27B）: Prefill tok/s
@@ -314,8 +314,10 @@ MoE decode：llama.cpp 用一般解碼（出廠設定；它的 MTP 在 12 個 Mo
 | 長度 | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL 對 ROCm | WHIRL 對 Vulkan |
 |---|---|---|---|---|---|
 | 2k | **500.9** | 310.1 | 162.9 | +62% | +207% |
-| 32k | **414.9** | 265.1 | 221.6 | +56% | +87% |
-| 128k | **289.8¹** | 181.1¹ | 127.9¹ | +60% | +127% |
+| 32k | **414.9** | 266.2 | 221.6 | +56% | +87% |
+| 64k | **368.1** | 230.9 | 177.3 | +59% | +108% |
+| 96k | **324.2** | 203.3 | 149.0 | +59% | +118% |
+| 128k | **290.6** | 180.8 | 127.8 | +61% | +128% |
 <!-- /gen -->
 
 <!-- gen:s8.swift.tg.zh -->
@@ -324,8 +326,10 @@ MoE decode：llama.cpp 用一般解碼（出廠設定；它的 MTP 在 12 個 Mo
 | 長度 | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL 對 ROCm | WHIRL 對 Vulkan |
 |---|---|---|---|---|---|
 | 2k | **31.0** | 24.5 | 25.1 | +27% | +24% |
-| 32k | **29.0** | 22.2 | 17.0 | +31% | +71% |
-| 128k | **24.2¹** | 16.3¹ | 11.2¹ | +48% | +116% |
+| 32k | **29.0** | 22.7 | 17.0 | +28% | +71% |
+| 64k | **24.9** | 18.4 | 18.0 | +35% | +38% |
+| 96k | **23.6** | 17.9 | 16.6 | +32% | +42% |
+| 128k | **24.0** | 16.2 | 11.6 | +48% | +107% |
 <!-- /gen -->
 
 **中文寫程式對話**（512 token，對草稿是困難情況：全部全新撰寫，沒有可照抄的內容）：
