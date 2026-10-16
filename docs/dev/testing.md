@@ -41,8 +41,10 @@ the chosen token did not. A bit-exact refactor must not change even that.
 | `single` | `short`: a Chinese coding prompt, chunked prefill, then 24 decode steps on the pipelined decode path that chat uses (logits hash on every step). `long4k`: a 4000-token prompt (the prefill is split into `max_batch` chunks), then 8 decode steps. `mtp`: MTP speculative decode of 64 tokens with the model's default draft count held fixed (no timing-based adaptation). `mtp_ngram`: the same with n-gram drafts forced whenever they match. |
 | `pair` | Two sequences on the server's multi-sequence paths: a solo reference for each, segmented prefill (`prefillSegs`), batched decode rows, a batched verify with literal drafts, and one batched MTP draft + verify cycle after an MTP segmented prefill (DeltaNet replay on, as in the server). |
 
-Models: one dense and one MoE model. `WHIRL_GOLDEN_DENSE` defaults to Qwen3.8-27B UD-Q4_K_M and
-`WHIRL_GOLDEN_MOE` defaults to Ornith-1.5-35B-A3B MXFP4, both at their LM Studio download paths.
+Models: the required set is `swift` (Swift-1.5 27B MXFP4-A, the headline dense model, `WHIRL_GOLDEN_SWIFT`)
+and `moe` (Ornith-1.5-35B-A3B MXFP4, `WHIRL_GOLDEN_MOE`), the default `-Models swift,moe`. `dense`
+(Qwen3.8-27B UD-Q4_K_M, `WHIRL_GOLDEN_DENSE`) is optional (`-Models dense`). Each defaults to its LM Studio
+download path.
 Each reference file stores the model's file name and size, so a check against a different file
 fails on the first line. Modes: `--precise`, `--balance`, `--fast`. The fast mode loses precision
 (quantized KV, relaxed acceptance) but is still deterministic, so it can be hashed too.
@@ -212,12 +214,14 @@ set. The R9700 set is checked once, when the change is merged.
 
 **The release gate** (`tools/gates/release_gate.ps1`, FIX-TEST-A) is the versioned list of those
 checks: the CPU test binaries and self-tests, golden xcheck, `whirl-kernel-test --require-all`,
-selftest, golden check (with its in-run cross-checks), seqtest (dense precise / balance / fast, MoE
-precise / balance), bench DFlash2 hashes in all three modes, and the server gate (balance and fast
+selftest, golden check (with its in-run cross-checks), seqtest (Swift precise / balance / fast, MoE
+precise / balance), and the server gate with Swift as the dense model (balance and fast
 basic,mt_cache; precise basic with `--cli`; fast_stream dense and MoE; tier,sys,restore_conc,pool in
 balance and precise with `--kv auto`). Each step has an exit code and an output rule; the gate prints a
 table, writes `PASS_<tag>` or `FAIL_<tag>` and exits 0 only when every selected step passed (1 a step
 failed, 2 setup error such as a missing model or the wrong `-ExpectCommit`). Model and text paths come
-from `WHIRL_GATE_*` variables (see the script header). `-InjectFail` turns one golden reference into a
+from `WHIRL_GATE_*` variables (see the script header): `WHIRL_GATE_SWIFT` and `WHIRL_GATE_MOE` are required;
+`WHIRL_GATE_DENSE` (Q4_K_M) is optional and adds the Q4_K_M selftest / golden / seqtest steps and the
+bench DFlash2 hash steps (target Q4_K_M; Swift with DFlash2 is not gated yet). `-InjectFail` turns one golden reference into a
 mismatch to prove the gate goes red. `whirl-server-tests --only`, `WHIRL_TIER_ONLY` and
 `whirl-kernel-test --only` exit 2 for a name that matches nothing or a run with 0 checks.
