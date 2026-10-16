@@ -26,7 +26,22 @@ def by_rule(cases, rule):
     return [c for c in cases if c["rule"] == rule]
 
 
-class Dense(unittest.TestCase):
+# The mechanism tests below (Dense, MoE) were written against the KL-ROBUST-2 / MOE-BAL-3 limit values;
+# they test the judging rule, so they run with those values. The current values: class ModesMxfp4.
+LEGACY_LIMITS = {"balance": (0.005, 0.98), "fast": (0.03, 0.93)}
+LEGACY_MOE_LIMITS = {"balance": (2.0, 3.0, 0.030), "fast": (8.0, 12.0, 0.08)}
+
+
+class LegacyLimits(unittest.TestCase):
+    def setUp(self):
+        self._saved = (klgate.LIMITS, klgate.MOE_LIMITS)
+        klgate.LIMITS, klgate.MOE_LIMITS = dict(LEGACY_LIMITS), dict(LEGACY_MOE_LIMITS)
+
+    def tearDown(self):
+        klgate.LIMITS, klgate.MOE_LIMITS = self._saved
+
+
+class Dense(LegacyLimits):
     def test_average_first(self):
         # one position over the KL limit (0.006 > 0.005), the length average under it: passes
         res = [win(1, 0.006, 0.99), win(2, 0.004, 0.99), win(3, 0.004, 0.99)] + [win(4, 0.001, 0.99)] * 3
@@ -75,7 +90,7 @@ class Dense(unittest.TestCase):
         self.assertEqual(cs[0]["kl_mean"], 0.0049)
 
 
-class MoE(unittest.TestCase):
+class MoE(LegacyLimits):
     N_KL = [0.001, 0.002, 0.003, 0.002, 0.002, 0.002]  # N = 0.002
     N_T1 = [0.99, 0.96, 0.97, 0.98, 0.98, 0.98]        # all-window mean 0.97667; 8192's own mean 0.97333
 
@@ -120,11 +135,7 @@ class MoE(unittest.TestCase):
         self.assertFalse(by_rule(under, "moe-length")[0]["pass"])
 
     def test_balance_top1_drop_is_3_points(self):
-        # MOE-BAL-3 (owner decision 2026-10-14 23:36): MoE balance top-1 drop 2.4 -> 3.0 points; the KL
-        # multipliers (2 N mean, 3 N per length), fast and the dense absolute limits are unchanged
-        self.assertEqual(klgate.MOE_LIMITS["balance"], (2.0, 3.0, 0.030))
-        self.assertEqual(klgate.MOE_LIMITS["fast"], (8.0, 12.0, 0.08))
-        self.assertEqual(klgate.LIMITS, {"balance": (0.005, 0.98), "fast": (0.03, 0.93)})
+        # MOE-BAL-3 (owner decision 2026-10-14 23:36): MoE balance top-1 drop 2.4 -> 3.0 points (legacy values)
         # the measured case that failed the 2.4-point floor: R9700 MoE zh 8k with q8dec, 93.88% vs the
         # noise all-window mean 96.40% (-2.52 points), 2.35 N -> passes now
         nz = noise([0.00597] * 3, [0.9640] * 3)
@@ -179,6 +190,50 @@ class MoE(unittest.TestCase):
         for want in ("8192/p0 (end 11)", "3.40 N", "avg of 3 positions", "<= 0.00600 (3 N)", "noise top1 all-window mean 97.67%",
                      "mean over all windows", "(2 N)", "not judged alone"):
             self.assertIn(want, txt)
+
+
+class ModesMxfp4(unittest.TestCase):
+    """MODES-MXFP4 (owner policy 2026-10-16): limits = regression guard set from the measured baseline of
+    the new mode definitions (MoE balance with fp8 + moefp8; Swift balance with fp8), R9700 numbers."""
+
+    def test_constants(self):
+        self.assertEqual(klgate.MOE_LIMITS, {"balance": (4.5, 7.0, 0.045), "fast": (8.0, 12.0, 0.08)})
+        self.assertEqual(klgate.LIMITS, {"balance": (0.005, 0.97), "fast": (0.03, 0.93)})
+
+    def test_moe_balance_fp8_baseline_passes(self):
+        # R9700 Ornith code: N 0.00194, noise top-1 99.15%; balance per length 98304 0.00959 (4.96 N) 97.53%
+        nz = noise([0.00194] * 3, [0.9915] * 3)
+        cs = klgate.judge([win(1, 0.00959, 0.9753)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz)
+        self.assertTrue(all(c["pass"] for c in cs) is False)  # all-window mean = 4.96 N > 4.5 N on its own
+        self.assertTrue(by_rule(cs, "moe-length")[0]["pass"])
+        # zh: N 0.00597, noise top-1 96.40%; 129297 0.02131 (3.57 N) 93.49% (-2.91 points)
+        nz = noise([0.00597] * 3, [0.9640] * 3)
+        cs = klgate.judge([win(1, 0.02131, 0.9349)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz)
+        self.assertTrue(all(c["pass"] for c in cs))
+        # the measured all-window means (code 3.48 N, zh 2.92 N) pass the 4.5 N mean limit
+        cs = klgate.judge([win(1, 0.00675, 0.98)] * 6, GROUPS, POSS, "balance", True, noise([0.00194] * 3, [0.9915] * 3))
+        self.assertTrue(by_rule(cs, "moe-mean")[0]["pass"])
+        # the MOE-BAL-3 table without fp8 (1.91 N, -2.52 points) passes too
+        cs = klgate.judge([win(1, 0.01400, 0.9388)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz)
+        self.assertTrue(all(c["pass"] for c in cs))
+
+    def test_moe_balance_regressions_fail(self):
+        nz = noise([0.002] * 3, [0.97] * 3)
+        at = klgate.judge([win(1, 0.014, 0.97)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz)  # exactly 7 N
+        over = klgate.judge([win(1, 0.01401, 0.97)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz)
+        self.assertTrue(by_rule(at, "moe-length")[0]["pass"])
+        self.assertFalse(by_rule(over, "moe-length")[0]["pass"])
+        self.assertTrue(by_rule(klgate.judge([win(1, 0.002, 0.925)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz), "moe-length")[0]["pass"])
+        self.assertFalse(by_rule(klgate.judge([win(1, 0.002, 0.9249)] * 3, GROUPS[:3], POSS[:3], "balance", True, nz), "moe-length")[0]["pass"])
+        m = by_rule(klgate.judge([win(1, 0.00901, 0.97)] * 6, GROUPS, POSS, "balance", True, nz), "moe-mean")[0]
+        self.assertFalse(m["pass"])  # 4.505 N > 4.5 N
+
+    def test_dense_balance(self):
+        # R9700 Swift zh 129297 balance: KL 0.00151, top-1 98.18% passes; 96.9% or KL 0.0051 fails
+        self.assertTrue(klgate.judge([win(1, 0.00151, 0.9818)] * 3, GROUPS[:3], POSS[:3], "balance", False)[0]["pass"])
+        self.assertTrue(klgate.judge([win(1, 0.00151, 0.97)] * 3, GROUPS[:3], POSS[:3], "balance", False)[0]["pass"])
+        self.assertFalse(klgate.judge([win(1, 0.00151, 0.969)] * 3, GROUPS[:3], POSS[:3], "balance", False)[0]["pass"])
+        self.assertFalse(klgate.judge([win(1, 0.0051, 0.99)] * 3, GROUPS[:3], POSS[:3], "balance", False)[0]["pass"])
 
 
 class Replay(unittest.TestCase):

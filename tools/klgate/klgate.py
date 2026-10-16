@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KL gate (FIX-TEST-B, MOE-BAL, KL-ROBUST, KL-ROBUST-2): balance and fast against precise, on a fixed corpus, at fixed context lengths.
+# KL gate (FIX-TEST-B, MOE-BAL, KL-ROBUST, KL-ROBUST-2, MODES-MXFP4): balance and fast against precise, on a fixed corpus, at fixed context lengths.
 # SPDX-License-Identifier: Apache-2.0
 #
 # For every model x prompt x mode, one `whirl chat` run prefills the whole prompt (raw, no MTP) and
@@ -25,16 +25,24 @@
 # positions is stable. So per length the positions are AVERAGED FIRST (KL mean and top-1), and the
 # per-window limits apply to that per-length average; the MoE mean limit stays on the mean over all
 # windows. The report prints every position (not judged alone), the per-length average and the
-# number each limit was applied to. Limit values (MOE-BAL, owner decision 2026-10-13; MoE balance top-1
-# drop 2.4 -> 3.0 points in MOE-BAL-3, owner decision 2026-10-14 23:36):
+# number each limit was applied to.
+# MODES-MXFP4 (owner policy 2026-10-16): the limits are a REGRESSION GUARD per mode, not a near-lossless
+# proof (that is the task-accuracy check) and never a veto on an allowed balance item (fp8, moefp8, q8dec,
+# h16, gdnwmma, int8 KV). They are set from the measured baseline of each mode's definition on the two
+# product models (Swift-1.5 27B MXFP4-A, Ornith-1.5-35B-A3B MXFP4; audit/MODES-MXFP4.md) with a margin, as
+# the fast limits were. Limit values:
 #   dense models (absolute, per-length average):
-#     balance: KL <= 0.005 and top-1 >= 98%      fast: KL <= 0.03 and top-1 >= 93%
+#     balance: KL <= 0.005 and top-1 >= 97%      fast: KL <= 0.03 and top-1 >= 93%
+#     (balance top-1 98% -> 97% in MODES-MXFP4: Swift balance with fp8 measured 98.18% at zh 128k on the
+#     R9700, a 3-row margin; KL 0.0015 max against 0.005)
 #     (512 rows per window since MOE-BAL: with 128 rows one row is 0.78 points of top-1)
 #   MoE models (arch *moe): relative to the noise floor N measured in the same gate run = precise vs
 #     precise with the sequential DeltaNet prefill (WHIRL_GDN_SEQ=1, an equally exact f32 path), same
 #     windows; N = the mean of the noise run's window KLs (all lengths x positions), N_top1 = the noise
 #     run's top-1 averaged over ALL its windows (KL-ROBUST-2: not the same window, both sides jitter):
-#     balance: mean KL over all windows <= 2 N, each length's average KL <= 3 N, its average top-1 >= N_top1 - 3.0 points
+#     balance: mean KL over all windows <= 4.5 N, each length's average KL <= 7 N, its average top-1 >= N_top1 - 4.5 points
+#     (MODES-MXFP4: fp8 + moefp8 back in MoE balance, R9700 baseline mean 3.48 N (code) / 2.92 N (zh), per length
+#     max 4.96 N, top-1 drop max 2.91 points; MOE-BAL / MOE-BAL-3 had 2 N / 3 N / 3.0 points for the table without fp8)
 #     fast:    mean KL <= 8 N, each length's average KL <= 12 N, average top-1 >= N_top1 - 8 points
 #     (two equally exact paths of a 256-expert top-8 router already differ by KL 0.002-0.006 on
 #     these prompts, above the dense balance limit; see audit/MOE-KL.md). The 3.0-point top-1 drop
@@ -65,9 +73,9 @@ import time
 
 import numpy as np
 
-LIMITS = {"balance": (0.005, 0.98), "fast": (0.03, 0.93)}  # dense: absolute (KL max, top-1 min) per length average
+LIMITS = {"balance": (0.005, 0.97), "fast": (0.03, 0.93)}  # dense: absolute (KL max, top-1 min) per length average
 # MoE: (mean KL over all windows <= k_mean * N, per-length average KL <= k_win * N, its top-1 >= N_top1(all windows) - drop)
-MOE_LIMITS = {"balance": (2.0, 3.0, 0.030), "fast": (8.0, 12.0, 0.08)}
+MOE_LIMITS = {"balance": (4.5, 7.0, 0.045), "fast": (8.0, 12.0, 0.08)}
 ROWS = 512
 # window end offsets before each length, earliest first (see the header): chunk phases 0 / 48 / 16
 OFFSETS = (1216, 592, 0)

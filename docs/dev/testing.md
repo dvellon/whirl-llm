@@ -111,14 +111,18 @@ and the per-window limits apply to that per-length average.** A single window's 
 forwards (the same 512 tokens after an 80-row instead of a 4096-row forward: audit/KL-ROBUST.md), and
 the noise floor jitters the same way, while the mean over positions is stable. The report prints
 every position (not judged alone), each length's average, and the number each limit was applied to.
-The limit values are unchanged. They depend on the model type (the `arch` line of the precise run's
-log; owner decision 2026-10-13, audit/MOE-KL.md, audit/MOE-BAL.md):
+**The limits are a regression guard per mode (MODES-MXFP4, owner policy 2026-10-16), not a
+near-lossless proof and not a veto on an allowed item.** Balance is defined by the items it may use
+(fp8, moefp8, q8dec, h16, gdnwmma, int8 KV); near-lossless is shown separately with task accuracy.
+The limits are set from the measured baseline of each mode on the two product models
+(Swift-1.5 27B MXFP4-A, Ornith-1.5-35B-A3B MXFP4) with a margin. They depend on the model type (the
+`arch` line of the precise run's log):
 
 Dense models (`qwen35`), absolute, on each length's 3-position average:
 
 | Mode | KL mean (3 x 512-row windows) | top-1 agreement |
 |---|---|---|
-| balance | <= 0.005 | >= 98% |
+| balance | <= 0.005 | >= 97% |
 | fast | <= 0.03 | >= 93% |
 
 MoE models (`qwen35moe`), relative to the noise floor **N** measured in the same gate run: one more
@@ -131,14 +135,15 @@ limit, so an absolute limit cannot tell a real regression from the model's own s
 
 | Mode | mean KL over all windows (4 lengths x 3) | KL of each length's average | top-1 of each length's average |
 |---|---|---|---|
-| balance | <= 2 N | <= 3 N | >= N_top1 - 3.0 points |
+| balance | <= 4.5 N | <= 7 N | >= N_top1 - 4.5 points |
 | fast | <= 8 N | <= 12 N | >= N_top1 - 8 points |
 
-The MoE balance top-1 drop was 2.4 points until MOE-BAL-3 (owner decision 2026-10-14): 3.0 points
-admits int8 decode activations (`q8dec`, the q8_1 scheme llama.cpp itself uses for decode, i.e. the
-same numeric level as llama.cpp); the KL limits are unchanged (audit/MOE-BAL-3.md).
-The fast multipliers were set from the measured fast numbers as a regression guard, not as a quality
-claim. 512 rows per window: with 128 rows one row is 0.78 points of top-1 (dense fast zh 8k once
+MODES-MXFP4 baselines (R9700, both GPUs in audit/MODES-MXFP4.md): MoE balance with fp8 + moefp8,
+mean 3.48 N (code) / 2.92 N (zh), per-length average up to 4.96 N, top-1 drop up to 2.91 points;
+Swift balance (fp8) KL 0.0007-0.0015, top-1 down to 98.18% (zh 128k), hence the dense balance
+top-1 limit 97% (98% before, set for Q4_K_M without fp8). The previous MoE balance limits (2 N / 3 N /
+3.0 points; MOE-BAL, MOE-BAL-3) belonged to the table without fp8 / moefp8.
+The fast multipliers were set the same way from the measured fast numbers. 512 rows per window: with 128 rows one row is 0.78 points of top-1 (dense fast zh 8k once
 missed 93% by a single row); the limits were not relaxed for it. A 256-row run still failed (dense zh
 8k balance 97.27% / fast 92.97%, MoE zh balance 2.04 N): the window start also moves where the
 prefill is split into forwards, so the bits of a window - and its KL / top-1 - change with the window
@@ -146,7 +151,10 @@ size as well as by sampling (audit/MOE-BAL.md). That is why the gate now measure
 length and judges their average (KL-ROBUST, KL-ROBUST-2); judged window by window, the 3-position run
 failed MoE balance on single windows that the average passes. The tool keeps one precise dump in
 memory (3 GB at 3 x 512 rows) and compares every other run right after it finishes.
-`tools/klgate/test_klgate_judge.py` unit-tests the judging rule (no GPU). `--as MODE=ARG` runs MODE
+`tools/klgate/test_klgate_judge.py` unit-tests the judging rule (no GPU). `--noise-dense` also runs
+the noise floor on dense models (reported, not judged). `--rejudge REPORT --report OUT` judges an
+earlier report's per-window numbers with the current limits without running anything (exe hash,
+device and corpus are carried over and `rejudged_from` is recorded), e.g. after a limit change. `--as MODE=ARG` runs MODE
 with another CLI argument and judges it by MODE's limits (a negative test: its report never passes).
 `golden.ps1 record` refuses a report with fewer than 3 positions.
 
