@@ -6,7 +6,7 @@ WHIRL 0.2.0 對 **ggml-org 官方 llama.cpp b11214**，**ROCm** 與 **Vulkan** �
 
 **WHIRL 領先不多的地方（請先看）：**
 
-- **Radeon 8060S 上短 prompt 後的稠密 decode**：2k token 時對 llama.cpp ROCm 領先 9%、對 Vulkan 6%，在量測雜訊範圍內。那裡的稠密 decode 受記憶體頻寬限制（約 256 GB/s，權重 15 GB 以上）；領先隨上下文擴大（32k 起 +24% 到 +48%）。
+- **Radeon 8060S 上稠密 decode，2k token 文件問答**：對 llama.cpp ROCm 領先 9%、對 Vulkan 6%，在量測雜訊範圍內。那裡的稠密 decode 受記憶體頻寬限制（約 256 GB/s，權重 15 GB 以上）；領先隨上下文擴大（32k 起 +24% 到 +48%）。
 - **MoE decode 是各自出廠設定對比，不是同條件對比**：WHIRL 用自己的 MTP 草稿；llama.cpp 在 MoE 模型上不用投機解碼，因為它的 MTP 在這個模型上比一般解碼慢（R9700：12 格中 11 格較慢，1 格快 0.4 tok/s）。
 - **precise 要付出速度**：R9700 上 decode 比 balance 慢 14–26%、prefill 慢 6–13%。**fast 不一定比 balance 快**：MoE 模型在短、中等上下文時 balance 解碼較快。
 - **不用投機的一般解碼**在每個引擎都受記憶體頻寬限制；WHIRL 大部分的 decode 領先來自 MTP + n-gram 投機解碼。
@@ -17,7 +17,7 @@ WHIRL 0.2.0 對 **ggml-org 官方 llama.cpp b11214**，**ROCm** 與 **Vulkan** �
 |---|---|
 | 主機 | ASUS ROG Flow Z13（GZ302EA）：AMD Ryzen AI Max+ 395（16 核／32 執行緒），128 GB LPDDR5X-8000，Windows 看得到 63.6 GB |
 | GPU 1 | AMD Radeon AI PRO R9700（gfx1201，RDNA 4，32 GB GDDR6），以 **USB4 外接**於上述主機 |
-| GPU 2 | AMD Radeon 8060S（gfx1151，RDNA 3.5），主機內顯。**最大功率：牆上插座端 80 W，筆電放在外接 8 吋風扇下，溫度接近 100 °C**（未更動任何功率、散熱或驅動設定） |
+| GPU 2 | AMD Radeon 8060S（gfx1151，RDNA 3.5），主機內顯。**最大功率（80 W），ASUS ROG Flow Z13**（未更動任何功率、散熱或驅動設定） |
 | 作業系統／驅動 | Windows 11 Home 26H2；AMD Software: Adrenalin Edition 26.8.1（驅動 32.0.31041.1004） |
 | WHIRL | R9700：v0.2.0 候選版 rc9（分支 `rel020` `bc78613`；rc10 在 R9700 上完全相同，只改了 8060S 的 prefill forward 大小）。8060S：候選版 rc10（`bd81154`）；8060S 的中文對話與 agent 工作階段：rc7（見 §5）。[TBD：正式 0.2.0 `whirl.exe`／`whirl-server.exe` 的 SHA-256，以及正式版是否由 `bd81154` 建置] |
 | llama.cpp | 官方 b11214 Windows 執行檔，ROCm 版與 Vulkan 版 |
@@ -43,7 +43,45 @@ Swift-1.5 27B MXFP4 沒有用 0.2.0 重新量測；它的 0.1.3 數字在[附錄
 - **llama.cpp 解碼模式**：稠密＝每個後端取一般與 MTP + n-gram 中較快者（每格標註；每個稠密格都是 MTP + n-gram 較快）；MoE＝一般解碼（出廠設定）。llama.cpp prefill＝每個後端兩次量測中較快者。
 - **WHIRL**：`whirl-server MODEL --balance|--precise|--fast -np 1 --ctx-per-slot 163840 --kv-ssd-mode off`；MTP（+ n-gram）照預設開啟。
 
-### llama.cpp 旗標
+### <a id="prompts"></a>2.1 實際提示與重現方法
+
+投機解碼在回答可預測時最快（照抄或背誦文字）。所以這裡寫明每個 decode 數字回答的是什麼。
+
+**文件問答**（2k–128k 的 prefill 與 decode 表）。提示依序是：每個請求都不同的第一行 `【測試編號 <nonce>】`（不會命中前綴快取），接著一份由授權寬鬆的真實來源組成的文件（C++、Python、Rust、TypeScript 原始檔，中文技術文件、中文維基、英文技術文件；每段以 `### 檔案 N：專案/路徑（授權）` 開頭，沒有重複的 4096-token 視窗），依整行截到目標長度，然後是 `---` 和下面這個問題，每個長度都一樣（原文）：
+
+> 請根據上面第 1 個檔案（llama.cpp/src/models/muse-glimmer.cpp）中的函式 `graph`，用繁體中文說明它的用途、參數與回傳值，指出一個可能出錯的邊界情況，並寫出修改後能正確處理該情況的完整函式程式碼。
+
+第 1 個檔案在每個提示的最前面，所以 256 token 的回答是說明提示裡的一個函式並改寫它：有一部分可以照抄提示中的程式碼，這對所有使用草稿的引擎都有幫助（WHIRL 的 MTP + n-gram，稠密模型上 llama.cpp 的 MTP + n-gram）。
+
+**中文寫程式對話**（512 token；先送一個 64 token 的暖機請求），原文：
+
+```text
+請用 Python 寫一個命令列工具 `dedup.py`：掃描指定目錄（可遞迴）中的所有檔案，用檔案大小先分組、再用 SHA-256 找出內容完全相同的檔案，最後輸出每一組重複檔案的路徑與大小，並統計可以省下多少空間。要求：
+1. 用 argparse，支援 `--min-size`（忽略太小的檔案）與 `--json`（改用 JSON 輸出）。
+2. 大檔案要分塊讀取，不能一次讀進記憶體。
+3. 遇到沒有權限或讀取失敗的檔案要略過並在最後列出。
+4. 附上 pytest 測試，至少涵蓋：空目錄、兩個相同檔案、大小相同但內容不同。
+請先簡短說明設計，再給完整程式碼。
+```
+
+這一列對投機草稿是困難情況：中文提問、中文說明與英文程式碼都是全新撰寫，提示裡除了幾個選項名稱之外沒有可讓回答照抄的內容（投機解碼在回答可預測時最快，例如照抄或背誦已知文字；這一列沒有這種情況）。
+
+**Coding agent 工作階段**（§5）：16k token 的 skills／MCP 系統提示，`read_file` 工具回傳一份 3.6k token 的 llama.cpp C++ 原始檔，接著四輪使用者提問（說明檔案；找出最複雜的函式；把該函式改寫成程式碼；審閱訊息中附上的修改版檔案），每次呼叫重送完整歷史，每次最多 384 token。
+
+[TBD：把提示檔（含各檔來源與授權的文件語料、提示產生腳本、agent 工作階段測試資料）放進 repository 或作為發布附件，並在此連結；需 owner 決定，因為語料包含各自授權的第三方文字。]
+
+**請求與重現**（兩種 server 都照 §6 啟動；PowerShell）：
+
+```powershell
+$prompt = Get-Content -Raw -Encoding UTF8 .\prompt.txt      # document QA prompt (or the chat prompt)
+$body = @{ model = 'whirl'; messages = @(@{ role = 'user'; content = $prompt }); max_tokens = 256; temperature = 0;   # chat: 512
+           chat_template_kwargs = @{ enable_thinking = $false } } | ConvertTo-Json -Depth 6
+$r = Invoke-RestMethod http://127.0.0.1:8099/v1/chat/completions -Method Post `
+       -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
+$r.timings.prompt_per_second, $r.timings.predicted_per_second   # prefill tok/s, decode tok/s (same field names in both servers)
+```
+
+### 2.2 llama.cpp 旗標
 
 | | R9700 | Radeon 8060S |
 |---|---|---|
@@ -71,7 +109,7 @@ Swift-1.5 27B MXFP4 沒有用 0.2.0 重新量測；它的 0.1.3 數字在[附錄
 <!-- /gen -->
 
 <!-- gen:r97.qwen.tg.zh -->
-#### Qwen3.8-27B UD-Q4_K_M（稠密）: Decode tok/s（prompt 之後生成 256 token）
+#### Qwen3.8-27B UD-Q4_K_M（稠密）: Decode tok/s，文件問答（256 token 回答：說明文件中的一個函式並改寫）
 
 | 長度 | WHIRL balance | WHIRL precise | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance 對 ROCm | balance 對 Vulkan |
 |---|---|---|---|---|---|---|---|
@@ -97,7 +135,7 @@ Swift-1.5 27B MXFP4 沒有用 0.2.0 重新量測；它的 0.1.3 數字在[附錄
 <!-- /gen -->
 
 <!-- gen:r97.ornith.tg.zh -->
-#### Ornith-1.5-35B-A3B MXFP4（MoE，約 3B 啟用）: Decode tok/s（prompt 之後生成 256 token）
+#### Ornith-1.5-35B-A3B MXFP4（MoE，約 3B 啟用）: Decode tok/s，文件問答（256 token 回答：說明文件中的一個函式並改寫）
 
 | 長度 | WHIRL balance | WHIRL precise | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance 對 ROCm | balance 對 Vulkan |
 |---|---|---|---|---|---|---|---|
@@ -111,7 +149,9 @@ Swift-1.5 27B MXFP4 沒有用 0.2.0 重新量測；它的 0.1.3 數字在[附錄
 
 MoE decode：llama.cpp 一般解碼（出廠設定），WHIRL 用 MTP。
 
-### 3.1 中文提問寫程式對話（512 token）
+### 3.1 中文寫程式對話（512 token）
+
+對草稿是困難情況：全部全新撰寫，提示裡沒有可照抄的內容（[提示](#prompts)）。
 
 <!-- gen:r97.chat.zh -->
 | 模型 | WHIRL precise | WHIRL balance | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance 對 ROCm | balance 對 Vulkan |
@@ -120,7 +160,7 @@ MoE decode：llama.cpp 一般解碼（出廠設定），WHIRL 用 MTP。
 | Ornith-1.5-35B-A3B MXFP4（MoE，約 3B 啟用） | 196.8 | **250.1** | 229.0 | 118.9 (一般) | 115.1 (一般) | +110% | +117% |
 <!-- /gen -->
 
-## 4. Radeon 8060S（最大功率：牆上插座端 80 W，筆電放在外接 8 吋風扇下，溫度接近 100 °C）
+## 4. Radeon 8060S（最大功率（80 W），ASUS ROG Flow Z13）
 
 WHIRL balance。¹ 只量一次，請當作「約」。² 不可靠（兩次分別 20.1 與 15.3 tok/s，相差 31%）。
 
@@ -137,7 +177,7 @@ WHIRL balance。¹ 只量一次，請當作「約」。² 不可靠（兩次分�
 <!-- /gen -->
 
 <!-- gen:s8.qwen.tg.zh -->
-#### Qwen3.8-27B UD-Q4_K_M（稠密）: Decode tok/s (256 tokens)
+#### Qwen3.8-27B UD-Q4_K_M（稠密）: Decode tok/s，文件問答（256 token 回答：說明文件中的一個函式並改寫）
 
 | 長度 | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL 對 ROCm | WHIRL 對 Vulkan |
 |---|---|---|---|---|---|
@@ -161,7 +201,7 @@ WHIRL balance。¹ 只量一次，請當作「約」。² 不可靠（兩次分�
 <!-- /gen -->
 
 <!-- gen:s8.ornith.tg.zh -->
-#### Ornith-1.5-35B-A3B MXFP4（MoE，約 3B 啟用）: Decode tok/s (256 tokens)
+#### Ornith-1.5-35B-A3B MXFP4（MoE，約 3B 啟用）: Decode tok/s，文件問答（256 token 回答：說明文件中的一個函式並改寫）
 
 | 長度 | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL 對 ROCm | WHIRL 對 Vulkan |
 |---|---|---|---|---|---|
@@ -174,7 +214,9 @@ WHIRL balance。¹ 只量一次，請當作「約」。² 不可靠（兩次分�
 
 稠密 decode：llama.cpp 用 MTP + n-gram，WHIRL 用 MTP。MoE decode：llama.cpp 一般解碼（出廠設定），WHIRL 用 MTP。
 
-### 4.1 中文提問寫程式對話（512 token）
+### 4.1 中文寫程式對話（512 token）
+
+與 §3.1 相同提示（對草稿是困難情況，沒有可照抄的內容）。
 
 WHIRL 用 v0.2.0-rc7 量測（rc8–rc10 只改了 8060S 的 prefill forward 大小；這項測試以解碼為主）。
 

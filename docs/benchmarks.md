@@ -6,7 +6,7 @@ WHIRL 0.2.0 against the **official ggml-org llama.cpp release b11214**, its **RO
 
 **Where WHIRL does not lead by much (read this first):**
 
-- **Dense decode on the Radeon 8060S after a short prompt**: +9% over llama.cpp ROCm and +6% over Vulkan at 2k tokens, within run-to-run noise. Dense decode there is memory-bound (about 256 GB/s for 15+ GB of weights); the lead grows with context (+24% to +48% from 32k on).
+- **Dense decode on the Radeon 8060S, document QA at 2k tokens**: +9% over llama.cpp ROCm and +6% over Vulkan at 2k tokens, within run-to-run noise. Dense decode there is memory-bound (about 256 GB/s for 15+ GB of weights); the lead grows with context (+24% to +48% from 32k on).
 - **MoE decode is compared as shipped, not like for like**: WHIRL uses its MTP drafts; llama.cpp decodes the MoE model without speculation, because its MTP was slower than plain decoding on this model (R9700: slower in 11 of 12 cells, 0.4 tok/s faster in one).
 - **precise costs speed**: on the R9700 it is 14–26% slower than balance in decode and 6–13% slower in prefill. **fast is not always faster than balance**: on the MoE model at short and medium context balance decodes faster.
 - **Plain decoding without speculation** is memory-bandwidth bound in every engine; most of WHIRL's decode lead comes from MTP + n-gram speculative decoding.
@@ -17,7 +17,7 @@ WHIRL 0.2.0 against the **official ggml-org llama.cpp release b11214**, its **RO
 |---|---|
 | Host | ASUS ROG Flow Z13 (GZ302EA): AMD Ryzen AI Max+ 395 (16 cores / 32 threads), 128 GB LPDDR5X-8000 of which 63.6 GB visible to Windows |
 | GPU 1 | AMD Radeon AI PRO R9700 (gfx1201, RDNA 4, 32 GB GDDR6), **connected as a USB4 eGPU** to the host above |
-| GPU 2 | AMD Radeon 8060S (gfx1151, RDNA 3.5), the host's integrated GPU. **Max power: 80 W at the wall, laptop under an external 8-inch fan, temperatures near 100 °C** (no power, thermal or driver setting was changed) |
+| GPU 2 | AMD Radeon 8060S (gfx1151, RDNA 3.5), the host's integrated GPU. **max power (80 W), ASUS ROG Flow Z13** (no power, thermal or driver setting was changed) |
 | OS / GPU driver | Windows 11 Home 26H2; AMD Software: Adrenalin Edition 26.8.1 (driver 32.0.31041.1004) |
 | WHIRL | R9700: v0.2.0 release candidate rc9 (branch `rel020` `bc78613`; rc10 is identical on the R9700, it changed only the 8060S prefill forward size). 8060S: release candidate rc10 (`bd81154`); the 8060S Chinese-chat and agent-session rows: rc7 (see §5). [TBD: SHA-256 of the final 0.2.0 `whirl.exe` / `whirl-server.exe`, and confirmation that the release is built from `bd81154`] |
 | llama.cpp | official b11214 Windows binaries, ROCm build and Vulkan build |
@@ -43,7 +43,45 @@ Swift-1.5 27B MXFP4 was not re-measured for 0.2.0; its 0.1.3 numbers are in the 
 - **llama.cpp decode mode**: dense = the faster of plain and MTP + n-gram within each backend (named per cell; MTP + n-gram won every dense cell); MoE = plain decoding (as shipped). llama.cpp prefill = the faster of its two runs per backend.
 - **WHIRL**: `whirl-server MODEL --balance|--precise|--fast -np 1 --ctx-per-slot 163840 --kv-ssd-mode off`; MTP (+ n-gram) on, as by default.
 
-### llama.cpp flags
+### <a id="prompts"></a>2.1 Exact prompts and how to reproduce
+
+Speculative decoding is fastest when the reply is predictable (copying or reciting text). So here is exactly what each decode number replied to.
+
+**Document QA** (the 2k–128k prefill and decode tables). The prompt is: a first line `【測試編號 <nonce>】` that is unique per request (so nothing hits a prefix cache), then a document built from permissively licensed real sources (C++, Python, Rust and TypeScript source files, Chinese technical documents, Chinese Wikipedia, English technical documents; each part headed `### 檔案 N：project/path（license）`, no repeated 4096-token windows), cut at a whole line to the target length, then `---` and this question, the same at every length (verbatim):
+
+> 請根據上面第 1 個檔案（llama.cpp/src/models/muse-glimmer.cpp）中的函式 `graph`，用繁體中文說明它的用途、參數與回傳值，指出一個可能出錯的邊界情況，並寫出修改後能正確處理該情況的完整函式程式碼。
+
+File 1 is at the start of every prompt, so the 256-token answer explains a function the prompt contains and rewrites it: part of it can copy code from the prompt, which helps the drafts of every engine that uses them (WHIRL MTP + n-gram, llama.cpp MTP + n-gram on the dense model).
+
+**Chinese coding chat** (512 tokens; one request after a 64-token warm-up), verbatim:
+
+```text
+請用 Python 寫一個命令列工具 `dedup.py`：掃描指定目錄（可遞迴）中的所有檔案，用檔案大小先分組、再用 SHA-256 找出內容完全相同的檔案，最後輸出每一組重複檔案的路徑與大小，並統計可以省下多少空間。要求：
+1. 用 argparse，支援 `--min-size`（忽略太小的檔案）與 `--json`（改用 JSON 輸出）。
+2. 大檔案要分塊讀取，不能一次讀進記憶體。
+3. 遇到沒有權限或讀取失敗的檔案要略過並在最後列出。
+4. 附上 pytest 測試，至少涵蓋：空目錄、兩個相同檔案、大小相同但內容不同。
+請先簡短說明設計，再給完整程式碼。
+```
+
+This is a hard case for speculative drafts: the Chinese question, the Chinese explanation and the English code are all newly written, and the prompt holds nothing for the reply to copy beyond a few option names (draft-based decoding is fastest when replies are predictable, such as copying or reciting known text; this row has none of that).
+
+**Coding-agent session** (§5): a 16k-token skills / MCP system prompt, the `read_file` tool returning a 3.6k-token C++ source file from llama.cpp, then four user turns (explain the file; find its most complex function; rewrite that function as code; review an edited copy of the file sent in the message), each call resending the full history, at most 384 tokens per call.
+
+[TBD: publish the prompt files (the document corpus with its per-file sources and licenses, the prompt builder, the agent-session fixture) in the repository or as a release asset, and link them here; owner decision, because the corpus contains third-party text under its own licenses.]
+
+**Request and reproduction** (both servers, started as in §6; PowerShell):
+
+```powershell
+$prompt = Get-Content -Raw -Encoding UTF8 .\prompt.txt      # document QA prompt (or the chat prompt)
+$body = @{ model = 'whirl'; messages = @(@{ role = 'user'; content = $prompt }); max_tokens = 256; temperature = 0;   # chat: 512
+           chat_template_kwargs = @{ enable_thinking = $false } } | ConvertTo-Json -Depth 6
+$r = Invoke-RestMethod http://127.0.0.1:8099/v1/chat/completions -Method Post `
+       -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
+$r.timings.prompt_per_second, $r.timings.predicted_per_second   # prefill tok/s, decode tok/s (same field names in both servers)
+```
+
+### 2.2 llama.cpp flags
 
 | | R9700 | Radeon 8060S |
 |---|---|---|
@@ -71,7 +109,7 @@ All three WHIRL modes; leads are for balance (the default). Single run per cell;
 <!-- /gen -->
 
 <!-- gen:r97.qwen.tg.en -->
-#### Qwen3.8-27B UD-Q4_K_M (dense): Decode tok/s (256 tokens after the prompt)
+#### Qwen3.8-27B UD-Q4_K_M (dense): Decode tok/s, document QA (256-token answer: explain a function from the document and rewrite it)
 
 | Prompt | WHIRL balance | WHIRL precise | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance vs ROCm | balance vs Vulkan |
 |---|---|---|---|---|---|---|---|
@@ -97,7 +135,7 @@ All three WHIRL modes; leads are for balance (the default). Single run per cell;
 <!-- /gen -->
 
 <!-- gen:r97.ornith.tg.en -->
-#### Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active): Decode tok/s (256 tokens after the prompt)
+#### Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active): Decode tok/s, document QA (256-token answer: explain a function from the document and rewrite it)
 
 | Prompt | WHIRL balance | WHIRL precise | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance vs ROCm | balance vs Vulkan |
 |---|---|---|---|---|---|---|---|
@@ -111,7 +149,9 @@ All three WHIRL modes; leads are for balance (the default). Single run per cell;
 
 MoE decode: llama.cpp plain (as shipped), WHIRL MTP.
 
-### 3.1 Chinese-question coding chat (512 tokens)
+### 3.1 Chinese coding chat (512 tokens)
+
+A hard case for drafts: all newly written, nothing in the prompt to copy ([prompt](#prompts)).
 
 <!-- gen:r97.chat.en -->
 | Model | WHIRL precise | WHIRL balance | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance vs ROCm | balance vs Vulkan |
@@ -120,7 +160,7 @@ MoE decode: llama.cpp plain (as shipped), WHIRL MTP.
 | Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active) | 196.8 | **250.1** | 229.0 | 118.9 (plain) | 115.1 (plain) | +110% | +117% |
 <!-- /gen -->
 
-## 4. Radeon 8060S (max power: 80 W at the wall, laptop under an external 8-inch fan, temperatures near 100 °C)
+## 4. Radeon 8060S (max power (80 W), ASUS ROG Flow Z13)
 
 WHIRL balance. ¹ single run, read as "about". ² unreliable (two runs, 20.1 and 15.3 tok/s, 31% apart).
 
@@ -137,7 +177,7 @@ WHIRL balance. ¹ single run, read as "about". ² unreliable (two runs, 20.1 and
 <!-- /gen -->
 
 <!-- gen:s8.qwen.tg.en -->
-#### Qwen3.8-27B UD-Q4_K_M (dense): Decode tok/s (256 tokens)
+#### Qwen3.8-27B UD-Q4_K_M (dense): Decode tok/s, document QA (256-token answer: explain a function from the document and rewrite it)
 
 | Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
 |---|---|---|---|---|---|
@@ -161,7 +201,7 @@ WHIRL balance. ¹ single run, read as "about". ² unreliable (two runs, 20.1 and
 <!-- /gen -->
 
 <!-- gen:s8.ornith.tg.en -->
-#### Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active): Decode tok/s (256 tokens)
+#### Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active): Decode tok/s, document QA (256-token answer: explain a function from the document and rewrite it)
 
 | Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
 |---|---|---|---|---|---|
@@ -174,7 +214,9 @@ WHIRL balance. ¹ single run, read as "about". ² unreliable (two runs, 20.1 and
 
 Dense decode: llama.cpp MTP + n-gram, WHIRL MTP. MoE decode: llama.cpp plain (as shipped), WHIRL MTP.
 
-### 4.1 Chinese-question coding chat (512 tokens)
+### 4.1 Chinese coding chat (512 tokens)
+
+Same prompt as §3.1 (a hard case for drafts, nothing to copy).
 
 WHIRL measured with v0.2.0-rc7 (rc8–rc10 changed only the 8060S prefill forward size; this test is decode-bound).
 

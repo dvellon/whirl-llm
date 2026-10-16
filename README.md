@@ -18,13 +18,13 @@ WHIRL 0.2.0 in its default mode (balance) against the official llama.cpp release
 | Prefill, 2k prompt | **1,782** | 1,140 (WHIRL +56%) | 804.4 (WHIRL +122%) | **8,624** | 4,014 (WHIRL +115%) | 3,551 (WHIRL +143%) |
 | Prefill, 32k prompt | **1,719** | 1,089 (WHIRL +58%) | 761.2 (WHIRL +126%) | **6,651** | 3,872 (WHIRL +72%) | 3,395 (WHIRL +96%) |
 | Prefill, 128k prompt | **1,233** | 759.2 (WHIRL +62%) | 553.9 (WHIRL +123%) | **3,758** | 2,307 (WHIRL +63%) | 1,922 (WHIRL +95%) |
-| Decode after a 2k prompt | **82.1** | 46.8 (WHIRL +75%) | 49.8 (WHIRL +65%) | **241.9** | 115.4 (WHIRL +110%) | 115.9 (WHIRL +109%) |
-| Decode after a 32k prompt | **75.8** | 40.7 (WHIRL +86%) | 42.7 (WHIRL +78%) | **203.2** | 101.4 (WHIRL +100%) | 100.6 (WHIRL +102%) |
-| Decode after a 128k prompt | **48.8** | 27.6 (WHIRL +77%) | 33.9 (WHIRL +44%) | **141.0** | 75.3 (WHIRL +87%) | 73.8 (WHIRL +91%) |
-| Decode, Chinese-question coding chat | **103.1** | 61.4 (WHIRL +68%) | 61.2 (WHIRL +68%) | **250.1** | 118.9 (WHIRL +110%) | 115.1 (WHIRL +117%) |
+| Decode, QA about a 2k-token document | **82.1** | 46.8 (WHIRL +75%) | 49.8 (WHIRL +65%) | **241.9** | 115.4 (WHIRL +110%) | 115.9 (WHIRL +109%) |
+| Decode, QA about a 32k-token document | **75.8** | 40.7 (WHIRL +86%) | 42.7 (WHIRL +78%) | **203.2** | 101.4 (WHIRL +100%) | 100.6 (WHIRL +102%) |
+| Decode, QA about a 128k-token document | **48.8** | 27.6 (WHIRL +77%) | 33.9 (WHIRL +44%) | **141.0** | 75.3 (WHIRL +87%) | 73.8 (WHIRL +91%) |
+| Decode, Chinese coding chat (all new writing) | **103.1** | 61.4 (WHIRL +68%) | 61.2 (WHIRL +68%) | **250.1** | 118.9 (WHIRL +110%) | 115.1 (WHIRL +117%) |
 <!-- /gen -->
 
-**Radeon 8060S** (gfx1151, Ryzen AI Max+ 395). **Max power: 80 W at the wall, laptop under an external 8-inch fan, temperatures near 100 °C.** Same models.
+**Radeon 8060S** (gfx1151, Ryzen AI Max+ 395). **Max power (80 W), ASUS ROG Flow Z13.** Same models.
 
 <!-- gen:glance.s8.en -->
 | tok/s, higher is better | Dense 27B: WHIRL | llama.cpp ROCm | llama.cpp Vulkan | MoE 35B-A3B: WHIRL | llama.cpp ROCm | llama.cpp Vulkan |
@@ -32,15 +32,17 @@ WHIRL 0.2.0 in its default mode (balance) against the official llama.cpp release
 | Prefill, 2k prompt | **472.9** | 302.2 (WHIRL +56%) | 149.6 (WHIRL +216%) | **2,355** | 1,262 (WHIRL +87%) | 447.7¹ (WHIRL +426%) |
 | Prefill, 32k prompt | **396.4** | 259.1 (WHIRL +53%) | 201.9 (WHIRL +96%) | **1,794** | 1,049¹ (WHIRL +71%) | 756.2¹ (WHIRL +137%) |
 | Prefill, 128k prompt | **288.4** | 176.7¹ (WHIRL +63%) | 118.4¹ (WHIRL +144%) | **1,056** | 636.6¹ (WHIRL +66%) | 428.4¹ (WHIRL +146%) |
-| Decode after a 2k prompt | **27.0** | 24.7 (WHIRL +9%) | 25.5 (WHIRL +6%) | **101.8** | 70.2 (WHIRL +45%) | 70.7¹ (WHIRL +44%) |
-| Decode after a 32k prompt | **25.0** | 18.9 (WHIRL +32%) | 20.2 (WHIRL +24%) | **84.2** | 57.9¹ (WHIRL +46%) | 57.1¹ (WHIRL +48%) |
-| Decode after a 128k prompt | **20.2** | 13.7¹ (WHIRL +48%) | 14.1¹ (WHIRL +44%) | **55.5** | 38.0¹ (WHIRL +46%) | 37.3¹ (WHIRL +49%) |
-| Decode, Chinese-question coding chat | **33.3** | 25.9 (WHIRL +29%) | 27.9 (WHIRL +20%) | **106.3** | 70.6¹ (WHIRL +51%) | 72.9¹ (WHIRL +46%) |
+| Decode, QA about a 2k-token document | **27.0** | 24.7 (WHIRL +9%) | 25.5 (WHIRL +6%) | **101.8** | 70.2 (WHIRL +45%) | 70.7¹ (WHIRL +44%) |
+| Decode, QA about a 32k-token document | **25.0** | 18.9 (WHIRL +32%) | 20.2 (WHIRL +24%) | **84.2** | 57.9¹ (WHIRL +46%) | 57.1¹ (WHIRL +48%) |
+| Decode, QA about a 128k-token document | **20.2** | 13.7¹ (WHIRL +48%) | 14.1¹ (WHIRL +44%) | **55.5** | 38.0¹ (WHIRL +46%) | 37.3¹ (WHIRL +49%) |
+| Decode, Chinese coding chat (all new writing) | **33.3** | 25.9 (WHIRL +29%) | 27.9 (WHIRL +20%) | **106.3** | 70.6¹ (WHIRL +51%) | 72.9¹ (WHIRL +46%) |
 <!-- /gen -->
 
 ¹ single run (n = 1); read it as "about". Every other 8060S cell is the median of 2 or 3 runs; every R9700 length cell is a single run, measured the same day for all three engines.
 
 How llama.cpp decodes in these tables: on the dense model with its fastest speculative mode (MTP + n-gram, `--spec-type draft-mtp,ngram-mod`; the faster of that and plain decoding is shown per backend). On the MoE model llama.cpp decodes **without** speculation, because its MTP was slower than plain decoding on this model in our measurements, while WHIRL uses its MTP drafts. The MoE decode rows therefore compare both engines **as shipped**, not like for like. Full tables, with WHIRL's precise and fast modes, are under [Performance](#performance).
+
+What the decode rows measure: every length uses the same question about the document (explain one function quoted near the start of the document and write a corrected version of it, 256 tokens), so part of the reply can copy code from the prompt, which helps speculative drafts in every engine that uses them. Exact prompts and commands: [benchmarks.md](docs/benchmarks.md#prompts). The coding-chat row is the opposite, a hard case: everything in the reply is newly written.
 
 **A real coding-agent session on the Radeon 8060S** (max power as above): a 16k-token skills / MCP system prompt, a tool call that reads a 3.6k-token source file, four user turns (explain the file, find the most complex function, rewrite it, review an edited version), full history resent on every call, dense Qwen3.8-27B Q4_K_M:
 
@@ -151,7 +153,7 @@ All three WHIRL modes are shown; the leads are for balance, the default. Every c
 <!-- /gen -->
 
 <!-- gen:r97.qwen.tg.en -->
-#### Qwen3.8-27B UD-Q4_K_M (dense): Decode tok/s (256 tokens after the prompt)
+#### Qwen3.8-27B UD-Q4_K_M (dense): Decode tok/s, document QA (256-token answer: explain a function from the document and rewrite it)
 
 | Prompt | WHIRL balance | WHIRL precise | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance vs ROCm | balance vs Vulkan |
 |---|---|---|---|---|---|---|---|
@@ -177,7 +179,7 @@ All three WHIRL modes are shown; the leads are for balance, the default. Every c
 <!-- /gen -->
 
 <!-- gen:r97.ornith.tg.en -->
-#### Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active): Decode tok/s (256 tokens after the prompt)
+#### Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active): Decode tok/s, document QA (256-token answer: explain a function from the document and rewrite it)
 
 | Prompt | WHIRL balance | WHIRL precise | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance vs ROCm | balance vs Vulkan |
 |---|---|---|---|---|---|---|---|
@@ -191,7 +193,7 @@ All three WHIRL modes are shown; the leads are for balance, the default. Every c
 
 MoE decode: llama.cpp plain decoding (as shipped; its MTP was slower than plain in 11 of 12 MoE cells and 0.4 tok/s faster in the twelfth), WHIRL MTP.
 
-**Chinese-question coding chat** (Chinese question, Chinese explanation, English code; 512 tokens; WHIRL median of 3 runs, llama.cpp first run, because its n-gram drafts learn a repeated prompt):
+**Chinese coding chat** (512 tokens; WHIRL median of 3 runs, llama.cpp first run, because its n-gram drafts learn a repeated prompt). This row is a hard case for speculative drafts: the Chinese question, the Chinese explanation and the English code are all newly written, and the prompt holds nothing for the reply to copy beyond a few option names (draft-based decoding is fastest when replies are predictable, such as copying or reciting known text; this row has none of that).
 
 <!-- gen:r97.chat.en -->
 | Model | WHIRL precise | WHIRL balance | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance vs ROCm | balance vs Vulkan |
@@ -202,7 +204,7 @@ MoE decode: llama.cpp plain decoding (as shipped; its MTP was slower than plain 
 
 ### <a id="radeon-8060s"></a>Radeon 8060S
 
-**Max power: 80 W at the wall, laptop under an external 8-inch fan, temperatures near 100 °C.** WHIRL balance; median of 2–3 runs per cell unless marked. ASUS ROG Flow Z13 (Ryzen AI Max+ 395, 128 GB, 63.6 GB visible to Windows).
+**Max power (80 W), ASUS ROG Flow Z13** (Ryzen AI Max+ 395, 128 GB, 63.6 GB visible to Windows). WHIRL balance; median of 2–3 runs per cell unless marked.
 
 <!-- gen:s8.qwen.pp.en -->
 #### Qwen3.8-27B UD-Q4_K_M (dense): Prefill tok/s
@@ -217,7 +219,7 @@ MoE decode: llama.cpp plain decoding (as shipped; its MTP was slower than plain 
 <!-- /gen -->
 
 <!-- gen:s8.qwen.tg.en -->
-#### Qwen3.8-27B UD-Q4_K_M (dense): Decode tok/s (256 tokens)
+#### Qwen3.8-27B UD-Q4_K_M (dense): Decode tok/s, document QA (256-token answer: explain a function from the document and rewrite it)
 
 | Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
 |---|---|---|---|---|---|
@@ -241,7 +243,7 @@ MoE decode: llama.cpp plain decoding (as shipped; its MTP was slower than plain 
 <!-- /gen -->
 
 <!-- gen:s8.ornith.tg.en -->
-#### Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active): Decode tok/s (256 tokens)
+#### Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active): Decode tok/s, document QA (256-token answer: explain a function from the document and rewrite it)
 
 | Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
 |---|---|---|---|---|---|
@@ -254,7 +256,7 @@ MoE decode: llama.cpp plain decoding (as shipped; its MTP was slower than plain 
 
 ¹ single run; read it as "about". ² unreliable: two runs that differ by 31% (20.1 and 15.3 tok/s; llama.cpp's MTP + n-gram acceptance varied), so this lead is not quoted anywhere else. Dense decode: llama.cpp MTP + n-gram, WHIRL MTP. MoE decode: llama.cpp plain (as shipped), WHIRL MTP.
 
-**Chinese-question coding chat on the 8060S** (same prompt as on the R9700; WHIRL measured with the v0.2.0-rc7 pre-release build, whose decode path is unchanged in 0.2.0):
+**Chinese coding chat on the 8060S** (same prompt as on the R9700, the hard case described above; WHIRL measured with the v0.2.0-rc7 pre-release build, whose decode path is unchanged in 0.2.0):
 
 <!-- gen:s8.chat.en -->
 | Model | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
@@ -265,7 +267,7 @@ MoE decode: llama.cpp plain decoding (as shipped; its MTP was slower than plain 
 
 ### Where WHIRL does not lead by much
 
-- **Dense decode on the 8060S after a short prompt**: +9% over llama.cpp ROCm and +6% over Vulkan at 2k, within run-to-run noise. Dense decode on the 8060S is memory-bound (about 256 GB/s for 15+ GB of weights), so the lead comes from speculative decoding and grows with context (+24% to +48% from 32k on).
+- **Dense decode on the 8060S, document QA at 2k tokens**: +9% over llama.cpp ROCm and +6% over Vulkan at 2k, within run-to-run noise. Dense decode on the 8060S is memory-bound (about 256 GB/s for 15+ GB of weights), so the lead comes from speculative decoding and grows with context (+24% to +48% from 32k on).
 - **Plain decoding without speculation** is memory-bandwidth bound in every engine; most of WHIRL's decode lead comes from MTP + n-gram speculative decoding.
 - **fast is not always faster than balance**: on the MoE model at short and medium context (R9700), balance decodes faster than fast; fast helps mostly in prefill and in dense decode.
 - **precise costs speed**: 14–26% of decode and 6–13% of prefill against balance on the R9700 (tables above).

@@ -18,13 +18,13 @@ WHIRL 0.2.0 預設模式（balance）對 ggml-org 官方 llama.cpp **b11214**，
 | Prefill，2k prompt | **1,782** | 1,140 (WHIRL +56%) | 804.4 (WHIRL +122%) | **8,624** | 4,014 (WHIRL +115%) | 3,551 (WHIRL +143%) |
 | Prefill，32k prompt | **1,719** | 1,089 (WHIRL +58%) | 761.2 (WHIRL +126%) | **6,651** | 3,872 (WHIRL +72%) | 3,395 (WHIRL +96%) |
 | Prefill，128k prompt | **1,233** | 759.2 (WHIRL +62%) | 553.9 (WHIRL +123%) | **3,758** | 2,307 (WHIRL +63%) | 1,922 (WHIRL +95%) |
-| Decode，2k prompt 之後 | **82.1** | 46.8 (WHIRL +75%) | 49.8 (WHIRL +65%) | **241.9** | 115.4 (WHIRL +110%) | 115.9 (WHIRL +109%) |
-| Decode，32k prompt 之後 | **75.8** | 40.7 (WHIRL +86%) | 42.7 (WHIRL +78%) | **203.2** | 101.4 (WHIRL +100%) | 100.6 (WHIRL +102%) |
-| Decode，128k prompt 之後 | **48.8** | 27.6 (WHIRL +77%) | 33.9 (WHIRL +44%) | **141.0** | 75.3 (WHIRL +87%) | 73.8 (WHIRL +91%) |
-| Decode，中文提問寫程式對話 | **103.1** | 61.4 (WHIRL +68%) | 61.2 (WHIRL +68%) | **250.1** | 118.9 (WHIRL +110%) | 115.1 (WHIRL +117%) |
+| Decode，2k token 文件問答 | **82.1** | 46.8 (WHIRL +75%) | 49.8 (WHIRL +65%) | **241.9** | 115.4 (WHIRL +110%) | 115.9 (WHIRL +109%) |
+| Decode，32k token 文件問答 | **75.8** | 40.7 (WHIRL +86%) | 42.7 (WHIRL +78%) | **203.2** | 101.4 (WHIRL +100%) | 100.6 (WHIRL +102%) |
+| Decode，128k token 文件問答 | **48.8** | 27.6 (WHIRL +77%) | 33.9 (WHIRL +44%) | **141.0** | 75.3 (WHIRL +87%) | 73.8 (WHIRL +91%) |
+| Decode，中文寫程式對話（全新撰寫） | **103.1** | 61.4 (WHIRL +68%) | 61.2 (WHIRL +68%) | **250.1** | 118.9 (WHIRL +110%) | 115.1 (WHIRL +117%) |
 <!-- /gen -->
 
-**Radeon 8060S**（gfx1151，Ryzen AI Max+ 395）。**最大功率：牆上插座端 80 W，筆電放在外接 8 吋風扇下，溫度接近 100 °C。** 模型相同。
+**Radeon 8060S**（gfx1151，Ryzen AI Max+ 395）。**最大功率（80 W），ASUS ROG Flow Z13。** 模型相同。
 
 <!-- gen:glance.s8.zh -->
 | tok/s，越高越好 | 稠密 27B：WHIRL | llama.cpp ROCm | llama.cpp Vulkan | MoE 35B-A3B：WHIRL | llama.cpp ROCm | llama.cpp Vulkan |
@@ -32,15 +32,17 @@ WHIRL 0.2.0 預設模式（balance）對 ggml-org 官方 llama.cpp **b11214**，
 | Prefill，2k prompt | **472.9** | 302.2 (WHIRL +56%) | 149.6 (WHIRL +216%) | **2,355** | 1,262 (WHIRL +87%) | 447.7¹ (WHIRL +426%) |
 | Prefill，32k prompt | **396.4** | 259.1 (WHIRL +53%) | 201.9 (WHIRL +96%) | **1,794** | 1,049¹ (WHIRL +71%) | 756.2¹ (WHIRL +137%) |
 | Prefill，128k prompt | **288.4** | 176.7¹ (WHIRL +63%) | 118.4¹ (WHIRL +144%) | **1,056** | 636.6¹ (WHIRL +66%) | 428.4¹ (WHIRL +146%) |
-| Decode，2k prompt 之後 | **27.0** | 24.7 (WHIRL +9%) | 25.5 (WHIRL +6%) | **101.8** | 70.2 (WHIRL +45%) | 70.7¹ (WHIRL +44%) |
-| Decode，32k prompt 之後 | **25.0** | 18.9 (WHIRL +32%) | 20.2 (WHIRL +24%) | **84.2** | 57.9¹ (WHIRL +46%) | 57.1¹ (WHIRL +48%) |
-| Decode，128k prompt 之後 | **20.2** | 13.7¹ (WHIRL +48%) | 14.1¹ (WHIRL +44%) | **55.5** | 38.0¹ (WHIRL +46%) | 37.3¹ (WHIRL +49%) |
-| Decode，中文提問寫程式對話 | **33.3** | 25.9 (WHIRL +29%) | 27.9 (WHIRL +20%) | **106.3** | 70.6¹ (WHIRL +51%) | 72.9¹ (WHIRL +46%) |
+| Decode，2k token 文件問答 | **27.0** | 24.7 (WHIRL +9%) | 25.5 (WHIRL +6%) | **101.8** | 70.2 (WHIRL +45%) | 70.7¹ (WHIRL +44%) |
+| Decode，32k token 文件問答 | **25.0** | 18.9 (WHIRL +32%) | 20.2 (WHIRL +24%) | **84.2** | 57.9¹ (WHIRL +46%) | 57.1¹ (WHIRL +48%) |
+| Decode，128k token 文件問答 | **20.2** | 13.7¹ (WHIRL +48%) | 14.1¹ (WHIRL +44%) | **55.5** | 38.0¹ (WHIRL +46%) | 37.3¹ (WHIRL +49%) |
+| Decode，中文寫程式對話（全新撰寫） | **33.3** | 25.9 (WHIRL +29%) | 27.9 (WHIRL +20%) | **106.3** | 70.6¹ (WHIRL +51%) | 72.9¹ (WHIRL +46%) |
 <!-- /gen -->
 
 ¹ 只量一次（n = 1），請當作「約」。8060S 其餘每格都是 2 或 3 次的中位數；R9700 每個長度格都是單次量測，三個引擎同一天量完。
 
 表中 llama.cpp 的解碼方式：稠密模型用它最快的投機解碼（MTP + n-gram，`--spec-type draft-mtp,ngram-mod`；每個後端取它和一般解碼較快者）。MoE 模型上 llama.cpp **不用**投機解碼，因為我們量到它的 MTP 在這個模型上比一般解碼慢；WHIRL 則用自己的 MTP 草稿。所以 MoE 的 decode 列是兩邊**各自的出廠設定**對比，不是同條件對比。含 WHIRL precise 與 fast 模式的完整表格在[效能](#效能)。
+
+decode 列量的是什麼：每個長度都問同一個關於文件的問題（說明文件開頭附近的一個函式，並寫出修正後的版本，256 token），所以回答有一部分可以照抄提示中的程式碼，這對所有使用投機草稿的引擎都有幫助。實際提示與指令：[benchmarks.md](guide/zh-TW/benchmarks.md#prompts)。寫程式對話那一列正好相反，是困難情況：回答全部是全新撰寫。
 
 **8060S 上一段真實的 coding agent 工作階段**（最大功率同上）：16k token 的 skills／MCP 系統提示、一次讀取 3.6k token 原始檔的工具呼叫、四輪使用者提問（說明檔案、找出最複雜的函式、改寫它、審閱修改後的版本），每次呼叫都重送完整歷史，稠密 Qwen3.8-27B Q4_K_M：
 
@@ -151,7 +153,7 @@ WHIRL 0.2.0 對 ggml-org 官方 llama.cpp b11214 Windows 執行檔，ROCm 與 Vu
 <!-- /gen -->
 
 <!-- gen:r97.qwen.tg.zh -->
-#### Qwen3.8-27B UD-Q4_K_M（稠密）: Decode tok/s（prompt 之後生成 256 token）
+#### Qwen3.8-27B UD-Q4_K_M（稠密）: Decode tok/s，文件問答（256 token 回答：說明文件中的一個函式並改寫）
 
 | 長度 | WHIRL balance | WHIRL precise | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance 對 ROCm | balance 對 Vulkan |
 |---|---|---|---|---|---|---|---|
@@ -177,7 +179,7 @@ WHIRL 0.2.0 對 ggml-org 官方 llama.cpp b11214 Windows 執行檔，ROCm 與 Vu
 <!-- /gen -->
 
 <!-- gen:r97.ornith.tg.zh -->
-#### Ornith-1.5-35B-A3B MXFP4（MoE，約 3B 啟用）: Decode tok/s（prompt 之後生成 256 token）
+#### Ornith-1.5-35B-A3B MXFP4（MoE，約 3B 啟用）: Decode tok/s，文件問答（256 token 回答：說明文件中的一個函式並改寫）
 
 | 長度 | WHIRL balance | WHIRL precise | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance 對 ROCm | balance 對 Vulkan |
 |---|---|---|---|---|---|---|---|
@@ -191,7 +193,7 @@ WHIRL 0.2.0 對 ggml-org 官方 llama.cpp b11214 Windows 執行檔，ROCm 與 Vu
 
 MoE decode：llama.cpp 用一般解碼（出廠設定；它的 MTP 在 12 個 MoE 格子中有 11 格比一般解碼慢，第 12 格快 0.4 tok/s），WHIRL 用 MTP。
 
-**中文提問寫程式對話**（中文提問、中文說明、英文程式碼；512 token；WHIRL 取 3 次中位數，llama.cpp 取第 1 次，因為它的 n-gram 草稿會學會重複的提示）：
+**中文寫程式對話**（512 token；WHIRL 取 3 次中位數，llama.cpp 取第 1 次，因為它的 n-gram 草稿會學會重複的提示）。這一列對投機草稿是困難情況：中文提問、中文說明與英文程式碼都是全新撰寫，提示裡除了幾個選項名稱之外沒有可讓回答照抄的內容（投機解碼在回答可預測時最快，例如照抄或背誦已知文字；這一列沒有這種情況）。
 
 <!-- gen:r97.chat.zh -->
 | 模型 | WHIRL precise | WHIRL balance | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance 對 ROCm | balance 對 Vulkan |
@@ -202,7 +204,7 @@ MoE decode：llama.cpp 用一般解碼（出廠設定；它的 MTP 在 12 個 Mo
 
 ### <a id="radeon-8060s"></a>Radeon 8060S
 
-**最大功率：牆上插座端 80 W，筆電放在外接 8 吋風扇下，溫度接近 100 °C。** WHIRL balance；除非標註，每格是 2–3 次的中位數。ASUS ROG Flow Z13（Ryzen AI Max+ 395，128 GB，Windows 看得到 63.6 GB）。
+**最大功率（80 W），ASUS ROG Flow Z13**（Ryzen AI Max+ 395，128 GB，Windows 看得到 63.6 GB）。WHIRL balance；除非標註，每格是 2–3 次的中位數。
 
 <!-- gen:s8.qwen.pp.zh -->
 #### Qwen3.8-27B UD-Q4_K_M（稠密）: Prefill tok/s
@@ -217,7 +219,7 @@ MoE decode：llama.cpp 用一般解碼（出廠設定；它的 MTP 在 12 個 Mo
 <!-- /gen -->
 
 <!-- gen:s8.qwen.tg.zh -->
-#### Qwen3.8-27B UD-Q4_K_M（稠密）: Decode tok/s (256 tokens)
+#### Qwen3.8-27B UD-Q4_K_M（稠密）: Decode tok/s，文件問答（256 token 回答：說明文件中的一個函式並改寫）
 
 | 長度 | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL 對 ROCm | WHIRL 對 Vulkan |
 |---|---|---|---|---|---|
@@ -241,7 +243,7 @@ MoE decode：llama.cpp 用一般解碼（出廠設定；它的 MTP 在 12 個 Mo
 <!-- /gen -->
 
 <!-- gen:s8.ornith.tg.zh -->
-#### Ornith-1.5-35B-A3B MXFP4（MoE，約 3B 啟用）: Decode tok/s (256 tokens)
+#### Ornith-1.5-35B-A3B MXFP4（MoE，約 3B 啟用）: Decode tok/s，文件問答（256 token 回答：說明文件中的一個函式並改寫）
 
 | 長度 | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL 對 ROCm | WHIRL 對 Vulkan |
 |---|---|---|---|---|---|
@@ -254,7 +256,7 @@ MoE decode：llama.cpp 用一般解碼（出廠設定；它的 MTP 在 12 個 Mo
 
 ¹ 只量一次，請當作「約」。² 不可靠：兩次量測相差 31%（20.1 與 15.3 tok/s；llama.cpp 的 MTP + n-gram 接受率不穩），因此這一格的領先幅度不在其他地方引用。稠密 decode：llama.cpp 用 MTP + n-gram，WHIRL 用 MTP。MoE decode：llama.cpp 用一般解碼（出廠設定），WHIRL 用 MTP。
 
-**8060S 上的中文提問寫程式對話**（與 R9700 相同提示；WHIRL 用 v0.2.0-rc7 預發布版量測，其解碼路徑在 0.2.0 沒有改變）：
+**8060S 上的中文寫程式對話**（與 R9700 相同提示，即上述困難情況；WHIRL 用 v0.2.0-rc7 預發布版量測，其解碼路徑在 0.2.0 沒有改變）：
 
 <!-- gen:s8.chat.zh -->
 | 模型 | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL 對 ROCm | WHIRL 對 Vulkan |
@@ -265,7 +267,7 @@ MoE decode：llama.cpp 用一般解碼（出廠設定；它的 MTP 在 12 個 Mo
 
 ### WHIRL 領先不多的地方
 
-- **8060S 上短 prompt 後的稠密 decode**：2k 時對 llama.cpp ROCm 領先 9%、對 Vulkan 6%，在量測雜訊範圍內。8060S 的稠密 decode 受記憶體頻寬限制（約 256 GB/s，權重 15 GB 以上），領先來自投機解碼，並隨上下文變長而擴大（32k 起 +24% 到 +48%）。
+- **8060S 上稠密 decode，2k token 文件問答**：對 llama.cpp ROCm 領先 9%、對 Vulkan 6%，在量測雜訊範圍內。8060S 的稠密 decode 受記憶體頻寬限制（約 256 GB/s，權重 15 GB 以上），領先來自投機解碼，並隨上下文變長而擴大（32k 起 +24% 到 +48%）。
 - **不用投機的一般解碼**在每個引擎都受記憶體頻寬限制；WHIRL 大部分的 decode 領先來自 MTP + n-gram 投機解碼。
 - **fast 不一定比 balance 快**：R9700 上 MoE 模型在短、中等上下文時，balance 解碼比 fast 快；fast 主要幫助 prefill 與稠密 decode。
 - **precise 要付出速度**：R9700 上比 balance 慢 14–26%（decode）與 6–13%（prefill）（見上表）。
