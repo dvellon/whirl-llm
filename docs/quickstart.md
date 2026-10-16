@@ -76,7 +76,7 @@ WHIRL prints what happened and what to do, and exits with a code:
 | 2 | bad command line | `.\whirl.exe chat --help` |
 | 3 | GPU / driver problem | install Adrenalin 26.8.1 or newer; check `.\whirl.exe devices` |
 | 4 | model file problem | the file exists, is a GGUF, and its architecture is `qwen35` / `qwen35moe` |
-| 5 | out of GPU memory | a smaller `--ctx`, or `$env:WHIRL_KV = "q8v"` |
+| 5 | out of GPU memory | a smaller `--ctx` (server: also `--ctx-per-slot`, or fewer slots with `-np 1`); with `--precise` on a dense model, try the default mode (its KV cache is about half the size) |
 | 6 | server port in use | `--port 8081` |
 
 If Windows shows "Windows protected your PC", or the program is blocked, see

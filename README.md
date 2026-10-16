@@ -44,7 +44,7 @@ How llama.cpp decodes in these tables: on the dense model with its fastest specu
 
 What the decode rows measure: every length uses the same question about the document (explain one function quoted near the start of the document and write a corrected version of it, 256 tokens), so part of the reply can copy code from the prompt, which helps speculative drafts in every engine that uses them. Exact prompts and commands: [benchmarks.md](docs/benchmarks.md#prompts). The coding-chat row is the opposite, a hard case: everything in the reply is newly written.
 
-**A real coding-agent session on the Radeon 8060S** (max power as above): a 16k-token skills / MCP system prompt, a tool call that reads a 3.6k-token source file, four user turns (explain the file, find the most complex function, rewrite it, review an edited version), full history resent on every call, dense Qwen3.8-27B Q4_K_M:
+**A real coding-agent session on the Radeon 8060S** (max power (80 W), ASUS ROG Flow Z13): a 16k-token skills / MCP system prompt, a tool call that reads a 3.6k-token source file, four user turns (explain the file, find the most complex function, rewrite it, review an edited version), full history resent on every call, dense Qwen3.8-27B Q4_K_M:
 
 <!-- gen:s8.agent.en -->
 | Session | WHIRL | llama.cpp ROCm | llama.cpp Vulkan |
@@ -64,7 +64,7 @@ WHIRL finishes the cold session in 26% less time than llama.cpp ROCm and 58% les
 | second session (shares that prefix) | **13.1 s** | 25.9 s | 29.0 s |
 <!-- /gen -->
 
-On the R9700 WHIRL finishes the cold session in 45% less time than llama.cpp ROCm and 57% less than llama.cpp Vulkan. The code-rewrite turn decodes at about 121–145 tok/s on WHIRL; as on the 8060S it is mostly copied code (llama.cpp ROCm: 120.5 tok/s in the cold session, 183.7 in the second), so it is not a WHIRL lead.
+On the R9700 WHIRL finishes the cold session in 45% less time than llama.cpp ROCm and 57% less than llama.cpp Vulkan. The code-rewrite turn decodes at about 121–145 tok/s on WHIRL; as on the 8060S it is mostly copied code (llama.cpp ROCm: 120.5 tok/s in the cold session, 183.7 in the second), so it is not a WHIRL lead. In both tables the engines did not make the same number of tool calls (each writes its own text, so some re-read the file), and the second session reads and rewrites a different source file than the cold one; see [benchmarks.md §5](docs/benchmarks.md#agent-session).
 
 ## Speed without changing the answer
 
@@ -73,7 +73,7 @@ WHIRL 0.2.0 has three numerics modes. You pick one per process (`--precise`, `--
 | Mode | What it is | KV cache | Output guarantee |
 |---|---|---|---|
 | **precise** | bitwise lossless: nothing is quantized beyond the GGUF's own weights; f16 / f32 activations everywhere | f16 | the same bits with or without speculative drafts, alone or batched with other users, and from a prefix-cache hit or a restored session |
-| **balance** (default) | near-lossless: int8 decode activations (the same q8_1 scheme llama.cpp decodes with); on the R9700 also f16-WMMA DeltaNet prefill and, for MXFP4 dense files, fp8 prefill activations | dense: int8 (`q8h`); MoE: f16 | MTP / n-gram drafts, batching and cache restores give the same tokens as plain greedy decoding in balance mode. Against precise: KL about 1e-4 to 1e-3 on the dense models; on the MoE model about 1.9× the model's own noise floor |
+| **balance** (default) | near-lossless, default | dense: `q8h`; MoE: f16 | MTP / n-gram drafts, batching and cache restores give the same tokens as plain greedy decoding in balance mode |
 | **fast** (opt-in) | maximum speed within an accepted, gated loss: balance plus 4-bit KV and relaxed MTP acceptance (dense models) | 4-bit (`q4`) | lossy within published KL limits; the text can depend on the drafts and on other users |
 
 What this means in practice:
@@ -83,7 +83,7 @@ What this means in practice:
 - **precise** is the mode with the bitwise guarantee: bitwise lossless, output identical to plain greedy decoding. **balance** is near-lossless and the default. precise costs speed (R9700, Chinese coding chat, dense model: 77.8 vs 103.1 tok/s in balance).
 - **Weights** are whatever GGUF you choose; WHIRL computes with them as stored. Continuing a conversation reuses the state computed for the previous turn, which is numerically equivalent but not bit-identical to re-processing the whole history as one prompt ([kv-and-caching.md](docs/guide/en/kv-and-caching.md)).
 
-Every mode, item and measured KL: [usage.md, numerics modes](docs/usage.md#modes).
+Every mode in detail, with measurements: [usage.md, numerics modes](docs/usage.md#modes).
 
 ## Requirements
 
@@ -213,9 +213,9 @@ MoE decode: llama.cpp plain decoding (as shipped; its MTP was slower than plain 
 | Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active) | 196.8 | **250.1** | 229.0 | 118.9 (plain) | 115.1 (plain) | +110% | +117% |
 <!-- /gen -->
 
-### <a id="radeon-8060s"></a>Radeon 8060S
+### <a id="radeon-8060s"></a>Radeon 8060S, max power (80 W), ASUS ROG Flow Z13
 
-**Max power (80 W), ASUS ROG Flow Z13** (Ryzen AI Max+ 395, 128 GB, 63.6 GB visible to Windows). WHIRL balance; median of 2–3 runs per cell unless marked.
+Ryzen AI Max+ 395, 128 GB (63.6 GB visible to Windows). WHIRL balance; median of 2–3 runs per cell unless marked.
 
 <!-- gen:s8.qwen.pp.en -->
 #### Qwen3.8-27B UD-Q4_K_M (dense): Prefill tok/s
@@ -332,7 +332,7 @@ Our own MXFP4 quantization of the dense 27B (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ
 | 128k | **24.0** | 16.2 | 11.6 | +48% | +107% |
 <!-- /gen -->
 
-**Chinese coding chat** (512 tokens, the hard case for drafts: all newly written, nothing to copy):
+**Chinese coding chat** (512 tokens, the hard case for drafts: all newly written, nothing to copy; Radeon 8060S at max power (80 W), ASUS ROG Flow Z13):
 
 <!-- gen:swift.chat.en -->
 | GPU | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
@@ -350,7 +350,7 @@ Our own MXFP4 quantization of the dense 27B (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ
 
 ## What's new in 0.2.0
 
-- **Radeon 8060S (Ryzen AI Max+ 395) support**, tuned: faster than llama.cpp ROCm and Vulkan at every measured prompt length on both models (tables above). Image input works on the 8060S, and the RAM and SSD cache tiers are on by default there (on Windows the BIOS VRAM carve-out and the OS RAM are separate pools, so a 128k-token session restores in 0.34 s from RAM and 2 s from SSD instead of 537 s of prefill).
+- **Radeon 8060S (Ryzen AI Max+ 395) support**, tuned: faster than llama.cpp ROCm and Vulkan at every measured prompt length on both models (tables above). Image input works on the 8060S, and the RAM and SSD cache tiers are on by default there (on Windows the BIOS VRAM carve-out and the OS RAM are separate pools, so a 128k-token session restores in 0.34 s from RAM and 2 s from SSD instead of being prefilled again).
 - **Three numerics modes**: precise (bitwise lossless), balance (default, near-lossless), fast (opt-in, gated loss). See [above](#speed-without-changing-the-answer).
 - **DFlash2 drafts, opt-in** (`--draft dflash --draft-model Qwen3.8-27B-DFlash2-Q8_0.gguf`, drafter from Hugging Face `incoai/Qwen3.8-27B-DFlash2-GGUF`, not bundled): for one user with short or medium context and predictable output, +19% to +48% over MTP on the R9700; slower with 4 users (about −39%), after 37k+ tokens of context and on mostly-Chinese output (about −10%); costs about 1.9 GiB of VRAM. Greedy output equals plain greedy decoding of the same mode.
 - **SSD cache writes far less**: by default it writes only reused sessions, when the server stops (or after about 5 minutes idle, or when RAM must evict them); a one-shot prompt is never written. The cache never exceeds `--kv-ssd-gb` (default 64 GiB) on disk, and files unused for 7 days are deleted. (Before, a benchmark of many different long prompts could write hundreds of GB.)

@@ -136,7 +136,7 @@ f16 副本放在 attention 期間閒置的 prefill 緩衝區（預設 prefill ba
 17 GiB），而不是「剩下的全部 VRAM」：在 100 GiB 的 UMA 裝置上，剩下的就是大部分系統記憶體。那裡的 host 層自 0.2.0 起**預設開啟**
 （TIER-8S-DEF）。先前預設關閉的理由（「KV pool 本來就在系統記憶體」）在 Windows 上不成立：BIOS 把 VRAM 保留區和作業系統
 記憶體分開，KV pool 在保留區，RAM 層是另外 pin 住的作業系統記憶體，還原是一次真正的複製。實測（Qwen3.8-27B Q4_K_M，balance，
-128k）：冷 prefill 537 s、從 RAM 層還原 0.34 s、重啟後從 SSD 層還原 2 s，decode 速度不變。RAM 層大小的規則（只看作業系統可見
+128k）：從 RAM 層還原 0.34 s、重啟後從 SSD 層還原 2 s，decode 速度不變。RAM 層大小的規則（只看作業系統可見
 記憶體，不看 128 GB 的總量）：`clamp(可見記憶體 / 8, 一個最大 context 條目, 16 GiB)`，且不超過啟動時可用記憶體的 1/4；可見記憶體
 低於 32 GB 則關閉，啟動日誌會寫明大小與原因。64 GB 的電腦為 8 GiB（實際多佔 8 GiB 作業系統記憶體）。SSD 層預設
 `--kv-ssd-mode shutdown`（只寫重用過的項目：關閉 WHIRL 時、主記憶體層必須擠出時，以及閒置約 5 分鐘後在背景寫；一次性的 prompt 永遠不寫）。`--kv-ram-mb N` / `WHIRL_KV_RAM_MB` 照給定值；`--kv-ram-mb 0` 關閉兩層，

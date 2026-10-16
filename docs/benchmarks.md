@@ -40,7 +40,7 @@ Swift-1.5 27B MXFP4 (§4.2) and the R9700 agent session (§5) were measured late
 - **Prompts**: a long-document question-answering prompt at 2k, 8k, 32k, 64k, 96k and 128k tokens (8k on the R9700 only), each with a unique first line so no request hits a prefix cache; 256 generated tokens. Chinese-question coding chat: one Chinese coding question (Chinese explanation, English code), 512 tokens.
 - **Greedy decoding, thinking off, one user** (`-np 1`), tok/s from each server's own `timings`. One GPU job on the machine at a time (lock file), one server per engine, model and mode.
 - **R9700**: every cell measured in one run on 2026-10-16, one request per length (n = 1); WHIRL chat = median of 3; llama.cpp chat = first run only, because its n-gram drafts learn a repeated prompt (later runs reached 180–330 tok/s by copying).
-- **Radeon 8060S**: at least 25 s of 2k-prompt warm-up before each sweep; engines interleaved, order rotated between rounds; cell = median of rounds (n = 1 to 3, marked); one cell (llama.cpp ROCm, dense, 96k decode) has two runs 31% apart and is marked unreliable.
+- **Radeon 8060S**: at least 25 s of 2k-prompt warm-up before each sweep; engines interleaved, order rotated between rounds; cell = median of rounds (n = 1 to 3, marked); one cell (llama.cpp ROCm, dense, 96k decode) has two runs 31% apart and is marked unreliable. llama.cpp cells on the 8060S may combine rounds from runs on different days (same llama.cpp binary, same settings), and the 8060S Swift-1.5 medians include the 2k-prompt smoke-test round run before the sweep (same method).
 - **llama.cpp decode mode**: dense = MTP + n-gram (on the R9700 plain decoding was measured too and MTP + n-gram was faster in every dense cell, so each cell shows the faster of the two, named per cell; on the 8060S only MTP + n-gram was run); MoE = plain decoding (as shipped). llama.cpp prefill on the R9700 = the faster of its two runs per backend; on the 8060S the prefill of the same runs as the decode.
 - **WHIRL**: `whirl-server MODEL --balance|--precise|--fast -np 1 --ctx-per-slot 163840 --kv-ssd-mode off`; MTP (+ n-gram) on, as by default.
 
@@ -284,7 +284,7 @@ Our own MXFP4 quantization of the dense 27B (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ
 | 128k | **24.0** | 16.2 | 11.6 | +48% | +107% |
 <!-- /gen -->
 
-**Chinese coding chat** (512 tokens, the hard case for drafts: all newly written, nothing to copy):
+**Chinese coding chat** (512 tokens, the hard case for drafts: all newly written, nothing to copy; Radeon 8060S at max power (80 W), ASUS ROG Flow Z13):
 
 <!-- gen:swift.chat.en -->
 | GPU | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
@@ -293,11 +293,11 @@ Our own MXFP4 quantization of the dense 27B (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ
 | Radeon 8060S (max power) | **33.6** | 27.6 (MTP+n-gram) | 28.3 (MTP+n-gram) | +22% | +19% |
 <!-- /gen -->
 
-## 5. Coding-agent session (Radeon 8060S and R9700)
+## <a id="agent-session"></a>5. Coding-agent session (Radeon 8060S and R9700)
 
-### 5.1 Radeon 8060S (max power as above)
+### 5.1 Radeon 8060S (max power (80 W), ASUS ROG Flow Z13)
 
-Dense Qwen3.8-27B Q4_K_M. Per session: a 16k-token shared skills / MCP system prompt plus a `read_file` tool (a 3.6k-token source file), four user turns (explain the file, find the most complex function, rewrite it as code, review a resent edited file), full history resent on every call, one client, sequential, temperature 0, at most 384 tokens per call. MTP for all engines (llama.cpp MTP + n-gram). Session 0 starts cold (the ~20k-token system + tools prompt is not cached yet); session 1 shares that prefix. Median of 2 rounds. WHIRL v0.2.0-rc7 (whose dense prefill forward size on the 8060S is the one 0.2.0 ships).
+Dense Qwen3.8-27B Q4_K_M. Per session: a 16k-token shared skills / MCP system prompt plus a `read_file` tool (a 3.6k-token source file), four user turns (explain the file, find the most complex function, rewrite it as code, review a resent edited file), full history resent on every call, one client, sequential, temperature 0, at most 384 tokens per call. MTP for all engines (llama.cpp MTP + n-gram). Session 0 starts cold (the ~20k-token system + tools prompt is not cached yet) and reads `llama-batch.cpp`; session 1 shares that prefix and reads a different file, `llama-chat.cpp` (the same files for every engine). Median of 2 rounds. WHIRL v0.2.0-rc7 (whose dense prefill forward size on the 8060S is the one 0.2.0 ships).
 
 <!-- gen:s8.agent.en -->
 | Session | WHIRL | llama.cpp ROCm | llama.cpp Vulkan |
@@ -308,7 +308,7 @@ Dense Qwen3.8-27B Q4_K_M. Per session: a 16k-token shared skills / MCP system pr
 
 - WHIRL finishes the cold session in 26% less time than llama.cpp ROCm and 58% less than llama.cpp Vulkan.
 - The code-rewrite turn (384 tokens) decodes at about 36–44 tok/s on WHIRL. It mostly copies code from the file, so n-gram drafts help every engine: llama.cpp ROCm 42.2 tok/s in session 0 and 111.1 in session 1 (session 1 rewrites a different file, `llama-chat.cpp`); this turn is not a WHIRL lead.
-- At temperature 0 every engine writes its own text, so the workloads are not byte-identical (some engines re-read the file in a later turn).
+- At temperature 0 every engine writes its own text, so the workloads are not byte-identical (some engines re-read the file in a later turn, so the number of tool calls differs).
 
 ### 5.2 R9700
 

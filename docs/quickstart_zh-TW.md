@@ -70,7 +70,7 @@ WHIRL 會說明發生了什麼、該怎麼做，並以代碼結束：
 | 2 | 指令列有誤 | `.\whirl.exe chat --help` |
 | 3 | GPU / 驅動程式問題 | 安裝 Adrenalin 26.8.1 或更新版；檢查 `.\whirl.exe devices` |
 | 4 | 模型檔問題 | 確認檔案存在、是 GGUF，而且架構是 `qwen35` / `qwen35moe` |
-| 5 | GPU 記憶體不足 | 較小的 `--ctx`，或 `$env:WHIRL_KV = "q8v"` |
+| 5 | GPU 記憶體不足 | 較小的 `--ctx`（server 另可調小 `--ctx-per-slot`，或用 `-np 1` 減少 slot）；稠密模型若用了 `--precise`，改用預設模式（KV 快取約只要一半） |
 | 6 | 伺服器 port 已被占用 | `--port 8081` |
 
 若 Windows 顯示「Windows 已保護您的電腦」或程式被封鎖，請見 [Windows 安全性提示](windows_security_zh-TW.md)。

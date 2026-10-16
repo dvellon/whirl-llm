@@ -222,7 +222,7 @@ the left-over would be most of system memory. The host tiers are **on** by defau
 (TIER-8S-DEF); they used to be off on the argument that the KV pool already is system memory, which
 does not hold on Windows: the BIOS splits the VRAM carve-out (the KV pool) from the OS RAM, the RAM
 tier is separate pinned OS memory, and a restore is a real copy. Measured (Qwen3.8-27B Q4_K_M,
-balance, 128k session): cold prefill 537 s, RAM-tier restore 0.34 s, SSD-tier restore after a restart
+balance, 128k session): RAM-tier restore 0.34 s, SSD-tier restore after a restart
 2 s, decode speed unchanged. Size rule, from the OS-visible RAM only (not the 128 GB total):
 `clamp(OS-visible RAM / 8, one max-context entry (about 6 GiB for 27B at 262k), 16 GiB)`, at most 1/4
 of the RAM available at startup, off under 32 GB of OS-visible RAM; 8 GiB on a 64 GB machine. The
