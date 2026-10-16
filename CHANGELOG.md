@@ -11,7 +11,7 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 - **Three numerics modes**: `--precise` (bitwise lossless, f16 KV), `--balance` (default, near-lossless), `--fast` (opt-in, 4-bit KV and relaxed MTP acceptance within gated KL limits). In precise and balance, speculative decoding, batching and cache restores give the same tokens as plain greedy decoding of that mode. Details below and in [usage.md](docs/usage.md#modes).
 - **R9700 vs the official llama.cpp b11214** (balance, one user, 2k-128k): dense Qwen3.8-27B Q4_K_M prefill +55% to +62% over ROCm and +122% to +126% over Vulkan, decode (document QA: explain and rewrite a function from the prompt) +62% to +86% / +43% to +78%; Ornith-1.5-35B-A3B MXFP4 prefill +63% to +115% / +93% to +143%, decode +87% to +110% / +91% to +109% (MoE decode as shipped: WHIRL MTP vs llama.cpp plain, its MTP being slower on this model).
 - **DFlash2 drafts, opt-in** (`--draft dflash`), **SSD tier that writes only reused sessions and never exceeds its cap**, **second question about the same long document served from a tail checkpoint**, **CLI and server bit-identical** for the same prompt.
-- **Upgrading from 0.1.x**: balance (the default) is not bit-for-bit the 0.1.x output (q8h KV on dense models, new kernels, new sampler for temperature > 0); use `--precise` for bitwise-reproducible output. The SSD tier default changed to `shutdown`. [TBD: confirm `CMakeLists.txt` `project(whirl VERSION 0.2.0)` and the zip name `whirl-0.2.0-windows-x64.zip` before tagging; rel020 still says 0.1.4]
+- **Upgrading from 0.1.x**: use `--precise` when you need bitwise-lossless output (identical to plain greedy decoding). The SSD tier default changed to `shutdown`. [TBD: confirm `CMakeLists.txt` `project(whirl VERSION 0.2.0)` and the zip name `whirl-0.2.0-windows-x64.zip` before tagging; rel020 still says 0.1.4]
 
 
 ### Radeon 8060S: prefill forward size per model, dense back to 2048 rows (SRV-PP-DENSE)
@@ -165,7 +165,7 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
   | mode | KV format | activations / kernels | output guarantee |
   |---|---|---|---|
   | precise | f16 (every model, every GPU) | no fp8, f32 DeltaNet, no h16; f16 decode / verify activations | bitwise reproducible: the same bits with or without drafts, solo or batched; on the server the same bits for a prompt whatever the load, forward size or schedule-point resume; CLI == server except a CLI prompt of 4096·k + fewer than 64 tokens and a server system message of 2048+ tokens (kv-and-caching.md section 7) |
-  | balance (default) | q8h on dense models, f16 on MoE models | dense: items `fp8`, `gdnwmma`, `h16`, `kvq8`; MoE: `gdnwmma`, `h16` (no `fp8` / `moefp8` since MOE-BAL); int8 decode / verify activations | near-lossless on dense models (KL vs precise about 1e-4 to 1e-3); on the MoE model about 1.9x the model's own noise floor (KL 0.002-0.014; MoE balance top-1 within 3.0 points of the noise floor's, MOE-BAL-3), MTP / n-gram == plain greedy; **not** bit for bit the 0.1.x output (q8v KV gone, KG-1 kernels, specsample sampler) |
+  | balance (default) | q8h on dense models, f16 on MoE models | dense: items `fp8`, `gdnwmma`, `h16`, `kvq8`; MoE: `gdnwmma`, `h16` (no `fp8` / `moefp8` since MOE-BAL); int8 decode / verify activations | near-lossless on dense models (KL vs precise about 1e-4 to 1e-3); on the MoE model about 1.9x the model's own noise floor (KL 0.002-0.014; MoE balance top-1 within 3.0 points of the noise floor's, MOE-BAL-3), MTP / n-gram == plain greedy |
   | fast | q4 (R9700 since FAST-1c, Radeon 8060S) | balance + `kvq4`, `relaxacc` (dense models with an MTP head) | lossy within the published KL; the text may depend on drafts |
 
 - **precise** (`--precise`) on every GPU: no fp8 MXFP4 prefill activations (and no rounding of
@@ -175,9 +175,8 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
   lowered with a warning, or the program stops with a message when `--ctx` / `--ctx-per-slot` was
   given. MXFP4 prefill is slower in precise mode than in 0.1.x.
 - **balance** uses the items `fp8`, `moefp8`, `gdnwmma`, `h16` and `kvq8` (`--balance=ITEMS` picks
-  a subset). It is near-lossless, not bit for bit the 0.1.x output: the KV format is q8h on dense
-  models (BAL-Q8, no q8v), dense models get the KG-1 kernels, and sampling uses specsample (see
-  those entries). **fast** is balance plus the lossy items `kvq4` (4-bit KV) and `relaxacc`
+  a subset). It is near-lossless: the KV format is q8h on dense models (BAL-Q8, no q8v), dense
+  models get the KG-1 kernels, and sampling uses specsample (see those entries). **fast** is balance plus the lossy items `kvq4` (4-bit KV) and `relaxacc`
   (relaxed MTP acceptance, dense models with an MTP head); where neither applies (e.g. MoE models
   on a GPU without q4 KV kernels) the log says "fast runs as balance".
 - `whirl selftest`: the precise decode checks turn fp8 prefill, MoE fp8 and h16 off themselves

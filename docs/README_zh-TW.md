@@ -53,7 +53,18 @@ decode 列量的是什麼：每個長度都問同一個關於文件的問題（�
 | 第二次（共用同一前綴） | **45.7 s** | 52.5 s | 166.4 s |
 <!-- /gen -->
 
-冷啟動那一段，WHIRL 比 llama.cpp ROCm 少花 26% 時間，比 llama.cpp Vulkan 少 58%（各 2 輪的中位數）。改寫程式碼那一輪，WHIRL 解碼約 36–44 tok/s；這一輪大多是照抄檔案裡的程式碼，n-gram 草稿對每個引擎都有幫助（llama.cpp ROCm：冷啟動段 42.2 tok/s，第二段 111.1，因為它抄了自己先前的回答），所以這一輪不算 WHIRL 領先。這段工作階段用 v0.2.0-rc7 預發布版量測；之後的候選版只改了 8060S 的 prefill forward 大小，0.2.0 的稠密模型用的就是 rc7 的大小。對 llama.cpp 的 agent 工作階段量測只有 8060S，R9700 沒有。
+冷啟動那一段，WHIRL 比 llama.cpp ROCm 少花 26% 時間，比 llama.cpp Vulkan 少 58%（各 2 輪的中位數）。改寫程式碼那一輪，WHIRL 解碼約 36–44 tok/s；這一輪大多是照抄檔案裡的程式碼，n-gram 草稿對每個引擎都有幫助（llama.cpp ROCm：冷啟動段 42.2 tok/s，第二段 111.1，因為它抄了自己先前的回答），所以這一輪不算 WHIRL 領先。這段工作階段用 v0.2.0-rc7 預發布版量測；之後的候選版只改了 8060S 的 prefill forward 大小，0.2.0 的稠密模型用的就是 rc7 的大小。
+
+**同一段工作階段在 R9700 上**（稠密 Qwen3.8-27B Q4_K_M，相同測試資料，各 2 輪中位數，冷啟動＝每輪重開 server）：
+
+<!-- gen:r97.agent.zh -->
+| 工作階段 | WHIRL | llama.cpp ROCm | llama.cpp Vulkan |
+|---|---|---|---|
+| 冷啟動（20k token 系統＋工具提示尚未快取） | **26.5 s** | 48.5 s | 61.9 s |
+| 第二次（共用同一前綴） | **13.1 s** | 25.9 s | 29.0 s |
+<!-- /gen -->
+
+R9700 上冷啟動那一段，WHIRL 比 llama.cpp ROCm 少花 45% 時間，比 llama.cpp Vulkan 少 57%。改寫程式碼那一輪 WHIRL 解碼約 121–145 tok/s；和 8060S 一樣，這一輪大多是照抄程式碼（llama.cpp ROCm：冷啟動段 120.5 tok/s，第二段 183.7），所以不算 WHIRL 領先。
 
 ## 變快，但答案不變
 
@@ -69,7 +80,7 @@ WHIRL 0.2.0 有三種數值模式，每個行程選一種（`--precise`、`--bal
 
 - 在 **precise 與 balance**，每一項加速都經過檢查，輸出的 token 和該模式下單純 greedy 解碼相同：MTP 與 n-gram 投機解碼、多人合批、共用系統提示的前綴快取命中、對同一份長文件的第二個問題、從 RAM 或 SSD 層還原的工作階段。常駐測試把關（`whirl selftest`、kernel 測試、server 關卡、兩張卡的 golden 輸出）。
 - **precise 與 balance 絕不使用 4-bit KV、3-bit 權重或 fp8 attention。** 只有 fast 會用 4-bit KV，而且只在你要求時。
-- balance 是偏速度的預設，和 0.1.x 一樣，但輸出並非與 0.1.x 逐位元相同（KV 格式、kernel 與取樣器都改了；見 [CHANGELOG](../CHANGELOG.md)）。precise 要付出速度（R9700、中文寫程式對話、稠密模型：77.8 對 balance 的 103.1 tok/s）。
+- **precise** 是有逐位元保證的模式：逐位元無損，輸出與單純 greedy 解碼完全相同。**balance** 接近無損，是預設。precise 要付出速度（R9700、中文寫程式對話、稠密模型：77.8 對 balance 的 103.1 tok/s）。
 - **權重**就是你選的 GGUF，WHIRL 照檔案原樣計算。接續對話時沿用上一輪算好的狀態，數值上等價，但和把整段歷史當成一個 prompt 重新處理並非逐位元相同（[kv-and-caching.md](guide/zh-TW/kv-and-caching.md)）。
 
 所有模式、項目與量到的 KL：[usage.md 的數值模式](usage.md#modes)。
@@ -265,13 +276,73 @@ MoE decode：llama.cpp 用一般解碼（出廠設定；它的 MTP 在 12 個 Mo
 | Ornith-1.5-35B-A3B MXFP4（MoE，約 3B 啟用） | **106.3** | 70.6¹ | 72.9¹ | +51% | +46% |
 <!-- /gen -->
 
+### <a id="swift-mxfp4"></a>Swift-1.5 27B MXFP4（我們的稠密量化）
+
+我們自己製作的稠密 27B MXFP4 量化（`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`，變體 A），提示與旗標同上，同一天稍晚用 0.2.0 候選版量測。R9700 上 WHIRL 的 MXFP4 prefill 路徑比 Q4_K_M 快很多，所以 prefill 領先比 Q4_K_M 大：對 llama.cpp ROCm +115% 到 +166%、對 Vulkan +194% 到 +296%；decode +50% 到 +75%／+43% 到 +78%。8060S：prefill +56% 到 +62%／+87% 到 +207%，decode +27% 到 +48%／+24% 到 +116%。
+
+**R9700**（每格單次量測；llama.cpp prefill 取它一般與 MTP + n-gram 兩次量測中較快者）：
+
+<!-- gen:r97.swift.pp.zh -->
+#### Swift-1.5-Qwen3.8-27B MXFP4-A（稠密 27B）: Prefill tok/s
+
+| 長度 | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL 對 ROCm | WHIRL 對 Vulkan |
+|---|---|---|---|---|---|
+| 2k | **3,263** | 1,227 | 823.2 | +166% | +296% |
+| 32k | **2,822** | 1,174 | 815.4 | +140% | +246% |
+| 64k | **2,334** | 1,010 | 718.8 | +131% | +225% |
+| 96k | **1,974** | 892.5 | 645.3 | +121% | +206% |
+| 128k | **1,716** | 798.5 | 584.0 | +115% | +194% |
+<!-- /gen -->
+
+<!-- gen:r97.swift.tg.zh -->
+#### Swift-1.5-Qwen3.8-27B MXFP4-A（稠密 27B）: Decode tok/s，文件問答（256 token 回答：說明文件中的一個函式並改寫）
+
+| 長度 | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL 對 ROCm | WHIRL 對 Vulkan |
+|---|---|---|---|---|---|
+| 2k | **87.3** | 50.9 (MTP+n-gram) | 50.2 (MTP+n-gram) | +72% | +74% |
+| 32k | **76.9** | 44.0 (MTP+n-gram) | 43.1 (MTP+n-gram) | +75% | +78% |
+| 64k | **64.0** | 38.6 (MTP+n-gram) | 39.5 (MTP+n-gram) | +66% | +62% |
+| 96k | **60.2** | 36.1 (MTP+n-gram) | 40.7 (MTP+n-gram) | +67% | +48% |
+| 128k | **49.8** | 33.2 (MTP+n-gram) | 34.8 (MTP+n-gram) | +50% | +43% |
+<!-- /gen -->
+
+**Radeon 8060S**，最大功率（80 W），ASUS ROG Flow Z13（只量了 2k、32k、128k 的提示長度；¹ 只量一次，請當作「約」；其他格為 2 或 3 次中位數；llama.cpp 用 MTP + n-gram）：
+
+<!-- gen:s8.swift.pp.zh -->
+#### Swift-1.5-Qwen3.8-27B MXFP4-A（稠密 27B）: Prefill tok/s
+
+| 長度 | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL 對 ROCm | WHIRL 對 Vulkan |
+|---|---|---|---|---|---|
+| 2k | **500.9** | 310.1 | 162.9 | +62% | +207% |
+| 32k | **414.9** | 265.1 | 221.6 | +56% | +87% |
+| 128k | **289.8¹** | 181.1¹ | 127.9¹ | +60% | +127% |
+<!-- /gen -->
+
+<!-- gen:s8.swift.tg.zh -->
+#### Swift-1.5-Qwen3.8-27B MXFP4-A（稠密 27B）: Decode tok/s，文件問答（256 token 回答：說明文件中的一個函式並改寫）
+
+| 長度 | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL 對 ROCm | WHIRL 對 Vulkan |
+|---|---|---|---|---|---|
+| 2k | **31.0** | 24.5 | 25.1 | +27% | +24% |
+| 32k | **29.0** | 22.2 | 17.0 | +31% | +71% |
+| 128k | **24.2¹** | 16.3¹ | 11.2¹ | +48% | +116% |
+<!-- /gen -->
+
+**中文寫程式對話**（512 token，對草稿是困難情況：全部全新撰寫，沒有可照抄的內容）：
+
+<!-- gen:swift.chat.zh -->
+| GPU | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL 對 ROCm | WHIRL 對 Vulkan |
+|---|---|---|---|---|---|
+| Radeon AI PRO R9700 | **110.7** | 57.8 (MTP+n-gram) | 57.6 (MTP+n-gram) | +92% | +92% |
+| Radeon 8060S（最大功率） | **33.6** | 27.6 (MTP+n-gram) | 28.3 (MTP+n-gram) | +22% | +19% |
+<!-- /gen -->
+
 ### WHIRL 領先不多的地方
 
 - **8060S 上稠密 decode，2k token 文件問答**：對 llama.cpp ROCm 領先 9%、對 Vulkan 6%，在量測雜訊範圍內。8060S 的稠密 decode 受記憶體頻寬限制（約 256 GB/s，權重 15 GB 以上），領先來自投機解碼，並隨上下文變長而擴大（32k 起 +24% 到 +48%）。
 - **不用投機的一般解碼**在每個引擎都受記憶體頻寬限制；WHIRL 大部分的 decode 領先來自 MTP + n-gram 投機解碼。
 - **fast 不一定比 balance 快**：R9700 上 MoE 模型在短、中等上下文時，balance 解碼比 fast 快；fast 主要幫助 prefill 與稠密 decode。
 - **precise 要付出速度**：R9700 上比 balance 慢 14–26%（decode）與 6–13%（prefill）（見上表）。
-- Swift-1.5 27B MXFP4 沒有用 0.2.0 重新量測；它的 0.1.3 數字在 [benchmarks.md](guide/zh-TW/benchmarks.md#appendix-v013)。
 
 ## 0.2.0 新功能
 

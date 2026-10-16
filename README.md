@@ -53,7 +53,18 @@ What the decode rows measure: every length uses the same question about the docu
 | second session (shares that prefix) | **45.7 s** | 52.5 s | 166.4 s |
 <!-- /gen -->
 
-WHIRL finishes the cold session in 26% less time than llama.cpp ROCm and 58% less than llama.cpp Vulkan (median of 2 rounds each). The code-rewrite turn decodes at about 36–44 tok/s on WHIRL; that turn is mostly copied code, so n-gram drafts help every engine there (llama.cpp ROCm: 42.2 tok/s in the cold session, 111.1 in the second, where it copied its own earlier answer), and it is not a WHIRL lead. This session was measured with the v0.2.0-rc7 pre-release build; the later release candidates changed only the 8060S prefill forward size, and 0.2.0 uses rc7's size for dense models. An agent-session measurement against llama.cpp exists only for the 8060S, not for the R9700.
+WHIRL finishes the cold session in 26% less time than llama.cpp ROCm and 58% less than llama.cpp Vulkan (median of 2 rounds each). The code-rewrite turn decodes at about 36–44 tok/s on WHIRL; that turn is mostly copied code, so n-gram drafts help every engine there (llama.cpp ROCm: 42.2 tok/s in the cold session, 111.1 in the second, where it copied its own earlier answer), and it is not a WHIRL lead. This session was measured with the v0.2.0-rc7 pre-release build; the later release candidates changed only the 8060S prefill forward size, and 0.2.0 uses rc7's size for dense models.
+
+**The same session on the R9700** (dense Qwen3.8-27B Q4_K_M, same fixture, median of 2 rounds, cold start = a fresh server per round):
+
+<!-- gen:r97.agent.en -->
+| Session | WHIRL | llama.cpp ROCm | llama.cpp Vulkan |
+|---|---|---|---|
+| cold (20k-token system + tools prompt not cached yet) | **26.5 s** | 48.5 s | 61.9 s |
+| second session (shares that prefix) | **13.1 s** | 25.9 s | 29.0 s |
+<!-- /gen -->
+
+On the R9700 WHIRL finishes the cold session in 45% less time than llama.cpp ROCm and 57% less than llama.cpp Vulkan. The code-rewrite turn decodes at about 121–145 tok/s on WHIRL; as on the 8060S it is mostly copied code (llama.cpp ROCm: 120.5 tok/s in the cold session, 183.7 in the second), so it is not a WHIRL lead.
 
 ## Speed without changing the answer
 
@@ -69,7 +80,7 @@ What this means in practice:
 
 - In **precise and balance**, every acceleration is checked to give the same tokens as plain greedy decoding of that mode: MTP and n-gram speculative decoding, several users batched together, prefix-cache hits on shared system prompts, a second question about the same long document, and sessions restored from the RAM or SSD tier. Standing tests enforce it (`whirl selftest`, kernel tests, server gates, golden outputs on both GPUs).
 - **precise and balance never use 4-bit KV, 3-bit weights or fp8 attention.** fast is the only mode with 4-bit KV, and only when you ask for it.
-- balance is the speed-oriented default, like 0.1.x, but it is not bit-for-bit the 0.1.x output (KV format, kernels and sampler changed; [CHANGELOG](CHANGELOG.md)). precise costs speed (R9700, Chinese coding chat, dense model: 77.8 vs 103.1 tok/s in balance).
+- **precise** is the mode with the bitwise guarantee: bitwise lossless, output identical to plain greedy decoding. **balance** is near-lossless and the default. precise costs speed (R9700, Chinese coding chat, dense model: 77.8 vs 103.1 tok/s in balance).
 - **Weights** are whatever GGUF you choose; WHIRL computes with them as stored. Continuing a conversation reuses the state computed for the previous turn, which is numerically equivalent but not bit-identical to re-processing the whole history as one prompt ([kv-and-caching.md](docs/guide/en/kv-and-caching.md)).
 
 Every mode, item and measured KL: [usage.md, numerics modes](docs/usage.md#modes).
@@ -265,13 +276,73 @@ MoE decode: llama.cpp plain decoding (as shipped; its MTP was slower than plain 
 | Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active) | **106.3** | 70.6¹ | 72.9¹ | +51% | +46% |
 <!-- /gen -->
 
+### <a id="swift-mxfp4"></a>Swift-1.5 27B MXFP4 (our dense quant)
+
+Our own MXFP4 quantization of the dense 27B (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`, variant A), same prompts and flags as above, measured with the 0.2.0 release candidate later the same day. On the R9700 WHIRL's MXFP4 prefill path is much faster than its Q4_K_M path, so the prefill lead is larger than on Q4_K_M: +115% to +166% over llama.cpp ROCm and +194% to +296% over Vulkan; decode +50% to +75% / +43% to +78%. On the 8060S: prefill +56% to +62% / +87% to +207%, decode +27% to +48% / +24% to +116%.
+
+**R9700** (single run per cell; llama.cpp prefill shows the faster of its plain and MTP + n-gram runs):
+
+<!-- gen:r97.swift.pp.en -->
+#### Swift-1.5-Qwen3.8-27B MXFP4-A (dense 27B): Prefill tok/s
+
+| Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| 2k | **3,263** | 1,227 | 823.2 | +166% | +296% |
+| 32k | **2,822** | 1,174 | 815.4 | +140% | +246% |
+| 64k | **2,334** | 1,010 | 718.8 | +131% | +225% |
+| 96k | **1,974** | 892.5 | 645.3 | +121% | +206% |
+| 128k | **1,716** | 798.5 | 584.0 | +115% | +194% |
+<!-- /gen -->
+
+<!-- gen:r97.swift.tg.en -->
+#### Swift-1.5-Qwen3.8-27B MXFP4-A (dense 27B): Decode tok/s, document QA (256-token answer: explain a function from the document and rewrite it)
+
+| Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| 2k | **87.3** | 50.9 (MTP+n-gram) | 50.2 (MTP+n-gram) | +72% | +74% |
+| 32k | **76.9** | 44.0 (MTP+n-gram) | 43.1 (MTP+n-gram) | +75% | +78% |
+| 64k | **64.0** | 38.6 (MTP+n-gram) | 39.5 (MTP+n-gram) | +66% | +62% |
+| 96k | **60.2** | 36.1 (MTP+n-gram) | 40.7 (MTP+n-gram) | +67% | +48% |
+| 128k | **49.8** | 33.2 (MTP+n-gram) | 34.8 (MTP+n-gram) | +50% | +43% |
+<!-- /gen -->
+
+**Radeon 8060S**, max power (80 W), ASUS ROG Flow Z13 (prompt lengths 2k, 32k and 128k only; ¹ single run, read as "about"; other cells median of 2 or 3 runs; llama.cpp MTP + n-gram):
+
+<!-- gen:s8.swift.pp.en -->
+#### Swift-1.5-Qwen3.8-27B MXFP4-A (dense 27B): Prefill tok/s
+
+| Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| 2k | **500.9** | 310.1 | 162.9 | +62% | +207% |
+| 32k | **414.9** | 265.1 | 221.6 | +56% | +87% |
+| 128k | **289.8¹** | 181.1¹ | 127.9¹ | +60% | +127% |
+<!-- /gen -->
+
+<!-- gen:s8.swift.tg.en -->
+#### Swift-1.5-Qwen3.8-27B MXFP4-A (dense 27B): Decode tok/s, document QA (256-token answer: explain a function from the document and rewrite it)
+
+| Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| 2k | **31.0** | 24.5 | 25.1 | +27% | +24% |
+| 32k | **29.0** | 22.2 | 17.0 | +31% | +71% |
+| 128k | **24.2¹** | 16.3¹ | 11.2¹ | +48% | +116% |
+<!-- /gen -->
+
+**Chinese coding chat** (512 tokens, the hard case for drafts: all newly written, nothing to copy):
+
+<!-- gen:swift.chat.en -->
+| GPU | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| Radeon AI PRO R9700 | **110.7** | 57.8 (MTP+n-gram) | 57.6 (MTP+n-gram) | +92% | +92% |
+| Radeon 8060S (max power) | **33.6** | 27.6 (MTP+n-gram) | 28.3 (MTP+n-gram) | +22% | +19% |
+<!-- /gen -->
+
 ### Where WHIRL does not lead by much
 
 - **Dense decode on the 8060S, document QA at 2k tokens**: +9% over llama.cpp ROCm and +6% over Vulkan at 2k, within run-to-run noise. Dense decode on the 8060S is memory-bound (about 256 GB/s for 15+ GB of weights), so the lead comes from speculative decoding and grows with context (+24% to +48% from 32k on).
 - **Plain decoding without speculation** is memory-bandwidth bound in every engine; most of WHIRL's decode lead comes from MTP + n-gram speculative decoding.
 - **fast is not always faster than balance**: on the MoE model at short and medium context (R9700), balance decodes faster than fast; fast helps mostly in prefill and in dense decode.
 - **precise costs speed**: 14–26% of decode and 6–13% of prefill against balance on the R9700 (tables above).
-- Swift-1.5 27B MXFP4 was not re-measured for 0.2.0; its 0.1.3 numbers are in [benchmarks.md](docs/benchmarks.md#appendix-v013).
 
 ## What's new in 0.2.0
 

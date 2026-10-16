@@ -21,7 +21,7 @@ WHIRL 0.2.0 against the **official ggml-org llama.cpp release b11214**, its **RO
 | OS / GPU driver | Windows 11 Home 26H2; AMD Software: Adrenalin Edition 26.8.1 (driver 32.0.31041.1004) |
 | WHIRL | R9700: v0.2.0 release candidate rc9 (branch `rel020` `bc78613`; rc10 is identical on the R9700, it changed only the 8060S prefill forward size). 8060S: release candidate rc10 (`bd81154`); the 8060S Chinese-chat and agent-session rows: rc7 (see §5). [TBD: SHA-256 of the final 0.2.0 `whirl.exe` / `whirl-server.exe`, and confirmation that the release is built from `bd81154`] |
 | llama.cpp | official b11214 Windows binaries, ROCm build and Vulkan build |
-| Measured | 2026-10-16 (R9700 07:00–10:28; 8060S between 00:30 and 14:44) |
+| Measured | 2026-10-16 (R9700 07:00–10:28; 8060S between 00:30 and 14:44; Swift-1.5 and the R9700 agent session 15:15–17:24) |
 
 **eGPU note:** the R9700 sits behind USB4 (~3.8 GB/s host link each way). This affects model load time and host-RAM / SSD KV restores; it does not affect prefill or decode, which stay in VRAM.
 
@@ -31,8 +31,9 @@ WHIRL 0.2.0 against the **official ggml-org llama.cpp release b11214**, its **RO
 |---|---|---|
 | Dense 27B | `Qwen3.8-27B-UD-Q4_K_M.gguf` (unsloth) | dense 27B, MTP head, UD-Q4_K_M |
 | MoE 35B-A3B | `Ornith-1.5-35B-A3B-MXFP4.gguf` (ours) | MoE, 35B total, ~3B active per token, MTP head, MXFP4 experts |
+| Swift 27B MXFP4 | `Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf` (ours, variant A) | dense 27B, MTP head, MXFP4 (Q6_K output head, Q8_0 MTP layer and embeddings); §4.2 |
 
-Swift-1.5 27B MXFP4 was not re-measured for 0.2.0; its 0.1.3 numbers are in the [appendix](#appendix-v013).
+Swift-1.5 27B MXFP4 (§4.2) and the R9700 agent session (§5) were measured later the same day with release candidate rc10 (on the R9700 rc10 is the same as rc9 for every path measured here). Swift's 0.1.3 numbers are in the [appendix](#appendix-v013).
 
 ## 2. Methodology
 
@@ -227,7 +228,70 @@ WHIRL measured with v0.2.0-rc7 (rc8–rc10 changed only the 8060S prefill forwar
 | Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active) | **106.3** | 70.6¹ | 72.9¹ | +51% | +46% |
 <!-- /gen -->
 
-## 5. Coding-agent session (Radeon 8060S, max power as above)
+### 4.2 Swift-1.5 27B MXFP4-A (dense), R9700 and Radeon 8060S
+
+Our own MXFP4 quantization of the dense 27B (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`, variant A), same prompts and flags as above, measured with the 0.2.0 release candidate later the same day. On the R9700 WHIRL's MXFP4 prefill path is much faster than its Q4_K_M path, so the prefill lead is larger than on Q4_K_M: +115% to +166% over llama.cpp ROCm and +194% to +296% over Vulkan; decode +50% to +75% / +43% to +78%. On the 8060S: prefill +56% to +62% / +87% to +207%, decode +27% to +48% / +24% to +116%.
+
+**R9700** (single run per cell; llama.cpp prefill shows the faster of its plain and MTP + n-gram runs):
+
+<!-- gen:r97.swift.pp.en -->
+#### Swift-1.5-Qwen3.8-27B MXFP4-A (dense 27B): Prefill tok/s
+
+| Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| 2k | **3,263** | 1,227 | 823.2 | +166% | +296% |
+| 32k | **2,822** | 1,174 | 815.4 | +140% | +246% |
+| 64k | **2,334** | 1,010 | 718.8 | +131% | +225% |
+| 96k | **1,974** | 892.5 | 645.3 | +121% | +206% |
+| 128k | **1,716** | 798.5 | 584.0 | +115% | +194% |
+<!-- /gen -->
+
+<!-- gen:r97.swift.tg.en -->
+#### Swift-1.5-Qwen3.8-27B MXFP4-A (dense 27B): Decode tok/s, document QA (256-token answer: explain a function from the document and rewrite it)
+
+| Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| 2k | **87.3** | 50.9 (MTP+n-gram) | 50.2 (MTP+n-gram) | +72% | +74% |
+| 32k | **76.9** | 44.0 (MTP+n-gram) | 43.1 (MTP+n-gram) | +75% | +78% |
+| 64k | **64.0** | 38.6 (MTP+n-gram) | 39.5 (MTP+n-gram) | +66% | +62% |
+| 96k | **60.2** | 36.1 (MTP+n-gram) | 40.7 (MTP+n-gram) | +67% | +48% |
+| 128k | **49.8** | 33.2 (MTP+n-gram) | 34.8 (MTP+n-gram) | +50% | +43% |
+<!-- /gen -->
+
+**Radeon 8060S**, max power (80 W), ASUS ROG Flow Z13 (prompt lengths 2k, 32k and 128k only; ¹ single run, read as "about"; other cells median of 2 or 3 runs; llama.cpp MTP + n-gram):
+
+<!-- gen:s8.swift.pp.en -->
+#### Swift-1.5-Qwen3.8-27B MXFP4-A (dense 27B): Prefill tok/s
+
+| Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| 2k | **500.9** | 310.1 | 162.9 | +62% | +207% |
+| 32k | **414.9** | 265.1 | 221.6 | +56% | +87% |
+| 128k | **289.8¹** | 181.1¹ | 127.9¹ | +60% | +127% |
+<!-- /gen -->
+
+<!-- gen:s8.swift.tg.en -->
+#### Swift-1.5-Qwen3.8-27B MXFP4-A (dense 27B): Decode tok/s, document QA (256-token answer: explain a function from the document and rewrite it)
+
+| Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| 2k | **31.0** | 24.5 | 25.1 | +27% | +24% |
+| 32k | **29.0** | 22.2 | 17.0 | +31% | +71% |
+| 128k | **24.2¹** | 16.3¹ | 11.2¹ | +48% | +116% |
+<!-- /gen -->
+
+**Chinese coding chat** (512 tokens, the hard case for drafts: all newly written, nothing to copy):
+
+<!-- gen:swift.chat.en -->
+| GPU | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| Radeon AI PRO R9700 | **110.7** | 57.8 (MTP+n-gram) | 57.6 (MTP+n-gram) | +92% | +92% |
+| Radeon 8060S (max power) | **33.6** | 27.6 (MTP+n-gram) | 28.3 (MTP+n-gram) | +22% | +19% |
+<!-- /gen -->
+
+## 5. Coding-agent session (Radeon 8060S and R9700)
+
+### 5.1 Radeon 8060S (max power as above)
 
 Dense Qwen3.8-27B Q4_K_M. Per session: a 16k-token shared skills / MCP system prompt plus a `read_file` tool (a 3.6k-token source file), four user turns (explain the file, find the most complex function, rewrite it as code, review a resent edited file), full history resent on every call, one client, sequential, temperature 0, at most 384 tokens per call. MTP for all engines (llama.cpp MTP + n-gram). Session 0 starts cold (the ~20k-token system + tools prompt is not cached yet); session 1 shares that prefix. Median of 2 rounds. WHIRL v0.2.0-rc7 (whose dense prefill forward size on the 8060S is the one 0.2.0 ships).
 
@@ -241,7 +305,21 @@ Dense Qwen3.8-27B Q4_K_M. Per session: a 16k-token shared skills / MCP system pr
 - WHIRL finishes the cold session in 26% less time than llama.cpp ROCm and 58% less than llama.cpp Vulkan.
 - The code-rewrite turn (384 tokens) decodes at about 36–44 tok/s on WHIRL. It mostly copies code from the file, so n-gram drafts help every engine: llama.cpp ROCm 42.2 tok/s in session 0 and 111.1 in session 1 (it copied its own earlier answer); this turn is not a WHIRL lead.
 - At temperature 0 every engine writes its own text, so the workloads are not byte-identical (some engines re-read the file in a later turn).
-- No comparable agent-session measurement against llama.cpp exists for the R9700.
+
+### 5.2 R9700
+
+Same fixture, client and flags (WHIRL balance; llama.cpp ROCm and Vulkan with MTP + n-gram, R9700 flags of §2.2), WHIRL release candidate rc10. Median of 2 rounds; each round starts a fresh server, so session 0 is cold. The two rounds differ by less than 1% for every engine.
+
+<!-- gen:r97.agent.en -->
+| Session | WHIRL | llama.cpp ROCm | llama.cpp Vulkan |
+|---|---|---|---|
+| cold (20k-token system + tools prompt not cached yet) | **26.5 s** | 48.5 s | 61.9 s |
+| second session (shares that prefix) | **13.1 s** | 25.9 s | 29.0 s |
+<!-- /gen -->
+
+- WHIRL finishes the cold session in 45% less time than llama.cpp ROCm and 57% less than llama.cpp Vulkan.
+- The code-rewrite turn decodes at about 121–145 tok/s on WHIRL; llama.cpp ROCm 120.5 tok/s in session 0 and 183.7 in session 1 (it copied its own earlier answer); not a WHIRL lead.
+- As on the 8060S the engines write different text, so some re-read the file with an extra tool call; the workloads are not byte-identical.
 
 ## 6. Exact commands (0.2.0)
 
@@ -266,7 +344,7 @@ The harness (PowerShell job runner, Python client using only the standard librar
 
 ## <a id="appendix-v013"></a>Appendix: v0.1.3 release benchmark (R9700, kept for reference)
 
-Measured with WHIRL 0.1.3 against llama.cpp b11214 (ROCm build) on 2026-10-05; not re-measured for 0.2.0. 0.1.3 had no numerics modes (its defaults are closest to 0.2.0's balance, but not bit-identical to it). The 0.1.3 Radeon 8060S bring-up snapshot is superseded by §4 above and is no longer listed.
+Measured with WHIRL 0.1.3 against llama.cpp b11214 (ROCm build) on 2026-10-05; not re-measured for 0.2.0. 0.1.3 had no numerics modes. The 0.1.3 Radeon 8060S bring-up snapshot is superseded by §4 above and is no longer listed.
 
 Every WHIRL number on this page was measured with the v0.1.3 release package (`whirl.exe` /
 `whirl-server.exe`, release candidate 1, whose executables are byte-identical to the final release; SHA-256 in §1). The v0.1.0 (and, for the agent rows, v0.1.2)
