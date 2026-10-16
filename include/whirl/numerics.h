@@ -7,13 +7,11 @@
 //    WHIRL_KV). If f16 KV does not fit, the context shrinks (when not given explicitly) or the load
 //    stops with a message pointing to --balance / a shorter context.
 //  - balance: the speed-oriented defaults (MXFP4 fp8 prefill activations, f16-WMMA DeltaNet,
-//    f16 GEMM intermediates); KV q8h on dense models, f16 on MoE models. MoE models (MOE-BAL,
-//    2026-10-13): fp8 and moefp8 are fast-only (forModel), so MoE balance = gdnwmma + h16 + q8dec
-//    with f16 KV: with fp8 in front of the router, MoE balance was 3.3-3.6x its own noise floor.
-//    MOE-BAL-3 (2026-10-15): q8dec stays in MoE balance (int8 activations, as llama.cpp's q8_1);
-//    MOE-BAL-2 had moved it to fast, which cost ~20% decode on the R9700.
-//  - fast: balance plus aggressive gated items (4-bit KV, relaxed speculative acceptance, ...);
-//    on MoE models fast also turns fp8 and moefp8 on.
+//    f16 GEMM intermediates, int8 decode activations q8dec); KV q8h on dense models, f16 on MoE models.
+//    Balance is defined by its allowed items (owner policy 2026-10-16, MODES-MXFP4): fp8, moefp8,
+//    q8dec, f16 intermediates (h16, gdnwmma), int8 KV - near-lossless, not bitwise. MoE models get
+//    the same items (fp8 + moefp8 back in MoE balance; MOE-BAL 2026-10-13 had made them fast-only).
+//  - fast: balance plus aggressive gated items (4-bit KV, relaxed speculative acceptance, ...).
 //    Implemented: kvq4 (4-bit KV where the code object has it: Radeon 8060S; elsewhere fast keeps
 //    f16 KV until there are q4 kernels) and relaxacc. The others are listed as skipped.
 // KV format: fixed per mode and model type (chooseKv), never switched by what fits: a format that
@@ -62,9 +60,10 @@ inline constexpr std::uint32_t bit(Item it) { return 1u << static_cast<unsigned>
 inline constexpr std::uint32_t balance_items = bit(Item::fp8) | bit(Item::moefp8) | bit(Item::gdnwmma) | bit(Item::h16) | bit(Item::kvq8) | bit(Item::specsample);
 inline constexpr std::uint32_t fast_only_items =
     bit(Item::kvq4) | bit(Item::relaxacc) | bit(Item::headq) | bit(Item::moeskip) | bit(Item::a8) | bit(Item::a4);
-// MoE models: balance items that only the fast mode enables (MOE-BAL; an explicit item list
-// such as --balance=fp8,moefp8 still enables them)
-inline constexpr std::uint32_t moe_fast_items = bit(Item::fp8) | bit(Item::moefp8);
+// MoE models: balance items that only the fast mode enables (an explicit item list still enables
+// them). Empty since MODES-MXFP4 (owner 2026-10-16): MoE balance has fp8 + moefp8 again
+// (MOE-BAL 2026-10-13 had moved them here). Kept as the per-model-type hook of forModel.
+inline constexpr std::uint32_t moe_fast_items = 0;
 // implemented items (the rest are "not yet implemented": skipped, the mode runs as balance)
 inline constexpr std::uint32_t implemented_items = balance_items | bit(Item::kvq4) | bit(Item::relaxacc);
 
@@ -81,8 +80,8 @@ struct Request {
 // "precise" | "balance" ("balanced") | "fast", optionally ":item,item" ("=item,item" for the
 // --balance= / --fast= flags is split off by the caller). Throws std::invalid_argument.
 Request parseMode(std::string_view spec, std::string source);
-// The request for a model type (MOE-BAL): balance (no explicit item list) on a MoE model drops
-// moe_fast_items (recorded in `moved`, reported as skipped). Precise, fast, custom lists and dense
+// The request for a model type: balance (no explicit item list) on a MoE model drops
+// moe_fast_items (recorded in `moved`, reported as skipped; empty since MODES-MXFP4). Precise, fast, custom lists and dense
 // models are unchanged. Idempotent; the loader applies it
 // once the model type is known.
 Request forModel(const Request& r, bool moe);

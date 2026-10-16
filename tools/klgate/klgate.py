@@ -283,6 +283,56 @@ def case_lines(mname, pname, md, c, noise=None):
     return out
 
 
+def rejudge(src, out):
+    """Judge an earlier report's per-window numbers with the current limits (no runs). The numbers come
+    from src's runs of src's exe, so exe_sha256 / device / corpus / lengths / positions are carried over."""
+    if not out:
+        print("klgate: --rejudge needs --report")
+        return 2
+    with open(src, encoding="utf-8") as f:
+        old = json.load(f)
+    if old.get("mode_args"):
+        print("klgate: --rejudge of a negative test (--as) report")
+        return 2
+    rep = {k: v for k, v in old.items() if k not in ("cases", "pass", "summary", "limits", "moe_limits")}
+    rep.update(limits=LIMITS, moe_limits=MOE_LIMITS, cases=[], rejudged_from=os.path.abspath(src),
+               rejudged=time.strftime("%Y-%m-%d %H:%M:%S"), errors=list(old.get("errors", [])))
+    noise_by = {(n["model"], n["prompt"]): n for n in old.get("noise", [])}
+    seen = []
+    for c in old["cases"]:
+        key = (c["model"], c["prompt"], c["mode"])
+        if c["rule"] == "moe-mean" or key in seen:
+            continue
+        seen.append(key)
+        res, groups, poss = [], [], []
+        for x in old["cases"]:
+            if (x["model"], x["prompt"], x["mode"]) != key or x["rule"] == "moe-mean":
+                continue
+            for p in x["positions"]:
+                res.append((p["end"], p["zero_rows"], p["kl_mean"], p["kl_p99"], p["kl_max"], p["top1"]))
+                groups.append(x["group"])
+                poss.append(p["pos"])
+        moe = c["rule"].startswith("moe")
+        noise = noise_by.get(key[:2]) if moe else None
+        if moe and noise is None:
+            rep["errors"].append(f"{key[0]}:{key[1]}: MoE noise floor missing in {src}")
+            continue
+        base = {"model": key[0], "prompt": key[1], "mode": key[2]}
+        for j in judge(res, groups, poss, key[2], moe, noise):
+            rep["cases"].append({**base, **j})
+            for line in case_lines(key[0], key[1], key[2], j, noise):
+                log(line)
+    npass = sum(1 for c in rep["cases"] if c["pass"])
+    nfail = len(rep["cases"]) - npass
+    rc = 2 if rep["errors"] or not rep["cases"] else (1 if nfail else 0)
+    rep["pass"] = rc == 0
+    rep["summary"] = f"{npass} passed, {nfail} failed, {len(rep['errors'])} errors (rejudged)"
+    log(f"klgate: rejudged {src}: {rep['summary']} -> {'PASS' if rc == 0 else 'FAIL'} (exit {rc})")
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(rep, f, indent=1)
+    return rc
+
+
 def main():
     global ROWS, POSITIONS
     ap = argparse.ArgumentParser(description="KL gate: balance / fast vs precise")
@@ -303,9 +353,16 @@ def main():
                          "judged by MODE's limits; the report never passes (pass false), so it cannot feed golden record")
     ap.add_argument("--truncate", action="store_true",
                     help="prefill each prompt only up to the longest length (quick checks; same window numbers)")
+    ap.add_argument("--noise-dense", action="store_true",
+                    help="also run the noise floor (precise + WHIRL_GDN_SEQ=1) on dense models: reported, not judged")
+    ap.add_argument("--rejudge", default="", metavar="REPORT",
+                    help="no runs: judge the per-window numbers of an earlier report with the current limits and write "
+                         "--report (exe_sha256 / device / corpus carried over, rejudged_from recorded)")
     ap.add_argument("--positions", type=int, default=POSITIONS, choices=[1, 2, 3],
                     help=f"windows per length (default {POSITIONS}; 1 = the single window before each length)")
     a = ap.parse_args()
+    if a.rejudge:
+        return rejudge(a.rejudge, a.report)
     ROWS = a.rows
     POSITIONS = a.positions
     offsets = OFFSETS[len(OFFSETS) - POSITIONS:]
@@ -428,7 +485,7 @@ def main():
                         ok_runs = False
                         break
                     moe = arch.endswith("moe")
-                    runs += (["noise"] if moe else []) + modes
+                    runs += (["noise"] if moe or a.noise_dense else []) + modes
                     log(f"  {mname}: arch {arch or '?'} -> {'MoE: limits relative to the noise floor' if moe else 'dense: absolute limits'}")
                     continue
                 if t.shape != ref.shape:
@@ -441,22 +498,24 @@ def main():
                 continue
 
             noise = None
-            if moe:
+            if moe or "noise" in res_by:
                 if "noise" not in res_by:
                     rep["errors"].append(f"{mname}:{pname}: MoE noise floor run missing")
                     continue
                 nw = res_by["noise"]
                 n_mean = float(np.mean([x[2] for x in nw]))
-                noise = {"model": mname, "prompt": pname, "n_mean": n_mean,
+                noise = {"model": mname, "prompt": pname, "n_mean": n_mean, "judged": moe,
                          "windows": [{"length": x[0], "group": groups[w], "pos": poss[w], "kl_mean": x[2], "kl_p99": x[3], "kl_max": x[4],
                                       "top1": x[5]} for w, x in enumerate(nw)]}
                 rep["noise"].append(noise)
                 log(f"  noise  {mname:6s} {pname:5s}: N = {n_mean:.5f}, top1 all-window mean "
                     f"{np.mean([x[5] for x in nw]) * 100:.2f}%  (" +
                     ", ".join(f"{x[0]}: KL {x[2]:.5f} top1 {x[5] * 100:.2f}%" for x in nw) + ")")
-                if n_mean <= 0:
+                if n_mean <= 0 and moe:
                     rep["errors"].append(f"{mname}:{pname}: noise floor N = 0 (WHIRL_GDN_SEQ=1 did not change the bits)")
                     continue
+                if not moe:
+                    noise = None  # dense: reported only, absolute limits
             for md in modes:
                 if md not in res_by:
                     continue

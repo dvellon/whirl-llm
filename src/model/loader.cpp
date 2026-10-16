@@ -490,9 +490,9 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
     }
     m.k = loadKernels(m.module, m.kv_q8, m.kv_rot, m.kv_kf16, m.kv_q4);
     // MXFP4 routed experts: process-level switches (as WHIRL_KV), read by CLI and server alike
-    // MOE-BAL: on MoE models fp8 / moefp8 are fast-only (numerics::forModel)
+    // per-model-type request (numerics::forModel; MoE balance = dense balance items since MODES-MXFP4)
     m.num_req = numerics::forModel(opt.numerics, cfg.moe);
-    // MoE expert fp8: fast only since MOE-BAL (WHIRL_MOE_FP8 overrides the mode)
+    // MoE expert fp8: balance / fast item moefp8 (WHIRL_MOE_FP8 overrides the mode)
     m.moe_fp8 = envFlag("MOE_FP8", m.num_req.has(numerics::Item::moefp8));
     m.moe_mxw = envFlag("MOE_MXW", true);
     m.moe_wide = envFlag("MOE_WIDE", false);  // MoE wide verify (balance / fast, opt-in), see wideCapable
@@ -689,7 +689,7 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
     // GDN prefill x16b (fp8 rows + f16 rows from one norm) must fit in x16 for any batch > 16
     if (B > 16 && m.x16bOff() + B * cfg.n_embd * 2 > m.x16_bytes) throw ModelError("X16bOverflow");
     m.sx8 = m.alloc(B * 4);
-    m.fp8_prefill = m.num_req.has(numerics::Item::fp8);  // balance item, fast only on MoE (WHIRL_FP8 overrides in loadOrTune)
+    m.fp8_prefill = m.num_req.has(numerics::Item::fp8);  // balance / fast item (WHIRL_FP8 overrides in loadOrTune)
     if (cfg.moe) {
         const u64 Kx = cfg.n_expert_used;
         const u64 F = cfg.n_ff_exp;

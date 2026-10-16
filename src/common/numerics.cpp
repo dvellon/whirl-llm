@@ -257,7 +257,7 @@ Plan plan(const Request& r_in, const Target& t) {
                 break;
         }
         if (s.moved && why.empty())
-            why = "MoE: fast only (balance with fp8 activations measured 3.3-3.6x the model's KL noise floor; --fast turns it on)";
+            why = "MoE: fast only (--fast turns it on)";
         s.enabled = s.moved ? false : why.empty();
         s.note = s.enabled ? note : why;
     }
