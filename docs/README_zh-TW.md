@@ -66,7 +66,7 @@ decode 列量的是什麼：每個長度都問同一個關於文件的問題（�
 
 R9700 上冷啟動那一段，WHIRL 比 llama.cpp ROCm 少花 45% 時間，比 llama.cpp Vulkan 少 57%。改寫程式碼那一輪 WHIRL 解碼約 121–145 tok/s；和 8060S 一樣，這一輪大多是照抄程式碼（llama.cpp ROCm：冷啟動段 120.5 tok/s，第二段 183.7），所以不算 WHIRL 領先。兩張表中各引擎的工具呼叫次數並不相同（各自寫出的文字不同，有些會重讀檔案），而且第二段讀取並改寫的是和冷啟動段不同的原始檔；詳見 [benchmarks.md §5](guide/zh-TW/benchmarks.md#agent-session)。
 
-## 變快，但答案不變
+## 三種模式：速度與精度
 
 WHIRL 0.2.0 有三種數值模式，每個行程選一種（`--precise`、`--balance`、`--fast`）；不加旗標時是 **balance**。
 
@@ -74,12 +74,12 @@ WHIRL 0.2.0 有三種數值模式，每個行程選一種（`--precise`、`--bal
 |---|---|---|---|
 | **precise** | 逐位元無損：除了 GGUF 本身的權重之外，不再量化任何東西；激活值全程 f16／f32 | f16 | 有沒有投機草稿、單獨跑或和其他使用者合批、命中前綴快取或還原工作階段，輸出位元都相同 |
 | **balance**（預設） | 近乎無損，預設 | 稠密：`q8h`；MoE：f16 | MTP／n-gram 草稿、合批、快取還原，輸出的 token 都和 balance 模式下單純 greedy 解碼相同 |
-| **fast**（自選） | 在通過關卡的可接受損失內求最高速度：balance 再加 4-bit KV 與放寬的 MTP 接受規則（稠密模型） | 4-bit（`q4`） | 有損，但在公布的 KL 門檻內；文字可能隨草稿與其他使用者而不同 |
+| **fast**（自選） | 在通過關卡的可接受損失內求最高速度：balance 再加 4-bit KV 與放寬的 MTP 接受規則（稠密模型；Radeon 8060S 上的稠密模型改用 int8 `q8h` KV，在那張卡上 decode 較快） | 4-bit（`q4`）；8060S 稠密：`q8h` | 有損，但在公布的 KL 門檻內；文字可能隨草稿與其他使用者而不同 |
 
 實際上代表：
 
 - 在 **precise 與 balance**，每一項加速都經過檢查，輸出的 token 和該模式下單純 greedy 解碼相同：MTP 與 n-gram 投機解碼、多人合批、共用系統提示的前綴快取命中、對同一份長文件的第二個問題、從 RAM 或 SSD 層還原的工作階段。常駐測試把關（`whirl selftest`、kernel 測試、server 關卡、兩張卡的 golden 輸出）。
-- **precise 與 balance 絕不使用 4-bit KV、3-bit 權重或 fp8 attention。** 只有 fast 會用 4-bit KV，而且只在你要求時。
+- **precise 與 balance 絕不使用 4-bit KV、3-bit 權重或 fp8 attention。** 只有 fast 可能用到 4-bit KV，而且只在你要求時。
 - **precise** 是有逐位元保證的模式：逐位元無損，輸出與單純 greedy 解碼完全相同。**balance** 近乎無損，是預設。precise 要付出速度（R9700、中文寫程式對話、稠密模型：77.8 對 balance 的 103.1 tok/s）。
 - **權重**就是你選的 GGUF，WHIRL 照檔案原樣計算。接續對話時沿用上一輪算好的狀態，數值上等價，但和把整段歷史當成一個 prompt 重新處理並非逐位元相同（[kv-and-caching.md](guide/zh-TW/kv-and-caching.md)）。
 
@@ -351,11 +351,11 @@ Ryzen AI Max+ 395，128 GB（Windows 看得到 63.6 GB）。WHIRL balance；除�
 ## 0.2.0 新功能
 
 - **支援 Radeon 8060S（Ryzen AI Max+ 395）並已調校**：兩個模型在每個量過的 prompt 長度都比 llama.cpp ROCm 與 Vulkan 快（見上表）。8060S 也能圖片輸入，RAM 與 SSD 快取層預設開啟（Windows 上 BIOS 的 VRAM carve-out 與作業系統 RAM 是兩個獨立的池，所以 128k token 的工作階段從 RAM 還原 0.34 秒、從 SSD 2 秒，不必重新 prefill）。
-- **三種數值模式**：precise（逐位元無損）、balance（近乎無損，預設）、fast（自選，損失受關卡管控）。見[上方](#變快但答案不變)。
+- **三種數值模式**：precise（逐位元無損）、balance（近乎無損，預設）、fast（自選，損失受關卡管控）。見[上方](#三種模式速度與精度)。
 - **DFlash2 草稿，自選**（`--draft dflash --draft-model Qwen3.8-27B-DFlash2-Q8_0.gguf`，草稿模型在 Hugging Face `incoai/Qwen3.8-27B-DFlash2-GGUF`，不隨附）：R9700 上一個使用者、短或中等上下文、可預測的輸出時，比 MTP 快 19% 到 48%；4 個使用者時較慢（約 −39%），37k token 以上上下文與以中文為主的輸出（約 −10%）也較慢；約佔 1.9 GiB VRAM。greedy 輸出與同模式的單純 greedy 解碼相同。
 - **SSD 快取寫入大幅減少**：預設只在 server 停止時（或閒置約 5 分鐘、或 RAM 必須淘汰時）寫入被重複使用過的工作階段；只用一次的 prompt 永遠不寫。快取在磁碟上永遠不超過 `--kv-ssd-gb`（預設 64 GiB），7 天沒用的檔案會刪除。（以前對許多不同長 prompt 做評測，可能寫入數百 GB。）
 - **對同一份長文件問第二個問題時沿用它**：server 保留尾端檢查點，只需 prefill 新問題（約 0.3k–1.3k token），不必重跑整份文件。
-- **CLI 與 server 對同一個 prompt 輸出逐位元相同**（相同的 prefill 排程）。
+- **CLI 與 server 對同一個 prompt 輸出逐位元相同**（相同的 prefill 排程；有兩個記載的例外，見 [kv-and-caching.md §7](guide/zh-TW/kv-and-caching.md)）。
 
 完整清單：[CHANGELOG.md](../CHANGELOG.md)。
 

@@ -66,7 +66,7 @@ WHIRL finishes the cold session in 26% less time than llama.cpp ROCm and 58% les
 
 On the R9700 WHIRL finishes the cold session in 45% less time than llama.cpp ROCm and 57% less than llama.cpp Vulkan. The code-rewrite turn decodes at about 121–145 tok/s on WHIRL; as on the 8060S it is mostly copied code (llama.cpp ROCm: 120.5 tok/s in the cold session, 183.7 in the second), so it is not a WHIRL lead. In both tables the engines did not make the same number of tool calls (each writes its own text, so some re-read the file), and the second session reads and rewrites a different source file than the cold one; see [benchmarks.md §5](docs/benchmarks.md#agent-session).
 
-## Speed without changing the answer
+## Three modes: speed and precision
 
 WHIRL 0.2.0 has three numerics modes. You pick one per process (`--precise`, `--balance`, `--fast`); with no flag it runs **balance**.
 
@@ -74,12 +74,12 @@ WHIRL 0.2.0 has three numerics modes. You pick one per process (`--precise`, `--
 |---|---|---|---|
 | **precise** | bitwise lossless: nothing is quantized beyond the GGUF's own weights; f16 / f32 activations everywhere | f16 | the same bits with or without speculative drafts, alone or batched with other users, and from a prefix-cache hit or a restored session |
 | **balance** (default) | near-lossless, default | dense: `q8h`; MoE: f16 | MTP / n-gram drafts, batching and cache restores give the same tokens as plain greedy decoding in balance mode |
-| **fast** (opt-in) | maximum speed within an accepted, gated loss: balance plus 4-bit KV and relaxed MTP acceptance (dense models) | 4-bit (`q4`) | lossy within published KL limits; the text can depend on the drafts and on other users |
+| **fast** (opt-in) | maximum speed within an accepted, gated loss: balance plus 4-bit KV and relaxed MTP acceptance (dense models; on the Radeon 8060S dense models use int8 `q8h` KV, which decodes faster there) | 4-bit (`q4`); 8060S dense: `q8h` | lossy within published KL limits; the text can depend on the drafts and on other users |
 
 What this means in practice:
 
 - In **precise and balance**, every acceleration is checked to give the same tokens as plain greedy decoding of that mode: MTP and n-gram speculative decoding, several users batched together, prefix-cache hits on shared system prompts, a second question about the same long document, and sessions restored from the RAM or SSD tier. Standing tests enforce it (`whirl selftest`, kernel tests, server gates, golden outputs on both GPUs).
-- **precise and balance never use 4-bit KV, 3-bit weights or fp8 attention.** fast is the only mode with 4-bit KV, and only when you ask for it.
+- **precise and balance never use 4-bit KV, 3-bit weights or fp8 attention.** fast is the only mode that can use 4-bit KV, and only when you ask for it.
 - **precise** is the mode with the bitwise guarantee: bitwise lossless, output identical to plain greedy decoding. **balance** is near-lossless and the default. precise costs speed (R9700, Chinese coding chat, dense model: 77.8 vs 103.1 tok/s in balance).
 - **Weights** are whatever GGUF you choose; WHIRL computes with them as stored. Continuing a conversation reuses the state computed for the previous turn, which is numerically equivalent but not bit-identical to re-processing the whole history as one prompt ([kv-and-caching.md](docs/guide/en/kv-and-caching.md)).
 
@@ -351,11 +351,11 @@ Our own MXFP4 quantization of the dense 27B (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ
 ## What's new in 0.2.0
 
 - **Radeon 8060S (Ryzen AI Max+ 395) support**, tuned: faster than llama.cpp ROCm and Vulkan at every measured prompt length on both models (tables above). Image input works on the 8060S, and the RAM and SSD cache tiers are on by default there (on Windows the BIOS VRAM carve-out and the OS RAM are separate pools, so a 128k-token session restores in 0.34 s from RAM and 2 s from SSD instead of being prefilled again).
-- **Three numerics modes**: precise (bitwise lossless), balance (default, near-lossless), fast (opt-in, gated loss). See [above](#speed-without-changing-the-answer).
+- **Three numerics modes**: precise (bitwise lossless), balance (default, near-lossless), fast (opt-in, gated loss). See [above](#three-modes-speed-and-precision).
 - **DFlash2 drafts, opt-in** (`--draft dflash --draft-model Qwen3.8-27B-DFlash2-Q8_0.gguf`, drafter from Hugging Face `incoai/Qwen3.8-27B-DFlash2-GGUF`, not bundled): for one user with short or medium context and predictable output, +19% to +48% over MTP on the R9700; slower with 4 users (about −39%), after 37k+ tokens of context and on mostly-Chinese output (about −10%); costs about 1.9 GiB of VRAM. Greedy output equals plain greedy decoding of the same mode.
 - **SSD cache writes far less**: by default it writes only reused sessions, when the server stops (or after about 5 minutes idle, or when RAM must evict them); a one-shot prompt is never written. The cache never exceeds `--kv-ssd-gb` (default 64 GiB) on disk, and files unused for 7 days are deleted. (Before, a benchmark of many different long prompts could write hundreds of GB.)
 - **A second question about the same long document reuses it**: the server keeps a tail checkpoint, so it prefills only the new question (about 0.3k–1.3k tokens) instead of the whole document.
-- **CLI and server give bit-identical output** for the same prompt (same prefill schedule).
+- **CLI and server give bit-identical output** for the same prompt (same prefill schedule; two documented exceptions in [kv-and-caching.md §7](docs/guide/en/kv-and-caching.md)).
 
 Full list: [CHANGELOG.md](CHANGELOG.md).
 
