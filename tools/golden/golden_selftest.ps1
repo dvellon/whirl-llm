@@ -73,8 +73,11 @@ try {
         -not (Test-Path (Join-Path $g2 "gfx1201\dense\precise_single.txt")) -and -not (Test-Path (Join-Path $g2 "models.txt")) }
     # 5) in-run cross-checks with the real dense precise references as the fake run's output
     $realRoot = Join-Path $PSScriptRoot "..\..\tests\golden"
-    $r = @{ out = @(& pwsh -NoProfile -File $gate xcheck -Arch gfx1201 -GoldenRoot $realRoot 2>&1 | ForEach-Object { "$_" }); rc = $LASTEXITCODE }
-    Expect "xcheck of the committed gfx1201 references" $r 0
+    # every model that has committed gfx1201 references (the default model list includes swift, whose
+    # references may not be recorded yet; the release gate's own xcheck step covers the required set)
+    $realModels = (@(Get-ChildItem -Directory (Join-Path $realRoot "gfx1201") | ForEach-Object { $_.Name }) -join ",")
+    $r = @{ out = @(& pwsh -NoProfile -File $gate xcheck -Arch gfx1201 -Models $realModels -GoldenRoot $realRoot 2>&1 | ForEach-Object { "$_" }); rc = $LASTEXITCODE }
+    Expect "xcheck of the committed gfx1201 references ($realModels)" $r 0
     $fd = Join-Path $tmp "fake_out"
     New-Item -ItemType Directory -Force $fd | Out-Null
     foreach ($s in @("single", "pair")) {

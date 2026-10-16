@@ -3,11 +3,14 @@
 # {model} x {mode} x {suite} and records the "G ..." lines under
 # tests/golden/<arch>/<model>/<mode>_<suite>.txt, or diffs a new run against them.
 #
-#   pwsh tools/golden/golden.ps1 check  [-Arch gfx1201|gfx1151] [-Models dense,moe] [-Modes precise,balance,fast] [-Suites single,pair]
+#   pwsh tools/golden/golden.ps1 check  [-Arch gfx1201|gfx1151] [-Models swift,moe[,dense]] [-Modes precise,balance,fast] [-Suites single,pair]
 #   pwsh tools/golden/golden.ps1 record [-Arch ...] ...
 #
 # Exit code: 0 all match, 1 mismatch (first differing step per file printed), 2 a run failed / setup error.
-# Model files: $env:WHIRL_GOLDEN_DENSE / $env:WHIRL_GOLDEN_MOE, else the default LM Studio paths below.
+# Models (SWIFT-GATES): swift = Swift-1.5 27B MXFP4-A (dense, the headline dense model) and moe =
+# Ornith-1.5-35B-A3B MXFP4 are the default and required set; dense = Qwen3.8-27B UD-Q4_K_M is optional
+# (-Models dense, or swift,moe,dense).
+# Model files: $env:WHIRL_GOLDEN_SWIFT / $env:WHIRL_GOLDEN_MOE / $env:WHIRL_GOLDEN_DENSE, else the default LM Studio paths below.
 # The executable: -Exe, else build\Release\whirl.exe of this checkout.
 # A golden file stores the model file name and size; check refuses a different model. The model is
 # also identified by a hash of its size + first and last 4 MiB (tests/golden/models.txt, written by record).
@@ -32,7 +35,7 @@
 param(
     [Parameter(Mandatory = $true, Position = 0)][ValidateSet("check", "record", "xcheck")][string]$Action,
     [ValidateSet("gfx1201", "gfx1151")][string]$Arch = "gfx1201",
-    [string[]]$Models = @("dense", "moe"),
+    [string[]]$Models = @("swift", "moe"),
     [string[]]$Modes = @("precise", "balance", "fast"),
     [string[]]$Suites = @(),
     [string]$Exe = "",
@@ -60,6 +63,7 @@ foreach ($s in $Suites) { if ($s -notin @("single", "pair", "ngram")) { Write-Ho
 $lms = Join-Path $env:USERPROFILE ".lmstudio\models"
 $modelPath = @{
     dense = if ($env:WHIRL_GOLDEN_DENSE) { $env:WHIRL_GOLDEN_DENSE } else { Join-Path $lms "unsloth\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-Q4_K_M.gguf" }
+    swift = if ($env:WHIRL_GOLDEN_SWIFT) { $env:WHIRL_GOLDEN_SWIFT } else { Join-Path $lms "ukisai\Swift-1.5-Qwen3.8-27b-MXFP4\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf" }
     moe   = if ($env:WHIRL_GOLDEN_MOE) { $env:WHIRL_GOLDEN_MOE } else { Join-Path $lms "ornith-ai\Ornith-1.5-35B-A3B-MXFP4\Ornith-1.5-35B-A3B-MXFP4.gguf" }
 }
 # FIX-TEST-B: no reference is recorded without a passing KL gate report for this exe / arch / models
