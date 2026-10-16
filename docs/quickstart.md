@@ -42,8 +42,8 @@ cd C:\whirl\whirl-0.2.0-windows-x64
 "downloaded from the internet" mark so that Windows does not ask about every file; see
 [Windows security prompts](windows_security.md).)
 
-**The first run with a model tunes the GPU kernels once**: a few seconds for MXFP4 models, about
-1.5 minutes for a 27B Q4_K_M model (a message says so). The result is cached in
+**The first run with a model tunes the GPU kernels once**: on the R9700 a few seconds for MXFP4 models, about
+1.5 minutes for a 27B Q4_K_M model; longer on the Radeon 8060S (a message says so). The result is cached in
 `%LOCALAPPDATA%\whirl`, so later runs start right away.
 
 ## 4. Start the server
@@ -64,8 +64,8 @@ Any OpenAI-compatible client (Open WebUI, Continue, Cline, the `openai` Python p
 with base URL `http://127.0.0.1:8080/v1` and any API key. The server listens only on this computer
 unless you pass `--host 0.0.0.0`; it has no authentication.
 
-Stop it with **Ctrl+C**: running requests finish and cached sessions are written to the SSD tier
-(at most 10 seconds), so the next start can restore them.
+Stop it with **Ctrl+C**: running requests finish and sessions that were reused are written to the SSD tier
+(the stop waits up to 60 seconds for this), so the next start can restore them.
 
 ## 5. If something goes wrong
 

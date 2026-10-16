@@ -41,7 +41,7 @@ Swift-1.5 27B MXFP4 (§4.2) and the R9700 agent session (§5) were measured late
 - **Greedy decoding, thinking off, one user** (`-np 1`), tok/s from each server's own `timings`. One GPU job on the machine at a time (lock file), one server per engine, model and mode.
 - **R9700**: every cell measured in one run on 2026-10-16, one request per length (n = 1); WHIRL chat = median of 3; llama.cpp chat = first run only, because its n-gram drafts learn a repeated prompt (later runs reached 180–330 tok/s by copying).
 - **Radeon 8060S**: at least 25 s of 2k-prompt warm-up before each sweep; engines interleaved, order rotated between rounds; cell = median of rounds (n = 1 to 3, marked); one cell (llama.cpp ROCm, dense, 96k decode) has two runs 31% apart and is marked unreliable.
-- **llama.cpp decode mode**: dense = the faster of plain and MTP + n-gram within each backend (named per cell; MTP + n-gram won every dense cell); MoE = plain decoding (as shipped). llama.cpp prefill = the faster of its two runs per backend.
+- **llama.cpp decode mode**: dense = MTP + n-gram (on the R9700 plain decoding was measured too and MTP + n-gram was faster in every dense cell, so each cell shows the faster of the two, named per cell; on the 8060S only MTP + n-gram was run); MoE = plain decoding (as shipped). llama.cpp prefill on the R9700 = the faster of its two runs per backend; on the 8060S the prefill of the same runs as the decode.
 - **WHIRL**: `whirl-server MODEL --balance|--precise|--fast -np 1 --ctx-per-slot 163840 --kv-ssd-mode off`; MTP (+ n-gram) on, as by default.
 
 ### <a id="prompts"></a>2.1 Exact prompts and how to reproduce
@@ -307,7 +307,7 @@ Dense Qwen3.8-27B Q4_K_M. Per session: a 16k-token shared skills / MCP system pr
 <!-- /gen -->
 
 - WHIRL finishes the cold session in 26% less time than llama.cpp ROCm and 58% less than llama.cpp Vulkan.
-- The code-rewrite turn (384 tokens) decodes at about 36–44 tok/s on WHIRL. It mostly copies code from the file, so n-gram drafts help every engine: llama.cpp ROCm 42.2 tok/s in session 0 and 111.1 in session 1 (it copied its own earlier answer); this turn is not a WHIRL lead.
+- The code-rewrite turn (384 tokens) decodes at about 36–44 tok/s on WHIRL. It mostly copies code from the file, so n-gram drafts help every engine: llama.cpp ROCm 42.2 tok/s in session 0 and 111.1 in session 1 (session 1 rewrites a different file, `llama-chat.cpp`); this turn is not a WHIRL lead.
 - At temperature 0 every engine writes its own text, so the workloads are not byte-identical (some engines re-read the file in a later turn).
 
 ### 5.2 R9700
@@ -322,7 +322,7 @@ Same fixture, client and flags (WHIRL balance; llama.cpp ROCm and Vulkan with MT
 <!-- /gen -->
 
 - WHIRL finishes the cold session in 45% less time than llama.cpp ROCm and 57% less than llama.cpp Vulkan.
-- The code-rewrite turn decodes at about 121–145 tok/s on WHIRL; llama.cpp ROCm 120.5 tok/s in session 0 and 183.7 in session 1 (it copied its own earlier answer); not a WHIRL lead.
+- The code-rewrite turn decodes at about 121–145 tok/s on WHIRL; llama.cpp ROCm 120.5 tok/s in session 0 and 183.7 in session 1 (session 1 rewrites a different file, `llama-chat.cpp`); not a WHIRL lead.
 - As on the 8060S the engines write different text, so some re-read the file with an extra tool call; the workloads are not byte-identical.
 
 ## 6. Exact commands (0.2.0)

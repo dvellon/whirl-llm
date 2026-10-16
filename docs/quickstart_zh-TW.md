@@ -38,7 +38,7 @@ cd C:\whirl\whirl-0.2.0-windows-x64
 `whirl devices` 應該會列出 `AMD Radeon AI PRO R9700 (gfx1201)` 和／或 Radeon 8060S（gfx1151）；兩張都在時預設 R9700，`--device 8060s` 選 8060S。（`Unblock-File` 會移除「從網路下載」的標記，
 Windows 就不會對每個檔案都詢問一次；見 [Windows 安全性提示](windows_security_zh-TW.md)。）
 
-**第一次使用某個模型時，會先為 GPU 調校一次 kernel**：MXFP4 模型只要幾秒，27B Q4_K_M 模型約 1.5 分鐘
+**第一次使用某個模型時，會先為 GPU 調校一次 kernel**：R9700 上 MXFP4 模型只要幾秒，27B Q4_K_M 模型約 1.5 分鐘，Radeon 8060S 較久
 （畫面會有提示）。結果快取在 `%LOCALAPPDATA%\whirl`，之後執行會直接開始。
 
 ## 4. 啟動伺服器
@@ -59,7 +59,7 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -Conten
 `http://127.0.0.1:8080/v1`，API key 隨意。除非加上 `--host 0.0.0.0`，伺服器只接受這台電腦的連線；它沒有
 身分驗證。
 
-按 **Ctrl+C** 停止：執行中的請求會跑完，快取的 session 會寫入 SSD 層（最多 10 秒），下次啟動就能還原。
+按 **Ctrl+C** 停止：執行中的請求會跑完，重複使用過的 session 會寫入 SSD 層（停止時最多等 60 秒），下次啟動就能還原。
 
 ## 5. 出問題時
 

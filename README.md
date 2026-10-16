@@ -40,7 +40,7 @@ WHIRL 0.2.0 in its default mode (balance) against the official llama.cpp release
 
 ¹ single run (n = 1); read it as "about". Every other 8060S cell is the median of 2 or 3 runs; every R9700 length cell is a single run, measured the same day for all three engines.
 
-How llama.cpp decodes in these tables: on the dense model with its fastest speculative mode (MTP + n-gram, `--spec-type draft-mtp,ngram-mod`; the faster of that and plain decoding is shown per backend). On the MoE model llama.cpp decodes **without** speculation, because its MTP was slower than plain decoding on this model in our measurements, while WHIRL uses its MTP drafts. The MoE decode rows therefore compare both engines **as shipped**, not like for like. Full tables, with WHIRL's precise and fast modes, are under [Performance](#performance).
+How llama.cpp decodes in these tables: on the dense model with its fastest speculative mode (MTP + n-gram, `--spec-type draft-mtp,ngram-mod`; on the R9700 plain decoding was measured too and was slower in every dense cell). On the MoE model llama.cpp decodes **without** speculation, because its MTP was slower than plain decoding on this model in our measurements, while WHIRL uses its MTP drafts. The MoE decode rows therefore compare both engines **as shipped**, not like for like. Full tables, with WHIRL's precise and fast modes, are under [Performance](#performance).
 
 What the decode rows measure: every length uses the same question about the document (explain one function quoted near the start of the document and write a corrected version of it, 256 tokens), so part of the reply can copy code from the prompt, which helps speculative drafts in every engine that uses them. Exact prompts and commands: [benchmarks.md](docs/benchmarks.md#prompts). The coding-chat row is the opposite, a hard case: everything in the reply is newly written.
 
@@ -53,7 +53,7 @@ What the decode rows measure: every length uses the same question about the docu
 | second session (shares that prefix) | **45.7 s** | 52.5 s | 166.4 s |
 <!-- /gen -->
 
-WHIRL finishes the cold session in 26% less time than llama.cpp ROCm and 58% less than llama.cpp Vulkan (median of 2 rounds each). The code-rewrite turn decodes at about 36–44 tok/s on WHIRL; that turn is mostly copied code, so n-gram drafts help every engine there (llama.cpp ROCm: 42.2 tok/s in the cold session, 111.1 in the second, where it copied its own earlier answer), and it is not a WHIRL lead. This session was measured with the v0.2.0-rc7 pre-release build; the later release candidates changed only the 8060S prefill forward size, and 0.2.0 uses rc7's size for dense models.
+WHIRL finishes the cold session in 26% less time than llama.cpp ROCm and 58% less than llama.cpp Vulkan (median of 2 rounds each). The code-rewrite turn decodes at about 36–44 tok/s on WHIRL; that turn is mostly copied code, so n-gram drafts help every engine there (llama.cpp ROCm: 42.2 tok/s in the cold session, 111.1 in the second session, which rewrites a different file), and it is not a WHIRL lead. This session was measured with the v0.2.0-rc7 pre-release build; the later release candidates changed only the 8060S prefill forward size, and 0.2.0 uses rc7's size for dense models.
 
 **The same session on the R9700** (dense Qwen3.8-27B Q4_K_M, same fixture, median of 2 rounds, cold start = a fresh server per round):
 
@@ -127,7 +127,7 @@ The first run with a model tunes the GPU kernels once and caches the result in `
 WHIRL reads `general.architecture` from the GGUF and accepts only `qwen35` and `qwen35moe` (the Gated DeltaNet + gated attention hybrid, with an optional MTP head) and fine-tunes that keep that architecture. Other architectures (Llama, Gemma, Mistral, DeepSeek, `qwen3`, `qwen2`, …) are refused at load time with a clear message, and so are tensor types WHIRL has no kernels for (for example NVFP4); there is no slow generic fallback.
 
 > **Our own MXFP4 quantizations, made for WHIRL:**
-> - Dense 27B: [**Swift-1.5-Qwen3.8-27b-MXFP4-GGUF**](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF), variant A (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`). Swift-1.5 also thinks much less than the base model (44% fewer thinking tokens on our mixed Chinese/English coding prompts).
+> - Dense 27B: [**Swift-1.5-Qwen3.8-27b-MXFP4-GGUF**](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF), variant A (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`). Swift-1.5 also thinks much less than the base model (44% fewer thinking tokens than Qwen3.8-27B MXFP4 on 4 Chinese coding prompts, a small sample; see the model card).
 > - MoE 35B (~3B active): [**Ornith-1.5-35B-A3B-MXFP4-GGUF**](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF).
 
 Tested GGUF files (loaded, greedy output checked, MTP output identical to plain greedy in precise and balance):

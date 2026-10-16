@@ -40,9 +40,9 @@ WHIRL 0.2.0 預設模式（balance）對 ggml-org 官方 llama.cpp **b11214**，
 
 ¹ 只量一次（n = 1），請當作「約」。8060S 其餘每格都是 2 或 3 次的中位數；R9700 每個長度格都是單次量測，三個引擎同一天量完。
 
-表中 llama.cpp 的解碼方式：稠密模型用它最快的投機解碼（MTP + n-gram，`--spec-type draft-mtp,ngram-mod`；每個後端取它和一般解碼較快者）。MoE 模型上 llama.cpp **不用**投機解碼，因為我們量到它的 MTP 在這個模型上比一般解碼慢；WHIRL 則用自己的 MTP 草稿。所以 MoE 的 decode 列是兩邊**各自的出廠設定**對比，不是同條件對比。含 WHIRL precise 與 fast 模式的完整表格在[效能](#效能)。
+表中 llama.cpp 的解碼方式：稠密模型用它最快的投機解碼（MTP + n-gram，`--spec-type draft-mtp,ngram-mod`；R9700 上也量了一般解碼，每個稠密格都比較慢）。MoE 模型上 llama.cpp **不用**投機解碼，因為我們量到它的 MTP 在這個模型上比一般解碼慢；WHIRL 則用自己的 MTP 草稿。所以 MoE 的 decode 列是兩邊**各自的出廠設定**對比，不是同條件對比。含 WHIRL precise 與 fast 模式的完整表格在[效能](#效能)。
 
-decode 列量的是什麼：每個長度都問同一個關於文件的問題（說明文件開頭附近的一個函式，並寫出修正後的版本，256 token），所以回答有一部分可以照抄提示中的程式碼，這對所有使用投機草稿的引擎都有幫助。實際提示與指令：[benchmarks.md](guide/zh-TW/benchmarks.md#prompts)。寫程式對話那一列正好相反，是困難情況：回答全部是全新撰寫。
+decode 列量的是什麼：每個長度都問同一個關於文件的問題（解釋文件開頭附近的一個函式，並寫出修正後的版本，256 token），所以回答有一部分可以照抄提示中的程式碼，這對所有使用投機草稿的引擎都有幫助。實際提示與指令：[benchmarks.md](guide/zh-TW/benchmarks.md#prompts)。寫程式對話那一列正好相反，是困難情況：回答全部是全新撰寫。
 
 **8060S 上一段真實的 coding agent 工作階段**（最大功率同上）：16k token 的 skills／MCP 系統提示、一次讀取 3.6k token 原始檔的工具呼叫、四輪使用者提問（說明檔案、找出最複雜的函式、改寫它、審閱修改後的版本），每次呼叫都重送完整歷史，稠密 Qwen3.8-27B Q4_K_M：
 
@@ -53,7 +53,7 @@ decode 列量的是什麼：每個長度都問同一個關於文件的問題（�
 | 第二次（共用同一前綴） | **45.7 s** | 52.5 s | 166.4 s |
 <!-- /gen -->
 
-冷啟動那一段，WHIRL 比 llama.cpp ROCm 少花 26% 時間，比 llama.cpp Vulkan 少 58%（各 2 輪的中位數）。改寫程式碼那一輪，WHIRL 解碼約 36–44 tok/s；這一輪大多是照抄檔案裡的程式碼，n-gram 草稿對每個引擎都有幫助（llama.cpp ROCm：冷啟動段 42.2 tok/s，第二段 111.1，因為它抄了自己先前的回答），所以這一輪不算 WHIRL 領先。這段工作階段用 v0.2.0-rc7 預發布版量測；之後的候選版只改了 8060S 的 prefill forward 大小，0.2.0 的稠密模型用的就是 rc7 的大小。
+冷啟動那一段，WHIRL 比 llama.cpp ROCm 少花 26% 時間，比 llama.cpp Vulkan 少 58%（各 2 輪的中位數）。改寫程式碼那一輪，WHIRL 解碼約 36–44 tok/s；這一輪大多是照抄檔案裡的程式碼，n-gram 草稿對每個引擎都有幫助（llama.cpp ROCm：冷啟動段 42.2 tok/s，第二段 111.1，第二段改寫的是另一個檔案），所以這一輪不算 WHIRL 領先。這段工作階段用 v0.2.0-rc7 預發布版量測；之後的候選版只改了 8060S 的 prefill forward 大小，0.2.0 的稠密模型用的就是 rc7 的大小。
 
 **同一段工作階段在 R9700 上**（稠密 Qwen3.8-27B Q4_K_M，相同測試資料，各 2 輪中位數，冷啟動＝每輪重開 server）：
 
@@ -127,7 +127,7 @@ server 在 `http://127.0.0.1:8080/v1` 提供 OpenAI API（`/v1/chat/completions`
 WHIRL 讀取 GGUF 的 `general.architecture`，只接受 `qwen35` 與 `qwen35moe`（Gated DeltaNet + gated attention 混合架構，可附 MTP head），以及保留此架構的微調模型。其他架構（Llama、Gemma、Mistral、DeepSeek、`qwen3`、`qwen2`……）載入時會被拒絕並給出清楚訊息；WHIRL 沒有 kernel 的張量型別（例如 NVFP4）也一樣；沒有慢速的通用退路。
 
 > **我們為 WHIRL 製作的 MXFP4 量化：**
-> - 稠密 27B：[**Swift-1.5-Qwen3.8-27b-MXFP4-GGUF**](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF)，變體 A（`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`）。Swift-1.5 的思考也比基底模型短很多（我們的中英混合寫程式提示上，思考 token 少 44%）。
+> - 稠密 27B：[**Swift-1.5-Qwen3.8-27b-MXFP4-GGUF**](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF)，變體 A（`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`）。Swift-1.5 的思考也比基底模型短很多（4 題中文寫程式提示的小樣本，思考 token 比 Qwen3.8-27B MXFP4 少 44%；見模型卡）。
 > - MoE 35B（約 3B 啟用）：[**Ornith-1.5-35B-A3B-MXFP4-GGUF**](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF)。
 
 測試過的 GGUF 檔（可載入、greedy 輸出檢查過、precise 與 balance 下 MTP 輸出與單純 greedy 相同）：

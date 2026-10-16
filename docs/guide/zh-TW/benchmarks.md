@@ -41,7 +41,7 @@ Swift-1.5 27B MXFP4（§4.2）與 R9700 的 agent 工作階段（§5）在同一
 - **greedy 解碼、關閉思考、一個使用者**（`-np 1`），tok/s 取自各 server 自己的 `timings`。整台機器一次只跑一個 GPU 工作（鎖檔），每個引擎、模型、模式各開一個 server。
 - **R9700**：每格都在 2026-10-16 同一輪量完，每個長度一個請求（n = 1）；WHIRL 對話取 3 次中位數；llama.cpp 對話只取第 1 次，因為它的 n-gram 草稿會學會重複的提示（之後幾次靠照抄達到 180–330 tok/s）。
 - **Radeon 8060S**：每輪掃描前至少 25 秒的 2k prompt 暖機；引擎交錯執行，每輪輪換順序；每格取各輪中位數（n = 1 到 3，有標註）；有一格（llama.cpp ROCm、稠密、96k decode）兩次相差 31%，標為不可靠。
-- **llama.cpp 解碼模式**：稠密＝每個後端取一般與 MTP + n-gram 中較快者（每格標註；每個稠密格都是 MTP + n-gram 較快）；MoE＝一般解碼（出廠設定）。llama.cpp prefill＝每個後端兩次量測中較快者。
+- **llama.cpp 解碼模式**：稠密＝MTP + n-gram（R9700 上也量了一般解碼，每個稠密格都是 MTP + n-gram 較快，所以每格取兩者較快者並標註；8060S 只跑 MTP + n-gram）；MoE＝一般解碼（出廠設定）。llama.cpp prefill 在 R9700 取每個後端兩次量測中較快者；8060S 取與 decode 同一次量測的 prefill。
 - **WHIRL**：`whirl-server MODEL --balance|--precise|--fast -np 1 --ctx-per-slot 163840 --kv-ssd-mode off`；MTP（+ n-gram）照預設開啟。
 
 ### <a id="prompts"></a>2.1 實際提示與重現方法
@@ -307,7 +307,7 @@ WHIRL 用 v0.2.0-rc7 量測（rc8–rc10 只改了 8060S 的 prefill forward 大
 <!-- /gen -->
 
 - 冷啟動段，WHIRL 比 llama.cpp ROCm 少花 26% 時間，比 llama.cpp Vulkan 少 58%。
-- 改寫程式碼那一輪（384 token），WHIRL 解碼約 36–44 tok/s。這一輪大多照抄檔案裡的程式碼，n-gram 草稿對每個引擎都有幫助：llama.cpp ROCm 第 0 段 42.2 tok/s、第 1 段 111.1（它抄了自己先前的回答）；這一輪不算 WHIRL 領先。
+- 改寫程式碼那一輪（384 token），WHIRL 解碼約 36–44 tok/s。這一輪大多照抄檔案裡的程式碼，n-gram 草稿對每個引擎都有幫助：llama.cpp ROCm 第 0 段 42.2 tok/s、第 1 段 111.1（第 1 段改寫的是另一個檔案 `llama-chat.cpp`）；這一輪不算 WHIRL 領先。
 - temperature 0 時每個引擎寫出自己的文字，所以工作量並非逐位元相同（有些引擎在後面的回合重讀了檔案）。
 
 ### 5.2 R9700
@@ -322,7 +322,7 @@ WHIRL 用 v0.2.0-rc7 量測（rc8–rc10 只改了 8060S 的 prefill forward 大
 <!-- /gen -->
 
 - 冷啟動段，WHIRL 比 llama.cpp ROCm 少花 45% 時間，比 llama.cpp Vulkan 少 57%。
-- 改寫程式碼那一輪，WHIRL 解碼約 121–145 tok/s；llama.cpp ROCm 第 0 段 120.5 tok/s、第 1 段 183.7（它抄了自己先前的回答）；不算 WHIRL 領先。
+- 改寫程式碼那一輪，WHIRL 解碼約 121–145 tok/s；llama.cpp ROCm 第 0 段 120.5 tok/s、第 1 段 183.7（第 1 段改寫的是另一個檔案 `llama-chat.cpp`）；不算 WHIRL 領先。
 - 和 8060S 一樣，各引擎寫出的文字不同，有些會多一次工具呼叫重讀檔案，所以工作量並非逐位元相同。
 
 ## 6. 實際指令（0.2.0）
