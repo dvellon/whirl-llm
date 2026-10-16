@@ -9,18 +9,18 @@ PowerShell.
 
 | | |
 |---|---|
-| GPU | **AMD Radeon AI PRO R9700** (RDNA 4, gfx1201). One GPU; other GPUs are not supported by this build |
+| GPU | **AMD Radeon AI PRO R9700** (RDNA 4, gfx1201, 32 GB) or **Radeon 8060S** (RDNA 3.5, gfx1151, Ryzen AI Max+ 395). One GPU per process; other GPUs are not officially supported |
 | OS | Windows 11, 64-bit |
-| Driver | **AMD Software: Adrenalin Edition 26.8.1** (driver 32.0.31041.1004) or newer |
+| Driver | **AMD Software: Adrenalin Edition 26.8.1 (driver 32.0.31041.1004) or newer**, for both GPUs; older drivers are untested |
 | Nothing else | no HIP SDK, no ROCm, no Visual C++ redistributable, no Python, no WSL |
 
 The driver installs the two AMD runtime files WHIRL uses (`amdhip64_7.dll`, `amd_comgr_3.dll`).
 
 ## 2. Download
 
-1. `whirl-0.1.0-windows-x64.zip` from the [WHIRL releases page](https://github.com/tsaipifong/whirl-llm/releases).
+1. `whirl-0.2.0-windows-x64.zip` from the [WHIRL releases page](https://github.com/tsaipifong/whirl-llm/releases).
    Compare its SHA-256 with the value published next to it:
-   `Get-FileHash .\whirl-0.1.0-windows-x64.zip -Algorithm SHA256`.
+   `Get-FileHash .\whirl-0.2.0-windows-x64.zip -Algorithm SHA256`.
 2. A supported GGUF model (list in the [README](../README.md#supported-models)). The fastest choice is our own
    MXFP4 quantization
    [`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF);
@@ -31,14 +31,14 @@ The driver installs the two AMD runtime files WHIRL uses (`amdhip64_7.dll`, `amd
 Open PowerShell in your Downloads folder and paste:
 
 ```powershell
-Unblock-File .\whirl-0.1.0-windows-x64.zip
-Expand-Archive .\whirl-0.1.0-windows-x64.zip -DestinationPath C:\whirl
-cd C:\whirl\whirl-0.1.0-windows-x64
+Unblock-File .\whirl-0.2.0-windows-x64.zip
+Expand-Archive .\whirl-0.2.0-windows-x64.zip -DestinationPath C:\whirl
+cd C:\whirl\whirl-0.2.0-windows-x64
 .\whirl.exe devices
 .\whirl.exe chat C:\models\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf "Explain TCP slow start in two sentences." --max-tokens 400
 ```
 
-`whirl devices` should list `AMD Radeon AI PRO R9700 (gfx1201)`. (`Unblock-File` removes the
+`whirl devices` should list `AMD Radeon AI PRO R9700 (gfx1201)` and/or the Radeon 8060S (gfx1151); with both present the R9700 is the default, `--device 8060s` selects the 8060S. (`Unblock-File` removes the
 "downloaded from the internet" mark so that Windows does not ask about every file; see
 [Windows security prompts](windows_security.md).)
 

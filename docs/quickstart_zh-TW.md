@@ -8,17 +8,17 @@
 
 | | |
 |---|---|
-| GPU | **AMD Radeon AI PRO R9700**（RDNA 4，gfx1201）。單張 GPU；此建置不支援其他 GPU |
+| GPU | **AMD Radeon AI PRO R9700**（RDNA 4，gfx1201，32 GB）或 **Radeon 8060S**（RDNA 3.5，gfx1151，Ryzen AI Max+ 395）。一個行程一張 GPU；其他 GPU 不在正式支援範圍 |
 | 作業系統 | Windows 11，64 位元 |
-| 驅動程式 | **AMD Software: Adrenalin Edition 26.8.1**（驅動程式 32.0.31041.1004）或更新版 |
+| 驅動程式 | **AMD Software: Adrenalin Edition 26.8.1（驅動程式 32.0.31041.1004）或更新版**，兩張卡相同；更舊的版本未測試 |
 | 其他都不需要 | 不用 HIP SDK、不用 ROCm、不用 Visual C++ 可轉散發套件、不用 Python、不用 WSL |
 
 驅動程式會安裝 WHIRL 用到的兩個 AMD runtime 檔（`amdhip64_7.dll`、`amd_comgr_3.dll`）。
 
 ## 2. 下載
 
-1. 從 [WHIRL 發布頁](https://github.com/tsaipifong/whirl-llm/releases)下載 `whirl-0.1.0-windows-x64.zip`，並核對
-   旁邊公布的 SHA-256：`Get-FileHash .\whirl-0.1.0-windows-x64.zip -Algorithm SHA256`。
+1. 從 [WHIRL 發布頁](https://github.com/tsaipifong/whirl-llm/releases)下載 `whirl-0.2.0-windows-x64.zip`，並核對
+   旁邊公布的 SHA-256：`Get-FileHash .\whirl-0.2.0-windows-x64.zip -Algorithm SHA256`。
 2. 一個支援的 GGUF 模型（清單見 [README](README_zh-TW.md#支援的模型)）。最快的選擇是我們自己量化的 MXFP4
    [`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF)；
    以下指令假設它存在 `C:\models\`。
@@ -28,14 +28,14 @@
 在「下載」資料夾開啟 PowerShell，貼上：
 
 ```powershell
-Unblock-File .\whirl-0.1.0-windows-x64.zip
-Expand-Archive .\whirl-0.1.0-windows-x64.zip -DestinationPath C:\whirl
-cd C:\whirl\whirl-0.1.0-windows-x64
+Unblock-File .\whirl-0.2.0-windows-x64.zip
+Expand-Archive .\whirl-0.2.0-windows-x64.zip -DestinationPath C:\whirl
+cd C:\whirl\whirl-0.2.0-windows-x64
 .\whirl.exe devices
 .\whirl.exe chat C:\models\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf "用兩句話說明 TCP 慢啟動（slow start）。" --max-tokens 400
 ```
 
-`whirl devices` 應該會列出 `AMD Radeon AI PRO R9700 (gfx1201)`。（`Unblock-File` 會移除「從網路下載」的標記，
+`whirl devices` 應該會列出 `AMD Radeon AI PRO R9700 (gfx1201)` 和／或 Radeon 8060S（gfx1151）；兩張都在時預設 R9700，`--device 8060s` 選 8060S。（`Unblock-File` 會移除「從網路下載」的標記，
 Windows 就不會對每個檔案都詢問一次；見 [Windows 安全性提示](windows_security_zh-TW.md)。）
 
 **第一次使用某個模型時，會先為 GPU 調校一次 kernel**：MXFP4 模型只要幾秒，27B Q4_K_M 模型約 1.5 分鐘

@@ -4,216 +4,283 @@
 
 **Windows HIP Inference for RDNA LLMs**
 
-WHIRL is an LLM inference engine for the AMD Radeon AI PRO R9700 (RDNA 4) on Windows.
-
-**Design principles**
-1. **Built for AMD GPUs on Windows.** A native Windows C++/HIP inference engine with hand-written, hand-tuned kernels for RDNA. No WSL, no Docker, no Linux VM: install the AMD driver and run.
-2. **Fully open, kernels included.** Everything from host-side scheduling to every GPU kernel is open source under Apache-2.0, with no closed binary components. Bug reports, benchmark results and code contributions are all welcome. Let's make AMD inference on Windows as good as it can be.
-3. **Accuracy before speed.** Every speedup (speculative decoding, batching, prefix caching, cache restore) produces output bit-identical to plain greedy decoding, enforced by standing tests. WHIRL never trades away accuracy beyond the model you chose.
-4. **Few models, pushed to the limit.** WHIRL doesn't try to run everything. It targets specific models on specific hardware and pushes them close to the hardware limit, adding architectures one at a time.
-5. **Transparent, verifiable numbers.** Every figure is measured, with methods, commands and raw data published. For content-dependent features such as speculative decoding, we report the best case, the typical case and the worst case, so you know what to expect.
-6. **Designed for real workflows.** Coding agents and long contexts come first: fast long-prompt processing, a responsive main conversation while others share the GPU, and a VRAM → RAM → SSD cache that survives server restarts.
-
-The architectures supported today are **`qwen35` (dense)** and **`qwen35moe` (mixture of experts)**; more will be added one by one. WHIRL follows the design philosophy of [NInfer](https://github.com/Neroued/ninfer) (Apache-2.0) — build for selected models and selected GPUs, as close to the hardware limit as possible; [zynfer](https://github.com/thanos/zynfer) carried the same idea to RDNA 4.
+WHIRL is an open-source (Apache-2.0) LLM inference engine for AMD GPUs on Windows: native C++/HIP, every kernel included, no WSL, Docker or ROCm install. Download the zip, unzip, run; the AMD driver is all it needs. Version 0.2.0 runs on the **AMD Radeon AI PRO R9700** (RDNA 4, 32 GB) and the **Radeon 8060S** (Ryzen AI Max+ 395), and it is faster than llama.cpp on both, at every prompt length we measured, from 2k to 128k tokens.
 
 ## WHIRL vs llama.cpp at a glance
 
-Same GGUF file, same prompts, one R9700, greedy decoding; llama.cpp b11214 (ROCm) with the fastest flags we found for each row. Every WHIRL speedup gives output bit-identical to plain greedy decoding ([why](#speed-without-changing-the-answer)).
+WHIRL 0.2.0 in its default mode (balance) against the official llama.cpp release **b11214** (ggml-org), shown separately for its **ROCm** and its **Vulkan** build. Same GGUF files, same prompts, greedy decoding, one user. The percentage in each llama.cpp cell is WHIRL's lead over that cell.
 
-| | Swift-1.5 27B MXFP4-A (dense) | Ornith-1.5-35B-A3B MXFP4 (MoE) |
-|---|---|---|
-| Decode tok/s, coding prompts | 112.4 vs 60.8 (**1.85×**) | 257.6 vs 118.8 (**2.17×**) |
-| Server, 4 users at once, aggregate tok/s | 182.1 vs 64.0 (**2.84×**) | 381.1 vs 176.8 (**2.16×**) |
-| Prefill tok/s, 8k-token prompt | 3,469 vs 1,338 (**2.59×**) | 11,258 vs 4,637 (**2.43×**) |
-| Prefill tok/s, 32k-token prompt | 2,907 vs 1,174 (**2.48×**) | 8,633 vs 3,778 (**2.29×**) |
-| Prefill tok/s, 128k-token prompt | 1,757 vs 791.3 (**2.22×**) | 4,311 vs 2,239 (**1.93×**) |
-| Prefill tok/s, 256k-token prompt | 969.8 vs 556.1 (**1.74×**)¹ | 2,135 vs 1,442 (**1.48×**)¹ |
-| Decode tok/s after a 256k-token prompt | 35.1 vs 16.8 (**2.09×**)¹ | 115.6 vs 53.7 (**2.15×**)¹ |
-| Time to first token, reusing a 26k-token system prompt | 0.108 s vs 0.384 s (**3.6×**) | 0.098 s vs 0.182 s (**1.9×**) |
+**Radeon AI PRO R9700** (gfx1201, 32 GB). Dense = Qwen3.8-27B UD-Q4_K_M, MoE = Ornith-1.5-35B-A3B MXFP4.
 
-¹ KV cache: WHIRL int8 (q8h) / llama.cpp f16; llama.cpp decodes without speculative decoding at 256k.
+<!-- gen:glance.r97.en -->
+| tok/s, higher is better | Dense 27B: WHIRL | llama.cpp ROCm | llama.cpp Vulkan | MoE 35B-A3B: WHIRL | llama.cpp ROCm | llama.cpp Vulkan |
+|---|---|---|---|---|---|---|
+| Prefill, 2k prompt | **1,782** | 1,140 (WHIRL +56%) | 804.4 (WHIRL +122%) | **8,624** | 4,014 (WHIRL +115%) | 3,551 (WHIRL +143%) |
+| Prefill, 32k prompt | **1,719** | 1,089 (WHIRL +58%) | 761.2 (WHIRL +126%) | **6,651** | 3,872 (WHIRL +72%) | 3,395 (WHIRL +96%) |
+| Prefill, 128k prompt | **1,233** | 759.2 (WHIRL +62%) | 553.9 (WHIRL +123%) | **3,758** | 2,307 (WHIRL +63%) | 1,922 (WHIRL +95%) |
+| Decode after a 2k prompt | **82.1** | 46.8 (WHIRL +75%) | 49.8 (WHIRL +65%) | **241.9** | 115.4 (WHIRL +110%) | 115.9 (WHIRL +109%) |
+| Decode after a 32k prompt | **75.8** | 40.7 (WHIRL +86%) | 42.7 (WHIRL +78%) | **203.2** | 101.4 (WHIRL +100%) | 100.6 (WHIRL +102%) |
+| Decode after a 128k prompt | **48.8** | 27.6 (WHIRL +77%) | 33.9 (WHIRL +44%) | **141.0** | 75.3 (WHIRL +87%) | 73.8 (WHIRL +91%) |
+| Decode, Chinese-question coding chat | **103.1** | 61.4 (WHIRL +68%) | 61.2 (WHIRL +68%) | **250.1** | 118.9 (WHIRL +110%) | 115.1 (WHIRL +117%) |
+<!-- /gen -->
 
-![Prefill throughput vs prompt length, WHIRL 0.1.3 vs llama.cpp](docs/images/bench_prefill.png)
+**Radeon 8060S** (gfx1151, Ryzen AI Max+ 395). **Max power: 80 W at the wall, laptop under an external 8-inch fan, temperatures near 100 °C.** Same models.
 
-![Decode speed on coding prompts, WHIRL 0.1.3 vs llama.cpp](docs/images/bench_decode_zh.png)
+<!-- gen:glance.s8.en -->
+| tok/s, higher is better | Dense 27B: WHIRL | llama.cpp ROCm | llama.cpp Vulkan | MoE 35B-A3B: WHIRL | llama.cpp ROCm | llama.cpp Vulkan |
+|---|---|---|---|---|---|---|
+| Prefill, 2k prompt | **472.9** | 302.2 (WHIRL +56%) | 149.6 (WHIRL +216%) | **2,355** | 1,262 (WHIRL +87%) | 447.7¹ (WHIRL +426%) |
+| Prefill, 32k prompt | **396.4** | 259.1 (WHIRL +53%) | 201.9 (WHIRL +96%) | **1,794** | 1,049¹ (WHIRL +71%) | 756.2¹ (WHIRL +137%) |
+| Prefill, 128k prompt | **288.4** | 176.7¹ (WHIRL +63%) | 118.4¹ (WHIRL +144%) | **1,056** | 636.6¹ (WHIRL +66%) | 428.4¹ (WHIRL +146%) |
+| Decode after a 2k prompt | **27.0** | 24.7 (WHIRL +9%) | 25.5 (WHIRL +6%) | **101.8** | 70.2 (WHIRL +45%) | 70.7¹ (WHIRL +44%) |
+| Decode after a 32k prompt | **25.0** | 18.9 (WHIRL +32%) | 20.2 (WHIRL +24%) | **84.2** | 57.9¹ (WHIRL +46%) | 57.1¹ (WHIRL +48%) |
+| Decode after a 128k prompt | **20.2** | 13.7¹ (WHIRL +48%) | 14.1¹ (WHIRL +44%) | **55.5** | 38.0¹ (WHIRL +46%) | 37.3¹ (WHIRL +49%) |
+| Decode, Chinese-question coding chat | **33.3** | 25.9 (WHIRL +29%) | 27.9 (WHIRL +20%) | **106.3** | 70.6¹ (WHIRL +51%) | 72.9¹ (WHIRL +46%) |
+<!-- /gen -->
 
-Full table (including Qwen3.8 Q4_K_M and where WHIRL does *not* lead by much): [Performance](#performance).
+¹ single run (n = 1); read it as "about". Every other 8060S cell is the median of 2 or 3 runs; every R9700 length cell is a single run, measured the same day for all three engines.
+
+How llama.cpp decodes in these tables: on the dense model with its fastest speculative mode (MTP + n-gram, `--spec-type draft-mtp,ngram-mod`; the faster of that and plain decoding is shown per backend). On the MoE model llama.cpp decodes **without** speculation, because its MTP was slower than plain decoding on this model in our measurements, while WHIRL uses its MTP drafts. The MoE decode rows therefore compare both engines **as shipped**, not like for like. Full tables, with WHIRL's precise and fast modes, are under [Performance](#performance).
+
+**A real coding-agent session on the Radeon 8060S** (max power as above): a 16k-token skills / MCP system prompt, a tool call that reads a 3.6k-token source file, four user turns (explain the file, find the most complex function, rewrite it, review an edited version), full history resent on every call, dense Qwen3.8-27B Q4_K_M:
+
+<!-- gen:s8.agent.en -->
+| Session | WHIRL | llama.cpp ROCm | llama.cpp Vulkan |
+|---|---|---|---|
+| cold (20k-token system + tools prompt not cached yet) | **101.6 s** | 137.7 s | 243.5 s |
+| second session (shares that prefix) | **45.7 s** | 52.5 s | 166.4 s |
+<!-- /gen -->
+
+WHIRL finishes the cold session in 26% less time than llama.cpp ROCm and 58% less than llama.cpp Vulkan (median of 2 rounds each). The code-rewrite turn decodes at about 36–44 tok/s on WHIRL; that turn is mostly copied code, so n-gram drafts help every engine there (llama.cpp ROCm: 42.2 tok/s in the cold session, 111.1 in the second, where it copied its own earlier answer), and it is not a WHIRL lead. This session was measured with the v0.2.0-rc7 pre-release build; the later release candidates changed only the 8060S prefill forward size, and 0.2.0 uses rc7's size for dense models. An agent-session measurement against llama.cpp exists only for the 8060S, not for the R9700.
 
 ## Speed without changing the answer
 
-Every acceleration in WHIRL is checked to produce **the same tokens, bit for bit, as plain greedy decoding** of the same model file:
+WHIRL 0.2.0 has three numerics modes. You pick one per process (`--precise`, `--balance`, `--fast`); with no flag it runs **balance**.
 
-| Acceleration | Guarantee | How it is checked |
-|---|---|---|
-| MTP and n-gram speculative decoding | the verified output is bit-identical to plain greedy decoding | built-in self-check `whirl selftest` (multi-row kernels vs one row, on the model's own weights), kernel tests, server gate |
-| Several users batched together | each request's output is bit-identical to running it alone | kernel tests (row-invariant GEMMs and attention), server gate |
-| Prefix-cache hits on shared system prompts and shared prefixes | bit-identical to processing the prompt from scratch (checkpoints sit on the prompt's own chunk schedule) | server gate |
-| Restoring a session from the RAM or SSD tier | byte-identical to the state that was saved | byte comparison on spill (`TIER_VERIFY`), server gate |
+| Mode | What it is | KV cache | Output guarantee |
+|---|---|---|---|
+| **precise** | bitwise lossless: nothing is quantized beyond the GGUF's own weights; f16 / f32 activations everywhere | f16 | the same bits with or without speculative drafts, alone or batched with other users, and from a prefix-cache hit or a restored session |
+| **balance** (default) | near-lossless: int8 decode activations (the same q8_1 scheme llama.cpp decodes with); on the R9700 also f16-WMMA DeltaNet prefill and, for MXFP4 dense files, fp8 prefill activations | dense: int8 (`q8h`); MoE: f16 | MTP / n-gram drafts, batching and cache restores give the same tokens as plain greedy decoding in balance mode. Against precise: KL about 1e-4 to 1e-3 on the dense models; on the MoE model about 1.9× the model's own noise floor |
+| **fast** (opt-in) | maximum speed within an accepted, gated loss: balance plus 4-bit KV and relaxed MTP acceptance (dense models) | 4-bit (`q4`) | lossy within published KL limits; the text can depend on the drafts and on other users |
 
-What WHIRL does **not** do to go faster: no KV cache below 8 bits (no 4-bit KV), no requantizing the model's weights to fewer bits (only the draft-only MTP and draft-head copies, which cannot change the output), no fp8 attention.
+What this means in practice:
 
-To be precise about what this means:
+- In **precise and balance**, every acceleration is checked to give the same tokens as plain greedy decoding of that mode: MTP and n-gram speculative decoding, several users batched together, prefix-cache hits on shared system prompts, a second question about the same long document, and sessions restored from the RAM or SSD tier. Standing tests enforce it (`whirl selftest`, kernel tests, server gates, golden outputs on both GPUs).
+- **precise and balance never use 4-bit KV, 3-bit weights or fp8 attention.** fast is the only mode with 4-bit KV, and only when you ask for it.
+- balance is the speed-oriented default, like 0.1.x, but it is not bit-for-bit the 0.1.x output (KV format, kernels and sampler changed; [CHANGELOG](CHANGELOG.md)). precise costs speed (R9700, Chinese coding chat, dense model: 77.8 vs 103.1 tok/s in balance).
+- **Weights** are whatever GGUF you choose; WHIRL computes with them as stored. Continuing a conversation reuses the state computed for the previous turn, which is numerically equivalent but not bit-identical to re-processing the whole history as one prompt ([kv-and-caching.md](docs/guide/en/kv-and-caching.md)).
 
-- **Weights** are whatever GGUF you choose; their quantization is the file author's choice, and WHIRL computes with it as stored.
-- **KV cache** defaults to f16. On the dense models, when f16 does not leave room for a long context, the server falls back to int8: `q8v` (f16 keys, int8 values), then `q8h` (int8 keys and values); the MoE model stays f16. `WHIRL_KV` pins the format. Both are numerically lossy compared with an unquantized model, like any quantized inference. WHIRL does not claim "zero loss".
-- **Continuing a conversation** reuses the KV and DeltaNet state computed for the previous turn, including the tokens generated by decoding. They come from the decode kernels (and from a different split of the prompt into chunks), so they are numerically equivalent but not bit-identical to re-processing the whole history as one prompt; the difference is documented and measured ([kv-and-caching.md](docs/guide/en/kv-and-caching.md)).
-- The MXFP4 files run in **speed mode**: prefill uses fp8 activations in the MXFP4 matrix multiplies and f16 in parts of the DeltaNet prefill. Decode and verification always use the same int8 path in both modes, so the guarantees above hold in both.
+Every mode, item and measured KL: [usage.md, numerics modes](docs/usage.md#modes).
 
 ## Requirements
 
-| Item | Details |
+| | |
 |---|---|
-| GPU | **AMD Radeon AI PRO R9700** (RDNA 4, gfx1201), or **Radeon 8060S** (Ryzen AI Max+ 395 iGPU, RDNA 3.5, gfx1151) — **preview, untuned** on this `gfx1151` branch ([below](#radeon-8060s)); one GPU per process |
-| OS | **Windows 11**, 64-bit |
-| Driver | **AMD Software: Adrenalin Edition 26.8.1** (driver 32.0.31041.1004) or newer |
-| To run | only the driver (it installs `amdhip64_7.dll` and `amd_comgr_3.dll`). No HIP SDK, no ROCm, no Visual C++ runtime |
-| To build from source | HIP SDK 7.2 + Visual Studio 2022 Build Tools (MSVC) + CMake + Ninja — see [building.md](docs/building.md) |
-| Memory / disk | the server pins about 1/4 of host RAM (8–32 GiB; 16 GiB on a 64 GB PC) for the RAM cache tier and may use up to 64 GiB of SSD for the SSD tier by default; both are adjustable or can be turned off (`--kv-ram-mb`, `--kv-ssd-gb`). On the Radeon 8060S the RAM tier is 1/8 of the OS-visible RAM (8 GiB on a 64 GB machine; off under 32 GB) and the SSD tier writes only at shutdown |
+| **Download and run** | Download **`whirl-0.2.0-windows-x64.zip`** from [Releases](https://github.com/tsaipifong/whirl-llm/releases), unzip, run. **Only the AMD driver is needed**: no HIP SDK, no ROCm, no Visual C++ runtime |
+| GPU | **AMD Radeon AI PRO R9700** (RDNA 4, gfx1201, 32 GB) or **Radeon 8060S** (RDNA 3.5, gfx1151, the Ryzen AI Max+ 395 iGPU); one GPU per process |
+| OS | Windows 11, 64-bit |
+| Driver | **AMD Software: Adrenalin Edition 26.8.1 (driver 32.0.31041.1004) or newer**, for both GPUs. Older drivers are untested |
+| Memory / disk | the server pins host RAM for its RAM cache tier (R9700 host: about 1/4 of RAM, 16 GiB on a 64 GB PC; Radeon 8060S: 1/8 of the OS-visible RAM, 8 GiB on a 64 GB machine, off under 32 GB) and may use up to 64 GiB of SSD for the SSD tier, written only when the server stops; both adjustable or off (`--kv-ram-mb`, `--kv-ssd-gb`) |
+| Advanced: build from source | for users who want to modify and tune WHIRL themselves: HIP SDK 7.2 + Visual Studio 2022 Build Tools (MSVC) + CMake + Ninja; see [building.md](docs/building.md) |
 
-Our test machine connects the R9700 as a USB4 / Thunderbolt eGPU; that works. Numbers on a card in a direct PCIe slot may differ slightly (mostly where data crosses the host link, such as model loading and the RAM / SSD tiers).
+Support scope: WHIRL officially supports the R9700 and the Radeon 8060S and targets cards with **16 GB or more**. Other AMD GPUs are untested (the RX 9070 series has the R9700's chip with 16 GB; untested). Cards under 16 GB are not officially supported; you are welcome to fork the source and adapt it.
 
-Not supported yet: other AMD GPUs. The RX 9070 series has the same chip (gfx1201) but 16 GB, most likely too little for these 27B / 35B models (untested). Radeon 8060S (Ryzen AI Max+ 395, gfx1151) support is in development on the [`gfx1151` branch](https://github.com/tsaipifong/whirl-llm/tree/gfx1151).
+Our R9700 is connected as a USB4 / Thunderbolt eGPU; that works. A card in a direct PCIe slot may differ slightly where data crosses the host link (model loading, RAM / SSD tier restores), not in prefill or decode.
 
 ## Quick start
 
-1. Download `whirl-0.1.3-windows-x64.zip` from [Releases](https://github.com/tsaipifong/whirl-llm/releases) and a [supported model](#supported-models).
-2. In PowerShell:
+1. Download `whirl-0.2.0-windows-x64.zip` from [Releases](https://github.com/tsaipifong/whirl-llm/releases) and a [supported model](#supported-models).
+2. Unzip and run, in PowerShell:
 
 ```powershell
-Unblock-File .\whirl-0.1.3-windows-x64.zip
-Expand-Archive .\whirl-0.1.3-windows-x64.zip -DestinationPath C:\whirl
-cd C:\whirl\whirl-0.1.3-windows-x64
-.\whirl.exe devices                                    # should list AMD Radeon AI PRO R9700 (gfx1201)
-.\whirl.exe chat C:\models\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf "Explain TCP slow start in two sentences." --max-tokens 400
-.\whirl-server.exe C:\models\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf --port 8080
+Unblock-File .\whirl-0.2.0-windows-x64.zip
+Expand-Archive .\whirl-0.2.0-windows-x64.zip -DestinationPath C:\whirl
+cd C:\whirl\whirl-0.2.0-windows-x64
+.\whirl.exe devices                                    # lists the R9700 (gfx1201) and/or the Radeon 8060S (gfx1151)
+.\whirl.exe chat C:\models\Qwen3.8-27B-UD-Q4_K_M.gguf "Explain TCP slow start in two sentences." --max-tokens 400
+.\whirl-server.exe C:\models\Qwen3.8-27B-UD-Q4_K_M.gguf --port 8080      # default mode: balance
 ```
 
-The server speaks the OpenAI API at `http://127.0.0.1:8080/v1` (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`), so any OpenAI-compatible client works. Stop it with Ctrl+C; cached sessions are written to the SSD tier first.
+The server speaks the OpenAI API at `http://127.0.0.1:8080/v1` (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`), so any OpenAI-compatible client works. Add `--precise` for bitwise-lossless output or `--fast` for maximum speed. Stop the server with Ctrl+C; reused sessions are written to the SSD tier first.
 
-For long documents, give a slot a longer context, for example `--ctx-per-slot 262144` (256k tokens per request); see [recipes.md](docs/recipes.md#long-context).
+With both GPUs present the R9700 is the default; `--device 8060s` (or `WHIRL_DEVICE=8060s`) selects the 8060S. For long documents give a slot a longer context, for example `--ctx-per-slot 262144`; see [recipes.md](docs/recipes.md#long-context).
 
-The first run with a model tunes the GPU kernels once — about 1.5 minutes for a 27B Q4_K_M file, a few seconds for MXFP4 files — and caches the result in `%LOCALAPPDATA%\whirl`. Full walkthrough: [quick start](docs/quickstart.md). Every option: [usage reference](docs/usage.md).
+The first run with a model tunes the GPU kernels once and caches the result in `%LOCALAPPDATA%\whirl` (on the R9700 about 1.5 minutes for a 27B Q4_K_M file, a few seconds for MXFP4 files; longer on the 8060S). Full walkthrough: [quick start](docs/quickstart.md). Every option: [usage reference](docs/usage.md).
+
+**Advanced: build from source** — for users who want to modify and tune WHIRL themselves: [building.md](docs/building.md).
 
 ## Supported models
 
 WHIRL reads `general.architecture` from the GGUF and accepts only `qwen35` and `qwen35moe` (the Gated DeltaNet + gated attention hybrid, with an optional MTP head) and fine-tunes that keep that architecture. Other architectures (Llama, Gemma, Mistral, DeepSeek, `qwen3`, `qwen2`, …) are refused at load time with a clear message, and so are tensor types WHIRL has no kernels for (for example NVFP4); there is no slow generic fallback.
 
-> **Recommended: our own MXFP4 quantizations give the best performance.**
+> **Our own MXFP4 quantizations, made for WHIRL:**
 > - Dense 27B: [**Swift-1.5-Qwen3.8-27b-MXFP4-GGUF**](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF), variant A (`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`). Swift-1.5 also thinks much less than the base model (44% fewer thinking tokens on our mixed Chinese/English coding prompts).
-> - MoE 35B (~3B active): **Ornith-1.5-35B-A3B MXFP4**: [tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF).
+> - MoE 35B (~3B active): [**Ornith-1.5-35B-A3B-MXFP4-GGUF**](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF).
 
-Tested GGUF files (loaded, greedy output checked, MTP output identical to plain greedy, benchmarked on the R9700):
+Tested GGUF files (loaded, greedy output checked, MTP output identical to plain greedy in precise and balance):
 
-| Model file (Hugging Face) | Type | Arch | Quantization | Mode |
-|---|---|---|---|---|
-| [tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF) `…-A-outQ6_K.gguf` (recommended), `…-B-outQ8_0.gguf`, `…-C-outQ4_K.gguf` | dense 27B | qwen35 | MXFP4 (+ Q8_0 MTP / embeddings) | speed mode; quantized by us for WHIRL |
-| [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) `Qwen3.8-27B-UD-Q4_K_M.gguf` | dense 27B | qwen35 | UD-Q4_K_M | precision mode |
-| [FreedomAISVR/Qwen3.8-27B-MXFP4-GGUF](https://huggingface.co/FreedomAISVR/Qwen3.8-27B-MXFP4-GGUF) `qwen3.8-27b-mxfp4.gguf` | dense 27B | qwen35 | MXFP4 | speed mode |
-| [`Ornith-1.5-35B-A3B-MXFP4.gguf`](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF) (quantized by us) | MoE 35B, ~3B active | qwen35moe | MXFP4 experts and dense (+ Q8_0 MTP / embeddings, Q6_K head) | speed mode (fp8 expert prefill) |
-| [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) `Ornith-1.5-35B-Q4_K_M.gguf` | MoE 35B, ~3B active | qwen35moe | Q4_K_M | precision mode |
+| Model file (Hugging Face) | Type | Arch | Quantization |
+|---|---|---|---|
+| [tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF) `…-A-outQ6_K.gguf` (recommended), `…-B-outQ8_0.gguf`, `…-C-outQ4_K.gguf` | dense 27B | qwen35 | MXFP4 (+ Q8_0 MTP / embeddings); quantized by us for WHIRL |
+| [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) `Qwen3.8-27B-UD-Q4_K_M.gguf` | dense 27B | qwen35 | UD-Q4_K_M (the dense model in the 0.2.0 benchmark) |
+| [FreedomAISVR/Qwen3.8-27B-MXFP4-GGUF](https://huggingface.co/FreedomAISVR/Qwen3.8-27B-MXFP4-GGUF) `qwen3.8-27b-mxfp4.gguf` | dense 27B | qwen35 | MXFP4 |
+| [`Ornith-1.5-35B-A3B-MXFP4.gguf`](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF) (quantized by us) | MoE 35B, ~3B active | qwen35moe | MXFP4 experts and dense (+ Q8_0 MTP / embeddings, Q6_K head) |
+| [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) `Ornith-1.5-35B-Q4_K_M.gguf` | MoE 35B, ~3B active | qwen35moe | Q4_K_M |
 
-Image input works with a Qwen3-VL-style mmproj (F16 / BF16) via `--mmproj`; it was tested with the 27B files above. Other `qwen35` / `qwen35moe` GGUFs should load but are untested. Choosing and making GGUFs: [quantization.md](docs/guide/en/quantization.md).
+Image input works with a Qwen3-VL-style mmproj (F16 / BF16) via `--mmproj`, on both GPUs. An opt-in DFlash2 drafter is available for the dense 27B model (`--draft dflash`, [below](#whats-new-in-020)). Other `qwen35` / `qwen35moe` GGUFs should load but are untested. Choosing and making GGUFs: [quantization.md](docs/guide/en/quantization.md).
 
 ## Performance
 
-WHIRL 0.1.3 vs llama.cpp b11214 (ROCm, the fastest flags we found for each row) on the R9700, greedy decoding, the same GGUF files and the same prompts in both engines. Decode numbers lead with WHIRL's default mode, **MTP + n-gram**; rows marked **no MTP** compare plain decoding without speculation. The KV cache format is shown per row.
+WHIRL 0.2.0 against the official llama.cpp b11214 (ggml-org Windows binaries), ROCm and Vulkan builds shown side by side. Same GGUF files, same prompts (a document-QA prompt with a unique first line, so no prefix-cache hits; 256 generated tokens), greedy decoding, thinking off, one user, tok/s from each server's own timings. Methods, flags and raw data: [benchmarks.md](docs/benchmarks.md).
 
-Our MXFP4 files (Swift-1.5 27B and Ornith-1.5-35B-A3B) are the main comparison; Qwen3.8-27B UD-Q4_K_M is shown for reference only. From 96k tokens on, each cell gives the KV format each engine actually used, as `KV WHIRL / llama.cpp`.
+### Radeon AI PRO R9700
 
-![Decode after a 16k and a 256k-token context](docs/images/bench_long_decode.png)
+All three WHIRL modes are shown; the leads are for balance, the default. Every cell is a single run, all engines measured on the same day (2026-10-16); treat differences under about 5% as noise. llama.cpp prefill shows the faster of its plain and speculative runs.
 
-![Server aggregate throughput with 4 users at once](docs/images/bench_server_concurrency.png)
+<!-- gen:r97.qwen.pp.en -->
+#### Qwen3.8-27B UD-Q4_K_M (dense): Prefill tok/s
 
-![Time to first token with a cached prefix](docs/images/bench_ttft_cache.png)
+| Prompt | WHIRL balance | WHIRL precise | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance vs ROCm | balance vs Vulkan |
+|---|---|---|---|---|---|---|---|
+| 2k | **1,782** | 1,615 | 1,768 | 1,140 | 804.4 | +56% | +122% |
+| 8k | **1,872** | 1,684 | 1,843 | 1,210 | 834.6 | +55% | +124% |
+| 32k | **1,719** | 1,565 | 1,701 | 1,089 | 761.2 | +58% | +126% |
+| 64k | **1,516** | 1,404 | 1,507 | 947.0 | 675.7 | +60% | +124% |
+| 96k | **1,359** | 1,272 | 1,352 | 843.9 | 608.8 | +61% | +123% |
+| 128k | **1,233** | 1,163 | 1,226 | 759.2 | 553.9 | +62% | +123% |
+<!-- /gen -->
 
-| R9700, greedy — WHIRL vs llama.cpp (ratio) | Swift-1.5 27B MXFP4-A (dense) | Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active) | Qwen3.8-27B UD-Q4_K_M (dense, reference) |
-|---|---|---|---|
-| Decode tok/s, 7 coding prompts (800 tokens) — WHIRL MTP+n-gram vs llama.cpp fastest¹ | 112.4 vs 60.8 (1.85×) | 257.6 vs 118.8 (2.17×) | 97.3 vs 56.0 (1.74×) |
-| Decode tok/s after a 16k-token context — WHIRL MTP+n-gram vs llama.cpp fastest¹ | 71.4 vs 60.9⁴ (1.17×) | 316.4 vs 106.9⁴ (2.96×) | 80.7 vs 60.7⁴ (1.33×) |
-| Decode tok/s, same 7 prompts — WHIRL **no MTP** vs llama.cpp **no MTP** | 38.1 vs 33.4 (1.14×) | 177.4 vs 118.8 (1.49×) | 34.8 vs 30.9 (1.13×) |
-| Server, 4 concurrent users, aggregate tok/s (incl. prefill) — WHIRL MTP+n-gram vs llama.cpp fastest¹ | 182.1 vs 64.0⁴ (2.84×) | 381.1 vs 176.8⁴ (2.16×) | 122.4 vs 57.1⁴ (2.14×) |
-| Prefill tok/s, 8k-token prompt (CLI bench tools) | 3,469 vs 1,338 (2.59×) | 11,258 vs 4,637 (2.43×) | 1,731 vs 1,223 (1.42×) |
-| Prefill tok/s, 32k-token prompt | 2,907 vs 1,174 (2.48×) | 8,633 vs 3,778 (2.29×) | 1,570 vs 1,086 (1.45×) |
-| Prefill tok/s, 96k-token prompt | 2,021.1 vs 886.7 (2.28×); KV f16 / f16 | 5,183.5 vs 2,602.6 (1.99×); KV f16 / f16 | 1,266.4 vs 837.3 (1.51×); KV f16 / f16 |
-| Prefill tok/s, 128k-token prompt | 1,757 vs 791.3 (2.22×); KV f16 / f16 | 4,311 vs 2,239 (1.93×); KV f16 / f16 | 1,158 vs 752.0 (1.54×); KV f16 / f16 |
-| **Prefill tok/s, 256k-token prompt** | 969.8 vs 556.1 (1.74×); KV q8h / f16 | 2,135.2 vs 1,442.2 (1.48×); KV q8h / f16 | 742.2 vs 516.4 (1.44×); KV q8h / q8_0 |
-| **Decode tok/s after a 256k-token prompt** — WHIRL MTP+n-gram vs llama.cpp plain decoding³ | 35.1 vs 16.8 (2.09×); KV q8h / f16 | 115.6 vs 53.7 (2.15×); KV q8h / f16 | 33.5 vs 10.5 (3.19×); KV q8h / q8_0 |
-| Time to first token, new conversation reusing a 26k-token system prompt (s, lower is better) | 0.108 vs 0.384⁴ (3.6×) | 0.098 vs 0.182⁴ (1.9×) | 0.121 vs 0.369⁴ (3.0×) |
-| Time to first token, 26k-token session after a server restart (restored from the SSD tier) | 0.613 s vs N/A² | 0.318 s vs N/A² | 0.672 s vs N/A² |
+<!-- gen:r97.qwen.tg.en -->
+#### Qwen3.8-27B UD-Q4_K_M (dense): Decode tok/s (256 tokens after the prompt)
 
-¹ llama.cpp's best of plain / MTP / MTP + n-gram for that row.
+| Prompt | WHIRL balance | WHIRL precise | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance vs ROCm | balance vs Vulkan |
+|---|---|---|---|---|---|---|---|
+| 2k | **82.1** | 60.6 | 92.2 | 46.8 (MTP+n-gram) | 49.8 (MTP+n-gram) | +75% | +65% |
+| 8k | **84.1** | 64.4 | 96.9 | 46.5 (MTP+n-gram) | 47.4 (MTP+n-gram) | +81% | +77% |
+| 32k | **75.8** | 58.1 | 78.5 | 40.7 (MTP+n-gram) | 42.7 (MTP+n-gram) | +86% | +78% |
+| 64k | **58.8** | 48.5 | 63.8 | 36.4 (MTP+n-gram) | 36.0 (MTP+n-gram) | +62% | +63% |
+| 96k | **56.1** | 45.2 | 54.6 | 34.2 (MTP+n-gram) | 39.2 (MTP+n-gram) | +64% | +43% |
+| 128k | **48.8** | 42.1 | 58.1 | 27.6 (MTP+n-gram) | 33.9 (MTP+n-gram) | +77% | +44% |
+<!-- /gen -->
 
-² llama.cpp has no automatic persistent KV cache.
+<!-- gen:r97.ornith.pp.en -->
+#### Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active): Prefill tok/s
 
-³ llama-bench `tg64@d262144`: 64 tokens generated after a 262,144-token context, plain decoding without speculative decoding. llama.cpp ran Swift-1.5 MXFP4 at 256k with f16 KV (it fits, 31.3 GB); Ornith-1.5 at 96k and 256k also used f16 KV; Qwen3.8 Q4_K_M at 256k needed q8_0 KV, because f16 spilled into shared memory.
+| Prompt | WHIRL balance | WHIRL precise | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance vs ROCm | balance vs Vulkan |
+|---|---|---|---|---|---|---|---|
+| 2k | **8,624** | 7,502 | 11,477 | 4,014 | 3,551 | +115% | +143% |
+| 8k | **7,733** | 6,756 | 10,794 | 4,487 | 3,912 | +72% | +98% |
+| 32k | **6,651** | 5,948 | 8,435 | 3,872 | 3,395 | +72% | +96% |
+| 64k | **5,333** | 4,892 | 6,440 | 3,173 | 2,735 | +68% | +95% |
+| 96k | **4,409** | 4,098 | 5,158 | 2,667 | 2,280 | +65% | +93% |
+| 128k | **3,758** | 3,528 | 4,283 | 2,307 | 1,922 | +63% | +95% |
+<!-- /gen -->
 
-⁴ llama.cpp re-measured for v0.1.3 with the same prompts as WHIRL; the mode used (the fastest measured): decode after 16k: Swift-1.5 MTP + n-gram, Ornith-1.5 plain, Qwen3.8 MTP + n-gram; 4 concurrent users: Swift-1.5 plain, Ornith-1.5 plain, Qwen3.8 plain; 26k system prompt TTFT: plain only (a 1-token reply; speculative decoding does not apply).
+<!-- gen:r97.ornith.tg.en -->
+#### Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active): Decode tok/s (256 tokens after the prompt)
 
-**Speculative decoding: best, typical and worst case** — Swift-1.5 27B MXFP4-A, WHIRL's default MTP + n-gram against decoding without speculation; the output is the same bit for bit:
+| Prompt | WHIRL balance | WHIRL precise | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance vs ROCm | balance vs Vulkan |
+|---|---|---|---|---|---|---|---|
+| 2k | **241.9** | 182.0 | 222.7 | 115.4 | 115.9 | +110% | +109% |
+| 8k | **218.1** | 188.1 | 207.1 | 112.3 | 111.9 | +94% | +95% |
+| 32k | **203.2** | 161.1 | 186.2 | 101.4 | 100.6 | +100% | +102% |
+| 64k | **174.2** | 142.8 | 182.9 | 90.7 | 89.6 | +92% | +94% |
+| 96k | **156.6** | 132.2 | 166.4 | 81.9 | 81.1 | +91% | +93% |
+| 128k | **141.0** | 119.4 | 158.4 | 75.3 | 73.8 | +87% | +91% |
+<!-- /gen -->
 
-| | Best case: file editing (repeated content) | Typical: coding-agent session | Long-document QA (heavy quoting, after 128k) | Worst case: new writing after 128k (nothing to copy) |
-|---|---|---|---|---|
-| Decode tok/s, MTP + n-gram | 174.4 | 92.9 | 87.6 | 39.4 |
-| Decode tok/s, no speculation | 39.1 | 32.8 | 25.3 | 25.2 |
-| Speedup | 4.47× | 2.83× | 3.47× | 1.56× |
-| Tokens per cycle | 6.19 | — | 6.45 | 1.76 |
+MoE decode: llama.cpp plain decoding (as shipped; its MTP was slower than plain in 11 of 12 MoE cells and 0.4 tok/s faster in the twelfth), WHIRL MTP.
 
-**Long context with int8 KV (q8h)** — WHIRL server, one user, `--ctx-per-slot 262144`, q8h KV (int8 keys and values; queries and keys Hadamard-rotated first), the setting used for 256k tokens on the dense models (set with `WHIRL_KV=q8h` for the MoE model):
+**Chinese-question coding chat** (Chinese question, Chinese explanation, English code; 512 tokens; WHIRL median of 3 runs, llama.cpp first run, because its n-gram drafts learn a repeated prompt):
 
-| WHIRL server, q8h KV, one user | Swift-1.5 27B MXFP4-A | Ornith-1.5-35B-A3B MXFP4 | Qwen3.8-27B UD-Q4_K_M (reference) |
-|---|---|---|---|
-| Prefill tok/s, 64k-token prompt | 2,162.0 | 5,671.3 | 1,289.9 |
-| Prefill tok/s, 128k-token prompt | 1,533.0 | 3,673.6 | 1,032.2 |
-| Prefill tok/s, 192k-token prompt | 1,212.2 | 2,770.7 | 876.6 |
-| Prefill tok/s, 256k-token prompt | 969.8 | 2,135.2 | 742.2 |
-| Decode tok/s (MTP+n-gram) after 128k | 62.5 | 214.0 | 58.3 |
-| Decode tok/s (MTP+n-gram) after 256k | 35.1 | 115.6 | 33.5 |
-| Long-document Q&A spot check (answer names the function asked about; not a formal needle test) | 128k ✓ / 256k ✓ | 128k ✓ / 256k ✓ | 128k ✓ / 256k ✓ |
+<!-- gen:r97.chat.en -->
+| Model | WHIRL precise | WHIRL balance | WHIRL fast | llama.cpp ROCm | llama.cpp Vulkan | balance vs ROCm | balance vs Vulkan |
+|---|---|---|---|---|---|---|---|
+| Qwen3.8-27B UD-Q4_K_M (dense) | 77.8 | **103.1** | 119.3 | 61.4 (MTP+n-gram) | 61.2 (MTP+n-gram) | +68% | +68% |
+| Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active) | 196.8 | **250.1** | 229.0 | 118.9 (plain) | 115.1 (plain) | +110% | +117% |
+<!-- /gen -->
 
-Where WHIRL does **not** lead by much: plain decoding (no MTP) of the dense models is memory-bandwidth bound in both engines (1.13–1.14× llama.cpp); decode after a 16k-token context leads by only 1.17× (Swift-1.5) and 1.33× (Qwen3.8) on the dense models; prefill of Qwen3.8 Q4_K_M leads by less (1.51× at 96k and 1.44× at 256k tokens, against 2.28× and 1.74× for Swift-1.5 MXFP4); Ornith-1.5 prefill at 256k leads by 1.48×; and in the worst case for speculative decoding (new writing after 128k tokens, nothing to copy) it gains only 1.56×. Our R9700 is a USB4 eGPU; prefill and decode stay in VRAM, but restores and model loading cross the host link.
+### <a id="radeon-8060s"></a>Radeon 8060S
 
-Full methodology and all numbers: [benchmarks.md](docs/benchmarks.md).
+**Max power: 80 W at the wall, laptop under an external 8-inch fan, temperatures near 100 °C.** WHIRL balance; median of 2–3 runs per cell unless marked. ASUS ROG Flow Z13 (Ryzen AI Max+ 395, 128 GB, 63.6 GB visible to Windows).
 
-### <a id="radeon-8060s"></a>Radeon 8060S (preview, untuned)
+<!-- gen:s8.qwen.pp.en -->
+#### Qwen3.8-27B UD-Q4_K_M (dense): Prefill tok/s
 
-The `gfx1151` branch adds a kernel set for the Radeon 8060S (Ryzen AI Max+ 395 iGPU). It is
-**correct but not tuned yet**: the kernel tests pass on it, MTP / MTP + n-gram output equals plain
-greedy on the three models in the table below, and the server gates pass. Builds contain both kernel sets; the
-R9700 is the default device when present, otherwise the 8060S (`whirl devices` shows which;
-`--device 8060s` / `WHIRL_DEVICE=8060s` selects it). Image input (`--mmproj`) works on the 8060S since 0.2.0
-([vision.md](docs/guide/en/vision.md#gfx1151)). Not yet on the 8060S: the `q8v` / `q8h` KV formats, fp8 prefill (MXFP4 prefill uses f16 activations). Unified memory: the server's
-default KV pool is 262,144 tokens and the RAM / SSD tiers are off unless `--kv-ram-mb` is given.
+| Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| 2k | **472.9** | 302.2 | 149.6 | +56% | +216% |
+| 32k | **396.4** | 259.1 | 201.9 | +53% | +96% |
+| 64k | **346.9** | 221.7 | 161.3 | +57% | +115% |
+| 96k | **310.4** | 195.5 | 137.0 | +59% | +127% |
+| 128k | **288.4** | 176.7¹ | 118.4¹ | +63% | +144% |
+<!-- /gen -->
 
-| Radeon 8060S, greedy, **untuned** — WHIRL vs llama.cpp (ratio) | Ornith-1.5-35B-A3B MXFP4 (MoE) | Swift-1.5 27B MXFP4-A (dense) | Qwen3.8-27B UD-Q4_K_M (dense) |
-|---|---|---|---|
-| Prefill tok/s, 88-token prompt | 560 vs 779 (0.72×) | 252 vs 264 (0.95×) | 234 vs 260 (0.90×) |
-| Prefill tok/s, 2k-token prompt | 1,475 vs 1,312 (1.12×) | 389 vs 292 (1.33×) | 357 vs 284 (1.26×) |
-| Prefill tok/s, 8k-token prompt | 1,372 vs 1,186 (1.16×) | 366 vs 272 (1.35×) | 337 vs 264 (1.28×) |
-| Decode tok/s, **no MTP** (llama-bench tg256) | 85.9 vs 66.8 (1.29×) | 14.9 vs 13.5 (1.10×) | 13.2 vs 12.4 (1.06×) |
-| Decode tok/s, WHIRL MTP / MTP + n-gram | 106.3 / 117.9 | 29.5 / 29.3 | 28.8 / 33.0 |
-| First run: prefill-kernel autotune (once per model) | 10 s | 85 s | 461 s |
+<!-- gen:s8.qwen.tg.en -->
+#### Qwen3.8-27B UD-Q4_K_M (dense): Decode tok/s (256 tokens)
 
-Bring-up snapshot, two interleaved rounds against llama.cpp b11214 ROCm on the same laptop; details in
-[benchmarks.md §14](docs/benchmarks.md#14-radeon-8060s-preview-bring-up-untuned).
+| Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| 2k | **27.0** | 24.7 | 25.5 | +9% | +6% |
+| 32k | **25.0** | 18.9 | 20.2 | +32% | +24% |
+| 64k | **22.6** | 17.9 | 18.2 | +27% | +24% |
+| 96k | **21.4** | ~17.7² | 16.7 | ~+21%² | +28% |
+| 128k | **20.2** | 13.7¹ | 14.1¹ | +48% | +44% |
+<!-- /gen -->
 
-## What's new since v0.1.0
+<!-- gen:s8.ornith.pp.en -->
+#### Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active): Prefill tok/s
 
-Both versions measured on the same machine, with the same GGUF file and the same prompts; the greedy output of the two versions is bit-identical.
+| Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| 2k | **2,355** | 1,262 | 447.7¹ | +87% | +426% |
+| 32k | **1,794** | 1,049¹ | 756.2¹ | +71% | +137% |
+| 64k | **1,417** | 848.8 | 603.6¹ | +67% | +135% |
+| 96k | **1,178** | 710.4 | 500.5¹ | +66% | +135% |
+| 128k | **1,056** | 636.6¹ | 428.4¹ | +66% | +146% |
+<!-- /gen -->
 
-| Swift-1.5 27B MXFP4-A, R9700 | v0.1.0 | v0.1.3 | Change |
-|---|---|---|---|
-| Prefill tok/s, 32k-token prompt (f16 KV) | 2,605.3 | 2,907.4 | +11.6% |
-| Prefill tok/s, 128k-token prompt (f16 KV) | 1,407.3 | 1,756.7 | +24.8% |
-| Prefill tok/s, 128k-token prompt (q8h KV, server) | 1,352.7 | 1,533.0 | +13.3% |
-| Prefill tok/s, 256k-token prompt (q8h KV, server) | 832.5 | 969.8 | +16.5% |
-| Decode tok/s, Q&A over a 128k-token document (answer quotes the document a lot) | 63.7 | 87.6 | +37.5% |
-| Decode tok/s, coding prompts | 110.7 | 120.7 | +9.1% |
-| KV pool, default 4 slots (tokens) | 210,688 | 226,304 | +7.4% |
-| 4 users, short prompts sent together: whole batch done (s, lower is better) | 9.57 | 8.62 | −9.9% |
-| Decode tok/s, long-context coding-agent request (agent session 3, step 143, 127.9k tokens) | 53.7 | 75.2 | +40.0% |
-| Decode tok/s, agent session 3 up to that request (mean of 144 requests) | 64.9 | 81.7 | +25.9% |
+<!-- gen:s8.ornith.tg.en -->
+#### Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active): Decode tok/s (256 tokens)
 
-v0.1.2 for reference (same machine, same output): 53.5 tok/s for the 127.9k request, 65.0 tok/s for the session; the gain is v0.1.3's.
+| Prompt | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| 2k | **101.8** | 70.2 | 70.7¹ | +45% | +44% |
+| 32k | **84.2** | 57.9¹ | 57.1¹ | +46% | +48% |
+| 64k | **72.9** | 49.0 | 48.4¹ | +49% | +51% |
+| 96k | **62.0** | 42.7 | 42.2¹ | +45% | +47% |
+| 128k | **55.5** | 38.0¹ | 37.3¹ | +46% | +49% |
+<!-- /gen -->
+
+¹ single run; read it as "about". ² unreliable: two runs that differ by 31% (20.1 and 15.3 tok/s; llama.cpp's MTP + n-gram acceptance varied), so this lead is not quoted anywhere else. Dense decode: llama.cpp MTP + n-gram, WHIRL MTP. MoE decode: llama.cpp plain (as shipped), WHIRL MTP.
+
+**Chinese-question coding chat on the 8060S** (same prompt as on the R9700; WHIRL measured with the v0.2.0-rc7 pre-release build, whose decode path is unchanged in 0.2.0):
+
+<!-- gen:s8.chat.en -->
+| Model | WHIRL balance | llama.cpp ROCm | llama.cpp Vulkan | WHIRL vs ROCm | WHIRL vs Vulkan |
+|---|---|---|---|---|---|
+| Qwen3.8-27B UD-Q4_K_M (dense) | **33.3** | 25.9 | 27.9 | +29% | +20% |
+| Ornith-1.5-35B-A3B MXFP4 (MoE, ~3B active) | **106.3** | 70.6¹ | 72.9¹ | +51% | +46% |
+<!-- /gen -->
+
+### Where WHIRL does not lead by much
+
+- **Dense decode on the 8060S after a short prompt**: +9% over llama.cpp ROCm and +6% over Vulkan at 2k, within run-to-run noise. Dense decode on the 8060S is memory-bound (about 256 GB/s for 15+ GB of weights), so the lead comes from speculative decoding and grows with context (+24% to +48% from 32k on).
+- **Plain decoding without speculation** is memory-bandwidth bound in every engine; most of WHIRL's decode lead comes from MTP + n-gram speculative decoding.
+- **fast is not always faster than balance**: on the MoE model at short and medium context (R9700), balance decodes faster than fast; fast helps mostly in prefill and in dense decode.
+- **precise costs speed**: 14–26% of decode and 6–13% of prefill against balance on the R9700 (tables above).
+- Swift-1.5 27B MXFP4 was not re-measured for 0.2.0; its 0.1.3 numbers are in [benchmarks.md](docs/benchmarks.md#appendix-v013).
+
+## What's new in 0.2.0
+
+- **Radeon 8060S (Ryzen AI Max+ 395) support**, tuned: faster than llama.cpp ROCm and Vulkan at every measured prompt length on both models (tables above). Image input works on the 8060S, and the RAM and SSD cache tiers are on by default there (on Windows the BIOS VRAM carve-out and the OS RAM are separate pools, so a 128k-token session restores in 0.34 s from RAM and 2 s from SSD instead of 537 s of prefill).
+- **Three numerics modes**: precise (bitwise lossless), balance (default, near-lossless), fast (opt-in, gated loss). See [above](#speed-without-changing-the-answer).
+- **DFlash2 drafts, opt-in** (`--draft dflash --draft-model Qwen3.8-27B-DFlash2-Q8_0.gguf`, drafter from Hugging Face `incoai/Qwen3.8-27B-DFlash2-GGUF`, not bundled): for one user with short or medium context and predictable output, +19% to +48% over MTP on the R9700; slower with 4 users (about −39%), after 37k+ tokens of context and on mostly-Chinese output (about −10%); costs about 1.9 GiB of VRAM. Greedy output equals plain greedy decoding of the same mode.
+- **SSD cache writes far less**: by default it writes only reused sessions, when the server stops (or after about 5 minutes idle, or when RAM must evict them); a one-shot prompt is never written. The cache never exceeds `--kv-ssd-gb` (default 64 GiB) on disk, and files unused for 7 days are deleted. (Before, a benchmark of many different long prompts could write hundreds of GB.)
+- **A second question about the same long document reuses it**: the server keeps a tail checkpoint, so it prefills only the new question (about 0.3k–1.3k tokens) instead of the whole document.
+- **CLI and server give bit-identical output** for the same prompt (same prefill schedule).
+
+Full list: [CHANGELOG.md](CHANGELOG.md).
 
 ## Windows security prompts
 
@@ -225,21 +292,32 @@ v0.1.2 for reference (same machine, same output): 53.5 tok/s for the 127.9k requ
 |---|---|---|
 | Quick start | [quickstart.md](docs/quickstart.md) | [quickstart_zh-TW.md](docs/quickstart_zh-TW.md) |
 | Recipes: connect a client, long agent sessions, long context, several users, images, reading the log, troubleshooting | [recipes.md](docs/recipes.md) | [recipes_zh-TW.md](docs/recipes_zh-TW.md) |
-| Usage reference (all commands, options, environment variables, exit codes) | [usage.md](docs/usage.md) | [usage.md](docs/guide/zh-TW/usage.md) |
+| Usage reference (all commands, options, numerics modes, environment variables, exit codes) | [usage.md](docs/usage.md) | [usage.md](docs/guide/zh-TW/usage.md) |
 | Server (API, sampling, tool calls, batching, decode floor, logs) | [server.md](docs/guide/en/server.md) | [server.md](docs/guide/zh-TW/server.md) |
 | Benchmarks vs llama.cpp | [benchmarks.md](docs/benchmarks.md) | [benchmarks.md](docs/guide/zh-TW/benchmarks.md) |
 | Windows security prompts | [windows_security.md](docs/windows_security.md) | [windows_security_zh-TW.md](docs/windows_security_zh-TW.md) |
-| Building from source | [building.md](docs/building.md) | [building_zh-TW.md](docs/building_zh-TW.md) |
+| Advanced: building from source | [building.md](docs/building.md) | [building_zh-TW.md](docs/building_zh-TW.md) |
 | Guide index | [index.md](docs/guide/en/index.md) | [index.md](docs/guide/zh-TW/index.md) |
 | Architecture | [architecture.md](docs/guide/en/architecture.md) | [architecture.md](docs/guide/zh-TW/architecture.md) |
 | Kernels | [kernels.md](docs/guide/en/kernels.md) | [kernels.md](docs/guide/zh-TW/kernels.md) |
-| Speculative decoding (MTP + n-gram) | [speculative-decoding.md](docs/guide/en/speculative-decoding.md) | [speculative-decoding.md](docs/guide/zh-TW/speculative-decoding.md) |
+| Speculative decoding (MTP + n-gram, DFlash2) | [speculative-decoding.md](docs/guide/en/speculative-decoding.md) | [speculative-decoding.md](docs/guide/zh-TW/speculative-decoding.md) |
 | KV cache, prefix caching, tiers | [kv-and-caching.md](docs/guide/en/kv-and-caching.md) | [kv-and-caching.md](docs/guide/zh-TW/kv-and-caching.md) |
 | Quantization and model files | [quantization.md](docs/guide/en/quantization.md) | [quantization.md](docs/guide/zh-TW/quantization.md) |
 | Image input | [vision.md](docs/guide/en/vision.md) | [vision.md](docs/guide/zh-TW/vision.md) |
 | HIP on Windows | [windows-hip.md](docs/guide/en/windows-hip.md) | [windows-hip.md](docs/guide/zh-TW/windows-hip.md) |
 | Benchmarking methodology | [benchmarking.md](docs/guide/en/benchmarking.md) | [benchmarking.md](docs/guide/zh-TW/benchmarking.md) |
-| **Pitfalls** (125, each with symptom → root cause → fix → check) | [pitfalls.md](docs/guide/en/pitfalls.md) | [pitfalls.md](docs/guide/zh-TW/pitfalls.md) |
+| **Pitfalls** (each with symptom → root cause → fix → check) | [pitfalls.md](docs/guide/en/pitfalls.md) | [pitfalls.md](docs/guide/zh-TW/pitfalls.md) |
+
+## Design principles
+
+1. **Built for AMD GPUs on Windows.** A native Windows C++/HIP inference engine with hand-written, hand-tuned kernels for RDNA. No WSL, no Docker, no Linux VM: install the AMD driver and run.
+2. **Fully open, kernels included.** Everything from host-side scheduling to every GPU kernel is open source under Apache-2.0, with no closed binary components. Bug reports, benchmark results and code contributions are all welcome.
+3. **Accuracy before speed.** In the precise and balance modes every speedup (speculative decoding, batching, prefix caching, cache restore) gives the same tokens as plain greedy decoding of that mode, enforced by standing tests. Anything lossier is opt-in (`--fast`) and gated by KL and accuracy limits.
+4. **Few models, pushed to the limit.** WHIRL targets specific models on specific hardware and pushes them close to the hardware limit, adding architectures one at a time. The architectures supported today are `qwen35` (dense) and `qwen35moe` (mixture of experts).
+5. **Transparent, verifiable numbers.** Every figure is measured, with methods, commands and raw data published, including where WHIRL does not lead by much.
+6. **Designed for real workflows.** Coding agents and long contexts come first: fast long-prompt processing, a responsive main conversation while others share the GPU, and a VRAM → RAM → SSD cache that survives server restarts.
+
+WHIRL follows the design philosophy of [NInfer](https://github.com/Neroued/ninfer) (Apache-2.0) — build for selected models and selected GPUs, as close to the hardware limit as possible; [zynfer](https://github.com/thanos/zynfer) carried the same idea to RDNA 4.
 
 ## Development and AI assistance
 
