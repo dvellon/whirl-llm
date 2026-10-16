@@ -29,14 +29,18 @@ inline std::size_t prefillChunkLen(std::size_t remaining) {
     return remaining <= prefill_chunk + prefill_merge ? remaining : prefill_chunk;
 }
 
-// Default forward size of a solo prefill (WHIRL_PREFILL_CHUNK unset): 2048 rows; gfx1151 (Radeon 8060S,
-// SRV-PP) 4096 = the whole default prefill batch: Ornith MoE 128k +3.6% over 2048 (CLI on the server's
-// schedule, real 131k prompt: 983 -> 1018 tok/s, the bench's speed). No extra memory (the prefill
-// buffers are sized for the batch either way). Same bits (whole-chunk grouping, section 7 of
-// docs/guide/en/kv-and-caching.md; seqtest gates it). gfx1201 keeps 2048 until measured there.
+// Default forward size of a solo prefill (WHIRL_PREFILL_CHUNK unset): 2048 rows; gfx1151 (Radeon 8060S)
+// MoE models 4096 = the whole default prefill batch (SRV-PP): Ornith MoE 128k +3.6% over 2048 (CLI on the
+// server's schedule, real 131k prompt: 983 -> 1018 tok/s; server 128k +4.2%). Dense models on gfx1151 keep
+// 2048 (SRV-PP-DENSE, server, 2 rounds): 4096 cost Qwen3.8-27B 3.5% / 5% / 8% / 13% at 32k / 64k / 96k /
+// 128k (128k 248.0 vs 284.6 tok/s), while MoE 64k / 96k gain 3.0% / 4.3%, so the 8060S default is per
+// model. No extra memory either way (the prefill buffers are sized for the batch). Same bits (whole-chunk
+// grouping, section 7 of docs/guide/en/kv-and-caching.md; seqtest gates it). gfx1201 keeps 2048 until measured there.
 inline constexpr std::size_t prefill_exec_default = 2048;
-inline constexpr std::size_t prefill_exec_default_gfx1151 = 4096;
-inline constexpr std::size_t prefillExecDefault(bool gfx1151) { return gfx1151 ? prefill_exec_default_gfx1151 : prefill_exec_default; }
+inline constexpr std::size_t prefill_exec_default_gfx1151_moe = 4096;
+inline constexpr std::size_t prefillExecDefault(bool gfx1151, bool moe) {
+    return gfx1151 && moe ? prefill_exec_default_gfx1151_moe : prefill_exec_default;
+}
 
 // EngineOptions::prefill_exec for a prefill batch: whole schedule chunks, and a forward (+ the merged
 // tail) must fit the batch; never below one chunk (the batch is >= prefill_chunk + prefill_merge,

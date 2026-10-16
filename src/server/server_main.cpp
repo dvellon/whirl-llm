@@ -682,9 +682,9 @@ int serveMain(int argc, char** argv, const char* program) {
         std::unique_ptr<qwen35::Model> mp = qwen35::Model::load(f, 0, stats, lo);
         qwen35::Model& model = *mp;
         // whole schedule chunks that fit the prefill batch (a forward never exceeds the batch:
-        // Engine::chunkLen caps it); default 2048 rows, gfx1151 4096 (SRV-PP)
+        // Engine::chunkLen caps it); default 2048 rows, gfx1151 MoE 4096 (SRV-PP; dense 2048, SRV-PP-DENSE)
         const bool g1151 = model.arch == hip::Arch::gfx1151;
-        const std::size_t prefill_exec = prefillExecFor(exec_req.value_or(prefillExecDefault(g1151)), lo.max_batch, g1151);
+        const std::size_t prefill_exec = prefillExecFor(exec_req.value_or(prefillExecDefault(g1151, model.cfg.moe)), lo.max_batch, g1151);
         {
             std::string tl;
             qwen35::loadOrTune(model, opt.path, tl);

@@ -5,6 +5,10 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## Unreleased (0.2.0)
 
+### Radeon 8060S: prefill forward size per model, dense back to 2048 rows (SRV-PP-DENSE)
+
+- On the Radeon 8060S (gfx1151) the default prefill forward is now 4096 rows for MoE models only; dense models keep 2048 rows (`prefillExecDefault(gfx1151, moe)`, `include/whirl/prefill_schedule.h`; `WHIRL_PREFILL_CHUNK` still overrides). The rc8 change to 4096 for every model slowed dense Qwen3.8-27B prefill on the 8060S by 3.5% / 5% / 8% / 13% at 32k / 64k / 96k / 128k (server, 2 rounds; 128k 248.0 -> 284.6 tok/s back with 2048), while Ornith MoE gains 3.0% / 4.3% / 4.2% at 64k / 96k / 128k with 4096. Same output bits (forward size is a schedule-point grouping; seqtest and golden unchanged), no memory change, R9700 unchanged.
+
 ### MoE balance keeps int8 decode activations; KL gate MoE balance top-1 tolerance 3.0 points (MOE-BAL-3)
 
 - **MoE balance keeps int8 decode activations** (`q8dec`, one f32 scale per 32 values): the same q8_1 activations llama.cpp itself uses for decode, i.e. the same numeric level as llama.cpp. MoE balance = `gdnwmma` + `h16` + `q8dec`, f16 KV (no `fp8` / `moefp8`, MOE-BAL). A short-lived table without `q8dec` (MOE-BAL-2, never released) cost about 20% of MoE balance decode on the R9700 and was reverted. Dense balance and every fast table are unchanged; `WHIRL_Q8DEC=0` gives f16 decode activations.

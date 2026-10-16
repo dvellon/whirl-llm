@@ -426,7 +426,7 @@ PowerShell 中先用 `$env:WHIRL_MODE = "precise"` 設定再啟動程式。**一
 | `WHIRL_CKPT_HOST=1` | 前綴檢查點放在 pinned 主記憶體，不放 VRAM |
 | `WHIRL_POOL_RESERVE_MB=N` | 決定 KV 池大小時保留不用的 VRAM（預設 768，MoE 1536） |
 | `WHIRL_VRAM_HEADROOM_MB=N` | 在上述保留之外，再留給桌面與其他程式的 VRAM。VRAM 小於 20 GiB 的卡（16 GB 的 RX 9070／9070 XT／9060 XT，通常同時負責顯示）預設 1536，這類卡的伺服器也預設 `--parallel 1`（KV 格式跟其他卡一樣由模式決定）；20 GiB 以上的卡預設 0，行為不變。0 = 不保留 |
-| `WHIRL_PREFILL_CHUNK=N` | 合併後單次 prefill forward 的最多列數（1024 的倍數，預設 2048，Radeon 8060S 為 4096；上限為 prefill batch） |
+| `WHIRL_PREFILL_CHUNK=N` | 合併後單次 prefill forward 的最多列數（1024 的倍數，預設 2048，Radeon 8060S 上 MoE 模型為 4096；上限為 prefill batch） |
 | `WHIRL_SEG_PREFILL=0` | 每個請求各自 prefill，不把多個請求放進同一次 forward |
 | `WHIRL_GATHER_MS=MS` | 收集一波新請求的等待時間窗（預設 30，0 = 關閉） |
 | `WHIRL_DECODE_MIN_TPS=N` | 其他請求 prefill 時，每個串流請求的 decode 保底速度（= `--decode-min-tps`，預設 20，0 = 關閉） |

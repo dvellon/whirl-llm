@@ -556,7 +556,7 @@ The output always equals plain greedy decoding (with sampling: the same distribu
 | `WHIRL_CKPT_HOST=1` | keep prefix checkpoints in pinned host memory instead of VRAM |
 | `WHIRL_POOL_RESERVE_MB=N` | VRAM left free when the KV pool is sized (default 768, MoE 1536) |
 | `WHIRL_VRAM_HEADROOM_MB=N` | VRAM kept free for the desktop and other programs, on top of the reserve. Default 1536 on cards with less than 20 GiB (16 GB RX 9070 / 9070 XT / 9060 XT, which usually also drive the display), where the server also defaults to `--parallel 1` (the KV format is the mode's, as on any card); 0 on larger cards, whose defaults are unchanged. 0 = no headroom |
-| `WHIRL_PREFILL_CHUNK=N` | most rows per merged prefill forward (multiple of 1024, default 2048, Radeon 8060S 4096; capped at the prefill batch) |
+| `WHIRL_PREFILL_CHUNK=N` | most rows per merged prefill forward (multiple of 1024, default 2048, Radeon 8060S MoE models 4096; capped at the prefill batch) |
 | `WHIRL_SEG_PREFILL=0` | prefill each request on its own instead of several in one forward |
 | `WHIRL_GATHER_MS=MS` | window to gather a burst of new requests (default 30, 0 = off) |
 | `WHIRL_DECODE_MIN_TPS=N` | decode floor per streaming request while others prefill (= `--decode-min-tps`, default 20, 0 = off) |
