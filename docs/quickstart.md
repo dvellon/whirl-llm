@@ -42,8 +42,8 @@ cd C:\whirl\whirl-0.2.0-windows-x64
 "downloaded from the internet" mark so that Windows does not ask about every file; see
 [Windows security prompts](windows_security.md).)
 
-**The first run with a model tunes the GPU kernels once**: on the R9700 a few seconds for MXFP4 models, about
-1.5 minutes for a 27B Q4_K_M model; longer on the Radeon 8060S (a message says so). The result is cached in
+**The first run with a model tunes the GPU kernels once**: on the R9700 a few seconds for our MXFP4 models,
+longer on the Radeon 8060S (a message says so). The result is cached in
 `%LOCALAPPDATA%\whirl`, so later runs start right away.
 
 ## 4. Start the server

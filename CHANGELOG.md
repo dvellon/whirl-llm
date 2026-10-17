@@ -3,13 +3,22 @@
 All notable changes to WHIRL are listed here. Versions follow `project(whirl VERSION ...)` in
 `CMakeLists.txt`.
 
-## 0.2.0 — [TBD: release date]
+## 0.2.0 — {{RELEASE_DATE}}
 
 ### Highlights
 
-- **Radeon 8060S (Ryzen AI Max+ 395, gfx1151) support, tuned.** Against the official llama.cpp b11214 at max power (80 W), ASUS ROG Flow Z13, WHIRL balance is faster than both the ROCm and the Vulkan build at every measured prompt length (2k-128k) on Qwen3.8-27B Q4_K_M and Ornith-1.5-35B-A3B MXFP4; in a real coding-agent session (dense 27B) it finishes the cold session in 101.6 s against 137.7 s (ROCm) and 243.5 s (Vulkan). Image input, and the RAM / SSD cache tiers on by default, on the 8060S. Tables: [README](README.md#performance), [benchmarks.md](docs/benchmarks.md).
-- **Three numerics modes**: `--precise` (bitwise lossless), `--balance` (default, near-lossless), `--fast` (opt-in, gated loss). In precise and balance, speculative decoding, batching and cache restores give the same tokens as plain greedy decoding of that mode. Details below and in [usage.md](docs/usage.md#modes).
-- **R9700 vs the official llama.cpp b11214** (balance, one user, 2k-128k): dense Qwen3.8-27B Q4_K_M prefill +55% to +62% over ROCm and +122% to +126% over Vulkan, decode (document QA: explain and rewrite a function from the prompt) +62% to +86% / +43% to +78%; Ornith-1.5-35B-A3B MXFP4 prefill +63% to +115% / +93% to +143%, decode +87% to +110% / +91% to +109% (MoE decode as shipped: WHIRL MTP vs llama.cpp plain, its MTP being slower on this model).
+<!-- gen:changelog.lead.en -->
+- **Faster than the official llama.cpp b11214 on both GPUs, in every mode and at every measured length (2k to ~250k tokens)**, ROCm and Vulkan builds compared separately, on our two MXFP4 models. WHIRL balance (default) leads, prefill / decode:
+  - R9700, Swift-1.5 27B MXFP4: prefill +139% to +191% over ROCm and +208% to +295% over Vulkan; decode +56% to +80% / +38% to +84%.
+  - R9700, Ornith-1.5-35B-A3B MXFP4: prefill +75% to +188% / +119% to +225%; decode +74% to +107% / +78% to +106% (as shipped: WHIRL MTP vs llama.cpp plain).
+  - Radeon 8060S (max power (80 W), ASUS ROG Flow Z13), Swift: prefill +53% to +65% / +93% to +183%; decode +28% to +46% / +24% to +105%.
+  - Radeon 8060S, Ornith: prefill +64% to +91% / +142% to +199%; decode +41% to +54% / +43% to +57%.
+  - Coding-agent session (Swift, cold): R9700 17.0 s vs 81.0 s / 69.4 s; 8060S 95.7 s vs 145.6 s / 264.4 s.
+  Decode = document QA (explain and rewrite a function quoted in the prompt). Ranges leave out three footnoted kinds of llama.cpp cells (R9700 Swift 8k cold request and ~250k memory spill, 8060S Vulkan 2k prefill); tables: [README](README.md#performance), [benchmarks.md](docs/benchmarks.md).
+<!-- /gen -->
+- **Radeon 8060S (Ryzen AI Max+ 395, gfx1151) support, tuned**, with image input and the RAM / SSD cache tiers on by default.
+- **Our MXFP4 models, quantized for WHIRL**: Swift-1.5 27B MXFP4 (dense) and Ornith-1.5-35B-A3B MXFP4 (MoE). fp8 prefill on the R9700, Q8_0 `ssm_alpha` / `ssm_beta` so MTP output stays bitwise identical to plain greedy decoding, and a Q6_K head for fast drafts ([README](README.md#why-whirl-is-fast-with-these-mxfp4-files)).
+- **Three numerics modes**: `--precise` (bitwise lossless), `--balance` (default, near-lossless), `--fast` (opt-in, gated loss; not fully optimized yet, see below). In precise and balance, speculative decoding, batching and cache restores give the same tokens as plain greedy decoding of that mode. Details below and in [usage.md](docs/usage.md#modes).
 - **DFlash2 drafts, opt-in** (`--draft dflash`), **SSD tier that writes only reused sessions and never exceeds its cap**, **second question about the same long document served from a tail checkpoint**, **CLI and server give the same output bits** for the same prompt.
 
 ### Radeon 8060S
@@ -23,7 +32,7 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 - `--precise` / `--balance` / `--fast` (or `--mode M`, env `WHIRL_MODE`) for `whirl` and `whirl-server`; one mode per process, shown in the start-up log and in `GET /props` (`"numerics"`). With no flag WHIRL runs **balance**.
 - **precise**: bitwise lossless; f16 KV on every model and GPU. The same bits with or without drafts, alone or batched, and from a cache restore.
 - **balance** (default): near-lossless; q8h KV on dense models, f16 KV on MoE models. MTP / n-gram drafts, batching and cache restores give the same tokens as plain greedy decoding in balance.
-- **fast** (opt-in): 4-bit KV (dense models on the Radeon 8060S keep q8h KV, which decodes faster there) and relaxed MTP acceptance on dense models with an MTP head, within the KL limits checked by `tools/klgate/klgate.py`. The text can depend on the drafts and on other users.
+- **fast** (opt-in, not fully optimized yet; it will improve in later 0.2.x releases): 4-bit KV (dense models on the Radeon 8060S keep q8h KV, which decodes faster there) and relaxed MTP acceptance on dense models with an MTP head, within the KL limits checked by `tools/klgate/klgate.py`. The text can depend on the drafts and on other users.
 - The KV format is fixed per mode, the same on every card, CLI and server. The automatic fallback to a lower-precision KV format is gone: when the format does not fit, the context is lowered with a warning, or the program stops with a message if you gave `--ctx` / `--ctx-per-slot`. `WHIRL_KV` remains a debug override.
 - Sampling (temperature > 0) in balance and fast uses a new exact speculative sampler: the text for a seed depends only on the seed and the model, not on the drafts, the prefix cache or earlier requests. `WHIRL_SPEC_SAMPLE=0` turns it off.
 - The per-item variables (`WHIRL_FP8`, `WHIRL_KV`, ...) still work and are reported as overrides of the mode.
@@ -59,7 +68,6 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 - The automatic KV format fallback is gone (see Numerics modes); use `--ctx` / `--ctx-per-slot` to size the context.
 - Use `--precise` when you need bitwise-lossless output (identical to plain greedy decoding). MXFP4 prefill is slower in precise mode than in 0.1.x.
 - Sampled text for a given seed can differ from earlier versions in balance and fast (new sampler).
-- [TBD: confirm `CMakeLists.txt` `project(whirl VERSION 0.2.0)` and the zip name `whirl-0.2.0-windows-x64.zip` before tagging; rel020 still says 0.1.4]
 
 ## 0.1.4 — 2026-10-06
 
@@ -144,7 +152,7 @@ Every change below keeps the output bit-identical to plain greedy decoding, unle
   bit-identical to the previous kernel (kernel-test invariants; last-token logits, MTP == plain and
   server outputs identical to 0.1.2). Kernel throughput at long context: f16 ~65 → ~93 TFLOPS, q8v
   ~61 → ~84 TFLOPS. `whirl bench` prefill, Swift-1.5 27B MXFP4-A (f16 KV, R9700): 32k +10%, 64k
-  +17%, 96k +21%, 128k +24%; Ornith MXFP4 64k +11%, 128k +14%; Qwen3.8-27B UD-Q4_K_M (f16 KV) 32k
+  +17%, 96k +21%, 128k +24%; Ornith MXFP4 64k +11%, 128k +14%; Qwen3.8-27B unsloth UD 4-bit K-quant (f16 KV) 32k
   +5%, 128k +16%. Long prompts on the server (q8v KV for the dense models): Swift 96k +19%, 128k +21%.
   q8 and q8h KV use `attn_kg` too (`attn_kg6_q8` / `attn_kg4_q8`; K dequantized from int8 with a
   magic-number f16 conversion, bit-identical to `attn_kx_q8`; probe at 61k 57.8 → 72.1 TFLOPS). Server
@@ -157,7 +165,7 @@ Every change below keeps the output bit-identical to plain greedy decoding, unle
   scratch (139k at batch 4096 on the 27B) go in ranges through the new `attn_prefill_wmma_s` with the
   softmax state carried. Bit-identical to `attn_prefill_wmma_q8` / `_q4` (kernel test: 180 new
   invariants; 16 greedy tokens after 64k / 128k prompts identical; bench hash identical), so goldens
-  are unchanged. Speed, Qwen3.8-27B UD-Q4_K_M, end to end: within the run-to-run drift of the 8060S
+  are unchanged. Speed, Qwen3.8-27B unsloth UD 4-bit K-quant, end to end: within the run-to-run drift of the 8060S
   (about ±3% between consecutive 4-minute runs). balance q8h vs `WHIRL_KV=f16`: prefill 8k 374.2 vs
   377.5 tok/s (−0.9%; old loader 369.5, −2.1%); 64k, two runs in opposite orders, 279.6 / 279.7 vs
   288.3 / 277.0 (mean −1.1%; old loader 272.8 / 280.2, −2.2%); 128k, two runs in opposite orders,
@@ -173,8 +181,8 @@ Every change below keeps the output bit-identical to plain greedy decoding, unle
   runs on them, bit-identical to `attn_kg_q8` (which converts K once per query head and was 29%
   slower than f16 at 128k keys). R9700, balance, q8h vs `WHIRL_KV=f16`: Swift-1.5 27B MXFP4-A prefill
   8k −1.5%, 32k −0.9%, 128k −1.0% (before −3.3 / −7.7 / −15.1%), decode_7p +1.7%; Qwen3.8-27B
-  UD-Q4_K_M 8k −0.5%, 32k −0.4%, 128k −0.7%, decode_7p +0.4%. Radeon 8060S (unchanged kernels):
-  Q4_K_M prefill 8k −0.8%, 64k −2.7%, decode at 64k −1.9%. `WHIRL_ATTN_DQF=0` restores the int8
+  unsloth UD 4-bit K-quant 8k −0.5%, 32k −0.4%, 128k −0.7%, decode_7p +0.4%. Radeon 8060S (unchanged kernels):
+  same 4-bit K-quant model, prefill 8k −0.8%, 64k −2.7%, decode at 64k −1.9%. `WHIRL_ATTN_DQF=0` restores the int8
   kernel. Goldens unchanged on gfx1201; gfx1151 dense balance re-recorded for the q8h default.
 - Speculative verify attention: a sequence's verify rows share one K/V pass in groups of up to 32
   query columns (`attn_wsplit2`; 27B: 5 rows × 6 GQA heads) instead of 16 (2 rows). The second column
