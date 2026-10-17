@@ -348,10 +348,10 @@ Ryzen AI Max+ 395。WHIRL 每格單次量測（2026-10-17）；llama.cpp 為 1 �
 
 ## 0.2.0 新功能
 
-- **支援 Radeon 8060S（Ryzen AI Max+ 395）並已調校**：兩個模型在每個量過的提示長度都比 llama.cpp ROCm 與 Vulkan 快（見上表）。8060S 也能圖片輸入，RAM 與 SSD 快取層預設開啟（Windows 上 BIOS 的 VRAM carve-out 與作業系統 RAM 是兩個獨立的池，所以 128k token 的工作階段從 RAM 還原 0.34 秒、從 SSD 2 秒，不必重新 prefill）。
+- **支援 Radeon 8060S（Ryzen AI Max+ 395）並已調校**：兩個模型在每個量過的提示長度都比 llama.cpp ROCm 與 Vulkan 快（見上表）。8060S 也能圖片輸入，RAM 與 SSD 快取層預設開啟（Windows 上 BIOS 的 VRAM carve-out 與作業系統 RAM 是兩個獨立的池，所以 128k token 的工作階段會從 RAM 或 SSD 還原，不必重新 prefill）。
 - **三種數值模式**：precise（逐位元無損）、balance（近乎無損，預設）、fast（自選，損失受關卡管控）。見[上方](#三種模式速度與精度)。
 - **我們的 MXFP4 模型**：Swift-1.5 27B MXFP4 與 Ornith-1.5-35B-A3B MXFP4，為 WHIRL 量化（[原因](#為什麼-whirl-跑這些-mxfp4-檔特別快)）。
-- **DFlash2 草稿，自選**（`--draft dflash --draft-model Qwen3.8-27B-DFlash2-Q8_0.gguf`，草稿模型在 Hugging Face `incoai/Qwen3.8-27B-DFlash2-GGUF`，不隨附）：R9700 上一個使用者、短或中等上下文、可預測的輸出時，比 MTP 快 19% 到 48%；4 個使用者時較慢（約 −39%），37k token 以上上下文與以中文為主的輸出（約 −10%）也較慢；約佔 1.9 GiB VRAM。greedy 輸出與同模式的單純 greedy 解碼相同。
+- **DFlash2 草稿，自選**（`--draft dflash --draft-model Qwen3.8-27B-DFlash2-Q8_0.gguf`，草稿模型在 Hugging Face `incoai/Qwen3.8-27B-DFlash2-GGUF`，不隨附）：一個使用者、短或中等上下文、可預測的輸出時比 MTP 快；4 個使用者、長上下文與以中文為主的輸出時較慢；約佔 1.9 GiB VRAM。greedy 輸出與同模式的單純 greedy 解碼相同。
 - **SSD 快取寫入大幅減少**：預設只在 server 停止時（或閒置約 5 分鐘、或 RAM 必須淘汰時）寫入被重複使用過的工作階段；只用一次的 prompt 永遠不寫。快取在磁碟上永遠不超過 `--kv-ssd-gb`（預設 64 GiB），7 天沒用的檔案會刪除。
 - **對同一份長文件問第二個問題時沿用它**：server 保留尾端檢查點，只需 prefill 新問題（約 0.3k–1.3k token），不必重跑整份文件。
 - **CLI 與 server 對同一個 prompt 輸出逐位元相同**（相同的 prefill 排程；有兩個記載的例外，見 [kv-and-caching.md §7](guide/zh-TW/kv-and-caching.md)）。

@@ -103,7 +103,7 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 - **Root cause (our reading):** WDDM residency makes resident only the allocation referenced by the
   kernel arguments.
 - **Fix:** do not rely on HIP VMM on Windows; use an explicit page table (WHIRL: 256-token KV pages,
-  one lookup per key tile, 0.3–0.5% decode cost).
+  one lookup per key tile, a small decode cost).
 - **Detection now:** the paged path is verified bit-identical to a contiguous cache.
 
 ### <a id="hip-5"></a>HIP-5 · Two big processes on one GPU: WDDM demotes both to shared memory
@@ -138,7 +138,7 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 - **Detection now:** speed claims come from wall-clock end-to-end runs only.
 
 ### <a id="hip-8"></a>HIP-8 · Event-per-op profiling destroys what it measures
-- **Symptom:** decode 34 → 14 tok/s with the profiler on; a server decode cycle 44 → 74 ms; MTP drafting
+- **Symptom:** decode speed more than halved with the profiler on; server decode cycles got much longer; MTP drafting
   time attributed to the embedding op. Even 3 events per cycle cost ~2.5% on the MoE model.
 - **Fix:** use profiling for proportions in prefill only; use knockout builds for decode; never profile
   during A/B.
@@ -154,7 +154,7 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 - **Symptom:** GPU idle four times per cycle.
 - **Root cause:** a synchronous H2D copy waits for all queued work.
 - **Fix:** pass small per-step data as kernel arguments (by-value structs); let kernels write what the next
-  step needs (argmax writes the next token/position on the device). +5% end to end.
+  step needs (argmax writes the next token/position on the device). Faster end to end.
 - **Detection now:** decode cycles have exactly one host synchronization.
 
 ### <a id="hip-11"></a>HIP-11 · `hipDeviceSynchronize` waits for background copies
@@ -199,16 +199,17 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
   metadata.
 
 ### <a id="hip-17"></a>HIP-17 · `GPU_MAX_HW_QUEUES=1` does nothing on Windows
-- **Conditions:** advice from Linux/ROCm, where decode steps alternated ~28 ↔ 36 ms on this card.
-- **Measured:** fresh process per run, interleaved, 8 pairs: 28.0 ms/token in all 16 runs with and without
-  it (spread 0.2%); MTP, server-restart and 8060S runs equally unchanged.
+- **Conditions:** advice from Linux/ROCm, where decode step times alternate between two levels on this card.
+- **Measured:** fresh process per run, interleaved, 8 pairs: the same decode step time in all 16 runs with
+  and without it (spread 0.2%); MTP, server-restart and 8060S runs equally unchanged.
 - **Root cause:** the bimodality is a KFD hardware-queue issue; Windows schedules through PAL/WDDM.
 - **Fix:** don't port Linux ROCm tuning variables without measuring.
 
 ### <a id="hip-18"></a>HIP-18 · HIP graphs give nothing here
-- **Measured:** 28.87 vs 28.81 ms/token; later 27.81 vs 27.79 ms. Host enqueue of 600–740 launches
+- **Measured:** no difference in decode step time, twice. Host enqueue of 600–740 launches
   (0.4–0.7 ms) is already hidden behind GPU execution.
-- **Fix:** keep the graph path optional; reduce launches by fusing same-input GEMVs instead (−1.2…−2.0%).
+- **Fix:** keep the graph path optional; reduce launches by fusing same-input GEMVs instead (−2.0% on the
+  27B MXFP4 decode step, [kernels.md](kernels.md#grouped)).
 
 ### <a id="hip-19"></a>HIP-19 · Device numbering in a two-GPU machine
 - **Facts:** ROCm/HIP: `ROCm0` = 8060S, `ROCm1` = R9700; with `HIP_VISIBLE_DEVICES=1` the R9700 becomes
@@ -245,7 +246,7 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 ### <a id="hip-24"></a><a id="hip-256k"></a>HIP-24 · `HipFailed` during a 256k prefill, with display re-enumeration (unresolved)
 - **Conditions:** R9700, 27B, q8h KV, 262,400-token pool, one prefill of ~262k tokens.
 - **Symptom:** `HipFailed` mid-prefill; Windows logged a Win32k display re-enumeration at the same time; the
-  next load also failed; later the same prompt succeeded (prefill 398 tok/s, needle found).
+  next load also failed; later the same prompt succeeded (needle found).
 - **Root cause:** unknown (suspected GPU reset).
 - **Mitigation:** prefill attention beyond 128k context is split into launches by head range (≈2% cost,
   identical results; never applied ≤ 128k). If it recurs: rerun with `AMD_LOG_LEVEL=1`.
@@ -408,7 +409,7 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 - **Detection now:** code-object metadata compared (VGPR/SGPR/scratch) for every entry after GEMV changes.
 
 ### <a id="kern-11"></a>KERN-11 · A second caller stopped inlining
-- **Symptom:** 248 VGPRs + scratch; verify n=3 30 → 32 ms.
+- **Symptom:** 248 VGPRs + scratch; verify got slower.
 - **Fix:** `__forceinline__` on shared implementations.
 
 ### <a id="kern-12"></a>KERN-12 · `break` in a pipelined loop disabled prefetching
@@ -447,8 +448,8 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 ### <a id="kern-19"></a>KERN-19 · Batch buckets tuned at the wrong size
 - **Symptom:** 85-token prompts padded into 256-token tiles (FFN-up 0.791 ms vs 0.271 ms with a smaller
   tile); the server's 1024-row chunks used configurations tuned at 512.
-- **Fix:** more buckets (11), each tuned at its own size; 85–89-token prefill −29%; server 8k cold prefill
-  +9.3% from the 1024 bucket alone.
+- **Fix:** more buckets (11), each tuned at its own size; short prompts and server cold prefill (from the
+  1024 bucket alone) got faster.
 - **Detection now:** the invariance check covers every option (tile choice never changes bits).
 
 ### <a id="kern-20"></a>KERN-20 · LDS above ~41 KB per workgroup cut occupancy
@@ -467,7 +468,7 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
   register-plus-LDS combination, not a general LDS limit.
 
 ### <a id="kern-21"></a>KERN-21 · "Read KV once for all queries" was slower
-- **Measured:** 24k MTP 39.5 → 35.6 tok/s.
+- **Measured:** slower MTP decode at 24k (the bottleneck was the reductions, not the KV reads).
 - **Root cause:** the bottleneck was the reductions, not KV reads; L2/Infinity Cache already served the
   repeated reads.
 
@@ -491,7 +492,7 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
   as for MXFP4). llama.cpp's Vulkan int8 path reached the same conclusion on this card.
 
 ### <a id="kern-25"></a>KERN-25 · Fusing dequant into the GEMM made it slower
-- **Measured:** bit-identical but −10…−13% on Q4_K_M prefill: decode VALU on the GEMM's critical path.
+- **Measured:** bit-identical but slower: the K-quant decode VALU work lands on the GEMM's critical path.
 - **Rule:** dequantize-then-GEMM wins at large batch; measure before fusing.
 
 ### <a id="kern-26"></a>KERN-26 · Double-buffered LDS and direct-to-register weights lost
@@ -504,7 +505,8 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 - **Rule:** measure every change at several context lengths.
 
 ### <a id="kern-28"></a>KERN-28 · Half the KV bytes, slower decode
-- **Measured:** q8h decode +1.0% / +3.6% / +5.2% ms/token at 16k / 64k / 128k; prefill attention +49%.
+- **Measured:** q8h decode slower than f16, increasingly with context; prefill attention also slower.
+  Fixed later by `kv_dq8` and Q8P ([kv-and-caching.md](kv-and-caching.md#formats)).
 - **Root cause:** dequantizing K in the split-K kernel costs more than the bandwidth saved.
 - **Fix:** q8v (K f16, V int8) decodes as fast as f16 ([kv-and-caching.md](kv-and-caching.md#formats)).
 
@@ -578,9 +580,9 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 
 ### <a id="mtp-4"></a>MTP-4 · A timing table carried across requests
 - **Symptom:** second and later requests from one user drafted too much (~4.5 vs ~3.3 per cycle on the
-  8060S); server 3.6% slower than the CLI on the R9700.
-- **Fix:** reset the cost model's timing table when a request starts on an idle engine (+4.1% for
-  requests 2–4; server vs CLI −0.5%).
+  8060S); the server was slower than the CLI on the R9700.
+- **Fix:** reset the cost model's timing table when a request starts on an idle engine (server back at
+  CLI speed for requests 2–4).
 - **Detection now:** server-vs-CLI speed check with before/after CLI references.
 
 ### <a id="mtp-5"></a>MTP-5 · Buffers sized for the MTP draft limit overflowed with n-gram drafts
@@ -588,25 +590,25 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 - **Fix:** size everything for the maximum verify batch (16 rows).
 
 ### <a id="mtp-6"></a>MTP-6 · A naive n-gram drafter only made things slower
-- **Measured:** edit task 128.4 → 111.5 tok/s (−13%).
+- **Measured:** edit tasks got slower than MTP alone.
 - **Root cause:** used whenever a match existed; only the latest occurrence of a 3-gram (common code
   3-grams point to the wrong place); capped at 8.
 - **Fix:** 3- and 12-token keys, longest backward match, counterfactual scoring, cost-model decision,
-  15 drafts → edits +48…+99%.
+  15 drafts → edits much faster than MTP alone.
 
 ### <a id="mtp-7"></a>MTP-7 · A one-off first-use cost poisoned the timing model
-- **Root cause:** the first 16-row verify costs ~50 ms extra once.
+- **Root cause:** the first 16-row verify has a one-off extra cost.
 - **Fix:** ignore the first sample of each row count.
 
 ### <a id="mtp-8"></a>MTP-8 · Truncating the draft vocabulary killed Chinese acceptance
-- **Measured:** 82% → 28–33% (Chinese tokens have high ids); later 2.58 → 2.43 tokens/cycle at 150k/100k.
+- **Measured:** acceptance collapsed (Chinese tokens have high ids); even at 150k/100k ids, fewer tokens per cycle.
 - **Rule:** draft heads may be quantized (2-bit works) but not truncated.
 
 ### <a id="mtp-9"></a>MTP-9 · More drafts hurt the MoE model
-- **Measured:** per-position acceptance 92 / 31 / 4 / 0%; 3 drafts slower than none at 24k.
+- **Measured:** per-position acceptance falls off sharply after the first draft; 3 drafts slower than none at 24k.
 - **Fix:** 1 draft for MoE by default.
 
-### <a id="mtp-10"></a>MTP-10 · p-min with a host sync per draft cost 3%
+### <a id="mtp-10"></a>MTP-10 · p-min with a host sync per draft was slower
 - **Fix:** decide on the GPU (stop flag read by later draft kernels); one sync per cycle.
 
 ---
@@ -642,7 +644,7 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 
 ### <a id="srv-5"></a>SRV-5 · A running slot kept a dead session's pages (restore impossible)
 - **Symptom:** a 126k-token restore never happened while other slots decoded; the request fell back to a
-  117k-token prefill (~75 s; others dropped to 9–15 tok/s) and failed with `KvPoolFull` (HTTP 500).
+  117k-token prefill (the other slots slowed to a crawl) and failed with `KvPoolFull` (HTTP 500).
 - **Root cause:** a slot that got a short request reusing nothing kept its old 459 pages; running slots
   are not evictable; only 310 pages were free.
 - **Fix:** return pages beyond `N + drafts + 2` at job start (quarantine / refcount aware).
@@ -699,12 +701,12 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
   literal `<|im_end|>`.
 
 ### <a id="srv-13"></a>SRV-13 · Bigger prefill chunks made follow-ups slower
-- **Symptom:** chunk 2048: cold prefill +18…+21%, but cross-slot follow-ups reused a checkpoint at 27,418
-  instead of 28,442 (30k + 1000 tokens: 1548 → 2230 ms).
+- **Symptom:** chunk 2048: faster cold prefill, but cross-slot follow-ups reused a checkpoint at 27,418
+  instead of 28,442 (30k + 1000 tokens: much slower TTFT).
 - **Fix:** schedule in 1024-token chunks, execute merged forwards of up to 2048 rows.
 
 ### <a id="srv-14"></a>SRV-14 · Checkpoints in pinned host memory: 96 small copies
-- **Measured:** ~40 ms per save/load at ~3.75 GB/s; agent turns −25%.
+- **Measured:** 96 small copies per save/load at ~3.75 GB/s; agent turns got slower.
 - **Rule:** gather to contiguous buffers before host copies; keep hot checkpoints in VRAM.
 
 ### <a id="srv-15"></a>SRV-15 · Evicted session ≠ solo — by policy, not by bug
@@ -805,7 +807,7 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 - **Rule:** prefer Q6_K heads for WHIRL.
 
 ### <a id="quant-4"></a>QUANT-4 · fp8 activations amplify every other perturbation
-- **Measured:** the same DeltaNet change: KL 4.5e-8 … 1.5e-4 under f16 prefill, 1.2e-4 … 7.0e-2 under fp8.
+- **Measured:** the same small DeltaNet change gave a far larger last-token KL under fp8 prefill than under f16.
 - **Rule:** evaluate precision-sensitive changes in precision mode; record, don't gate, speed-mode KL.
 
 (See also [MTP-2](#mtp-2): F32 `ssm_alpha` / `ssm_beta`.)
@@ -837,7 +839,7 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 
 ### <a id="meas-3"></a>MEAS-3 · Laptop thermals: boost vs sustained **[8060S]**
 - **Measured (ROG Flow Z13, ~80 W sustained):** prefill −15% after ~5–7 s; back-to-back processes: plain
-  decode 13.4 → 5.4–5.8 tok/s (−58%) after 3–5 min, identically for old and new binaries.
+  decode more than halved after 3–5 min, identically for old and new binaries.
 - **Fix:** 60–90 s idle before each run, interleave, report boost vs sustained; mini-PC numbers are not
   comparable.
 
@@ -856,8 +858,8 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 - **Fix:** reasoning before `ANSWER:`, 350 items, McNemar on discordant pairs.
 
 ### <a id="meas-7"></a>MEAS-7 · Speculative speed across different outputs
-- **Example:** a numerics change made an English summary 138 instead of 105 tokens; acceptance fell 2.76 →
-  2.42 tokens/cycle while each cycle got faster (40.6 → 39.9 ms).
+- **Example:** a numerics change made an English summary longer; fewer tokens per cycle were accepted
+  while each cycle got faster, so the prompt looked "slower".
 - **Fix:** compare ms/cycle and acceptance separately; only compare tok/s on identical outputs or
   multi-prompt means.
 
@@ -869,8 +871,9 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 - **Measured:** buffered write 1.8 GB/s vs unbuffered 5.1–5.3; 2 MiB reads QD1 4.1 vs QD4 7.0 GB/s.
 
 ### <a id="meas-10"></a>MEAS-10 · The reference engine can be broken
-- **Facts:** llama.cpp b10686 Vulkan decoded at 5.6 tok/s on the R9700 (prefill normal); fixed in b11214.
-  b11214 Vulkan with MTP at 14k/24k context dropped prefill from ~800 to ~97 tok/s. The ROCm build needed
+- **Facts:** llama.cpp b10686 Vulkan decoded far below its normal speed on the R9700 (prefill normal);
+  fixed in b11214. b11214 Vulkan with MTP at 14k/24k context dropped prefill to a fraction of its normal
+  speed. The ROCm build needed
   `--load-mode none` ([HIP-3](#hip-3)).
 - **Rule:** sanity-check the reference before publishing a comparison.
 
@@ -884,8 +887,7 @@ templates](#tok) · [Model files and quantization](#quant) · [Vision](#vis) · 
 ## <a id="egpu"></a>10. eGPU (USB4) — environment limitations
 
 ### <a id="egpu-1"></a>EGPU-1 · ~3.8 GB/s host link
-- **Measured:** D2H 3.78–3.81, H2D 3.84–3.86 GB/s for any piece size; KV restore ~14–16 µs per token;
-  128k restore ~1.9–2.0 s.
+- **Measured:** D2H 3.78–3.81, H2D 3.84–3.86 GB/s for any piece size; KV restores are bounded by it.
 - **Status:** environment limit; direct PCIe expected to be much faster (not measured).
 
 ### <a id="egpu-2"></a>EGPU-2 · H2D traffic slows kernel dispatch

@@ -168,14 +168,14 @@ on this model. Entries written by a different build or numerical configuration a
 - The KV format is chosen automatically and printed at startup with its reason. Dense models use the
   first of **f16 → q8v → q8h** whose required pool fits: `-np 1` at the default context gets f16, the
   default 4 slots get q8v, `--ctx-per-slot 262144` gets q8h. In our paired QA (350 items, up to 70k
-  contexts) no format differed measurably from f16; q8h decodes 3.6–5.2% slower at 64k–128k
+  contexts) no format differed measurably from f16
   ([kv-and-caching.md](guide/en/kv-and-caching.md#formats)). Force one with `$env:WHIRL_KV = "q8v"`
   (or `f16`, `q8`, `q8h`) before starting the server.
 - The MoE model (Ornith-1.5-35B-A3B) always uses f16 KV at 22 KiB per token (the 27B dense model:
   68 KiB in f16), so its default pool already holds ~414k tokens, and it decodes far faster at long
   context (301.5 vs 69.5 tok/s after 16k tokens, [benchmarks.md](benchmarks.md#6-decode-after-a-16k-token-context)).
-- A cold long prompt takes time: Swift 27B MXFP4-A prefills 32k tokens at ~2,600 tok/s (~13 s); at
-  256k the 27B model ran at ~400 tok/s (about 11 minutes) in our needle test. After that, the prefix
+- A cold long prompt takes time: Swift 27B MXFP4-A prefills 32k tokens at ~2,800 tok/s (~12 s) and
+  the ~250k-token prompt at ~1,150 tok/s (about 3.6 minutes) in balance ([benchmarks.md](benchmarks.md)). After that, the prefix
   cache and tiers make follow-up turns fast.
 - **VRAM.** The server sizes its KV pool to fill the free VRAM, so the process always shows about
   30–31 GiB dedicated ([benchmarks.md §9](benchmarks.md#9-vram)) — that is expected, not a leak. To
@@ -193,8 +193,8 @@ on this model. Entries written by a different build or numerical configuration a
   when the pool is full the least recently used *idle* slot is evicted — spilled to the RAM / SSD
   tiers first, so it is restored when that user returns.
 - Aggregate throughput, 4 concurrent users (~1.1k-token prompts, 256 tokens each, prefill included):
-  Swift 27B MXFP4-A **198.6 tok/s**, Ornith MoE MXFP4 **396.7 tok/s**, Qwen3.8-27B Q4_K_M
-  **134.1 tok/s** ([benchmarks.md §7](benchmarks.md#7-server-concurrency)). Every concurrent output
+  Swift 27B MXFP4-A **198.6 tok/s**, Ornith MoE MXFP4 **396.7 tok/s**
+  ([benchmarks.md §7](benchmarks.md#7-server-concurrency)). Every concurrent output
   equals the same request run alone.
 - Speculative drafts compete with users inside one verify pass, so the gain per user shrinks as more
   users decode at once; at 16 users MTP no longer helps.
@@ -278,7 +278,7 @@ same numbers ([server.md](guide/en/server.md#logging)).
 | Symptom | Cause and fix |
 |---|---|
 | "Windows protected your PC", or the program is blocked | the executables are not code-signed: **More info → Run anyway**, or `Unblock-File` the official zip before extracting; Smart App Control may block outright — see [windows_security.md](windows_security.md) |
-| first start with a new model sits for a while | one-time kernel autotune: a few seconds for MXFP4 files, about 1.5–2 minutes for a 27B Q4_K_M file (a message says so); cached in `%LOCALAPPDATA%\whirl` |
+| first start with a new model sits for a while | one-time kernel autotune: a few seconds for MXFP4 files, longer for K-quant files (a message says so); cached in `%LOCALAPPDATA%\whirl` |
 | start waits without loading | another WHIRL process holds the GPU (one process per GPU; the second waits up to 30 minutes, `WHIRL_GPU_WAIT`). Stop the other one |
 | exit code **2** | bad command line (unknown option, missing model path, a `--host` that is not this computer's): `.\whirl-server.exe --help` |
 | exit code **3** | GPU / driver problem: install AMD Software: Adrenalin Edition 26.8.1 or newer; check `.\whirl.exe devices` |

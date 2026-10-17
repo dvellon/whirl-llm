@@ -36,17 +36,11 @@ On Linux, HIP sits on ROCr and the KFD kernel driver. On Windows, HIP sits on AM
   generic failure (`hipErrorLaunchFailure`, llama.cpp's `ROCm error: unspecified launch failure`,
   WHIRL's `HipFailed`). **Set `AMD_LOG_LEVEL=1` first whenever anything fails.**
 - **Linux-specific advice does not transfer.** Example: on Linux/ROCm a decode loop on this
-  card was reported to alternate between ~28 and ~36 ms per step, fixed by
-  `GPU_MAX_HW_QUEUES=1` (a KFD hardware-queue assignment issue). We measured it on Windows with
-  a fresh process per run, interleaved with and without the variable:
-
-  | Run (R9700 unless noted) | without | with `GPU_MAX_HW_QUEUES=1` |
-  |---|---|---|
-  | 27B plain decode, 8 pairs | 28.0 ms/token in all 16 runs (35.67–35.74 tok/s, max–min 0.2%) | same |
-  | Ornith plain, 5 pairs | 176.2–176.4 tok/s | 176.2–176.9 |
-  | 27B MTP, 4 pairs | 116.11–116.63 | 116.27–116.61 |
-  | Server restarted per run, MTP on | 115.96–116.13 | 115.95–116.36 |
-  | 8060S 27B plain, 3 pairs, 60 s idle before each | 13.47–13.49 | 13.48–13.49 |
+  card was reported to alternate between two step times, fixed by `GPU_MAX_HW_QUEUES=1` (a KFD
+  hardware-queue assignment issue). We measured it on Windows with a fresh process per run,
+  interleaved with and without the variable — 27B plain decode (8 pairs; max–min 0.2% over all 16
+  runs), Ornith plain decode (5 pairs), 27B MTP (4 pairs), the server restarted per run with MTP on,
+  and the 8060S (3 pairs, 60 s idle before each): the same speed with and without it in every case.
 
   No bimodality exists on Windows, and the variable has no measurable effect. Do not cargo-cult
   ROCm environment variables from Linux guides.
@@ -103,15 +97,14 @@ the next section for why.
 - **`hipEvent` timing on the null stream reads low.** Our first kernel timings came from
   events recorded on the null stream and were consistently too small. Use host wall-clock time
   around a synchronized region, or events on an explicit stream with enough work between them.
-- **Per-op events distort what they measure.** An event-per-operation profiler mode dropped
-  decode from 34 to 14 tok/s and stretched a server decode cycle from 44 ms to 74 ms; it also
+- **Per-op events distort what they measure.** An event-per-operation profiler mode more than
+  halved decode speed and stretched server decode cycles accordingly; it also
   attributed MTP drafting time to the embedding op. A coarse mode with three events per cycle
   (MTP start, verify start, verify end) still costs about 2.5% on the MoE model. Use profiling
   only to find *proportions*, never to report speed, and switch it off for A/B runs.
 - **Knockouts.** For decode, where events distort too much, we build variants that skip one
-  kernel class and measure the difference (for example, a 16-row verify of 41.65 ms lost
-  4.6 ms without the DeltaNet step + snapshots, 1.2 ms without attention, 1.0 ms without
-  RMSNorm+quantize).
+  kernel class and measure the difference (for example, a 16-row verify without the DeltaNet step
+  + snapshots, without attention, or without RMSNorm+quantize).
 - **Standalone probes.** Kernel experiments run in a small host program that loads a code
   object, uses real weights extracted from the GGUF, interleaves variants for 6–12 rounds,
   reports min/median/max, and compares every variant's output byte for byte with the
@@ -171,7 +164,7 @@ Our interpretation: WDDM residency makes only the allocation referenced by the k
 resident. Running this probe on the R9700 while a benchmark was timing on the same card also
 faulted the benchmark process — never run probes on a GPU that is being measured. We
 implemented a real page table instead (256-token pages; [kv-and-caching.md](kv-and-caching.md)).
-The lookup costs 0.3–0.5% of decode time.
+The lookup is a small part of decode time.
 
 ### <a id="wddm-demote"></a>4.4 Two large processes on one GPU: WDDM demotes both to shared memory
 
@@ -254,15 +247,15 @@ check must fail on empty input.
 - **A synchronous `hipMemcpy` drains the queue.** Uploading a few token ids with `hipMemcpy`
   before each MTP draft step waited for all queued GPU work, so the GPU went idle four times per
   cycle. Passing the ids as kernel arguments (a small by-value struct) instead of copying them
-  gave +5% end to end. Rule: small per-step data goes in kernel arguments; the device writes
+  made decode faster end to end. Rule: small per-step data goes in kernel arguments; the device writes
   results it needs next (argmax writes the next token and position into device memory).
 - **`hipDeviceSynchronize` waits for every stream, including background copies.** Copies on a
   non-blocking stream did not block `hipStreamSynchronize(main)` (0.00 ms) or a small
   null-stream `hipMemcpy` (0.57 ms with 6000 copies queued), but `hipDeviceSynchronize` waited
   for all of them. Once WHIRL had a background tier stream, every device-wide sync in the server
   became a stall and was replaced by a stream sync.
-- **HIP graphs gave nothing on Windows.** Capturing the decode step: 28.87 vs 28.81 ms/token
-  early on, and 27.81 vs 27.79 ms later. Host enqueue (0.4–0.7 ms per step for ~600–740
+- **HIP graphs gave nothing on Windows.** Capturing the decode step made no measurable
+  difference, early on and later. Host enqueue (0.4–0.7 ms per step for ~600–740
   launches) is already hidden behind GPU execution. The graph path is kept as an option.
 - **Kernel launch overhead is real but small.** Each launch has a head/tail of about 2.8 µs
   (a pure-read kernel reaches 605 GB/s on a 50 MB matrix but 626 GB/s on the 1 GB output head).
@@ -309,7 +302,7 @@ mistakes them for engine behavior, and we did not optimize for them.
 | Kernel dispatch while H2D saturates the link | 1500 small kernels: 15 → 64 ms; 20 large kernels: +4%; small sync copy 0.11 → 0.25 ms |
 | `GPU_BLIT_ENGINE_TYPE` | no effect |
 | `PAL_DISABLE_SDMA=1` | moves the cost elsewhere; copies get slower |
-| Effect on serving | other slots' decode cycle 43.0 → 50.4 ms (+17%) for the 0.5–2.0 s a KV restore runs |
+| Effect on serving | other slots' decode cycles +17% for the 0.5–2.0 s a KV restore runs |
 
 The dispatch slowdown is proportional to bytes transferred; pacing the copies or changing the
 piece size did not reduce it. On a direct PCIe x16 link we expect neither the low bandwidth nor

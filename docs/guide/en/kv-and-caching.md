@@ -3,8 +3,9 @@
 # KV cache, checkpoints and tiered caching
 
 > **Status.** Implemented in the C++ server (`src/server/`, `src/tier/`). Every flag and `WHIRL_*`
-> variable is listed in [usage.md](../../usage.md). All numbers: Qwen3.8-27B on the R9700 (32 GB)
-> unless noted.
+> variable is listed in [usage.md](../../usage.md). Sizes are for the 27B architecture (the same
+> for any weight format of it); speed numbers are for the MXFP4 models on the R9700 (32 GB) where given.
+> Published speed numbers are in [benchmarks.md](../../benchmarks.md).
 
 **Who this helps:** anyone serving hybrid attention + recurrent models (DeltaNet, Mamba-like),
 where prefix caching needs recurrent-state checkpoints and not just KV blocks; anyone budgeting
@@ -14,7 +15,7 @@ KV formats on a 32 GB card; anyone building a RAM/SSD KV tier on Windows.
 
 | Item | Size |
 |---|---|
-| Weights (UD-Q4_K_M) | 15.32 GiB |
+| Weights (Swift-1.5 27B MXFP4-A file) | 15,815,469,280 bytes (14.7 GiB) |
 | KV per token, f16 (16 attention layers + MTP layer = 17 × K/V × 4 KV heads × 256 × 2 B) | 68 KiB |
 | KV per token, `q8v` (K f16, V int8) | 52.1 KiB |
 | KV per token, `q8` / `q8h` (K and V int8) | 36.1 KiB |
@@ -23,10 +24,9 @@ KV formats on a 32 GB card; anyone building a RAM/SSD KV tier on Windows.
 | 131,072 tokens of f16 KV | 8.5 GiB |
 
 The DeltaNet state itself is a fixed size per sequence, independent of context length. The server
-prints its VRAM split at startup; one example (four slots, before the RAM tier existed):
-weights + prefill buffers 17.85 GiB (the batch-4096 per-row scratch is ~538 KB/row, ~2.1 GiB),
-slot recurrent state + replay buffers 0.82 GiB, other 0.31 GiB, prefix checkpoints 1.56 GiB
-(4 slots × 2), KV pool 10.41 GiB, reserve 0.75 GiB.
+prints its VRAM split at startup: weights + prefill buffers (the batch-4096 per-row scratch is
+~538 KB/row, ~2.1 GiB), slot recurrent state + replay buffers, other, prefix checkpoints (2 per slot),
+KV pool, reserve.
 
 ## <a id="paged"></a>2. A paged KV pool shared by all slots
 
@@ -44,7 +44,7 @@ layer all use the same scheme.
 
 - The f16 paged version is **bit-identical** to the old contiguous cache (both models × 4 prompt
   types: prefill logits, MTP text, plain text).
-- The lookup costs **0.3–0.5%** of decode time (e.g. 64k plain decode 35.8 vs 35.7 ms/token).
+- The page-table lookup is cheap next to the KV reads themselves.
 
 **Server pool management.** A free-page stack; each slot owns a page list (kept while idle, for
 prefix reuse). Before every prefill chunk and every decode cycle a slot ensures pages up to
@@ -114,24 +114,12 @@ No format showed a measurable task-level difference (retrieval 100% everywhere, 
 contexts with decoys). An earlier QA version that asked for the answer only was too insensitive
 (5–7% correct for both models) and was replaced.
 
-**Needles:** 27B with q8h, 128k at 10%/50%/90% depth and 256k at 10%/90% depth all found
-(256k: 261,909-token prompt, prefill 398 tok/s, MTP decode 30 tok/s, dedicated VRAM 29.1 GiB).
+**Needles:** 27B with q8h, 128k at 10%/50%/90% depth and 256k at 10%/90% depth (261,909-token
+prompt) all found.
 
 ### 3.2 Speed — the surprise
 
-| Plain decode, ms/token (CLI, same binary, before `kv_dq8`) | 16k | 64k | 128k |
-|---|---|---|---|
-| f16 | 30.0 | 35.8–35.9 | 42.0–42.1 |
-| q8h | 30.3 (+1.0%) | 37.1–37.2 (+3.6%) | 44.2–44.3 (+5.2%) |
-| q8v | — | 35.7 (−0.3%) | 41.7 (−1.0%) |
-
-| Prefill, tok/s | 64k | 128k |
-|---|---|---|
-| f16 | 1125.7–1134.5 | 926.6–927.0 |
-| q8v | 1102.9–1105.4 (−2.3%) | 891.0–891.1 (−3.9%) |
-| q8h | 1100.2–1100.8 (−2.6%) | 890.2–891.3 (−3.9%) |
-
-Halving KV bytes made decode **slower**: the int8 dequantization of K inside the split-K decode
+Before `kv_dq8`, halving KV bytes made decode **slower**, increasingly so at longer contexts: the int8 dequantization of K inside the split-K decode
 kernel costs more than the bandwidth it saves (decode attention is not purely bandwidth-bound once
 dequant is added). The decode cost is entirely in K; quantizing only V (`q8v`) decodes as fast as
 f16 or slightly faster. The prefill cost is in V (the PV product), where q8v and q8h pay the same.
@@ -150,12 +138,10 @@ the f16 kernel (bit-identical, [kernels.md](kernels.md#flash)). `whirl bench`, b
 |---|---|---|---|---|
 | Swift-1.5 27B MXFP4-A, before | −3.3% | −7.7% | −15.1% | +2.4% |
 | Swift-1.5 27B MXFP4-A, now | 3,458 vs 3,512 (−1.5%) | 2,886 vs 2,913 (−0.9%) | 1,745 vs 1,763 (−1.0%) | 112.2 vs 110.4 (+1.7%) |
-| Qwen3.8-27B UD-Q4_K_M | 1,824 vs 1,833 (−0.5%) | 1,646 vs 1,653 (−0.4%) | 1,199 vs 1,207 (−0.7%) | 97.2 vs 96.8 (+0.4%) |
 
 The f16 copy lives in prefill buffers that are idle during attention (139k rows at the default
-prefill batch 4096); a prompt longer than that keeps the int8 kernel for the rest. Radeon 8060S
-(Qwen3.8-27B Q4_K_M, its own kernels, unchanged): prefill 8k 375.8 vs 379.0 (−0.8%), 64k chat prefill
-297.3 vs 305.6 (−2.7%), decode at 64k 9.35 vs 9.53 tok/s (−1.9%). Single runs (about ±1%).
+prefill batch 4096); a prompt longer than that keeps the int8 kernel for the rest. The Radeon 8060S
+uses its own kernels ([kernels.md](kernels.md#flash), KG-3).
 
 ### <a id="kv-auto"></a>3.3 Which format: fixed per mode
 
@@ -169,7 +155,7 @@ what fits:
 | balance (default) | q8h | f16 |
 | fast | q4 | q4 |
 
-- **Dense, balance: q8h.** Its KL against f16 is 0.0002–0.002 (KL-1), i.e. near lossless, and it
+- **Dense, balance: q8h.** It passed the balance KL gate against f16 at 128k (KL-1), i.e. near lossless, and it
   halves the KV bytes, so one 128k request plus a second long one fit on a 32 GB card without
   reshuffling formats.
 - **MoE: f16** in precise and balance. Its single-prompt KL under q8 was far above its own path
@@ -189,24 +175,16 @@ Project policy: with the default four slots, one session must be able to reach *
 while another running session can still reach **64k**. Idle sessions can be evicted. Floor pool =
 131,072 + 65,536 + 2 decode pages per request = **197,120 tokens**.
 
-| KV format | Pool with default `--parallel 4` | Meets floor |
-|---|---|---|
-| f16 | 160,512 | no (2.37 GiB short) |
-| **q8v** | 209,664 (at introduction) → **199,936** today | yes |
-| q8h | 302,080 | yes, but decode +3.6% (64k) / +5.2% (128k) |
-
-The pool shrank since q8v was introduced because later features reserve VRAM before the pool is
-sized: the tier stream and pinned arena (12.8 MiB visible to HIP), two shared system-prompt
-checkpoints (2 × 150.6 MiB, −7,424 tokens), and a larger code object (−256 tokens). Headroom over
-the floor is now **2,816 tokens**; any new resident buffer must be paid for elsewhere or the
-default falls back to q8h.
+With f16 KV the 27B pool on a 32 GB card did not meet the floor; that is why the dense balance
+default is an 8-bit format (q8v before BAL-Q8, q8h since). Later features reserve VRAM before the
+pool is sized: the tier stream and pinned arena (12.8 MiB visible to HIP), two shared system-prompt
+checkpoints (2 × 150.6 MiB, −7,424 tokens), and a larger code object (−256 tokens).
 
 Lossless VRAM savers considered for keeping f16: prefill batch 4096 → 3072 saves 0.52 GiB at no
-speed cost (3072 vs 4096: 4k +1.2%, 16k −0.7%, 64k 0.0%; 2048 costs 1.3–2.0%); aliasing scratch
-buffers (estimated ≤ 0.75 GiB, not done); halving checkpoints (0.78 GiB, hurts prefix caching).
-Together not enough for f16, so q8v. Also measured and rejected: prefill batch 8192 (no faster on
-long prompts, which are attention-bound; +2.1 GiB) and checkpoints in pinned host memory
-(checkpoint save/load took ~40 ms as 96 small copies at ~3.75 GB/s, agent turns −25%). The token
+measurable speed cost (2048 is slower); aliasing scratch buffers (estimated ≤ 0.75 GiB, not done);
+halving checkpoints (0.78 GiB, hurts prefix caching). Together not enough for f16. Also measured and
+rejected: prefill batch 8192 (no faster on long prompts, which are attention-bound; +2.1 GiB) and
+checkpoints in pinned host memory (96 small copies per save/load made agent turns slower). The token
 embedding in pinned host memory was first rejected only because pinned memory shows up as Shared
 Usage ([windows-hip.md](windows-hip.md#shared-usage)); since 0.1.3 the server keeps it in pinned host
 memory by default and declares its size (`%LOCALAPPDATA%\whirl\pinned\<pid>.txt`) so the monitor
@@ -221,9 +199,8 @@ pool ~341k tokens.
 the left-over would be most of system memory. The host tiers are **on** by default there since 0.2.0
 (TIER-8S-DEF); they used to be off on the argument that the KV pool already is system memory, which
 does not hold on Windows: the BIOS splits the VRAM carve-out (the KV pool) from the OS RAM, the RAM
-tier is separate pinned OS memory, and a restore is a real copy. Measured (Qwen3.8-27B Q4_K_M,
-balance, 128k session): RAM-tier restore 0.34 s, SSD-tier restore after a restart
-2 s, decode speed unchanged. Size rule, from the OS-visible RAM only (not the 128 GB total):
+tier is separate pinned OS memory, and a restore is a real copy (a 128k session restores from RAM or,
+after a restart, from the SSD instead of being re-prefilled; decode speed unchanged). Size rule, from the OS-visible RAM only (not the 128 GB total):
 `clamp(OS-visible RAM / 8, one max-context entry (about 6 GiB for 27B at 262k), 16 GiB)`, at most 1/4
 of the RAM available at startup, off under 32 GB of OS-visible RAM; 8 GiB on a 64 GB machine. The
 startup log prints the size and the reason. The SSD tier runs in `shutdown` mode (only reused entries
@@ -268,7 +245,7 @@ Server logs showed two root causes, not the single one first suspected:
    `\n`. The `prompt-end` checkpoint missed by one token, so **every turn re-prefilled the whole
    conversation** (hit ratio 0.000). Fix: split the prefill of such prompts at N−1 and save a
    `think-open` checkpoint after `<think>`. The CLI splits identically (where the split is made
-   does not differ between them); cost: one extra 1-token step on thinking prompts (~28 ms on the 27B).
+   does not differ between them); cost: one extra 1-token step on thinking prompts.
 
 | Multi-turn hit ratio (later turns: cached / prompt) | 27B before → after | MoE before → after |
 |---|---|---|
@@ -322,7 +299,7 @@ re-prefilled all of it.
 - **Always split at B.** When B ≥ 2048, prefill is *always* run as two chunk runs, [0, B) and
   [B, N), cold requests included. So a cold run and a run resumed from B execute identical chunks →
   bit-identical. (A 1024-aligned checkpoint that left cold runs unchanged would have recomputed
-  ~512 tokens on average, ~0.35 s — worse than the +0.5% cost of the split.)
+  ~512 tokens on average — worse than the small cost of the split.)
 - **Shared checkpoint.** When a prefill chunk ends at B, the server saves a `system` checkpoint
   (state + MTP hidden row, two kept in VRAM by default) and holds references to the KV pages of
   [0, B): pages before the one containing B−1 are shared via refcounts; that last page is copied
@@ -344,19 +321,16 @@ re-prefilled all of it.
   found here: the spill read the checkpoint on the tier stream before the main-stream copy that
   produced it had finished — fixed with an event wait.
 
-Cost: two VRAM checkpoints shrink the default pool by 7,424 tokens; cold prefill +0.5% (MXFP4 30k
-+0.5…2%).
+Cost: two VRAM checkpoints shrink the default pool by 7,424 tokens; cold prefill +0.5…2% (MXFP4 30k).
 
 | New session's first-turn TTFT | Before (always cold) | After: later sessions | After restart (SSD restore) |
 |---|---|---|---|
-| Q4_K_M, 13.1k-token system prompt | 10.22–10.30 s | **0.153–0.185 s** | 0.45–0.48 s |
-| Q4_K_M, 30.5k | 25.51–25.72 s | **0.567–0.608 s** | 1.27–1.28 s |
 | MXFP4, 13.1k | 4.31–4.40 s | **0.085–0.110 s** | 0.40 s |
 | MXFP4, 30.5k | 11.79–11.98 s | **0.361–0.379 s** | 1.06–1.07 s |
 
 Agent scenario (8 sessions, each "ask about a file → `read_file` → answer", shared 14k-token system
-prompt + 12 tools): sequential wall time 150.6 → 65.3 s (−56.6%), 4 concurrent 123.8 → 54.1 s
-(−56.3%); first-turn TTFT mean 11.00 → 1.50 s and 27.68 → 1.90 s.
+prompt + 12 tools): every session after the first starts from the shared checkpoint instead of a cold
+prefill, sequentially and with 4 concurrent sessions.
 
 Trade-off: server requests with a ≥ 2048-token system message are no longer bit-identical to
 binaries that did not split at B (numerically equivalent, like `think-open`); the CLI is unaffected.
@@ -364,9 +338,9 @@ binaries that did not split at B (numerically equivalent, like `think-open`); th
 ## <a id="merge"></a>7. Forward merging versus checkpoint granularity
 
 Bigger prefill forwards are faster, but checkpoints (`prefix`, `system`, `think-open`) can only sit
-at chunk boundaries. Making the server's chunk 2048 rows gave +18…+21% cold prefill, but cross-slot
-follow-ups then reused a `prefix` checkpoint at position 27,418 instead of 28,442, and a 30k
-context + 300 / + 1000 new tokens went from 980 → 1681 ms and 1548 → 2230 ms TTFT.
+at chunk boundaries. Making the server's chunk 2048 rows gave faster cold prefill, but cross-slot
+follow-ups then reused a `prefix` checkpoint at position 27,418 instead of 28,442, and the TTFT of a
+30k context + 300 / + 1000 new tokens got much worse.
 
 The adopted design keeps the **schedule** at 1024-token chunks (checkpoint positions unchanged) and
 **executes** consecutive whole chunks in one forward of up to 2048 rows (+256 tail) when no other
@@ -382,7 +356,7 @@ Ornith-1.5-35B-A3B MXFP4, precise / balance / fast, 9,500-token prompt; `whirl s
   B >= 2048, the think-open split and image ends; `include/whirl/prefill_schedule.h`). Every forward
   the engine runs ends at a schedule point: forwards of 1 chunk (decode floor engaged), 2 chunks
   (default; `WHIRL_PREFILL_CHUNK=2048`), 3 or 4 chunks (4 = the Radeon 8060S default for MoE models since SRV-PP: Ornith MoE 128k
-  983 -> 1018 tok/s; dense models keep 2 there, SRV-PP-DENSE: 4 cost Qwen3.8-27B 13% at 128k; a forward
+  983 -> 1018 tok/s; dense models keep 2 there, SRV-PP-DENSE: 4 was slower for the dense 27B at 128k; a forward
   never exceeds the prefill batch), with or without the TAIL-CK
   tail checkpoint (which stops merging there), all give the same last-row logits bits. Checkpoints
   are kept and reused only at schedule points (`onSchedule`), so a resume from the tail checkpoint,
@@ -409,15 +383,15 @@ Ornith-1.5-35B-A3B MXFP4, precise / balance / fast, 9,500-token prompt; `whirl s
   and without MTP, at 4,000 / 4,100 / 8,232 tokens, a thinking-mode prompt and a long system message;
   `--sched-lens 32800` adds lengths). `WHIRL_DUMP_LOGITS` (the KL gate) keeps its own 16-row forwards.
 
-| Server, MTP + n-gram | Q4_K_M before → after | MXFP4 before → after |
-|---|---|---|
-| Cold prefill 8k / 30k (tok/s) | 1304 → 1560 (+19.6%) / 1196 → 1413 (+18.1%) | 3135 → 3235 / 2595 → 2637 |
-| 30k cached + 1000 new tokens, cross-slot | 1540 → 1376 ms | 849 → 833 ms |
+| Server, MTP + n-gram, MXFP4 | before → after |
+|---|---|
+| Cold prefill 8k / 30k (tok/s) | 3135 → 3235 / 2595 → 2637 |
+| 30k cached + 1000 new tokens, cross-slot | 849 → 833 ms |
 
 ## <a id="tiers"></a>8. Tiered prefix cache: VRAM → pinned RAM → SSD
 
 When a session's slot is taken by other sessions, or the server restarts, its context used to be
-re-prefilled from scratch (126k tokens: 147 s). The tiers turn that into a restore.
+re-prefilled from scratch. The tiers turn that into a restore.
 
 ### 8.1 What is stored
 
@@ -448,7 +422,7 @@ then KV page j at `nck × ck_stride + j × page_bytes` (13.0 MiB per page for q8
   agent use (Hermes, 30–40k-token sessions, subagents) the 9 GiB default was 8.3 GiB full within an
   hour, after which LRU entries fell back to their slower SSD copies. The startup log line
   `kv tier: RAM tier size N MiB (reason)` shows the choice; the summary line shows the pinning time
-  (R9700 host, 64 GB: 16 GiB pinned in 3.1–3.4 s; "model ready" 13.6–14.1 s vs 11.8–12.3 s with the old 9 GiB and 10.2 s with the tier off, so the arena is still allocated up front).
+  (R9700 host, 64 GB: 16 GiB pinned in 3.1–3.4 s, which delays "model ready" by about that much; the arena is still allocated up front).
   It appears as Shared Usage in GPU counters; the server declares its pinned size so monitoring can
   subtract it.
 
@@ -509,8 +483,8 @@ then KV page j at `nck × ck_stride + j × page_bytes` (13.0 MiB per page for q8
 
 Under load, a 126k-token restore never happened. A slot that received a short request reusing
 nothing kept the old session's pages (459 of them) — running slots cannot be evicted — leaving 310
-free pages. The restore did not fit, the request fell back to a full 117k-token prefill (~75 s,
-during which the other three slots decoded at 9–15 tok/s), and finally failed with `KvPoolFull`
+free pages. The restore did not fit, the request fell back to a full 117k-token prefill (during which the other
+three slots decoded very slowly), and finally failed with `KvPoolFull`
 (HTTP 500). Fix: when a job starts and truncates its cache to the reuse point, every page beyond
 `N + drafts + 2` is returned to the pool immediately (via quarantine if a spill is reading it;
 shared pages via refcount). This bug existed since pages were introduced; it only shows when long
@@ -518,27 +492,19 @@ sessions and short requests mix.
 
 ### 8.6 Results
 
-| Q4_K_M, context | Full prefill TTFT | Restored from RAM | From SSD after restart | Never evicted (VRAM hit) |
-|---|---|---|---|---|
-| 28.3k | 23.06 s | 0.590 s | 0.654 s | 0.18 s |
-| 67.2k | ~59 s (62.5k: 58.83 s) | 1.221 s | 1.270 s | 0.23 s |
-| 125.1k | ~147 s (126.2k: 147.14 s) | 2.178 s | 2.207 s | 0.35 s |
-| 125.1k while 3 other slots decode | (before the page fix: restore impossible, KvPoolFull) | **2.225 s** | 2.280 s | |
+MXFP4, 28.3k-token context: full prefill TTFT 10.70 s, restored from RAM 0.62 s, from the SSD after a
+restart 0.71 s. A restore is bounded by the host link of this eGPU (~3.65 GB/s achieved). The SSD is
+only slightly slower than RAM because reads and H2D copies are pipelined. Since the page-return fix a
+125k-token restore also works while 3 other slots decode.
 
-A restore costs ~14–16 µs per token — the host-link limit of this eGPU (~3.65 GB/s achieved) — plus
-~80 ms for two checkpoints; 35–65× faster than re-prefilling. SSD is only 2–10% slower than RAM
-because reads and H2D copies are pipelined. MXFP4 28.3k: full 10.70 s, RAM 0.62 s, SSD 0.71 s.
-
-| Burst: 30.6k-token system prompt evicted from VRAM, 3 new sessions at once | Before | After |
-|---|---|---|
-| Shared entry in RAM | 2.78 / 23.57 / 3.68 s | 0.64 / 0.83 / 0.82 s |
-| After restart (entry on SSD) | 42.1 / 42.1 / 41.9 s | 0.89 / 0.71 / 0.89 s |
+A burst of 3 new sessions on a 30.6k-token system prompt that was evicted from VRAM now restores the
+shared entry from RAM (or, after a restart, from the SSD) instead of prefilling it.
 
 Multi-session agent under eviction pressure (6 sessions sharing a ~12k-token system prompt, each
 reading a ~3.5k-token file and asking 3 questions, 4 slots, requests interleaved so every session
-finds its slot taken): tiers off 378.1 s wall / 435,697 new prefill tokens; tiers on **146.4 s** /
-129,968 tokens — 2.58× faster, the same new-prefill count as a never-evicted solo run, identical
-texts. The normal path (no eviction) did not get slower (CLI mean 182.43 vs 182.43 tok/s).
+finds its slot taken): tiers off 435,697 new prefill tokens; tiers on 129,968 — the same
+new-prefill count as a never-evicted solo run, identical texts. The normal path (no eviction) did
+not get slower.
 
 Why an evicted session can differ from a solo run in one case: if its own entry is less than 512
 tokens longer than the shared system checkpoint, the server deliberately resumes from the system
@@ -548,8 +514,7 @@ KV. Forcing restores always (`WHIRL_TIER_MIN_GAIN=1`) made 28/28 calls identical
 byte-verify mode confirmed every spill/restore byte-identical (115 of them).
 
 **[eGPU] environment limitation:** while a restore saturates the USB4 link, kernel dispatch slows and
-the other slots' decode cycles stretch from 43.0 to 50.4 ms (+17%) for the 0.5–2.0 s the restore
-runs. Not optimized ([windows-hip.md](windows-hip.md#egpu)); not expected on direct PCIe.
+the other slots' decode cycles stretch for the duration of the restore. Not optimized ([windows-hip.md](windows-hip.md#egpu)); not expected on direct PCIe.
 
 ### 8.7 Gates
 
@@ -570,10 +535,10 @@ runs. Not optimized ([windows-hip.md](windows-hip.md#egpu)); not expected on dir
 - Each session's tier entry still copies the shared system prompt's KV; the 9 GiB RAM tier fills
   quickly with 30k-token system prompts. Entries could reference the shared entry's blocks.
 - Only two system checkpoints fit in VRAM; several alternating system prompts (main agent + different
-  sub-agents) evict each other (restores take ~0.3 s for 13k tokens).
+  sub-agents) evict each other and must be restored.
 - A second request for the same session entry restores it again from RAM; it could share the first
   slot's VRAM pages instead.
 - Pinned-size declaration files are keyed by PID; PID reuse caused false alarms
   (use PID + start time).
-- q8v prefill is 2–4% slower than f16 (V dequant in the PV loop); dequantizing V tiles into LDS once
-  could recover it.
+- q8v prefill is slower than f16 (V dequant in the PV loop); dequantizing V tiles into LDS once
+  could recover it (q8v is a debug override only).

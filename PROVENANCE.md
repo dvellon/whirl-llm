@@ -170,7 +170,7 @@ All documentation text was written new for this project.
 | docs/quickstart.md, docs/quickstart_zh-TW.md | new | |
 | docs/windows_security.md, docs/windows_security_zh-TW.md | new | |
 | docs/building.md, docs/building_zh-TW.md | new | |
-| docs/benchmarks.md, docs/guide/zh-TW/benchmarks.md, docs/images/* | new | |
+| docs/benchmarks.md, docs/guide/zh-TW/benchmarks.md | new | |
 | docs/guide/{en,zh-TW}/*.md | new | |
 
 ## gfx1151 (Radeon 8060S)

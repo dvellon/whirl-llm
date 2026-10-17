@@ -2,10 +2,8 @@
 
 # Benchmarking methodology and current numbers
 
-> **Status.** Sections 1–9 describe the methodology. The numbers in section 10 were measured on our
-> machine (R9700 as a USB4 eGPU, Windows 11 build 26200, HIP SDK 7.2) with the research build that
-> preceded the C++ engine, 2026-09-25 → 2026-10-02; the C++ engine produces the same outputs and
-> measured within ±1% of that build. Release measurements of WHIRL 0.1.0 against llama.cpp are in
+> **Status.** This page describes the methodology. The published numbers of the current release
+> (Swift-1.5 27B MXFP4 and Ornith-1.5-35B-A3B MXFP4 against the official llama.cpp builds) are in
 > [benchmarks.md](../../benchmarks.md).
 
 **Who this helps:** anyone comparing inference engines on AMD GPUs, or measuring small (1–5%)
@@ -21,9 +19,8 @@ kernel improvements without fooling themselves; laptop/APU users whose numbers d
    Shared Usage (baseline ~89 MiB; declared pinned host buffers subtracted) is discarded and rerun.
 4. **Interleave A and B, report min–max.** Never compare a new build against an old number.
 5. **Report percentages, and keep small wins.** Once the core gets faster, a 2–3% gain (or loss)
-   elsewhere is magnified; ideas rejected as noise are re-measured later. (The Q4_K MTP block was
-   rejected at −1.6% and adopted after later speedups, re-measured at +0.8% single-user and +2.8% at
-four users.)
+   elsewhere is magnified; ideas rejected as noise are re-measured later. (The Q4_K copy of the MTP
+   block was rejected at first and adopted after later speedups made its gain measurable.)
 6. **Correctness gates before speed.** A faster build that fails any gate is not measured further.
 
 ## 2. Interleaved A/B
@@ -34,13 +31,13 @@ four users.)
 - Record each output's hash. With greedy decoding the same engine/mode/prompt gives identical output
   across rounds (190/190 in one unified run), so min–max is real run-to-run variation, not content.
 - **If the outputs differ between A and B, do not compare MTP tok/s directly.** Speculative speed
-  depends on content. Example: a GEMV change altered an English summary's text from 105 to 138
-  tokens; the new text was harder to predict (2.76 → 2.42 tokens per cycle) and the prompt got
-  "slower" while each cycle was actually faster (40.6 → 39.9 ms). Compare ms per cycle, multi-prompt
+  depends on content. Example: a GEMV change altered an English summary's text; the new text was
+  harder to predict (fewer tokens per cycle) and the prompt got "slower" while each cycle was
+  actually faster. Compare ms per cycle, multi-prompt
   means, and acceptance separately.
 - **Noise floors we measured:** plain decode ms/token on the R9700 is stable to ~0.2% across
-  processes; the MoE model showed a ±3.5% bimodal shift between time slots (same binary interleaved
-  198.0 vs 198.1, but a different hour differs); the automatic draft policy adds ±2–4% per run.
+  processes; the MoE model showed a ±3.5% bimodal shift between time slots (the same binary
+  interleaved agrees, but a different hour differs); the automatic draft policy adds ±2–4% per run.
   Machine drift between sessions can look like a 2–6% gain or loss; only interleaved runs count.
 - Disable profiling for A/B runs (per-op events halve decode speed; even three events per cycle cost
   ~2.5% on the MoE model).
@@ -84,12 +81,12 @@ Max+ 395 run 120–160 W), and the performance mode holds full power for only ab
 from mini-PCs (including published llama.cpp and gufo results) are not comparable, especially for
 compute-bound prefill.
 
-| Observation | Number |
+| Observation | Effect |
 |---|---|
-| 27B prefill 4.9k tokens, 512-token chunks, cold | first 4 chunks (~5.4 s) 372–394 tok/s, then 345 → 327 (−15%) |
-| Same, right after a long decode | 310–332 from the start |
-| 27B plain decode 1,800 tokens after 2 min idle | 13.34 → 12.80 tok/s over 139 s (−4%, partly context growth); no cliff |
-| Back-to-back processes without cooling | 27B plain 13.4 → 5.4–5.8 tok/s (−58%) after 3–5 minutes, both binaries alike; prefill also drops |
+| Long prefill (4.9k tokens, 512-token chunks), cold | the first ~5 s run at boost speed, then prefill drops by about 15% |
+| Same, right after a long decode | starts at the lower speed |
+| Plain decode of 1,800 tokens after 2 min idle | about −4% over 139 s (partly context growth); no cliff |
+| Back-to-back processes without cooling | decode more than halves after 3–5 minutes, both binaries alike; prefill also drops |
 
 Rules: tests shorter than the boost window measure boost speed — report which one you measured, or
 both. Compare versions with interleaved runs and 60–90 s idle before each run. A 40-minute benchmark
@@ -156,81 +153,12 @@ gates that compare servers (a reference server with more free VRAM auto-picked f
 one picked q8v, and every comparison "failed"); compare tool calls by name + arguments (ids are
 random).
 
-## <a id="current-numbers"></a>10. Current numbers (installed prototype build, 2026-10-02)
+## <a id="current-numbers"></a>10. Current numbers
 
-Qwen3.8-27B, R9700, greedy. Unit tok/s unless noted.
-
-| | llama.cpp Q4_K_M | **WHIRL Q4_K_M** | llama.cpp MXFP4 | **WHIRL MXFP4** |
-|---|---|---|---|---|
-| Prefill 2k (2,022 tokens) | 1,108.9 | 1,721.8–1,724.8 | 1,207.7 | 3,762–3,777 |
-| Prefill 8k (8,178) | 1,177.2 | 1,746.5–1,750.9 | 1,279.8 | 3,548–3,557 |
-| Prefill 32k (32,751) | 1,074.3 | 1,527.0–1,537.8 | 1,157.4 | 2,782–2,784 |
-| Prefill 128k (126,818) | TODO (not measured) | 1,051.5–1,052.3 (TTFT 120.6 s) | TODO | 1,531.2–1,531.4 (82.8 s) |
-| Decode, MTP + n-gram (WHIRL default) | N/A | **145.4** | N/A | **159.1** |
-| Decode, MTP | 56.9 | 110.4 | 61.6 | 120.3 |
-| Decode, **no MTP** (ceiling ~38) | 30.9 | 34.3 | 33.0 | 37.6 |
-| Decode after a 16k context, no MTP | 29.4 | 32.5 | 31.3 | 35.3 |
-| Four concurrent users, wall-clock aggregate | 64.1 (older run, MTP on) | 138.7–139.6 | TODO | 190.3–190.7 |
-| Four users, steady state in the decode loop | — | 252.9 | — | 289.8 |
-| New session reusing a 13.1k / 30.5k system prompt, TTFT | TODO | 0.153–0.185 / 0.567–0.608 s (cold 10.30 / 25.6 s) | TODO | 0.085–0.110 / 0.361–0.379 s (cold 4.4 / 12.0 s) |
-| Evicted session restored, TTFT (RAM / SSD after restart) | TODO | 28.3k: 0.590 / 0.654 s; 125.1k: 2.178 / 2.207 s | TODO | 28.3k: 0.62 / 0.71 s |
-
-How to read it:
-
-- **Prefill (WHIRL):** CLI, KV f16, MTP off, 2 interleaved rounds. WHIRL's *server* cold prefill
-  (default settings, chunk merging) is 1,560 (8k) / 1,413 (30k) for Q4_K_M and 3,235 / 2,637 for
-  MXFP4. llama.cpp numbers are from the unified server protocol.
-- **Decode:** unified server protocol, 19-prompt average. On the editing prompts alone WHIRL reaches
-  about 300 (Q4_K_M) / 330 (MXFP4) tok/s with MTP + n-gram in the CLI.
-- **No-MTP decode** is bounded by memory bandwidth: 14.33 GB of weights per token on a card that
-  streams 604–626 GB/s gives ~38 tok/s at best; WHIRL's 1-token GEMV is at 97–100% of that, and a
-  decode step takes 27.74 ms (Q4_K_M) / 25.15 ms (MXFP4). Faster decode requires verifying several
-  tokens per weight pass.
-- **Concurrency:** ~1.1k-token prompts, 256 tokens generated, `--ctx-per-slot 4096`; wall-clock
-  aggregate includes prefill. llama.cpp's 64.1 is an older `-np 4` measurement with a similar but not
-  identical script.
-- **System prompt / restore:** default server; restores are bounded by the eGPU link (§7).
-- Every WHIRL output in these runs passed MTP/n-gram == plain greedy and concurrent == solo.
-
-### 10.1 Long context (27B Q4_K_M)
-
-| Depth | Prefill (TTFT) | Plain decode | MTP decode, coding continuation |
-|---|---|---|---|
-| 16k | 1,395 (11.7 s) | 33.3 | 82.8–84.2 |
-| 32k | 1,270 (27.3 s) | 31.2 | 71.0–72.3 |
-| 64k | 1,099 (62.8 s) | 28.0 | 61.5–62.4 |
-| 128k | 849 (149 s) | 23.9 | 47.5–48.9 |
-
-Early measurement (f16 KV, single slot), before the later prefill work: 128k prefill is now
-1,051–1,052 (Q4_K_M) and 1,531 (MXFP4). Needles found at every depth. Server default (q8v KV),
-MTP on: 64k decode 46.79, 128k 35.94–36.01. MXFP4 at 256k (q8v, single slot): prefill 863.6 tok/s
-(TTFT 303.2 s), plain decode 18.86.
-
-### 10.2 MoE model (Ornith-1.5-35B-A3B Q4_K_M)
-
-| | WHIRL | llama.cpp ROCm (early comparison) |
-|---|---|---|
-| CLI prefill 2,022 / 8,178 / 32,751 tokens (latest build) | 5,915 / 6,131 / 5,187 | — |
-| Prefill, 1.1k-token English summary (early) | 5,043 | 3,503 |
-| Decode no MTP / MTP, short (early) | 154.6 / 184.9 | 99.6 / 94.8 |
-| Decode no MTP / MTP, 24k (early) | 124.3 / 130.9 | 89.7 / 84.1 |
-| Coding benchmark, MTP + n-gram (CLI mean) | ~216 | — |
-
-### 10.3 Radeon 8060S
-
-The C++ engine's gfx1151 bring-up (preview, untuned) is measured in
-[benchmarks.md §14](../../benchmarks.md#14-radeon-8060s-preview-bring-up-untuned): prefill of ≥ 2k
-tokens 1.12–1.35× llama.cpp b11214, plain decode 1.06–1.29×, short prompts 0.72–0.95×. The numbers
-below are from the older research tree (cooled interleaved runs).
-
-| | 27B no MTP | 27B MTP | MoE no MTP | MoE MTP |
-|---|---|---|---|---|
-| WHIRL (cooled A/B) | 13.45 | 33.83–34.71 | 79.59–81.75 | 92.48–96.75 |
-
-Against llama.cpp b11214 on the 8060S (early): WHIRL led on prefill and short-context decode
-(27B English, MTP: 22.4 vs 16.6 ROCm / 21.3 Vulkan) but llama.cpp Vulkan led at long context before
-the WMMA decode-attention work (27B 14k MTP 17.0 vs 19.4); afterwards the MoE model at 24k reached
-59.9 vs Vulkan's 55.
+The published numbers are in [benchmarks.md](../../benchmarks.md): Swift-1.5 27B MXFP4 and
+Ornith-1.5-35B-A3B MXFP4 on the R9700 and the Radeon 8060S, all three WHIRL modes, against the
+official llama.cpp ROCm and Vulkan builds, 2k to ~250k tokens. Earlier development measurements on
+other model files are not published.
 
 ## 11. Benchmark sets
 
@@ -245,5 +173,5 @@ the WMMA decode-attention work (27B 14k MTP 17.0 vs 19.4); afterwards the MoE mo
 
 The primary benchmark reflects the project's main use: questions in Chinese, answers with Chinese
 explanations and comments and English code. Mixed text is harder to predict than pure English code
-(pure English coding ~105 tok/s vs mixed ~86 in the early MTP version), so it is the conservative
+(in the early MTP version pure English coding decoded clearly faster than mixed text), so it is the conservative
 choice.

@@ -94,7 +94,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
   但 kernel 寫入由第二個實體 handle 支撐的頁面時資料會遺失；有些執行還讓 GPU 發生 fault。
 - **根本原因（我們的判讀）：** WDDM 的駐留機制只會讓 kernel 參數所引用的那個配置駐留。
 - **修正：** 在 Windows 上不要依賴 HIP VMM；改用明確的頁表（WHIRL：256-token 的 KV 頁、
-  每個 key tile 查一次表，decode（逐 token 生成）成本 0.3–0.5%）。
+  每個 key tile 查一次表，decode（逐 token 生成）成本很小）。
 - **現在怎麼抓：** 分頁路徑經驗證與連續快取逐位元相同。
 
 ### <a id="hip-5"></a>HIP-5 · 一張 GPU 上跑兩個大型行程：WDDM 把兩個都降級到共享記憶體
@@ -128,7 +128,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 - **現在怎麼抓：** 速度宣稱只來自牆鐘時間的端到端執行。
 
 ### <a id="hip-8"></a>HIP-8 · 每個 op 一個 event 的 profile 會破壞它要量的東西
-- **症狀：** 開啟效能分析工具時 decode 從 34 → 14 tok/s；一個 server decode 循環從 44 → 74 ms；
+- **症狀：** 開啟效能分析工具時 decode 速度掉到一半以下；server decode 循環明顯變長；
   MTP 草擬時間被歸到 embedding op 上。即使每個循環只用 3 個 event，在 MoE 模型上也要付出約 2.5%。
 - **修正：** profile 只用來看 prefill 中的比例；decode 改用剔除式建置（knockout build）；
   A/B 期間絕不 profile。
@@ -144,7 +144,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 - **症狀：** 每個循環 GPU 閒置四次。
 - **根本原因：** 同步的 H2D 複製會等待所有已排入佇列的工作。
 - **修正：** 小量的逐步驟資料以 kernel 參數傳入（以值傳遞的 struct）；讓 kernel 自己寫出下一步
-  需要的東西（argmax 在裝置上寫入下一個 token/位置）。端到端 +5%。
+  需要的東西（argmax 在裝置上寫入下一個 token/位置）。端到端變快。
 - **現在怎麼抓：** decode 循環恰好只有一次主機同步。
 
 ### <a id="hip-11"></a>HIP-11 · `hipDeviceSynchronize` 會等待背景複製
@@ -187,17 +187,18 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
   VGPR/SGPR/scratch。
 
 ### <a id="hip-17"></a>HIP-17 · `GPU_MAX_HW_QUEUES=1` 在 Windows 上毫無作用
-- **條件：** 來自 Linux/ROCm 的建議；在 Linux/ROCm 上，這張卡的 decode 步驟會在約 28 ↔ 36 ms
+- **條件：** 來自 Linux/ROCm 的建議；在 Linux/ROCm 上，這張卡的 decode 步驟時間會在兩個水準
   之間交替。
-- **實測：** 每次執行用新的行程、交錯執行、8 組：不論有沒有設定，16 次執行全都是 28.0 ms/token
+- **實測：** 每次執行用新的行程、交錯執行、8 組：不論有沒有設定，16 次執行的 decode 步驟時間都相同
   （離散 0.2%）；MTP、server 重啟與 8060S 的執行也同樣沒有變化。
 - **根本原因：** 這種雙峰現象是 KFD 硬體佇列的問題；Windows 是透過 PAL/WDDM 排程。
 - **修正：** 不要未經量測就移植 Linux ROCm 的調校變數。
 
 ### <a id="hip-18"></a>HIP-18 · HIP graph 在這裡沒有任何幫助
-- **實測：** 28.87 vs 28.81 ms/token；後來 27.81 vs 27.79 ms。主機端排入 600–740 次啟動
+- **實測：** 兩次量測 decode 步驟時間都沒有差別。主機端排入 600–740 次啟動
   （0.4–0.7 ms）早已被 GPU 執行時間掩蓋。
-- **修正：** 保留 graph 路徑為選用；改以融合相同輸入的 GEMV 來減少啟動次數（−1.2…−2.0%）。
+- **修正：** 保留 graph 路徑為選用；改以融合相同輸入的 GEMV 來減少啟動次數（27B MXFP4 decode 步驟 −2.0%，
+  [kernels.md](kernels.md#grouped)）。
 
 ### <a id="hip-19"></a>HIP-19 · 雙 GPU 機器中的裝置編號
 - **事實：** ROCm/HIP：`ROCm0` = 8060S、`ROCm1` = R9700；設定 `HIP_VISIBLE_DEVICES=1` 時 R9700 會變成
@@ -233,7 +234,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 ### <a id="hip-24"></a><a id="hip-256k"></a>HIP-24 · 256k prefill 期間發生 `HipFailed`，伴隨顯示器重新列舉（未解決）
 - **條件：** R9700、27B、q8h KV、262,400-token 的池，一次約 262k token 的 prefill。
 - **症狀：** prefill 中途出現 `HipFailed`；同一時間 Windows 記錄了一次 Win32k 顯示器重新列舉；
-  下一次載入也失敗了；後來同一個提示詞成功了（prefill 398 tok/s，找到 needle）。
+  下一次載入也失敗了；後來同一個提示詞成功了（找到 needle）。
 - **根本原因：** 不明（懷疑是 GPU 重設）。
 - **緩解：** 超過 128k context 的 prefill 注意力會依 head 範圍切成多次啟動（成本約 2%，
   結果完全相同；≤ 128k 時從不套用）。若再次發生：以 `AMD_LOG_LEVEL=1` 重跑。
@@ -389,7 +390,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 - **現在怎麼抓**：GEMV 變動後，比對每個入口的 code-object metadata（VGPR/SGPR/scratch）。
 
 ### <a id="kern-11"></a>KERN-11 · 多了第二個呼叫者後不再 inline
-- **症狀**：248 個 VGPR + scratch；verify n=3 從 30 → 32 ms。
+- **症狀**：248 個 VGPR + scratch；verify 變慢。
 - **修正**：共用實作加上 `__forceinline__`。
 
 ### <a id="kern-12"></a>KERN-12 · 管線化迴圈中的 `break` 讓預取失效
@@ -428,8 +429,8 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 ### <a id="kern-19"></a>KERN-19 · 批次 bucket 在錯誤的大小上調校
 - **症狀**：85 token 的提示詞被補齊到 256 token 的 tile（FFN-up 0.791 ms，用較小 tile 只要
   0.271 ms）；server 的 1024 列 chunk 用的是在 512 上調校的配置。
-- **修正**：更多 bucket（11 個），每個都在自己的大小上調校；85–89 token 的 prefill −29%；光是 1024
-  bucket 就讓 server 8k 冷 prefill +9.3%。
+- **修正**：更多 bucket（11 個），每個都在自己的大小上調校；短提示詞變快，光是 1024
+  bucket 就讓 server 冷 prefill 變快。
 - **現在怎麼抓**：不變性檢查涵蓋每個選項（tile 選擇絕不改變位元）。
 
 ### <a id="kern-20"></a>KERN-20 · 每個 workgroup 的 LDS 超過約 41 KB 會壓低佔用率
@@ -448,7 +449,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
   不是一般性的 LDS 上限。
 
 ### <a id="kern-21"></a>KERN-21 · 「所有 query 只讀一次 KV」反而更慢
-- **實測**：24k MTP 39.5 → 35.6 tok/s。
+- **實測**：24k 的 MTP decode 變慢（瓶頸是歸約，不是讀 KV）。
 - **根本原因**：瓶頸在歸約，不在 KV 讀取；L2/Infinity Cache 已經承接了重複的讀取。
 
 ### <a id="kern-22"></a>KERN-22 · gfx11 WMMA 在一種情況下不精確
@@ -470,7 +471,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
   fp8）。llama.cpp 的 Vulkan int8 路徑在這張卡上得到相同結論。
 
 ### <a id="kern-25"></a>KERN-25 · 把反量化融合進 GEMM 反而更慢
-- **實測**：逐位元相同，但 Q4_K_M prefill −10…−13%：解碼用的 VALU 落在 GEMM 的關鍵路徑上。
+- **實測**：逐位元相同，但變慢：K-quant 解碼用的 VALU 落在 GEMM 的關鍵路徑上。
 - **規則**：大批次時先反量化再 GEMM 勝出；融合前先量測。
 
 ### <a id="kern-26"></a>KERN-26 · 雙緩衝 LDS 與權重直接進暫存器都輸了
@@ -483,8 +484,8 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 - **規則**：每個變更都要在多個上下文長度下量測。
 
 ### <a id="kern-28"></a>KERN-28 · KV 位元組減半，decode 反而變慢
-- **實測**：q8h decode 在 16k／64k／128k 時每 token 毫秒數 +1.0%／+3.6%／+5.2%；prefill attention
-  +49%。
+- **實測**：q8h decode 比 f16 慢，上下文越長越明顯；prefill attention 也變慢。後來由 `kv_dq8` 與 Q8P
+  修好（[kv-and-caching.md](kv-and-caching.md#formats)）。
 - **根本原因**：在 split-K kernel 中反量化 K 的成本高於省下的頻寬。
 - **修正**：q8v（K 用 f16、V 用 int8）的 decode 和 f16 一樣快（[kv-and-caching.md](kv-and-caching.md#formats)）。
 
@@ -548,8 +549,8 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 
 ### <a id="mtp-4"></a>MTP-4 · 計時表跨請求沿用
 - **症狀**：同一使用者的第二個及之後的請求草擬太多（在 8060S 上每輪約 4.5，應為約 3.3）；在 R9700
-  上 server 比 CLI 慢 3.6%。
-- **修正**：請求在閒置引擎上開始時，重設成本模型的計時表（請求 2–4 +4.1%；server 對 CLI −0.5%）。
+  上 server 比 CLI 慢。
+- **修正**：請求在閒置引擎上開始時，重設成本模型的計時表（請求 2–4 的 server 速度回到與 CLI 相當）。
 - **現在怎麼抓**：server 對 CLI 的速度檢查，附修正前／後的 CLI 參考值。
 
 ### <a id="mtp-5"></a>MTP-5 · 依 MTP 草稿上限配置的緩衝區被 n-gram 草稿撐爆
@@ -557,25 +558,25 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 - **修正**：一律按最大 verify 批次（16 列）配置。
 
 ### <a id="mtp-6"></a>MTP-6 · 天真的 n-gram 草擬器只會讓速度變慢
-- **實測**：編輯任務 128.4 → 111.5 tok/s（−13%）。
+- **實測**：編輯任務比單用 MTP 還慢。
 - **根本原因**：只要有匹配就使用；只取 3-gram 最近的一次出現（常見程式碼的 3-gram 會指向錯誤的
   位置）；上限 8 個。
 - **修正**：3 與 12 token 的鍵、最長向後匹配、反事實評分、由成本模型決定、15 個草稿 → 編輯
-  +48…+99%。
+  比單用 MTP 快很多。
 
 ### <a id="mtp-7"></a>MTP-7 · 一次性的首次使用成本污染了計時模型
-- **根本原因**：第一次 16 列 verify 會多花約 50 ms，只發生一次。
+- **根本原因**：第一次 16 列 verify 有一次性的額外成本。
 - **修正**：忽略每種列數的第一個樣本。
 
 ### <a id="mtp-8"></a>MTP-8 · 截斷草稿詞彙表毀掉了中文接受率
-- **實測**：82% → 28–33%（中文 token 的 id 很大）；之後在 150k/100k 時 2.58 → 2.43 token/輪。
+- **實測**：接受率大跌（中文 token 的 id 很大）；即使用 150k/100k 個 id，每輪 token 數也變少。
 - **規則**：草稿 head 可以量化（2-bit 可行），但不能截斷。
 
 ### <a id="mtp-9"></a>MTP-9 · 草稿越多，MoE 模型越吃虧
-- **實測**：各位置接受率 92／31／4／0%；24k 時 3 個草稿比不用草稿還慢。
+- **實測**：各位置接受率在第一個草稿之後急遽下降；24k 時 3 個草稿比不用草稿還慢。
 - **修正**：MoE 預設 1 個草稿。
 
-### <a id="mtp-10"></a>MTP-10 · 每個草稿都做一次 host sync 的 p-min 花掉 3%
+### <a id="mtp-10"></a>MTP-10 · 每個草稿都做一次 host sync 的 p-min 比較慢
 - **修正**：改在 GPU 上決定（由後續草稿 kernel 讀取停止旗標）；每輪只 sync 一次。
 
 ---
@@ -605,7 +606,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 - **現在怎麼抓**：agent 基準測試（LF 與 CRLF），在 off／on／on 加更多快照三種設定下，六輪全部相同。
 
 ### <a id="srv-5"></a>SRV-5 · 執行中的 slot 霸佔已失效 session 的頁面（無法還原）
-- **症狀**：其他 slot 在 decode 時，一次 126k-token 的還原始終沒發生；請求退回 117k-token 的 prefill（約 75 s；其他請求掉到 9–15 tok/s），最後以 `KvPoolFull`（HTTP 500）失敗。
+- **症狀**：其他 slot 在 decode 時，一次 126k-token 的還原始終沒發生；請求退回 117k-token 的 prefill（其他請求慢到幾乎停住），最後以 `KvPoolFull`（HTTP 500）失敗。
 - **根本原因**：某個 slot 接到一個什麼都沒重用的短請求，卻保留了舊的 459 頁；執行中的 slot 不可逐出；空閒頁只有 310 頁。
 - **修正**：工作開始時歸還超過 `N + drafts + 2` 的頁面（考慮隔離區／參考計數）。
 - **現在怎麼抓：**`restore_conc_gate`（在 3 個 decode 中的 slot 旁還原 == 從未被逐出）。
@@ -648,11 +649,11 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 - **修正**：改用三個 token 的模式 `<|im_end|>\n<|im_start|>`；gate 的系統提示詞現在含有字面 `<|im_end|>`。
 
 ### <a id="srv-13"></a>SRV-13 · prefill chunk 變大反而讓後續請求變慢
-- **症狀**：chunk 2048：冷 prefill +18…+21%，但跨 slot 的後續請求重用的是 27,418 而非 28,442 處的檢查點（30k + 1000 token：1548 → 2230 ms）。
+- **症狀**：chunk 2048：冷 prefill 變快，但跨 slot 的後續請求重用的是 27,418 而非 28,442 處的檢查點（30k + 1000 token 的 TTFT 明顯變差）。
 - **修正**：以 1024-token chunk 排程，執行時合併成最多 2048 列的 forward。
 
 ### <a id="srv-14"></a>SRV-14 · 檢查點放在 pinned host 記憶體：96 次小複製
-- **實測**：每次儲存／載入約 40 ms，約 3.75 GB/s；agent 輪次 −25%。
+- **實測**：每次儲存／載入是 96 次小複製，約 3.75 GB/s；agent 輪次變慢。
 - **規則**：在 host 複製前先收集到連續緩衝區；熱檢查點留在 VRAM。
 
 ### <a id="srv-15"></a>SRV-15 · 被逐出的 session ≠ 單獨——是政策，不是 bug
@@ -727,7 +728,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 - **規則**：WHIRL 優先用 Q6_K 頭。
 
 ### <a id="quant-4"></a>QUANT-4 · fp8 activation 會放大其他每一種擾動
-- **實測**：同一個 DeltaNet 修改：f16 prefill 下 KL 4.5e-8 … 1.5e-4，fp8 下 1.2e-4 … 7.0e-2。
+- **實測**：同一個小的 DeltaNet 修改，在 fp8 prefill 下的最後 token KL 遠大於 f16 prefill 下。
 - **規則**：對精度敏感的修改要在精確模式下評估；速度模式的 KL 只記錄，不設 gate。
 
 （另見 [MTP-2](#mtp-2)：F32 `ssm_alpha`／`ssm_beta`。）
@@ -754,7 +755,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 - **修正**：在同一個 session 中交錯 A/B，2 輪以上，看 min–max。
 
 ### <a id="meas-3"></a>MEAS-3 · 筆電散熱：boost vs 持續 **[8060S]**
-- **實測（ROG Flow Z13，持續約 80 W**）：約 5–7 s 後 prefill −15%；連續執行的行程：一般 decode 在 3–5 分鐘後 13.4 → 5.4–5.8 tok/s（−58%），新舊執行檔表現一樣。
+- **實測（ROG Flow Z13，持續約 80 W**）：約 5–7 s 後 prefill −15%；連續執行的行程：一般 decode 在 3–5 分鐘後掉到一半以下，新舊執行檔表現一樣。
 - **修正**：每次執行前閒置 60–90 s、交錯執行、分別回報 boost 與持續數字；迷你 PC 的數字不可比較。
 
 ### <a id="meas-4"></a>MEAS-4 · 速度檢查拿冷的 CLI 比熱的 server
@@ -770,7 +771,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 - **修正**：在 `ANSWER:` 之前先推理，350 題，對不一致的配對做 McNemar 檢定。
 
 ### <a id="meas-7"></a>MEAS-7 · 不同輸出之間的推測解碼速度
-- **例子**：一個數值修改讓一段英文摘要變成 138 而非 105 個 token；接受率從 2.76 → 2.42 tokens/cycle，而每個 cycle 變快（40.6 → 39.9 ms）。
+- **例子**：一個數值修改讓一段英文摘要變長；每個 cycle 被接受的 token 變少，而每個 cycle 變快，於是這個提示詞看起來「變慢」。
 - **修正**：分開比較 ms/cycle 與接受率；只在輸出完全相同或多提示詞平均時比較 tok/s。
 
 ### <a id="meas-8"></a>MEAS-8 · 會違反 VRAM 規則的工具
@@ -780,7 +781,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 - **實測**：緩衝寫入 1.8 GB/s vs 無緩衝 5.1–5.3；2 MiB 讀取 QD1 4.1 vs QD4 7.0 GB/s。
 
 ### <a id="meas-10"></a>MEAS-10 · 參考引擎也可能壞掉
-- **事實**：llama.cpp b10686 Vulkan 在 R9700 上 decode 只有 5.6 tok/s（prefill 正常）；b11214 已修正。b11214 Vulkan 搭配 MTP 在 14k/24k 上下文時，prefill 從約 800 掉到約 97 tok/s。ROCm 版需要 `--load-mode none`（[HIP-3](#hip-3)）。
+- **事實**：llama.cpp b10686 Vulkan 在 R9700 上 decode 遠低於正常速度（prefill 正常）；b11214 已修正。b11214 Vulkan 搭配 MTP 在 14k/24k 上下文時，prefill 掉到正常速度的一小部分。ROCm 版需要 `--load-mode none`（[HIP-3](#hip-3)）。
 - **規則**：發表比較之前，先檢查參考是否正常。
 
 ### <a id="meas-11"></a>MEAS-11 · agent 基準測試需要有上限的工具迴圈
@@ -792,7 +793,7 @@ eGPU 或直連 PCIe）、附上確切錯誤字串的**症狀**、**根本原因*
 ## <a id="egpu"></a>10. eGPU（USB4）——環境限制
 
 ### <a id="egpu-1"></a>EGPU-1 · 約 3.8 GB/s 的主機連結
-- **實測**：不論分塊大小，D2H 3.78–3.81、H2D 3.84–3.86 GB/s；KV 還原每個 token 約 14–16 µs；128k 還原約 1.9–2.0 s。
+- **實測**：不論分塊大小，D2H 3.78–3.81、H2D 3.84–3.86 GB/s；KV 還原受它限制。
 - **狀態**：環境限制；直接接 PCIe 預期會快很多（未量測）。
 
 ### <a id="egpu-2"></a>EGPU-2 · H2D 流量會拖慢 kernel 派發

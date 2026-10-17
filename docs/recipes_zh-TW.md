@@ -151,14 +151,14 @@ pinned RAM，在圖片到來前不佔 VRAM，見[第 5 節](#images)）。
   KV 池留給他。
 - KV 格式自動選擇，啟動時會連同原因印出。dense 模型取 **f16 → q8v → q8h** 中第一個放得下所需池大小的：
   `-np 1` 搭預設上下文得到 f16，預設 4 個 slot 得到 q8v，`--ctx-per-slot 262144` 得到 q8h。在我們的成對 QA
-  （350 題，上下文最長 70k）中，沒有任何格式和 f16 有可量測的差異；q8h 在 64k–128k 的 decode 慢 3.6–5.2%
+  （350 題，上下文最長 70k）中，沒有任何格式和 f16 有可量測的差異
   （[kv-and-caching.md](guide/zh-TW/kv-and-caching.md#formats)）。要強制指定，啟動前設 `$env:WHIRL_KV = "q8v"`
   （或 `f16`、`q8`、`q8h`）。
 - MoE 模型（Ornith-1.5-35B-A3B）一律用 f16 KV，每 token 22 KiB（27B dense 模型 f16 為 68 KiB），所以預設池就有
   約 414k token，長上下文的 decode 也快得多（16k token 之後 301.5 對 69.5 tok/s，
   [benchmarks.md](guide/zh-TW/benchmarks.md#6-16k-token-context-之後的-decode)）。
-- 冷的長提示詞需要時間：Swift 27B MXFP4-A prefill 32k token 約 2,600 tok/s（約 13 秒）；在我們的 needle 測試中，
-  27B 模型在 256k 時約 400 tok/s（約 11 分鐘）。之後的回合靠前綴快取與分層就很快。
+- 冷的長提示詞需要時間：balance 模式下 Swift 27B MXFP4-A prefill 32k token 約 2,800 tok/s（約 12 秒），
+  約 250k token 的提示約 1,150 tok/s（約 3.6 分鐘）（[benchmarks.md](guide/zh-TW/benchmarks.md)）。之後的回合靠前綴快取與分層就很快。
 - **VRAM。** 伺服器會把 KV 池開到填滿剩餘 VRAM，所以行程永遠顯示約 30–31 GiB 專用記憶體
   （[benchmarks.md 第 9 節](guide/zh-TW/benchmarks.md#9-vram)）——這是預期行為，不是洩漏。要把 VRAM 留給其他程式，
   用 `-c N`（token 數）限制池大小。工作管理員裡 8–16 GiB 的「共用 GPU 記憶體」是 pinned RAM 層，不是溢出的 VRAM。
@@ -173,7 +173,7 @@ pinned RAM，在圖片到來前不佔 VRAM，見[第 5 節](#images)）。
   slot 隨上下文變長取用頁面，池滿時最久沒用的*閒置* slot 會被逐出——先溢出到 RAM／SSD 層，所以那位使用者
   回來時會被還原。
 - 4 個並行使用者的合計吞吐量（約 1.1k token 提示詞、每個生成 256 token、含 prefill）：Swift 27B MXFP4-A
-  **198.6 tok/s**、Ornith MoE MXFP4 **396.7 tok/s**、Qwen3.8-27B Q4_K_M **134.1 tok/s**
+  **198.6 tok/s**、Ornith MoE MXFP4 **396.7 tok/s**
   （[benchmarks.md 第 7 節](guide/zh-TW/benchmarks.md#7-server-併發)）。每個並行輸出都和同一請求單獨執行時相同。
 - 推測解碼的草稿和使用者在同一次驗證中競爭，所以同時 decode 的使用者越多，每人的加速越少；到 16 個使用者時
   MTP 已經沒有幫助。
@@ -254,7 +254,7 @@ I kv tier | RAM 6.10 / 9.00 GiB in 4 entries, SSD 12.40 GiB in 9 entries | spill
 | 症狀 | 原因與解法 |
 |---|---|
 | 「Windows 已保護您的電腦」，或程式被封鎖 | 執行檔沒有程式碼簽章：按**其他資訊 → 仍要執行**，或在解壓縮前對官方 zip 執行 `Unblock-File`；智慧型應用程式控制可能直接封鎖——見 [Windows 安全性提示](windows_security_zh-TW.md) |
-| 新模型第一次啟動卡一陣子 | 一次性的 kernel 自動調校：MXFP4 檔幾秒，27B Q4_K_M 檔約 1.5–2 分鐘（會有訊息說明）；結果快取在 `%LOCALAPPDATA%\whirl` |
+| 新模型第一次啟動卡一陣子 | 一次性的 kernel 自動調校：MXFP4 檔幾秒，K-quant 檔會久一些（會有訊息說明）；結果快取在 `%LOCALAPPDATA%\whirl` |
 | 啟動後一直等、不載入 | 另一個 WHIRL 行程佔著 GPU（每張 GPU 一個行程；第二個最多等 30 分鐘，`WHIRL_GPU_WAIT`）。先停掉另一個 |
 | 結束代碼 **2** | 命令列錯誤（未知選項、缺模型路徑、`--host` 不是這台電腦的位址）：`.\whirl-server.exe --help` |
 | 結束代碼 **3** | GPU／驅動問題：安裝 AMD Software: Adrenalin Edition 26.8.1 或更新版；用 `.\whirl.exe devices` 檢查 |

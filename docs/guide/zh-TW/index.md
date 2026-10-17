@@ -53,8 +53,8 @@ WHIRL（*Windows HIP Inference for RDNA LLMs*）是以 C++ 與 HIP 撰寫、授�
   **USB4 eGPU**（host 連結約 3.8 GB/s）；這條連結造成的現象一律標為*環境限制*。8060S = AMD Radeon 8060S
   （RDNA 3.5、gfx1151），裝在散熱受限的筆電裡。作業系統：Windows 11 build 26200；HIP SDK 7.2。
 - **數字**都是實測，附單位與條件；範圍是交錯多輪的 min–max。decode 數字先報 WHIRL 的預設模式
-  （MTP + n-gram）；「不開 MTP」的數字會明確標示——在這張卡上，27B 4-bit 模型的一般 decode 受記憶體頻寬
-  限制，上限約 38 tok/s。
+  （MTP + n-gram）；「不開 MTP」的數字會明確標示——在這張卡上，27B MXFP4 模型的一般 decode 受記憶體頻寬
+  限制，上限約 40 tok/s（每步 25.15 ms）。
 - **逐位元相同**指的是位元完全相同，並由常設檢查把關。
 - **名稱。** 命令列旗標與 `WHIRL_*` 環境變數都是 WHIRL 0.1.0 的名稱，全部列在[使用參考](usage.md)。
 - **未知**的數字標為 TODO，不做推估。
@@ -64,6 +64,6 @@ WHIRL（*Windows HIP Inference for RDNA LLMs*）是以 C++ 與 HIP 撰寫、授�
 理念：[NInfer](https://github.com/Neroued/ninfer)（專門化引擎；Apache-2.0）。改寫自第三方的程式碼：
 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT：tokenizer 預切詞與 BPE 合併迴圈、IQ 查表）。
 技術：[r9700-stack](https://github.com/bkvargyas/r9700-stack)（Apache-2.0：E8M0 → fp8 指數折疊、fragment
-排列的 fp8 activation、只等 LDS 的 barrier 指令序列）。Strix Halo 的量測方法：[gufo](https://github.com/gufo-org/gufo)。
+排列的 fp8 activation、只等 LDS 的 barrier 指令序列）。Ryzen AI Max（Radeon 8060S）的量測方法：[gufo](https://github.com/gufo-org/gufo)。
 分層快取排程的想法（delay hit、命中即預取）：Strata 論文（arXiv 2508.18572）。詳見
 [THIRD_PARTY_NOTICES.md](../../../THIRD_PARTY_NOTICES.md) 與 [PROVENANCE.md](../../../PROVENANCE.md)。

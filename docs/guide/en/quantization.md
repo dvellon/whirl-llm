@@ -16,32 +16,23 @@ WHIRL treats a model file in one of two ways:
 
 | | Precision mode | Speed mode |
 |---|---|---|
-| Typical file | unsloth UD-Q4_K_M (K-quants + IQ quants) | MXFP4 |
+| Typical file | K-quant / IQ-quant GGUF (WHIRL loads Q4_K_M and similar files) | MXFP4 |
 | Prefill activations | f16 | fp8 (e4m3), one scale per token |
 | Rule for lossy changes | must pass KL vs path noise + paired QA (McNemar) + needles | accepted; effects measured and recorded |
 | Outputs across optimizations | bit-identical where the previous build was | may change when the speed path changes |
 | MTP == plain greedy, concurrent == solo | yes | yes |
 
 Speed mode applies automatically when the file contains MXFP4 tensors: fp8 prefill GEMMs, f16-WMMA
-DeltaNet chunks and f16 GEMM outputs for element-wise consumers. On the R9700 the last two (balance items `gdnwmma`, `h16`) also apply to dense models in other formats such as Q4_K_M (KG-1: Qwen3.8-27B Q4_K_M prefill +7–10% at 8k–128k; KL vs precise at 128k unchanged within ±4e-5, 2.7e-4 / 4.1e-4); their GEMMs keep f16 activations. `WHIRL_FP8=0` returns MXFP4
-prefill to f16 activations (then prefill is only 2–4% faster than Q4_K_M — the speed comes from fp8,
-not from the format). Decode is exact in both modes (int8 GEMV with the same per-unit arithmetic).
+DeltaNet chunks and f16 GEMM outputs for element-wise consumers. On the R9700 the last two (balance items `gdnwmma`, `h16`) also apply to dense models in other formats (K-quants such as Q4_K_M load and use them); their GEMMs keep f16 activations. `WHIRL_FP8=0` returns MXFP4
+prefill to f16 activations (most of the MXFP4 prefill speed comes from fp8, not from the format). Decode is exact in both modes (int8 GEMV with the same per-unit arithmetic).
 
-| Qwen3.8-27B on the R9700 | Q4_K_M (precision) | MXFP4 (speed) |
-|---|---|---|
-| Weights | 15.3 GiB | 13.9 GiB (12.89 GiB MXFP4 + 0.97 GiB Q6_K head) |
-| Default server KV pool (q8v, 4 slots) | 199,936 tokens | ~16% larger (228,096 after system checkpoints were added) |
-| CLI prefill 2k / 8k / 32k / 128k | 1,722 / 1,749 / 1,532 / 1,052 tok/s | 3,770 / 3,552 / 2,783 / 1,531 tok/s |
-| Decode no MTP / MTP / MTP + n-gram (server) | 34.3 / 110.4 / 145.4 | 37.6 / 120.3 / 159.1 |
-| Perplexity, zh/en code corpus (llama.cpp) | 3.640 | 3.795 (+4.3%) |
-| Paired QA, 350 items (WHIRL, greedy) | 265 (f16 KV run) | 256 (fp8 prefill run) |
-
-The two QA numbers come from different runs (not a paired comparison). Within MXFP4, fp8 vs f16
-prefill was paired: 256 vs 253, McNemar p = 0.58.
+Published speed numbers for the two MXFP4 models are in [benchmarks.md](../../benchmarks.md). Within
+MXFP4, fp8 vs f16 prefill was compared on a paired 350-item QA set (WHIRL, greedy): 256 vs 253 correct,
+McNemar p = 0.58.
 
 **Choose precision mode** when outputs must match a greedy reference and every optimization must
 pass precision gates. **Choose speed mode** for long prompts and agents that read many files, where
-prefill dominates; decode is also 8–10% faster (proportional to the weight bytes).
+prefill dominates; decode also gets faster in proportion to the smaller weight bytes.
 
 ## 2. Tensor types WHIRL accepts
 
@@ -52,24 +43,11 @@ stops the load — there is no generic dequantize-to-f16 fallback. MXFP4 is impl
 MXFP4 runs on the same int8 decode GEMVs and is dequantized to f16 for prefill (gfx1151 has no fp8
 WMMA, so MXFP4 prefill there uses f16 activations; the MoE experts take the generic paths).
 
-### 2.1 What the unsloth UD-Q4_K_M file contains
+### 2.1 Mixed-format K-quant files
 
-One file mixes nine formats, which is exactly why WHIRL tunes per file. Decode weights read per
-token (14.33 GB total):
-
-| Format | Bytes | 1-token time | Achieved bandwidth | Note |
-|---|---|---|---|---|
-| Q5_K | 4.834 GB | 8.33 ms | 580 GB/s | |
-| IQ4_XS | 4.760 GB | 8.06 ms | 590 GB/s | |
-| Q4_K | 3.489 GB | 6.12 ms | 570 GB/s | |
-| Q6_K | 0.430 GB | 0.76 ms | 566 GB/s | layers; the output head (1,043 MB) is separate |
-| IQ4_NL | 0.330 GB | 0.57 ms | 584 GB/s | |
-| Q3_K | 0.268 GB | 0.54 ms | 493 GB/s | later fixed to ~580 GB/s |
-| IQ3_S | 0.153 GB | 0.33 ms | 460 GB/s | later fixed to ~580 GB/s |
-| Q8_0 | 0.070 GB | 0.69 ms | 101 GB/s | tiny 48×5120 DeltaNet beta/alpha matrices; fused |
-| F32 | — | — | — | norms, conv weights, biases |
-
-(Early measurements; token_embd Q4_K 715 MB is read one row per token.)
+A typical K-quant file (for example an unsloth UD-Q4_K_M GGUF, which WHIRL loads) mixes nine formats in
+one file: Q5_K, IQ4_XS, Q4_K, Q6_K, IQ4_NL, Q3_K, IQ3_S, Q8_0 (the small DeltaNet beta/alpha matrices)
+and F32 (norms, conv weights, biases). That mix is why WHIRL tunes its kernels per file.
 
 ## <a id="mxfp4"></a>3. MXFP4 in WHIRL
 
@@ -90,10 +68,8 @@ token (14.33 GB total):
 5.9e-5, zh-short 2.5e-4, p4k 3.6e-3, p12k 4.0e-5, p24k 3.5e-5, code16k 2.9e-2, code32k 5.6e-2 (top-1
 flipped at a near-tie, p 0.265). For scale: f16 prefill with chunk 1024 vs 4096 gives KL 0
 (bit-identical); "decode the whole prompt token by token (int8 activations) vs f16 prefill" gives
-2.4e-6 / 9.3e-5 / 6.4e-4 (MXFP4) and 1.7e-6 / 5.7e-5 / 4.8e-3 (Q4_K_M); the format difference
-Q4_K_M vs MXFP4 (both f16) is 2.6e-4 … 1.4e-1. So fp8 adds about 3–25× the decode-path noise and
-5–45% of the format difference. fp8 activations also amplify any other perturbation: the same f16
-WMMA DeltaNet change that is 4.5e-8 … 1.5e-4 on Q4_K_M becomes 1.2e-4 … 7.0e-2 under fp8.
+2.4e-6 / 9.3e-5 / 6.4e-4. So fp8 adds about 3–25× the decode-path noise. fp8 activations also
+amplify any other perturbation: a small f16 WMMA DeltaNet change becomes much larger under fp8.
 
 `WHIRL_FP8_MASK` (bits: 1 = attention/DeltaNet/MTP projections, 2 = FFN gate/up, 4 = FFN down)
 exists for research on which GEMM class contributes the error; that study was not completed.
@@ -105,17 +81,16 @@ llama.cpp `llama-perplexity` (b11214 ROCm), mixed Chinese/English code corpus (2
 
 | File | PPL |
 |---|---|
-| Qwen3.8-27B UD-Q4_K_M | 3.6403 ± 0.0355 |
-| Qwen3.8-27B MXFP4 (FreedomAISVR) | 3.7952 ± 0.0384 (+4.3%; worse on 51/51 chunks; ΔNLL +0.0417 ± 0.0027 nats/token) |
+| Qwen3.8-27B MXFP4 (FreedomAISVR, reference) | 3.7952 ± 0.0384 |
 | Swift-1.5 MXFP4 A (Q6_K head) | 3.8271 ± 0.0394 |
 | Swift-1.5 MXFP4 B (Q8_0 head) | 3.8289 ± 0.0395 |
 | Swift-1.5 MXFP4 C (Q4_K head) | 3.8386 ± 0.0396 |
 
 Swift-1.5 is a different fine-tune, so its distance from Qwen MXFP4 (about +0.8% for A) is not all
-quantization. The PPL gap between UD-Q4_K_M and MXFP4 is expected: the reference MXFP4 file is
-almost uniformly 4.25 bpw without an imatrix, while UD-Q4_K_M averages more bits (Q5_K 4.5,
-IQ4_XS 4.43, Q4_K 3.92, Q6_K 1.69 GiB, …). (The two Qwen PPL runs peaked at 306 MiB shared GPU
-memory, which our VRAM rule flags for *speed*; the values are unaffected.)
+quantization. MXFP4 files are almost uniformly 4.25 bpw (mainline `llama-quantize` ignores the imatrix
+for MXFP4), so a K-quant file with more average bits per weight can score a lower perplexity. (The Qwen
+PPL run peaked at 306 MiB shared GPU memory, which our VRAM rule flags for *speed*; the value is
+unaffected.)
 
 ## <a id="swift"></a>5. How we quantized Swift-1.5-Qwen3.8-27B to MXFP4
 
@@ -169,7 +144,7 @@ with an F16 mmproj.
   followed a spec that kept them F32: WHIRL's MTP smoke test failed on all three variants (MTP output
   ≠ plain greedy) and drafts were capped at 1. Cause: WHIRL has no int8 GEMV for F32
   weights, so n = 1 used an f32-activation GEMV and n ≥ 2 (verify) an f16 GEMM — different numerics,
-  breaking MTP's bit-exactness. With Q8_0 (which has a fused exact kernel, as unsloth's Q4_K_M uses)
+  breaking MTP's bit-exactness. With Q8_0 (which has a fused exact kernel)
   all variants passed and drafts returned to 8. (Since 0.1.3 the engine runs F32 / F16 small
   matrices through one GEMV family for all n, so such files are exact, but they remain capped at
   1 draft because the fused DeltaNet decode kernel `gdn_ab` exists only for Q8_0 / MXFP4 α/β — see
@@ -219,7 +194,7 @@ MXFP4 experts with fp8 activations in prefill, whole-block int8 kernels in decod
 ### 6.1 Recipe
 
 1. **Convert** the BF16 checkpoint with llama.cpp's `convert_hf_to_gguf.py --outtype bf16`
-   (keeps the MTP layer: `nextn_predict_layers` 1, tensor names as in the official Q4_K_M).
+   (keeps the MTP layer: `nextn_predict_layers` 1, tensor names as in the official GGUF releases).
 2. **Quantize** with llama.cpp b11214's `llama-quantize`, **no imatrix** (mainline ignores it for
    MXFP4 and Q8_0 anyway), with a tensor-type file:
 
@@ -261,14 +236,14 @@ Same GGUF on both engines; WHIRL greedy, MTP output identical to plain greedy ou
 research prototype's output token for token); llama.cpp b11214 ROCm, `-fa on`, best of
 `-ub 512 / 2048` (2048 was faster for every prefill size).
 
-| | WHIRL MXFP4 | WHIRL Q4_K_M | llama.cpp MXFP4 | llama.cpp Q4_K_M |
-|---|---|---|---|---|
-| Prefill 88 / 2k / 8k / 32k tokens (tok/s) | 2,542 / 11,729 / 10,853 / 7,978 | 1,338 / 5,862 / 5,992 / 4,980 | 1,820 / 4,820 / 4,760 / 3,936 | 1,725 / 4,383 / 4,328 / 3,639 |
-| Decode, MTP + n-gram, 7 zh/en coding prompts (median, 800 tokens) | 253 tok/s | 224 tok/s | — | — |
-| Decode, MTP + n-gram, editing prompts (bugfix / refactor-js) | 272 / 253 tok/s | 224 / 241 tok/s | — | — |
-| Decode, no MTP (same prompts; llama.cpp `tg256`) | 194 tok/s | 180 tok/s | 120 tok/s | 103 tok/s |
-| Server, 1 request, MTP + n-gram (llama.cpp: no MTP) | 246 tok/s | 203 tok/s | 113 tok/s | 96 tok/s |
-| Server, 4 concurrent requests, aggregate | 435 tok/s (MTP + n-gram), 355 (no MTP) | 347, 321 | 227 (no MTP), 138 (MTP) | 219, 84 |
+| | WHIRL MXFP4 | llama.cpp MXFP4 |
+|---|---|---|
+| Prefill 88 / 2k / 8k / 32k tokens (tok/s) | 2,542 / 11,729 / 10,853 / 7,978 | 1,820 / 4,820 / 4,760 / 3,936 |
+| Decode, MTP + n-gram, 7 zh/en coding prompts (median, 800 tokens) | 253 tok/s | — |
+| Decode, MTP + n-gram, editing prompts (bugfix / refactor-js) | 272 / 253 tok/s | — |
+| Decode, no MTP (same prompts; llama.cpp `tg256`) | 194 tok/s | 120 tok/s |
+| Server, 1 request, MTP + n-gram (llama.cpp: no MTP) | 246 tok/s | 113 tok/s |
+| Server, 4 concurrent requests, aggregate | 435 tok/s (MTP + n-gram), 355 (no MTP) | 227 (no MTP), 138 (MTP) |
 
 The server rows use the same client for both engines (7 bench prompts, 800 tokens, thinking off,
 top_k 1); llama.cpp's MTP (`--spec-type draft-mtp`, 3 drafts) was slower than its plain decode on
@@ -284,7 +259,7 @@ the same values (same bits). In a 2k-token prefill profile the GEMM time dropped
 ## <a id="rules"></a>7. Checklist for making a GGUF that runs well on WHIRL
 
 1. Keep `general.architecture` `qwen35` / `qwen35moe` and **keep the MTP layer** (`nextn`) —
-   without it WHIRL decodes at the no-MTP ceiling (~38 tok/s for a 27B 4-bit model).
+   without it WHIRL decodes at the no-MTP ceiling (36.8 tok/s for Swift-1.5 MXFP4 A, §5.3).
 2. Do not use F32 for `ssm_alpha` / `ssm_beta`; use Q8_0 (or MXFP4).
 3. Prefer a **Q6_K output head**: it feeds the 2-bit draft head and has its own multi-row tuning.
    Avoid Q8_0 heads (every draft step pays for them).

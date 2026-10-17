@@ -58,7 +58,8 @@ other projects can reuse the lessons.
   OS: Windows 11 build 26200; HIP SDK 7.2.
 - **Numbers** are measured, with units and conditions; ranges are min–max over interleaved rounds.
   Decode numbers lead with WHIRL's default mode (MTP + n-gram); "no MTP" numbers are labeled — plain
-  decode of a 27B 4-bit model is bounded at ~38 tok/s by memory bandwidth on this card.
+  decode of the 27B MXFP4 model is bounded by memory bandwidth at about 40 tok/s on this card
+  (25.15 ms per step).
 - **Bit-exact** means identical bits, enforced by a permanent check.
 - **Names.** Command-line flags and `WHIRL_*` variables are those of WHIRL 0.1.0; all of them are
   listed in [usage.md](../../usage.md).
@@ -70,6 +71,6 @@ Ideas: [NInfer](https://github.com/Neroued/ninfer) (specialized engines; Apache-
 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT: tokenizer pre-split and BPE merge loop,
 IQ lookup tables). Techniques: [r9700-stack](https://github.com/bkvargyas/r9700-stack) (Apache-2.0: E8M0 →
 fp8 exponent folding, fragment-tiled fp8 activations, LDS-only barrier sequence). Measurement methodology
-for Strix Halo: [gufo](https://github.com/gufo-org/gufo). Hierarchical-cache scheduling ideas (delay hit, prefetch on hit): the Strata paper
+for Ryzen AI Max (Radeon 8060S): [gufo](https://github.com/gufo-org/gufo). Hierarchical-cache scheduling ideas (delay hit, prefetch on hit): the Strata paper
 (arXiv 2508.18572). Details in [THIRD_PARTY_NOTICES.md](../../../THIRD_PARTY_NOTICES.md) and
 [PROVENANCE.md](../../../PROVENANCE.md).

@@ -38,8 +38,8 @@ whirl-server --help | --version
 兩支程式都只接受 `general.architecture` 為 `qwen35`（dense）或 `qwen35moe`（混合專家，MoE）的 GGUF 檔，
 見[支援的模型](../../README_zh-TW.md#支援的模型)。CLI 一律 greedy 生成；伺服器另外支援取樣（temperature、top-p 等）。
 
-**第一次使用某個模型。** prefill kernel 會針對每個模型檔與 GPU 調校一次（stderr 會有提示）：27B Q4_K_M 約
-1.5～2 分鐘，MXFP4 檔只要幾秒。結果會快取起來（[第 8 節](#files)），之後直接開始。每一種候選組態算出的位元都
+**第一次使用某個模型。** prefill kernel 會針對每個模型檔與 GPU 調校一次（stderr 會有提示）：MXFP4 檔只要幾秒，
+K-quant 檔（混用多種 tensor 型別）會久一些。結果會快取起來（[第 8 節](#files)），之後直接開始。每一種候選組態算出的位元都
 相同，只有速度不同。
 
 **一張 GPU 一個行程。** WHIRL 執行時會持有該 GPU 的鎖。同一張 GPU 上的第二個 WHIRL 行程會等前一個結束
@@ -57,7 +57,7 @@ whirl-server --help | --version
 | 模式 | dense 模型 | MoE 模型 |
 |---|---|---|
 | precise | f16 | f16 |
-| balance（預設） | q8h（K、V 都是 int8，每 32 個值一個 f16 scale，q / k 先做 Hadamard 旋轉；相對 f16 的 KL 0.0002–0.002） | f16 |
+| balance（預設） | q8h（K、V 都是 int8，每 32 個值一個 f16 scale，q / k 先做 Hadamard 旋轉；在 128k 通過相對 f16 的 balance KL 門檻，KL-1） | f16 |
 | fast | q4 | q4 |
 
 格式不會因為放不放得下而切換：選定的格式放不下要求的 context 時，沒有指定 context 就降低 context 並發出警告；
@@ -78,14 +78,14 @@ whirl-server --help | --version
 | `gdnwmma` | balance | DeltaNet prefill 區塊用 f16 WMMA，取代 f32 區塊路徑 | MXFP4 模型，以及任何權重格式的 dense 模型（Q4_K_M、Q5_K、Q6_K、IQ4_XS 等；KG-1）；MoE 模型只限 MXFP4 | 略過（還沒有 kernel） |
 | `h16` | balance | FFN / DeltaNet 的 GEMM 輸出先存成 f16 再進逐元素運算 | MXFP4 模型，以及任何權重格式的 dense 模型（KG-1）；MoE 模型只限 MXFP4 | MXFP4 模型，只有 f16 權重 |
 | `kvq8` | balance | dense 模型一律用 q8h KV（不是 f16 放不下才換）；MoE 模型維持 f16 | dense 模型 | dense 模型 |
-| `kvq4` | fast | 4-bit KV（int4，每 32 個值一個 f16 scale，q / k 先做 Hadamard 旋轉）；8060S 的 decode attention 用 `attn_dq4` 讀取（約 180 GB/s）：Ornith-1.5-35B-A3B MXFP4 decode 128k 58.5 tok/s（f16 KV 32.7）、64k 67.0（46.4）；R9700（FAST-1c）Swift-1.5 27B 在 131k 的 decode：plain 30.98 tok/s（f16 KV 25.08）、MTP 68.79（63.12），128k prefill −1.9%；對 f16 的 KL 0.002–0.010 | dense 與 MoE | dense 與 MoE |
+| `kvq4` | fast | 4-bit KV（int4，每 32 個值一個 f16 scale，q / k 先做 Hadamard 旋轉）；8060S 的 decode attention 用 `attn_dq4` 讀取（約 180 GB/s）：Ornith-1.5-35B-A3B MXFP4 decode 128k 58.5 tok/s（f16 KV 32.7）、64k 67.0（46.4）；R9700（FAST-1c）Swift-1.5 27B 在 131k 的 decode：plain 30.98 tok/s（f16 KV 25.08）、MTP 68.79（63.12），128k prefill −1.9%；對 f16 的 KL 在 fast 門檻內 | dense 與 MoE | dense 與 MoE |
 | `relaxacc` | fast | 寬鬆推測接受（只對 MTP draft；n-gram draft 維持精確接受）。放寬接受若會讓結尾的 6-gram 與最近 4096 個 token 內重複，就不接受（重複防護）。greedy：draft 不是驗證列的 argmax 時，只要它在該列前 `WHIRL_RELAX_K` 名（預設 4）且 p(draft) >= `WHIRL_RELAX_ALPHA` × p(argmax)（預設 0.1）就保留；最後一個保留的 draft 之後那個 token 一定是目標模型自己的 argmax。temperature > 0：typical acceptance（Medusa）：在請求過濾後的分布上 p(draft) >= min(`WHIRL_RELAX_EPS` 0.09, `WHIRL_RELAX_DELTA` 0.3 × exp(−熵)) 就保留（此時不用 `specsample`）。**會改變 greedy 輸出**：fast 的 greedy 不等於 plain greedy，MTP ≠ plain；同樣的 prompt、seed、設定仍是確定的（此時 draft 數量策略改用固定的合成週期成本，不看牆鐘時間；並發請求共用 draft 數量，可能互相影響輸出）。`WHIRL_RELAX=0` 關閉；MoE 模型略過（每輪只有一個 MTP draft，量不到收益；`WHIRL_RELAX=1` 強制開） | dense MTP 模型 | dense MTP 模型 |
 | `headq`、`moeskip`、`a8`、`a4` | fast | 低位元輸出頭、略過 MoE 專家、W4A8 / W4A4 prefill | 尚未實作 | 尚未實作 |
 | `q8dec` | balance、fast | decode / verify GEMV 的 activation 用 int8（每 32 個值一個 f32 scale，同 llama.cpp 的 q8_1；balance 與 fast 一律包含） | 開 | 開 |
 
 balance 與 fast 依模型類型開了什麼（R9700；Radeon 8060S 沒有 fp8 WMMA，所以 `fp8` / `moefp8` 在任何模式都略過）：
 
-| 模式 | dense 模型（Qwen3.8-27B Q4_K_M、MXFP4 dense） | MoE 模型（Ornith-1.5-35B-A3B MXFP4） |
+| 模式 | dense 模型（MXFP4 dense；Q4_K_M 等 K-quant 檔也適用） | MoE 模型（Ornith-1.5-35B-A3B MXFP4） |
 |---|---|---|
 | precise | 全程 f16 / f32，f16 KV | 全程 f16 / f32，f16 KV |
 | balance | `fp8`（只限 MXFP4 檔）、`gdnwmma`、`h16`、`kvq8`（q8h KV）、`specsample`、`q8dec` | `fp8`、`moefp8`、`gdnwmma`、`h16`、`specsample`、`q8dec`，f16 KV |
@@ -138,7 +138,7 @@ decode 速度；開 MTP 時另列驗證回合數與草稿接受率。
 範例：
 
 ```powershell
-.\whirl.exe chat C:\models\Qwen3.8-27B-UD-Q4_K_M.gguf "用兩句話說明 TCP 慢啟動（slow start）。" --max-tokens 400
+.\whirl.exe chat C:\models\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf "用兩句話說明 TCP 慢啟動（slow start）。" --max-tokens 400
 .\whirl.exe chat C:\models\model.gguf @C:\work\long_prompt.txt --max-tokens 2000 --ctx 65536 --no-think
 .\whirl.exe chat C:\models\model.gguf "這張圖裡有什麼？" --mmproj C:\models\mmproj-F16.gguf --image C:\pics\cat.png
 ```
@@ -211,7 +211,7 @@ whirl serve  MODEL.gguf [選項]      （同一支程式）
 
 ```powershell
 # 27B 模型、4 個 slot、預設分層快取
-.\whirl-server.exe C:\models\Qwen3.8-27B-UD-Q4_K_M.gguf --port 8080
+.\whirl-server.exe C:\models\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf --port 8080
 
 # 單一使用者、長 context、不用 SSD 層
 .\whirl-server.exe C:\models\model.gguf -np 1 --ctx-per-slot 262144 --kv-ssd-gb 0

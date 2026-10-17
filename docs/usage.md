@@ -41,8 +41,8 @@ Both programs accept only GGUF files whose `general.architecture` is `qwen35` (d
 in the CLI; the server also samples (temperature, top-p, …).
 
 **First run with a new model.** The prefill kernels are tuned once per model file and GPU
-(a message on stderr says so): about 1.5–2 minutes for a 27B Q4_K_M file, a few seconds for MXFP4
-files. The result is cached ([section 8](#files)); later runs start right away. Every candidate
+(a message on stderr says so): a few seconds for MXFP4 files, longer for K-quant files (which mix
+many tensor types). The result is cached ([section 8](#files)); later runs start right away. Every candidate
 configuration gives the same bits, only the speed differs.
 
 **One process per GPU.** A WHIRL process holds a per-GPU lock while it runs. A second WHIRL process
@@ -64,7 +64,7 @@ is still accepted).
 | Mode | Dense models | MoE models |
 |---|---|---|
 | precise | f16 | f16 |
-| balance (default) | q8h (int8 K and V + one f16 scale per 32 values, Hadamard-rotated q / k; KL vs f16 0.0002–0.002) | f16 |
+| balance (default) | q8h (int8 K and V + one f16 scale per 32 values, Hadamard-rotated q / k; passes the balance KL gate vs f16 at 128k, KL-1) | f16 |
 | fast | q4 | q4 |
 
 The format is never switched by what fits: when the chosen format cannot hold the context, the
@@ -88,7 +88,7 @@ Items (pick a subset with `--balance=fp8,kvq8` or `--fast=...`; `WHIRL_MODE=bala
 | `h16` | balance | f16 FFN / DeltaNet GEMM outputs before the element-wise ops | MXFP4 models and dense models of any weight format (KG-1); MoE models only with MXFP4 | MXFP4 models, f16 weights only |
 | `kvq8` | balance | q8h KV on dense models, always (not only when f16 does not fit); MoE models keep f16 | dense models | dense models |
 | `specsample` | balance | Requests with temperature > 0: tokens are sampled by a race keyed by (seed, position, token) and MTP drafts are drawn from the draft head's distribution (same temperature / top-k / top-p / min-p) by the same race, accepted only when they equal the sampled token: exact sampling, acceptance close to the optimum, and the text for a seed does not depend on drafts (MTP on == off). The sequence for a seed differs from precise's sampler. Off (precise): inverse-CDF sampler, greedy drafts. Greedy (temperature 0) is unchanged in every mode | MTP models | MTP models |
-| `kvq4` | fast | 4-bit KV (int4 + one f16 scale per 32 values, Hadamard-rotated q / k); on the 8060S decode attention reads it through `attn_dq4` (~180 GB/s): Ornith-1.5-35B-A3B MXFP4 decode at 128k 58.5 tok/s (f16 KV 32.7), at 64k 67.0 (46.4); on the R9700 (FAST-1c) Swift-1.5 27B decode at 131k plain 30.98 tok/s (f16 KV 25.08), MTP 68.79 (63.12), prefill 128k −1.9%; KL vs f16 0.002–0.010 | dense and MoE | dense and MoE |
+| `kvq4` | fast | 4-bit KV (int4 + one f16 scale per 32 values, Hadamard-rotated q / k); on the 8060S decode attention reads it through `attn_dq4` (~180 GB/s): Ornith-1.5-35B-A3B MXFP4 decode at 128k 58.5 tok/s (f16 KV 32.7), at 64k 67.0 (46.4); on the R9700 (FAST-1c) Swift-1.5 27B decode at 131k plain 30.98 tok/s (f16 KV 25.08), MTP 68.79 (63.12), prefill 128k −1.9%; KL vs f16 within the fast gate | dense and MoE | dense and MoE |
 | `relaxacc` | fast | Relaxed speculative acceptance (MTP drafts; n-gram drafts stay exact). A relaxed acceptance is refused when it would end in a 6-gram already among the last 4096 tokens (repetition guard). Greedy: a draft that is not the verify row's argmax is still kept when it is among the row's top `WHIRL_RELAX_K` tokens (default 4) and p(draft) >= `WHIRL_RELAX_ALPHA` x p(argmax) (default 0.1); the token after the last kept draft is always the target's own argmax. Temperature > 0: typical acceptance (Medusa): keep the draft when p(draft) >= min(`WHIRL_RELAX_EPS` 0.09, `WHIRL_RELAX_DELTA` 0.3 x exp(-entropy)) on the request's filtered distribution (`specsample` is not used then). **Changes greedy output**: fast greedy is not plain greedy and MTP != plain; it stays deterministic for the same prompt, seed and settings (the draft-count policy then uses a fixed synthetic cycle cost, not wall-clock times; concurrent requests share draft counts and can change each other's output). `WHIRL_RELAX=0` turns it off; MoE models skip it (one MTP draft per cycle, no measured gain; `WHIRL_RELAX=1` forces it) | dense MTP models | dense MTP models |
 | `headq`, `moeskip`, `a8`, `a4` | fast | low-bit output head, MoE expert skipping, W4A8 / W4A4 prefill | not yet implemented | not yet implemented |
 | `q8dec` | balance, fast | int8 activations (one f32 scale per 32 values, as llama.cpp's q8_1) in the decode / verify GEMV (always part of balance and fast) | on | on |
@@ -96,7 +96,7 @@ Items (pick a subset with `--balance=fp8,kvq8` or `--fast=...`; `WHIRL_MODE=bala
 What balance and fast change, by model type (R9700; the Radeon 8060S has no fp8 WMMA, so `fp8` /
 `moefp8` are skipped there in every mode):
 
-| Mode | Dense models (Qwen3.8-27B Q4_K_M, MXFP4 dense) | MoE models (Ornith-1.5-35B-A3B MXFP4) |
+| Mode | Dense models (MXFP4 dense; also K-quant files such as Q4_K_M) | MoE models (Ornith-1.5-35B-A3B MXFP4) |
 |---|---|---|
 | precise | f16 / f32 everywhere, f16 KV | f16 / f32 everywhere, f16 KV |
 | balance | `fp8` (MXFP4 files only), `gdnwmma`, `h16`, `kvq8` (q8h KV), `specsample`, `q8dec` | `fp8`, `moefp8`, `gdnwmma`, `h16`, `specsample`, `q8dec`, f16 KV |
@@ -174,7 +174,7 @@ speed and, with MTP, the verify cycles and draft acceptance.
 Examples:
 
 ```powershell
-.\whirl.exe chat C:\models\Qwen3.8-27B-UD-Q4_K_M.gguf "Explain TCP slow start in two sentences." --max-tokens 400
+.\whirl.exe chat C:\models\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf "Explain TCP slow start in two sentences." --max-tokens 400
 .\whirl.exe chat C:\models\model.gguf @C:\work\long_prompt.txt --max-tokens 2000 --ctx 65536 --no-think
 .\whirl.exe chat C:\models\model.gguf "What is in this picture?" --mmproj C:\models\mmproj-F16.gguf --image C:\pics\cat.png
 ```
@@ -251,7 +251,7 @@ Examples:
 
 ```powershell
 # 27B model, 4 slots, default tiers
-.\whirl-server.exe C:\models\Qwen3.8-27B-UD-Q4_K_M.gguf --port 8080
+.\whirl-server.exe C:\models\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf --port 8080
 
 # one user, long contexts, no SSD tier
 .\whirl-server.exe C:\models\model.gguf -np 1 --ctx-per-slot 262144 --kv-ssd-gb 0
@@ -266,14 +266,14 @@ DFlash2 is an optional second draft source for Qwen3.8-27B (dense only; MoE mode
 have no drafter and keep MTP). A small block-diffusion drafter proposes up to 7 tokens per cycle
 from the target's hidden states; the target verifies them exactly like n-gram drafts, so the text is
 the same as without drafts (greedy: plain greedy decoding of the same numerics mode; sampling: the
-same text for the same seed). Only the speed changes, and not always for the better. Measured on
-the R9700 against the default MTP drafts:
+same text for the same seed). Only the speed changes, and not always for the better. Compared with
+the default MTP drafts on the R9700:
 
 | Workload | DFlash2 vs MTP |
 |---|---|
-| one user, short / medium context, English or predictable output (code, lists, repeated structure) | faster: up to +19..48% |
-| mostly-Chinese output | about 10% slower |
-| 4 concurrent users | about 39% slower |
+| one user, short / medium context, English or predictable output (code, lists, repeated structure) | faster |
+| mostly-Chinese output | slower |
+| 4 concurrent users | slower |
 | long context (37k+ tokens) | slower (acceptance drops) |
 
 Use it for a single user with short or medium prompts and English-heavy or predictable output; keep

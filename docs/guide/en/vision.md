@@ -14,12 +14,12 @@ depend on what the server did *before* the current request.
 
 ## 1. Goal and constraint
 
-The default 27B server leaves the KV pool only 2,816 tokens above the 128k + 64k floor
+The default 27B server left the KV pool only a little above the 128k + 64k floor
 ([kv-and-caching.md](kv-and-caching.md#floor)). A vision encoder that stays resident would push the
 default KV format from q8v to the slower q8h for *every* user, including those who never send an
 image. So the requirement was: **loading an mmproj must change neither the KV pool size nor
-resident VRAM.** Measured on the candidate: pool with `--mmproj` 199,936 tokens (unchanged), VRAM
-change at mmproj load 0.0 MiB.
+resident VRAM.** Measured on the candidate: pool with `--mmproj` unchanged, VRAM change at mmproj load
+0.0 MiB.
 
 ## 2. Design
 
@@ -27,7 +27,7 @@ change at mmproj load 0.0 MiB.
 |---|---|
 | Projector weights | loaded into **pinned host RAM** at startup; nothing of the encoder is in VRAM until an image arrives |
 | Encoder lifetime | kernels, resident weights and a copy stream are created **on demand** with the first image and **released after an idle timeout** (`--vis-idle-s`, default 60 s); VRAM returns to the text-only footprint |
-| Weight mode | `--vis-mode auto` (default): weights resident if that much VRAM is free, otherwise **streamed layer by layer per image**; `resident` / `stream` force a mode. The default 27B configuration leaves 0.76 GiB free, so weights stream: ~260 ms of H2D per image on this USB4 eGPU (environment-dependent) |
+| Weight mode | `--vis-mode auto` (default): weights resident if that much VRAM is free, otherwise **streamed layer by layer per image**; `resident` / `stream` force a mode. The default 27B configuration leaves too little VRAM free, so weights stream: ~260 ms of H2D per image on this USB4 eGPU (environment-dependent) |
 | Activations | borrow the prefill scratch buffers (no new allocation); the log reports how much one 4096-token image needs |
 | Preprocessing | resize/normalize bit-identical to PIL's bicubic path |
 | Embedding cache | projected embeddings cached in host memory by **content hash** (LRU, `--vis-cache-mb`, default 1024 MiB): the same image in a later request is not encoded again |

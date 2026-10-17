@@ -85,8 +85,8 @@ back" by truncating a cache, which shapes speculative decoding
 Reads GGUF v2 and v3 through a memory mapping: every metadata value type, nested arrays,
 alignment, and the full ggml type table (including `mxfp4`, `nvfp4`, the `iq*` and `tq*`
 families). Verified against gguf-py 0.19.0 on 13 files (every key, value, tensor name, type,
-shape, offset and byte size identical). The 15.3 GiB Qwen3.8 file (866 tensors) parses in
-about 7 ms because nothing is copied.
+shape, offset and byte size identical). A 27B file parses almost instantly because nothing is
+copied.
 
 ### 2.2 Tokenizer and chat templates — `src/tokenizer/`, `src/chat/` (in the repository)
 
@@ -191,29 +191,26 @@ tiers, speculative decoding (MTP + n-gram) per slot, sampling, tool-call parsing
 ## 3. Why specialize — the measured argument
 
 A specialized engine is only worth its cost if the specialization shows up in numbers that a
-generic engine cannot reach on the same hardware. Measured on the same R9700, same GGUF,
-greedy decoding, both engines through their own OpenAI-compatible servers, one model process
-at a time (full protocol in [benchmarking.md](benchmarking.md)):
+generic engine cannot reach on the same hardware. Swift-1.5 27B MXFP4 on the same R9700, same
+GGUF, WHIRL 0.2.0 in its default balance mode against the official llama.cpp builds:
 
-| Qwen3.8-27B, tok/s | llama.cpp b11214 ROCm, Q4_K_M | WHIRL, Q4_K_M | WHIRL, MXFP4 |
+| Swift-1.5 27B MXFP4, R9700, tok/s | WHIRL (balance) | llama.cpp ROCm | llama.cpp Vulkan |
 |---|---|---|---|
-| Prefill 8k tokens | 1,177 | 1,747–1,751 | 3,548–3,557 |
-| Decode, default mode (MTP + n-gram) | N/A | 145.4 | 159.1 |
-| Decode, MTP | 56.9 | 110.4 | 120.3 |
-| Decode, no MTP | 30.9 | 34.3 | 37.6 |
+| Prefill, 128k-token prompt | 1,715 | 718.7 | 557.2 |
+| Decode, QA about a 128k-token document | 53.9 | 33.2 | 34.8 |
+| Decode, coding chat (new text) | 109.6 | 57.8 | 57.6 |
 
-Decode rows: same unified server protocol for both engines (19-prompt average). The WHIRL
-prefill row is the CLI (KV f16); WHIRL's *server* cold prefill at 8k is 1,560 (Q4_K_M) /
-3,235 (MXFP4) tok/s, still well ahead. Details and caveats in
-[benchmarking.md](benchmarking.md#current-numbers).
+Settings, every length and the Ornith-1.5-35B-A3B MXFP4 numbers are in
+[benchmarks.md](../../benchmarks.md).
 
 Where the gap comes from, in order of size:
 
 1. **Speculative decoding designed around exactness.** WHIRL's multi-row GEMV produces results
-   bit-identical to the 1-row GEMV, so verifying 4 drafts costs about 15% more than decoding 1
-   token, and MTP output is identical to plain greedy output. That lets an adaptive policy use
+   bit-identical to the 1-row GEMV, so verifying 4 drafts costs 13% more than decoding 1
+   token (27B MXFP4: 28.44 vs 25.15 ms, [kernels.md](kernels.md#grouped)), and MTP output is
+   identical to plain greedy output. That lets an adaptive policy use
    up to 8 MTP drafts (15 with n-gram drafts) where llama.cpp uses a fixed maximum of 3.
-2. **Kernels shaped for one file.** The unsloth UD-Q4_K_M file mixes nine formats (Q5_K,
+2. **Kernels shaped for one file.** Mixed K-quant files (for example unsloth's UD quantizations) use nine formats (Q5_K,
    IQ4_XS, Q4_K, Q6_K, IQ4_NL, Q3_K, IQ3_S, Q8_0, F32). Each has its own decoder and its own
    tuned multi-row kernel; the slowest two (Q3_K, IQ3_S) were fixed after measuring every type
    against a pure-read ceiling.
@@ -222,10 +219,10 @@ Where the gap comes from, in order of size:
    epilogue. That is the "speed mode" ([quantization.md](quantization.md)).
 
 **Plain decode has a hard ceiling.** Without speculation, every token must stream all weights
-once: 14.33 GB for the Q4_K_M file. WHIRL's 1-token GEMV already runs at 97–100% of the
-measured pure-read ceiling (604–626 GB/s), and a full decode step takes 27.74 ms
-(Q4_K_M) / 25.15 ms (MXFP4). The no-MTP ceiling for a 27B 4-bit model on a 640 GB/s card is
-therefore about **38 tok/s**; kernel work can only recover a few percent. Going faster means
+once. WHIRL's 1-token GEMV already runs at 97–100% of the measured pure-read ceiling
+(604–626 GB/s), and a full decode step of the 27B MXFP4 model takes 25.15 ms, so plain decode
+cannot go much above **40 tok/s** (1 / 25.15 ms) on a 640 GB/s card; kernel work can only recover a
+few percent. Going faster means
 verifying several tokens per weight pass — which is why the default mode is MTP + n-gram and
 why decode numbers in these documents lead with it.
 

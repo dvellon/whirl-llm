@@ -43,8 +43,8 @@ compiler spills to scratch memory and performance collapses.
 
 ## <a id="gemv"></a>1. Decode GEMV: int8 activations, `v_dot4`, `v_perm` lookup tables
 
-Decode is a pure bandwidth problem: every token streams all weights once (14.33 GB for the
-UD-Q4_K_M file, which mixes nine formats). The design:
+Decode is a pure bandwidth problem: every token streams all weights once (K-quant files such as
+UD-Q4_K_M mix nine formats in one file). The design:
 
 - **Activations are quantized to int8** in groups of 32 with one scale per group, by the kernel
   that produces them (RMSNorm + quantize, SiLU·mul + quantize, attention combine + quantize are
@@ -60,9 +60,7 @@ UD-Q4_K_M file, which mixes nine formats). The design:
   unsloth file): run alone they reach only 101 GB/s because launch cost dominates, so they are
   fused with the causal conv + L2 norm into one grid.
 
-Result of the first full design: matmul 25.3 ms/token (566 GB/s, ~88% of spec), full step
-28.8 ms = 34.7 tok/s. After the later work below, a decode step is **27.74 ms (Q4_K_M) /
-25.15 ms (MXFP4)**.
+After the later work below, a decode step of the 27B MXFP4 model is **25.15 ms** (no MTP).
 
 ### 1.1 How close each format is to the ceiling
 
@@ -106,8 +104,8 @@ Bit-identical; q3_k 491 → 588–590 and 466 → 581–583 GB/s, iq3_s 502 → 
 | `gdn_abconv`: beta/alpha projections and conv + L2 norm in one grid (idle threads add 0 so the tree order is unchanged) | 2 → 1 per DeltaNet layer |
 | recurrent step + gated RMSNorm + int8 quantize | 3 → 1 |
 
-Launches per decode step went 868 → 740, decode step 28.37 → 28.17 ms (−0.7%). The remaining
-inter-launch gaps were about 1 ms per step; later we fused same-input GEMVs (§4).
+Launches per decode step went 868 → 740. Gaps between launches remained; later we fused
+same-input GEMVs (§4).
 
 ## <a id="multirow"></a>2. Multi-row GEMV that is bit-exact to the 1-row GEMV
 
@@ -120,12 +118,11 @@ greedy output. We require bit equality, so the arithmetic is shared:
   same float expression; the 32 slices are merged by a fixed xor tree (16, 8, 4, 2, 1). The
   1-token kernel uses the same code path (`QDN<T>::dot<1>`), so "1 row" is just the n = 1 case.
 - **Multi-token dp4 kernels** for 2–16 rows are macro-generated; from 6 rows each wave handles 2
-  rows sharing the loaded activations. Matmul time: T=1 25.35 → 25.0 ms, T=8 42 → 36,
-  T=11 64 → 41, T=16 100 → 53 ms (before the WMMA versions below).
+  rows sharing the loaded activations.
 - **Permanent check `checkGemvBitwise`:** every type × row count 2..16 × every kernel variant
   (and the output head) must equal the 1-token result bit for bit.
 
-WMMA GEMM was far too slow at these batch sizes (~158 ms for a 16-row step), so ≤ 16 rows always
+WMMA GEMM was far too slow at these batch sizes, so ≤ 16 rows always
 use GEMV-style kernels.
 
 ## <a id="wmma-gemv"></a>3. int8 WMMA mid-batch GEMV (3–16 rows, gfx1201)
@@ -147,8 +144,8 @@ branches become scalar), one 16-byte header load with branch-free scale decode, 
 `asm volatile` pins on each unit's accumulator — without them the compiler interleaved the
 WMMAs of four units and used 256 VGPRs plus hundreds of bytes of spill.
 
-Result: matmul T=8 36.5 → 30.5 ms, T=16 53.2 → 32.5 ms (T=1 unchanged); verify n=16
-68.3 → 42.8 ms; single-user MTP +6–8%; 4–16 concurrent users +16–25% aggregate.
+Result: faster 8- and 16-row matmuls and verify steps (T=1 unchanged), which helps single-user MTP
+and concurrent users.
 
 ### 3.1 Second generation: pipelined `gw2` / `gw8`
 
@@ -187,9 +184,8 @@ Default selection (rows → variant), measured per type:
 | IQ3_S | dp4 below 12 rows, v5 from 12 |
 | IQ4_NL, Q8_0 | unchanged (dp4 / earlier WMMA variants) |
 
-Result: verify n=16 41.61 → 39.62 ms (Q4_K_M), MXFP4 T=16 matmul 27.86 → 25.94 ms; four
-concurrent users' steady-state throughput 241.1 → 252.9 tok/s (Q4_K_M) and 276.7 → 289.8
-(MXFP4); single-user coding benchmark +3.8%, file editing +4.4% (Q4_K_M). Remaining cost of
+Result (27B MXFP4): T=16 matmul 27.86 → 25.94 ms; four concurrent users' steady-state throughput
+276.7 → 289.8 tok/s. Remaining cost of
 16 rows vs 1 row: q4_k 1.09×, q5_k 1.11×, iq4_xs 1.12×, mxfp4 1.16×, q6_k layers 1.46×, head
 1.25×, q3_k 1.9×, iq3_s 2.5× — the rest is the canonical float expression per (row, token,
 unit), which bit-exactness forbids skipping. Things that lost: 3–4 tiles per block (spills,
@@ -259,12 +255,12 @@ worse. Solution: single matrices keep the original entries; groups use separate 
 and the shared implementation is `__forceinline__` (with two callers it stopped inlining and hit
 248 VGPRs + scratch). Twins are used up to 11 rows (13 for MXFP4), above which they lost.
 
-| | Q4_K_M before | after | MXFP4 before | after |
-|---|---|---|---|---|
-| Launches per token | 740 | 674 | 740 | 596 |
-| Decode step (no MTP) | 28.09 ms | 27.74 (−1.2%) | 25.66 | 25.15 (−2.0%) |
-| Verify n=3 | 30.99 | 30.22 (−2.5%) | 27.70 | 27.26 (−1.6%) |
-| Verify n=5 | 32.38 | 31.71 (−2.1%) | 29.00 | 28.44 (−1.9%) |
+| 27B MXFP4 | before | after |
+|---|---|---|
+| Launches per token | 740 | 596 |
+| Decode step (no MTP) | 25.66 ms | 25.15 (−2.0%) |
+| Verify n=3 | 27.70 | 27.26 (−1.6%) |
+| Verify n=5 | 29.00 | 28.44 (−1.9%) |
 
 Cost: kernel build time 5 → 13 minutes. Mixed-type groups (in the unsloth file q/k/v are
 q4_k/q5_k/q5_k) still launch separately.
@@ -292,16 +288,15 @@ Pitfalls in this design (details in [pitfalls.md](pitfalls.md#kern)):
   not help.) A 32-bit candidate mask overflowed at 48 candidates (undefined shift) → 64-bit.
 
 Result of the first round: all matmuls of the model at T=4096 ran at 107–108 TFLOPS (~59% of
-180), the best pure f16 GEMM at 119 TFLOPS (~66%); prefill 1,296 / 1,430 / 1,355 tok/s at
-1.1k / 14k / 24k tokens.
+180), the best pure f16 GEMM at 119 TFLOPS (~66%).
 
 ### 5.2 Batch buckets
 
 | Change | Why | Effect |
 |---|---|---|
 | 2 buckets (tuned at 512 and 4096) | first design | an 85-token prompt was padded into a 256-token tile |
-| + bucket n ≤ 128 tuned at 128 | 85-token FFN-up took 0.791 ms with the 512-tuned tile vs 0.271 ms with an existing 64×128 tile | 85–89-token prefill 184–188 → 132–133 ms (−29%); n ≤ 256 was tried first and slowed 152/231-token prompts 3–4% |
-| 11 buckets: ≤32, 48, 64, 96, 128, 192, 256, 384, ≤768 (tuned at 512), 769–1024 (tuned at 1024), > 1024 (tuned at 4096) | the server runs 1024-row chunks, which fell in the 512-tuned bucket | changing only the tune file gave server 8k cold prefill 1318 → 1441 tok/s (+9.3%) |
+| + bucket n ≤ 128 tuned at 128 | 85-token FFN-up took 0.791 ms with the 512-tuned tile vs 0.271 ms with an existing 64×128 tile | short prompts faster; n ≤ 256 was tried first and slowed 152/231-token prompts |
+| 11 buckets: ≤32, 48, 64, 96, 128, 192, 256, 384, ≤768 (tuned at 512), 769–1024 (tuned at 1024), > 1024 (tuned at 4096) | the server runs 1024-row chunks, which fell in the 512-tuned bucket | changing only the tune file made server cold prefill faster |
 
 Tile choice only changes M/N blocking; the K-direction WMMA order is fixed, so every tile
 configuration produces identical bits. A permanent invariance check runs every GEMM option
@@ -318,9 +313,7 @@ else. Used for n ≥ 512. Rejected variants: activations read directly in tiled 
 every f16 producer would change — not worth it over the above), weights read directly in tiled
 form (+22–28%), both direct (+12–22%), double buffering / 512 threads / BK 64 (worse), no
 rasterization grouping (−9…−49%), and **fusing the dequant into the GEMM's weight fetch**
-(bit-identical but −10…−13%: Q4_K/Q5_K/Q6_K decode VALU work lands on the GEMM's critical path).
-
-Q4_K_M CLI prefill gained +9.6…+14.0% at 2k–32k and +8.1…+8.3% at 128k.
+(bit-identical but slower: the K-quant decode VALU work lands on the GEMM's critical path).
 
 ### 5.4 Small batches: `gemms` / `gemmsd`
 
@@ -343,8 +336,7 @@ the current ceiling, and gfx12 has no 16-byte asynchronous global→LDS load. Lo
 register prefetch (spills), activations read directly from global (too much L2 traffic), half
 activation slabs, weights decoded without LDS (−20…−66%).
 
-CLI prefill (Q4_K_M): 88 tokens 692.7–697.5 → 848.5–867.3 tok/s (+23.4%, TTFT 127 → 103 ms),
-209 tokens +9.5%, ≥ 493 tokens unchanged.
+End to end this helps prompts of up to a few hundred tokens; prompts of ≥ 493 tokens are unchanged.
 
 ### <a id="int8-prefill"></a>5.5 Negative result: int8 (W8A8 / exact W4A8) prefill on gfx1201
 
@@ -443,8 +435,8 @@ channels × 8 tokens per block, each input row read once). Enabled only when eve
 tensor uses the same GEMM input format; otherwise the unfused kernels run. All bit-identical —
 which required asm barriers, because the compiler contracted `x*x` into the first butterfly add
 and merged a multiply with the f16 conversion into `v_fma_mix`, each a 1-ulp difference
-(§12). Effect at 8k: misc 191 → 135 ms, norm 73 → 52, DeltaNet norm 53 → 36, DeltaNet prep
-86 → 50.
+(§12). Effect at 8k (per-op profile): the misc, norm, DeltaNet norm and DeltaNet prep op classes
+all got faster.
 
 Speed mode only (not bit-exact, MXFP4 default): FFN gate/up and DeltaNet qkv/z GEMMs write f16
 instead of f32 for their element-wise consumers (+5.4…+5.8% and +0.6%).
@@ -460,7 +452,7 @@ instead of f32 for their element-wise consumers (+5.4…+5.8% and +0.6%).
   `alpha = exp(m_old − m_new)`. When `__builtin_amdgcn_ballot_w32(alpha != 1.f)` is zero for the
   whole wave (the running max did not change — almost always deep in a long context), the 128
   multiplies are skipped. Multiplying by 1 is an identity, so results are bit-identical. −4.5% per
-  layer; CLI prefill +1.1…+1.3% at 64k, +2.0% at 128k.
+  layer.
 - **`attn_kx`.** Analysis at 120k context: the kernel reached 61 TFLOPS; removing K/V loads made
   it 70% faster; the PV half was the most expensive because 256 VGPRs still spilled 40 (o
   accumulator 128 + Qᵀ fragments 64), and every WMMA read a 512-byte fragment from LDS. `attn_kx`
@@ -524,9 +516,8 @@ instead of f32 for their element-wise consumers (+5.4…+5.8% and +0.6%).
   `attn_prefill_wmma_s` (softmax state carried in `st_ml` / the output, as `attn_kgs`) for keys past
   the scratch. Bit-identical to the old `attn_prefill_wmma_q8` / `_q4` loaders. The `_s` variant
   spills 56 VGPRs (the plain kernel sits at 256 with none); it only runs past ~139k keys or with
-  `WHIRL_ATTN_SEG`. End to end (Qwen3.8-27B Q4_K_M) the change is within the 8060S run-to-run drift
-  (±3%): q8h vs f16 8k −0.9%, 64k −1.1% (mean of two runs), 128k −0.1% (two runs in opposite orders; the first run of a pair was ~4% faster); the old
-  loader measured −2.1% / −2.2% at 8k / 64k. The kernel bench disagrees: it shows the f16 kernel
+  `WHIRL_ATTN_SEG`. End to end the change is within the 8060S run-to-run drift. The kernel bench
+  disagrees: it shows the f16 kernel
   slower than the int8 loader and key ranges of 16k–32k 26–35% faster for every format, but neither
   shows up end to end (`WHIRL_ATTN_SEG=32768`: 64k unchanged). Treat 8060S attention-kernel bench
   numbers with care; the open question is why (the `attn_prefill_wmma` launch covers all 24 heads ×
@@ -546,8 +537,7 @@ instead of f32 for their element-wise consumers (+5.4…+5.8% and +0.6%).
   own range of 64-position chunks. Split ranges are computed on the GPU from the device-resident
   position, so the decode step stays graph-capturable. Scoring is lane-per-position: each wave
   scores 32 positions over a 64-dim slice, q broadcast from LDS, partial sums of the 4 slices
-  added through LDS — no shuffles. Split-count scan at 24k: 64 / 128 / 256 splits =
-  35.5 / 33.9 / 34.7 ms/token.
+  added through LDS — no shuffles. The split count was chosen by a scan at 24k context.
 - **`attn_wsplit1` (WMMA grouped verify).** One block (KV head × split) processes a *group* of
   query columns with WMMA: the q heads of one KV head (GQA) × consecutive verify rows of one
   sequence. Sᵀ = K·Qᵀ and Oᵀ += Vᵀ·Pᵀ; K fragments are read directly from the cache; V is
@@ -560,15 +550,10 @@ instead of f32 for their element-wise consumers (+5.4…+5.8% and +0.6%).
 - Maximum splits 128 → 64 (each split is now more efficient; combine at position 24000:
   34.7 → 17.4 µs). Attention kernel at position 24000: 298 → ~170 µs.
 
-| Decode tok/s (MTP / plain) | before | after |
-|---|---|---|
-| 27B, 12k context | 55.3 / 31.3 | 64.5 / 33.1 |
-| 27B, 24k | 45.5 / 29.8 | 61.5 / 31.9 |
-| Ornith, 12k | 165 / 137 | 190 / 158 |
-| Ornith, 24k | 137 / 129 | 185 / 150 |
+Decode at 12k and 24k context got faster with MTP and without it, on the dense and the MoE model.
 
 - Lost: a 64-column variant (same speed; not bit-exact on gfx1151); a version that reads KV once
-  for all queries (24k MTP 39.5 → 35.6 tok/s — the bottleneck was the reductions, not KV reads,
+  for all queries (slower with MTP at 24k — the bottleneck was the reductions, not KV reads,
   and its 41 KB of LDS cut occupancy).
 - **`attn_wsplit2` (up to 32 columns).** With 16 columns per group, a sequence's verify rows go
   through attention two at a time (27B: 6 GQA heads per KV head), so each split's K/V range is read
@@ -590,8 +575,8 @@ instead of f32 for their element-wise consumers (+5.4…+5.8% and +0.6%).
 - **gfx1151 limitation:** gfx11 WMMA is not exact when a P = 0 entry multiplies another query's
   real V row, so on the 8060S each group holds one query (the kernel still runs, without sharing
   K/V).
-- After this work, plain decode time grows by about 0.11 ms per 1k tokens of context — exactly
-  the time to read 64 MiB more KV per 1k tokens at ~600 GB/s. Decode attention is at bandwidth;
+- After this work, plain decode time grows with context at the rate of reading the extra KV bytes
+  at ~600 GB/s. Decode attention is at bandwidth;
   the remaining lever is fewer KV bytes.
 - **int8 K in `attn_wsplit1/2` (q8, q8h): magic-number dequantization (`kv_dq8`).** The first
   int8 version converted each element with its own `cvt` and multiply, which cost more than the
@@ -627,10 +612,10 @@ multiples of 1024, so solo and batched prefill see the same chunks.
   registers as a C fragment, and **on gfx12 the C layout equals the B layout**, so K·S, Q·S, T·X,
   M·U and Kᵀ·U need no data movement of S. 116 WMMAs per wave per chunk.
 - Probe (8192 tokens, one layer): 13.4 ms → 1.9–2.0 ms (6.7×). Error vs an f64 token-by-token
-  recurrence: 7e-7 (f32 path) → 4.2e-4 (f16 inputs). On Q4_K_M with f16 prefill the
-  last-token KL was 4.5e-8 … 1.5e-4 (the method is precise); under fp8 prefill it rose to
-  1.2e-4 … 7.0e-2 because fp8 activations amplify any perturbation. Default for MXFP4 only; an
-  opt-in "relaxed" flag enables it for Q4_K_M. 8k MXFP4 prefill 2212 → 2639 tok/s (+19.3%).
+  recurrence: 7e-7 (f32 path) → 4.2e-4 (f16 inputs). With f16 prefill the method is precise;
+  under fp8 prefill the last-token KL grows because fp8 activations amplify any perturbation.
+  Since KG-1 it is the balance item `gdnwmma`, also for dense K-quant files. 8k MXFP4 prefill
+  2212 → 2639 tok/s (+19.3%).
 - Pitfalls: 700+ spilled VGPRs came from the compiler hoisting the 64-bit addresses of 32 V reads
   and 32 output writes out of the loop as loop invariants. Making the lane offset opaque each
   iteration (`asm volatile("" : "+v"(off))`) and splitting addresses into a uniform row base plus
@@ -645,7 +630,7 @@ rewrite prefetches every row's q/k/v/decay/beta into LDS, leaves one barrier per
 dependency chain (double-buffered reduction: row t's output reduction is deferred past row t+1's
 barrier), and does the norm + quantization once at the end (one wave per row, same addition order
 as before). Bit-identical — after an asm barrier, because the first version let the compiler
-contract `y*y` into the shuffle-add fma. Verify −0.2…−1%.
+contract `y*y` into the shuffle-add fma.
 
 How the recurrent state is rolled back when drafts are rejected (snapshots, then replay) is in
 [speculative-decoding.md](speculative-decoding.md#replay).
@@ -659,7 +644,7 @@ How the recurrent state is rolled back when drafts are rejected (snapshots, then
   host synchronization.
 - **Prefill:** (token, slot) pairs are grouped by expert on the GPU, gathered to f16, run through
   a grouped WMMA GEMM and scattered back. Token tile 32 when experts average fewer than 48 tokens,
-  else 64. 1.1k-token prefill ~3300 → ~5000 tok/s.
+  else 64. With MXFP4 experts the GEMM takes fp8 activations ([quantization.md](quantization.md#ornith-mxfp4)).
 - The fused DeltaNet beta/alpha kernel was generalized because Ornith stores beta/alpha as Q4_K
   (27B: Q8_0); without it 3-draft verification could not run. The MTP layer's FFN is MoE too.
 - **Routing near-ties are everywhere.** Between any two equally valid prefill paths (WMMA fast,

@@ -12,20 +12,16 @@ greedy output rather than merely "equivalent".
 
 ## 1. Why speculation is the only real lever
 
-A 27B 4-bit model reads 14.33 GB of weights per token. At the measured 604–626 GB/s streaming
-ceiling that caps plain decode at about 38 tok/s, and WHIRL's 1-token GEMV is already at
-97–100% of that ceiling ([kernels.md](kernels.md#gemv)). But verifying several tokens costs
-almost the same as decoding one, because the weights are read once for all rows:
+A 27B 4-bit model reads all its weights for every token. WHIRL's 1-token GEMV already runs at
+97–100% of the measured 604–626 GB/s streaming ceiling ([kernels.md](kernels.md#gemv)), and a plain
+decode step of the 27B MXFP4 model takes 25.15 ms (about 40 tok/s). But verifying
+several tokens costs almost the same as decoding one, because the weights are read once for all rows:
 
-| Rows through the model (Q4_K_M, R9700) | Time |
+| Rows through the model (27B MXFP4, R9700) | Time |
 |---|---|
-| 1 (plain decode step) | 27.74 ms |
-| 2 | 29.21 ms |
-| 3 | 30.22 ms |
-| 4 | 30.93 ms |
-| 5 | 31.71 ms |
-| 8 | 34.79 ms |
-| 16 | 39.50 ms |
+| 1 (plain decode step) | 25.15 ms |
+| 3 | 27.26 ms |
+| 5 | 28.44 ms |
 
 So every accepted draft is nearly free. The engineering problem is to (a) produce drafts that
 are likely to be accepted, (b) make the multi-row verify as cheap as possible, and (c) keep the
@@ -43,14 +39,13 @@ draft = argmax(output_head(norm(x)))            # output head shared with the tr
 ```
 
 Chaining: the MTP layer's own head-normed output is used as the hidden state for the next draft
-step, so k drafts cost k MTP steps. Conditional acceptance of the second chained draft was
-68–77% on our prompts.
+step, so k drafts cost k MTP steps.
 
 ### 2.1 A draft cycle
 
 1. MTP drafts k tokens; each draft token is passed to the next step **as a kernel argument** and
    stays on the GPU (a by-value token struct; no `hipMemcpy` — see
-   [windows-hip.md](windows-hip.md#streams) for why a synchronous copy here cost 5%).
+   [windows-hip.md](windows-hip.md#streams) for why a synchronous copy here was costly).
 2. The trunk verifies k+1 rows in one forward pass (k drafts + the token they follow), keeping
    every row's logits and hidden state.
 3. A pick kernel compares drafts with the trunk's argmax row by row and writes the accepted
@@ -58,18 +53,18 @@ step, so k drafts cost k MTP steps. Conditional acceptance of the second chained
 4. The host synchronizes **once per cycle**, reads the control word, emits accepted tokens and
    enqueues the next cycle.
 
-How the first version got from 34 to 68.8 tok/s (27B, Chinese thinking prompt, 3 drafts max at
-the time):
+How the first version was built up (3 drafts max at the time), each step faster than the one
+before:
 
-| Step | Change | tok/s |
-|---|---|---|
-| no MTP | int8 GEMV + fusion + device-resident state | 34.2 |
-| 1 draft | draft 1, verify 2; acceptance 75–82% | 50.7 |
-| 2 chained drafts | MTP's own head-normed output as next hidden | 55.9 |
-| multi-token GEMV decodes each weight unit once | T=4 matmul 35.7 → 28.6 ms | 58.4 |
-| batched verify attention | 2 launches per query → 2 launches for all queries | 61.1 |
-| 3 drafts + Q4_K draft head | third snapshot; draft head from the Q6_K output head | 64.3 |
-| whole cycle chained on the GPU | token ids as kernel args, one sync per cycle | 68.8 |
+| Step | Change |
+|---|---|
+| no MTP | int8 GEMV + fusion + device-resident state |
+| 1 draft | draft 1, verify 2 |
+| 2 chained drafts | MTP's own head-normed output as next hidden |
+| multi-token GEMV decodes each weight unit once | the 4-row matmul got much cheaper |
+| batched verify attention | 2 launches per query → 2 launches for all queries |
+| 3 drafts + 4-bit draft head | third snapshot; draft head from the Q6_K output head |
+| whole cycle chained on the GPU | token ids as kernel args, one sync per cycle |
 
 ## <a id="exact"></a>3. The exactness requirement
 
@@ -95,12 +90,12 @@ greedy. With bit equality, any difference between MTP and plain output is a bug,
 Swift-1.5 stored the tiny DeltaNet `ssm_alpha`/`ssm_beta` matrices as F32. WHIRL has no int8
 GEMV for F32 weights: n = 1 used an f32-activation GEMV, n ≥ 2 used an f16 GEMM — different
 numerics, so MTP output differed from plain greedy on all three variants. Requantizing those
-matrices to Q8_0 (which has a fused exact path, as in unsloth's Q4_K_M) fixed it.
+matrices to Q8_0 (which has a fused exact path) fixed it.
 
 **Engine fix (0.1.3).** F32 / F16 weights at n = 2..16 now run the same f32-activation GEMV
 instances as n = 1 (`gemv_<T>_8 / _4 / _1`), so every token is bit-identical to the single-row
 result and speculative output equals plain greedy on such files (for example the Cyber-Tiel
-series, and some Q4_0 / Q4_K_M quantizations). **They still draft only 1 token:** the fused DeltaNet
+series, and some Q4_0 / Q4_K_M quantizations load and run this way). **They still draft only 1 token:** the fused DeltaNet
 decode path (`gdn_ab`) exists only for Q8_0 and MXFP4 α/β, and without it (`fusedDecode()` false)
 only one recurrent-state snapshot is written per verify. This is a **hard cap**, not a choice of the
 cost model: the CLI (MTP and n-gram) and the server both clamp drafts to 1 (the server's startup
@@ -120,9 +115,9 @@ recurrent DeltaNet state cannot: after verifying k+1 rows it already contains al
 **Snapshots (first design).** During verify, the state after each row was written to a snapshot
 buffer (ping-pong `*_alt` buffers, later an array of up to 15 sets). On rejection at row k the
 engine swaps the state pointer to snapshot k — a pointer swap, no copy. State and snapshot
-pointers are passed by value as kernel arguments. Cost: about 0.4 ms per cycle at 3 drafts, but
-each snapshot set is 150 MiB for the 27B model (48 layers), and a 16-row verify spent about
-2.6 ms writing them. The server had to reserve 8 sets (1.2 GiB).
+pointers are passed by value as kernel arguments. But each snapshot set is 150 MiB for the 27B
+model (48 layers), a 16-row verify spent noticeable time writing them, and the server had to
+reserve 8 sets (1.2 GiB).
 
 **Replay (current design, server default).** Verify no longer writes per-row snapshots or even
 the final state. It records each row's *inputs* per slot and layer: the conv input rows
@@ -136,31 +131,20 @@ checkpoint save) or discards them (checkpoint load, reset).
 
 | Effect of replay | |
 |---|---|
-| 12-row verify at four concurrent users | 40.42 → 39.47 ms |
+| 12-row verify at four concurrent users | slightly faster (no snapshot writes) |
 | Server VRAM for snapshot sets | 1.2 GiB → 0 (the KV pool grew by 39,424 tokens at the time) |
 | n-gram drafts per slot in the server | no longer capped by the 8 snapshot sets (up to 15) |
-| Cost | MoE model, 1 user: −0.5% (the next verify replays ~1.3 extra rows) |
+| Cost | the next verify replays ~1.3 extra rows (a small cost for one user on the MoE model) |
 
 Possible next step: apply the pending rows for all layers and slots in one kernel on a second
 stream, overlapped with the next MTP draft steps.
 
 ## <a id="auto"></a>5. Choosing the number of drafts automatically
 
-The best fixed draft count depends on content. Max-draft sweep, 27B, tok/s (coding = harmonic
-mean of 5 tasks × 600 tokens):
-
-| Max drafts | Coding, no thinking | Coding, thinking | Chinese | English | 14k context | 24k context |
-|---|---|---|---|---|---|---|
-| 1 | 61.1 | 59.1 | 55.1 | 54.3 | 47.8 | 40.6 |
-| 2 | 81.7 | 75.7 | 65.8 | 61.4 | 52.8 | 44.8 |
-| 3 | 94.3 | 85.4 | 67.3 | 60.2 | 52.5 | 41.9 |
-| 4 | 103.2 | 90.1 | 67.3 | 58.7 | 50.7 | 36.5 |
-| 6 | 109.9 | 90.3 | 59.4 | 53.6 | 43.9 | 30.1 |
-| 8 | 111.1 | 83.7 | 51.7 | 44.8 | 36.0 | 24.4 |
-| 10 | 95.6 | 71.2 | 42.7 | 37.2 | 30.1 | 20.4 |
-| **auto (cap 8)** | **105.2** | **90.1** | **67.6** | **60.4** | **52.4** | **44.2** |
-
-Code wants 6–8, prose 3–4, long contexts 2–3. The auto policy is a cost model:
+The best fixed draft count depends on content. A max-draft sweep (1–10 drafts; coding with and
+without thinking, Chinese, English, 14k and 24k context) found that code wants 6–8 drafts, prose 3–4,
+long contexts 2–3, and that too many drafts are clearly slower than the best count. The auto policy
+is a cost model:
 
 - For each draft position i, track the **conditional acceptance** p_i (probability draft i is
   accepted given drafts 1..i−1 were) as an EMA. Expected tokens per cycle for k drafts:
@@ -169,68 +153,68 @@ Code wants 6–8, prose 3–4, long contexts 2–3. The auto policy is a cost mo
 - Each cycle pick k maximizing E(k) / T(k), with 3% hysteresis against timing noise, and probe a
   neighboring k every 32 cycles.
 
-It lands near each content type's best. Checked on the 8060S in one process with interleaved
-prompts (to avoid thermal drift): auto 31.36 tok/s vs the best fixed count (4) 31.28.
+It lands near each content type's best (in the sweep and on the 8060S, checked in one process with
+interleaved prompts to avoid thermal drift, it matched the best fixed count).
 Variants that showed no measurable gain and were removed: expiring the timing table after 64
 cycles, shrinking deep-position acceptance toward the previous position, keeping acceptance
 across requests.
 
-**MoE model: 1 draft.** Ornith's per-position acceptance was 92 / 31 / 4 / 0%; with 3 drafts it
-ran 171–172 tok/s and at 24k was slower than no MTP. Fixed at 1 (overridable).
+**MoE model: 1 draft.** Ornith's per-position acceptance falls off sharply after the first draft;
+with 3 drafts it was slower than with 1, and at 24k slower than no MTP. Fixed at 1 (overridable).
 
 **Server specifics:**
 
 - Draft caps by number of decoding slots (dense): `{8, 7, 4, 3, 2, 1, 1, 1}` for 1–8 slots (0 beyond),
   which keeps an MTP verify at ≤ 16 rows; n-gram drafts may use up to 32 rows in total with wide verify
   ([server.md](server.md#batching)). The cost model chooses within the cap. Raising the 4-slot cap from 2 to 3 (16 rows)
-  gave +10% at four users.
+  made four users faster.
 - With zero drafts (too many users), the MTP layer still processes accepted tokens (without the
   draft head) so its KV cache stays complete and drafting can resume immediately.
 - **Reset the timing table when a request starts on an idle engine.** The server kept the
   cycle-time table across requests; a single user sending requests back to back got too many
   drafts from the second request on (8060S: ~4.5 drafts per cycle vs ~3.3 in the CLI). Resetting
-  on idle-start gave +4.1% for requests 2–4, and server-vs-CLI speed went from −3.6% to −0.5%.
+  on idle-start brought the server back to CLI speed for requests 2–4.
 - Per-slot draft counts (moving drafts from the slot least likely to accept to the one most
-  likely) gave +13% at two mixed users but slowed low-acceptance requests by ~10% and fixed-batch
-  wall time by 5%; kept off for fairness.
+  likely) helped two mixed users but slowed low-acceptance requests and fixed-batch wall time;
+  kept off for fairness.
 
 **p-min / n-min (optional, off).** The pick kernel can also compute the draft's softmax
 probability; drafts after the first n-min stop when the probability falls below p-min. The stop
 decision runs on the GPU (a stop flag makes later draft kernels exit immediately), so there is
-still one sync per cycle. With the auto policy, p-min 0.3 changed speed by ±1% — not a default.
+still one sync per cycle. With the auto policy, p-min 0.3 made no measurable difference — not a default.
 
 ## <a id="draft-head"></a>6. Making drafts cheaper: draft-head quantization
 
 The output head (248,320 × 5120, Q6_K, 1.04 GB) runs once per draft step, so it dominates draft
 cost. Measured first: **acceptance barely depends on draft-head precision** (only the argmax
-matters): full Q6_K head 58.8%, Q4_K 59.1%, Q3_K 59.2% at a fixed 6 drafts.
+matters): a full Q6_K head and 4-bit and 3-bit requantized heads gave the same acceptance at a
+fixed 6 drafts.
 
 **D2 (2.5 bits per weight).** One f16 scale per 32 values and a 2-bit code per value,
 `w = s · (2c − 3)`, stored structure-of-arrays (codes K/4 bytes + scales K/16 bytes per row).
 Built at load time on the GPU from the Q6_K head, choosing for each block the scale with the
 smallest squared error among 6 candidates. Its own GEMV (int8 activations, `v_dot4`, 1–16 rows).
-Size 715 MB (Q4_K head) → 397 MB, which also saves 318 MB of VRAM.
+Size 715 MB (4-bit head) → 397 MB, which also saves 318 MB of VRAM.
 
-| Draft step | Full Q6_K head | Q4_K head | D2 head |
+| Draft step | Full Q6_K head | 4-bit (Q4_K) head | D2 head |
 |---|---|---|---|
 | R9700 | 2.72 ms | 2.17 ms | **1.64 ms** |
 | 8060S | 6.88 ms | 5.44 ms | **4.05 ms** |
 
-Interleaved A/B with the auto policy: R9700 27B +2.4%, MoE +2.0%; 8060S +1.5% / +2.5%. (Per-draft
-acceptance fell from 63.2% to 59.4% because the policy sends more drafts; tokens per second rose.)
+Interleaved A/B with the auto policy: faster on both models and both GPUs. (Per-draft acceptance
+fell because the policy sends more drafts; tokens per second rose.)
 
 **The MTP block in Q4_K.** Requantizing the MTP layer's Q6_K matrices (~330 MB) to Q4_K
-(~225 MB) was first rejected (acceptance −1.5 points, speed −1.6%). Re-measured after the other
-speedups it gave +0.8% single-user and cut the per-cycle MTP time at four users from 5.00 to
-4.35 ms, so it is now the default for dense models — an example of why small rejected ideas are
+(~225 MB) was first rejected (slightly lower acceptance, no gain). Re-measured after the other
+speedups it was faster for one user and at four users, so it is now the default for dense models — an example of why small rejected ideas are
 re-tested after the core gets faster. Files whose MTP block is stored as **Q8_0** (the Swift-1.5
 MXFP4 files: ~450 MB per draft step plus the 2-bit head) get the same Q4_K copies (`requant_q80_q4k`,
 ~240 MB); outputs are unchanged. Swift MXFP4-A on the R9700, ~16k-token prompts, steady-state decode:
 one user 78.3 → 85.4 tok/s, four users 213.7 → 221.2 tok/s aggregate (both with `attn_wsplit2`).
 
-**Rejected:** a Q3_K draft head (acceptance unchanged but its GEMV ran at ~488 GB/s: +0.3%);
-truncating the draft vocabulary to the first N token ids (Chinese tokens have high ids:
-acceptance fell from 82% to 28–33%; with 150,000/100,000 ids later, 2.58 → 2.43 tokens/cycle).
+**Rejected:** a Q3_K draft head (acceptance unchanged but its GEMV ran at only ~488 GB/s, no real
+gain); truncating the draft vocabulary to the first N token ids (Chinese tokens have high ids, so
+acceptance collapsed; even with 150,000/100,000 ids, fewer tokens per cycle).
 
 Model-file note: an output head stored as Q8_0 makes every draft step more expensive. Of three
 Swift-1.5 MXFP4 variants, the Q8_0-head file had the highest acceptance (73.2%) but the slowest
@@ -241,11 +225,11 @@ MTP (98.0 vs 117.0 tok/s for the Q6_K-head file). See [quantization.md](quantiza
 Editing tasks (rename a variable and write the file back, translate comments, refactor) copy
 long spans of the prompt. MTP is already 100% accepted on such spans within its 8-draft cap; the
 win comes from **longer drafts** (15) and **cheaper cycles** (an n-gram cycle runs no MTP draft
-steps: a 16-row verify is ~43–44 ms vs ~49 ms for an 8-draft MTP cycle).
+steps, so a 16-row n-gram verify costs less than an 8-draft MTP cycle).
 
 ### 7.1 What the first version did wrong
 
-An untested first version made every editing prompt slower (−13% on edits, −5…−7% elsewhere):
+An untested first version made every editing prompt slower, and other prompts too:
 it used an n-gram match whenever one existed regardless of its track record, took only the most
 recent occurrence of the 3-gram (common code 3-grams like `;\n    ` point to the wrong place),
 and was capped at the MTP limit of 8. Investigating why copying a file accepted only 25% of
@@ -275,7 +259,7 @@ n-gram drafts uncovered two unrelated problems that matter far beyond n-gram dra
 - **Decision.** Each cycle compares `max_k E_ng(k) / T_ng(k)` with MTP's chosen E/T and uses
   n-gram only if it is better, with the best k. n-gram cycle time is measured separately (prior:
   the 1-draft MTP cycle × (1 + 1.5%·(k−1)) until measured; the first occurrence of a row count is
-  not recorded, because the first 16-row verify carries a one-off ~50 ms cost). n-gram cycles do
+  not recorded, because the first 16-row verify carries a one-off cost). n-gram cycles do
   not update MTP's acceptance or timing model.
 - **An n-gram cycle** runs the MTP layer only on the pending rows (to keep MTP's KV cache
   complete) and verifies tokens supplied directly by the host.
@@ -288,21 +272,13 @@ n-gram drafts uncovered two unrelated problems that matter far beyond n-gram dra
 
 ### 7.3 Results (interleaved A/B, same binary, n-gram off vs on, all outputs == plain greedy)
 
-| 27B prompt (think off) | MTP | MTP + n-gram | Δ |
-|---|---|---|---|
-| Coding benchmark, 7-prompt mean | 94.38 | 94.20 | −0.2% (other runs +0.2%, +0.1%) |
-| py-rename-zh (1.6–2.2k-token file, write it back) | 157.9–158.1 | 283.8–284.3 | +79.8% |
-| zig-rename-en | 166.1–166.3 | 315.2–315.8 | +89.8% |
-| py-refactor-en | 160.2 | 268.1–269.3 | +67.8% |
-| py-rename-crlf | 170.8 | 338.7–339.2 | +98.5% |
-| zig-comment-zh | 143.7 | 213.0–213.1 | +48.3% |
-
-Per-prompt ±2% swings on the coding benchmark come from the MTP policy trajectory changing after
-a single n-gram cycle, not from n-gram cost (host-side lookup ~10 µs per cycle, 0.13%). MoE model:
-coding benchmark +2.0%, edits +52…+151%. Server agent benchmark (tool calls read_file /
-write_file, two "rename and write back" turns): write turns +28% / +21% at first, **+56% / +50%**
-after replay lifted the snapshot cap (327–329 and 284 tok/s). At 2–4 concurrent users n-gram
-was neutral (±1%).
+On the editing prompts (rename / refactor / comment translation of 1.6–2.2k-token files, written
+back whole, including a CRLF file) n-gram co-drafting is much faster than MTP alone, on the dense
+and the MoE model; on the coding benchmark it is neutral (small per-prompt swings come from the MTP
+policy trajectory changing after a single n-gram cycle, not from n-gram cost: the host-side lookup
+takes ~10 µs per cycle). In the server agent benchmark (tool calls read_file / write_file, two
+"rename and write back" turns) the write turns gained, more so after replay lifted the snapshot cap.
+At 2–4 concurrent users n-gram was neutral. Current decode numbers: [benchmarks.md](../../benchmarks.md).
 
 Bugs found while building it: arrays sized for 10 MTP drafts overflowed when n-gram allowed more
 than 10; and verify rows beyond the slot's mapped KV pages wrote into page 0 of the shared pool
@@ -335,36 +311,33 @@ produces the same text alone, concurrently, with MTP on or off.
 Same GGUF, same R9700, greedy. Unified server protocol (19 prompts; llama.cpp b11214 ROCm with
 `--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 0 --spec-draft-p-min 0.3`):
 
-| Qwen3.8-27B Q4_K_M | llama.cpp | WHIRL |
+| | llama.cpp | WHIRL |
 |---|---|---|
-| Decode, no MTP | 30.9 tok/s | 33.9 |
-| Decode, MTP | 56.9 | 105.9 |
-| Draft acceptance | 82.4% (30,100 / 36,528) | 64.8% (33,353 / 51,461) |
 | MTP output == plain output | 6 of 19 prompts | 19 of 19 |
 
-(WHIRL numbers from the same run; later kernel work raised WHIRL MTP to 110.4.) An earlier
-head-to-head with both engines capped at 3 drafts on five coding tasks: WHIRL 87–94 tok/s vs
-llama.cpp 61–68, with nearly identical acceptance (Java task: 441/483 vs 437/483). What we can
-attribute from measurements:
+Current speed numbers against the official llama.cpp builds (Swift-1.5 27B MXFP4 and Ornith MXFP4)
+are in [benchmarks.md](../../benchmarks.md). In an earlier head-to-head with both engines capped at
+3 drafts on five coding tasks, the acceptance was nearly identical (Java task: 441/483 vs 437/483)
+and WHIRL was still faster. What we can attribute from measurements:
 
-1. **Per-cycle cost.** In WHIRL, verifying 4 tokens costs ~15% more than decoding 1, the whole
-   cycle is chained on the GPU with one synchronization, and drafting uses a 2-bit head. With the
-   same acceptance, WHIRL still produced ~40% more tokens per second at the same draft cap.
+1. **Per-cycle cost.** In WHIRL, verifying 4 tokens costs 13% more than decoding 1 (27B MXFP4,
+   §1), the whole cycle is chained on the GPU with one synchronization, and drafting uses a 2-bit
+   head. With the same acceptance, WHIRL produced more tokens per second at the same draft cap.
 2. **Draft count.** llama.cpp is fixed at a maximum of 3 drafts here; WHIRL's policy uses up to 8
    (15 with n-gram), which matters most for code. Lower per-draft acceptance in WHIRL is the
    expected consequence of sending more drafts — tokens per cycle are higher.
 3. **Exactness.** llama.cpp's batched verify is not bit-identical to its single-token path (13 of
    19 outputs changed with MTP on). WHIRL's adaptive policy depends on bit-exact verify to stay
    correct with long draft runs.
-4. **MoE.** On Ornith, llama.cpp's MTP was roughly neutral and slower at long context
-   (decode 99.5 → 101.7 tok/s short, 89.7 → 84.1 at 24k); WHIRL: 158.9 → 188.1 short.
+4. **MoE.** On Ornith, llama.cpp's MTP was roughly neutral short and slower at long context;
+   WHIRL's MTP was faster than its plain decode.
 
-At long context the gap narrows (24k: WHIRL 45.1 vs llama.cpp 39.8 in the early comparison)
-because attention takes a larger share of each cycle for both engines.
+At long context the gap narrows because attention takes a larger share of each cycle for both
+engines.
 
 ## 11. Open items
 
-- Each cycle still has ~0.95 ms of host gap (enqueue overlaps the GPU; the gap is around
+- Each cycle still has a host gap of about a millisecond (enqueue overlaps the GPU; the gap is around
   completion and the next start). Removing it requires computing the accepted count and building
   the next MTP/verify row tables on the device.
 - Replay commit on a side stream (§4).

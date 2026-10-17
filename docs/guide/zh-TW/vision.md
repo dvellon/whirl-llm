@@ -10,7 +10,7 @@
 
 ## 1. 目標與限制
 
-預設的 27B server 在 128k + 64k 下限之上，只留給 KV 池 2,816 個 token（[kv-and-caching.md](kv-and-caching.md#floor)）。常駐的視覺編碼器會讓*每一位*使用者（包括從不傳送圖片的人）的預設 KV 格式從 q8v 退到較慢的 q8h。因此需求是：**載入 mmproj 不得改變 KV 池大小，也不得改變常駐 VRAM。** 在候選建置上量測：使用 `--mmproj` 時池為 199,936 個 token（不變），載入 mmproj 時 VRAM 變化 0.0 MiB。
+預設的 27B server 在 128k + 64k 下限之上，只留給 KV 池一點點餘裕（[kv-and-caching.md](kv-and-caching.md#floor)）。常駐的視覺編碼器會讓*每一位*使用者（包括從不傳送圖片的人）的預設 KV 格式從 q8v 退到較慢的 q8h。因此需求是：**載入 mmproj 不得改變 KV 池大小，也不得改變常駐 VRAM。** 在候選建置上量測：使用 `--mmproj` 時池大小不變，載入 mmproj 時 VRAM 變化 0.0 MiB。
 
 ## 2. 設計
 
@@ -18,7 +18,7 @@
 |---|---|
 | 投影器權重 | 啟動時載入 **pinned host RAM（鎖頁主機記憶體）**；在圖片到來之前，編碼器沒有任何部分位於 VRAM |
 | 編碼器生命週期 | kernel、常駐權重與一條複製串流在第一張圖片到來時**依需求**建立，並在**閒置逾時後釋放**（`--vis-idle-s`，預設 60 s）；VRAM 回到純文字時的佔用量 |
-| 權重模式 | `--vis-mode auto`（預設）：若有足夠的可用 VRAM 則權重常駐，否則**每張圖片逐層串流**；`resident` / `stream` 強制指定模式。預設 27B 設定只剩 0.76 GiB 可用，因此權重採串流：在這台 USB4 eGPU 上每張圖片約 260 ms 的 H2D（視環境而定） |
+| 權重模式 | `--vis-mode auto`（預設）：若有足夠的可用 VRAM 則權重常駐，否則**每張圖片逐層串流**；`resident` / `stream` 強制指定模式。預設 27B 設定剩下的可用 VRAM 不夠，因此權重採串流：在這台 USB4 eGPU 上每張圖片約 260 ms 的 H2D（視環境而定） |
 | activation（啟動值） | 借用 prefill（提示詞預填）的暫存緩衝區（不新增配置）；log 會回報一張 4096-token 圖片需要多少 |
 | 前處理 | resize/normalize 與 PIL 的 bicubic 路徑逐位元相同 |
 | 嵌入快取 | 投影後的嵌入依**內容雜湊**快取在主機記憶體中（LRU，`--vis-cache-mb`，預設 1024 MiB）：之後請求中的同一張圖片不會再編碼一次 |

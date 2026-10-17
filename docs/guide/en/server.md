@@ -280,17 +280,14 @@ it, the first request of a burst prefilled alone and then stalled 2.4 s while th
 0.90 s (MoE: 0.25 s) before the decode floor; with three long prompts at once it was 1.57 s and the
 stream fell to 3 tok/s (table above), 0.47–0.52 s and 21–23 tok/s with the default floor.
 
-| Concurrency (27B Q4_K_M / MXFP4, ~1.1k-token prompts, 256 generated, greedy) | C = 1 | C = 2 | C = 4 |
+| Concurrency (27B MXFP4, ~1.1k-token prompts, 256 generated, greedy) | C = 1 | C = 2 | C = 4 |
 |---|---|---|---|
-| Wall-clock aggregate tok/s (incl. prefill), MTP + n-gram | 61.6–62.4 | 98.0–99.6 | 138.7–139.6 |
-| MXFP4, same | 68.5–70.7 | 118.9–119.3 | 190.3–190.7 |
-| Steady state inside decode loop, Q4_K_M / MXFP4 (Scenario A) | 109.5–110.1 | — | 252.9 / **288.8** |
-| llama.cpp ROCm `-np 4`, MTP on (older measurement) | 39.8 | 43.3 | 64.1 |
+| Wall-clock aggregate tok/s (incl. prefill), MTP + n-gram | 68.5–70.7 | 118.9–119.3 | 190.3–190.7 |
+| Steady state inside decode loop (Scenario A) | — | — | **288.8** |
 
 Every concurrent output equals the same request run alone (gated). Earlier 8/16-user measurements
-(before several later optimizations; 4096 context per user): 27B no MTP 100.0 / 115.5 tok/s
-aggregate; at 16 users MTP no longer helps (113.1 vs 115.5) because 16 rows leave no room for
-drafts, and 16-row GEMV is already compute-bound. (These predate wide verify; with the default
+(before several later optimizations; 4096 context per user): at 16 users MTP no longer helps
+because 16 rows leave no room for drafts, and 16-row GEMV is already compute-bound. (These predate wide verify; with the default
 caps, 9–16 slots still get 0 drafts, so the conclusion holds. Rows 17–32 have no measured per-row
 cost yet.)
 

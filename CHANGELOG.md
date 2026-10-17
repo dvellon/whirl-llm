@@ -40,7 +40,7 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 ### DFlash2 drafts (opt-in)
 
 - `--draft dflash --draft-model FILE` (or `WHIRL_DRAFT_MODEL`) for `whirl chat`, `whirl bench` and `whirl-server`, dense 27B models; drafter `Qwen3.8-27B-DFlash2-Q8_0.gguf` from Hugging Face `incoai/Qwen3.8-27B-DFlash2-GGUF` (Apache-2.0, not bundled). Drafts are verified with exact acceptance, so greedy output equals plain greedy decoding of the same mode.
-- On the R9700, vs MTP: +19..48% for one user with short or medium context and predictable output; slower with 4 users (about -39%), after 37k+ tokens of context and on mostly-Chinese output (about -10%). Costs about 1.9 GiB of VRAM. Off by default.
+- Compared with MTP: faster for one user with short or medium context and predictable output; slower with 4 users, at long context and on mostly-Chinese output. Costs about 1.9 GiB of VRAM. Off by default.
 - Without a fitting drafter (MoE models, an unreadable or malformed file) WHIRL warns and keeps the MTP drafts.
 
 ### Prefix cache and SSD tier

@@ -57,7 +57,7 @@ WHIRL **不是**「Qwen 引擎」。它一次加入一種模型架構，並針�
 
 ### 2.1 GGUF 讀取器 — `src/gguf/`（已在儲存庫中）
 
-透過記憶體映射讀取 GGUF v2 與 v3：支援所有中繼資料值型別、巢狀陣列、對齊，以及完整的 ggml 型別表（包含 `mxfp4`、`nvfp4`、`iq*` 與 `tq*` 家族）。已在 13 個檔案上與 gguf-py 0.19.0 比對驗證（每個 key、value、tensor 名稱、型別、形狀、偏移與位元組大小都相同）。15.3 GiB 的 Qwen3.8 檔案（866 個 tensor）約 7 ms 就能解析完，因為完全不做複製。
+透過記憶體映射讀取 GGUF v2 與 v3：支援所有中繼資料值型別、巢狀陣列、對齊，以及完整的 ggml 型別表（包含 `mxfp4`、`nvfp4`、`iq*` 與 `tq*` 家族）。已在 13 個檔案上與 gguf-py 0.19.0 比對驗證（每個 key、value、tensor 名稱、型別、形狀、偏移與位元組大小都相同）。27B 的檔案幾乎瞬間就能解析完，因為完全不做複製。
 
 ### 2.2 Tokenizer 與聊天範本 — `src/tokenizer/`、`src/chat/`（已在儲存庫中）
 
@@ -114,24 +114,23 @@ Decode 狀態存放在 GPU 上。Argmax kernel 把下一個 token id 與位置�
 
 ## 3. 為何特化 — 以量測為據
 
-特化引擎只有在特化效果反映在通用引擎於同一硬體上達不到的數字時，才值得它的成本。以下在同一張 R9700、同一個 GGUF、greedy decoding、兩個引擎各自透過自家相容 OpenAI 的 server、一次只跑一個模型行程的條件下量測（完整流程見 [benchmarking.md](benchmarking.md)）：
+特化引擎只有在特化效果反映在通用引擎於同一硬體上達不到的數字時，才值得它的成本。以下是 Swift-1.5 27B MXFP4 在同一張 R9700、同一個 GGUF 上，WHIRL 0.2.0 預設的 balance 模式對官方 llama.cpp build：
 
-| Qwen3.8-27B，tok/s | llama.cpp b11214 ROCm，Q4_K_M | WHIRL，Q4_K_M | WHIRL，MXFP4 |
+| Swift-1.5 27B MXFP4，R9700，tok/s | WHIRL（balance） | llama.cpp ROCm | llama.cpp Vulkan |
 |---|---|---|---|
-| Prefill 8k token | 1,177 | 1,747–1,751 | 3,548–3,557 |
-| Decode，預設模式（MTP + n-gram） | N/A | 145.4 | 159.1 |
-| Decode，MTP | 56.9 | 110.4 | 120.3 |
-| Decode，無 MTP | 30.9 | 34.3 | 37.6 |
+| Prefill，128k token 提示詞 | 1,715 | 718.7 | 557.2 |
+| Decode，128k token 文件問答 | 53.9 | 33.2 | 34.8 |
+| Decode，寫程式對話（全新內容） | 109.6 | 57.8 | 57.6 |
 
-Decode 各列：兩個引擎使用相同的統一 server 流程（19 個提示詞平均）。WHIRL 的 prefill 列是 CLI（KV f16）；WHIRL *server* 在 8k 的冷 prefill 為 1,560（Q4_K_M）/ 3,235（MXFP4）tok/s，仍大幅領先。細節與注意事項見 [benchmarking.md](benchmarking.md#current-numbers)。
+設定、各長度數據與 Ornith-1.5-35B-A3B MXFP4 的數據見 [benchmarks.md](benchmarks.md)。
 
 差距的來源，依大小排序：
 
-1. **圍繞精確性設計的推測解碼。** WHIRL 的多列 GEMV 產生的結果與 1 列 GEMV 逐位元相同，因此驗證 4 個草稿只比 decode 1 個 token 多約 15% 成本，而且 MTP 輸出與單純 greedy 輸出完全相同。這讓自適應策略最多可使用 8 個 MTP 草稿（加上 n-gram 草稿時為 15 個），而 llama.cpp 使用固定上限 3 個。
-2. **為單一檔案量身打造的 kernel。** unsloth UD-Q4_K_M 檔案混用九種格式（Q5_K、IQ4_XS、Q4_K、Q6_K、IQ4_NL、Q3_K、IQ3_S、Q8_0、F32）。每種都有自己的解碼器與調校過的多列 kernel；最慢的兩種（Q3_K、IQ3_S）是在把每種型別與純讀取上限比對量測後才修好的。
+1. **圍繞精確性設計的推測解碼。** WHIRL 的多列 GEMV 產生的結果與 1 列 GEMV 逐位元相同，因此驗證 4 個草稿只比 decode 1 個 token 多 13% 成本（27B MXFP4：28.44 對 25.15 ms，[kernels.md](kernels.md#grouped)），而且 MTP 輸出與單純 greedy 輸出完全相同。這讓自適應策略最多可使用 8 個 MTP 草稿（加上 n-gram 草稿時為 15 個），而 llama.cpp 使用固定上限 3 個。
+2. **為單一檔案量身打造的 kernel。** 混合式 K-quant 檔案（例如 unsloth 的 UD 量化）混用九種格式（Q5_K、IQ4_XS、Q4_K、Q6_K、IQ4_NL、Q3_K、IQ3_S、Q8_0、F32）。每種都有自己的解碼器與調校過的多列 kernel；最慢的兩種（Q3_K、IQ3_S）是在把每種型別與純讀取上限比對量測後才修好的。
 3. **為硬體挑選的格式。** MXFP4 的 2 的冪次區塊縮放可以精確地併入 fp8 指數，因此 RDNA 4 的 fp8 WMMA 能以單一 epilogue、約 240 TOPS 執行 prefill GEMM。這就是「速度模式」（[quantization.md](quantization.md)）。
 
-**單純 decode 有硬性上限。** 沒有推測時，每個 token 都必須把所有權重串流一次：Q4_K_M 檔案是 14.33 GB。WHIRL 的 1-token GEMV 已跑到實測純讀取上限（604–626 GB/s）的 97–100%，完整的 decode 步驟耗時 27.74 ms（Q4_K_M）/ 25.15 ms（MXFP4）。因此 27B 4-bit 模型在 640 GB/s 顯示卡上的無 MTP 上限約為 **38 tok/s**；kernel 優化只能再挖回幾個百分點。要更快，就得在每次權重傳遞中驗證多個 token — 這就是預設模式是 MTP + n-gram 的原因，也是本文件中 decode 數字以它為首的原因。
+**單純 decode 有硬性上限。** 沒有推測時，每個 token 都必須把所有權重串流一次。WHIRL 的 1-token GEMV 已跑到實測純讀取上限（604–626 GB/s）的 97–100%，27B MXFP4 模型完整的 decode 步驟耗時 25.15 ms，所以在 640 GB/s 顯示卡上單純 decode 很難超過 **40 tok/s**（1 / 25.15 ms）；kernel 優化只能再挖回幾個百分點。要更快，就得在每次權重傳遞中驗證多個 token — 這就是預設模式是 MTP + n-gram 的原因，也是本文件中 decode 數字以它為首的原因。
 
 ## 4. 正確性模型
 

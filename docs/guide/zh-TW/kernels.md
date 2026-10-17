@@ -38,7 +38,7 @@ kernel 中使用超過 ~41 KB 就讓佔用率（occupancy）從 16 降到 6 wave
 
 ## <a id="gemv"></a>1. Decode GEMV：int8 activation、`v_dot4`、`v_perm` 查找表
 
-Decode（逐 token 生成）是純粹的頻寬問題：每個 token 都要把所有權重串流一次（UD-Q4_K_M 檔案為 14.33 GB，其中混用了九種格式）。設計如下：
+Decode（逐 token 生成）是純粹的頻寬問題：每個 token 都要把所有權重串流一次（UD-Q4_K_M 這類 K-quant 檔案一個檔案混用九種格式）。設計如下：
 
 - **Activation（啟動值）量化為 int8**，以 32 個為一組，每組一個 scale，由產生它們的 kernel 完成（RMSNorm + 量化、
   SiLU·mul + 量化、attention combine + 量化都是融合的）。
@@ -51,8 +51,7 @@ Decode（逐 token 生成）是純粹的頻寬問題：每個 token 都要把所
 - **小矩陣融合。** DeltaNet 的 beta/alpha 投影非常小（48 × 5120，在 unsloth 檔案中為 Q8_0）：單獨執行只能達到
   101 GB/s，因為啟動成本佔主導，所以把它們與 causal conv + L2 norm 融合成一個 grid。
 
-第一版完整設計的結果：matmul 每 token 25.3 ms（566 GB/s，約規格的 88%），完整一步 28.8 ms = 34.7 tok/s。
-經過下面後續的工作後，一個 decode 步驟為 **27.74 ms（Q4_K_M）/ 25.15 ms（MXFP4）**。
+經過下面後續的工作後，27B MXFP4 模型一個 decode 步驟（無 MTP）為 **25.15 ms**。
 
 ### 1.1 各格式距離上限多近
 
@@ -92,7 +91,7 @@ u16/u32 載入。逐位元相同；q3_k 491 → 588–590、466 → 581–583 GB
 | `gdn_abconv`：beta/alpha 投影與 conv + L2 norm 在同一個 grid（閒置執行緒加 0，所以樹狀順序不變） | 每個 DeltaNet 層 2 → 1 |
 | recurrent step + gated RMSNorm + int8 量化 | 3 → 1 |
 
-每個 decode 步驟的啟動次數從 868 → 740，decode 步驟 28.37 → 28.17 ms（−0.7%）。剩下的啟動間空隙約每步 1 ms；之後我們融合了相同輸入的
+每個 decode 步驟的啟動次數從 868 → 740。啟動之間仍有空隙；之後我們融合了相同輸入的
 GEMV（§4）。
 
 ## <a id="multirow"></a>2. 與 1 列 GEMV 逐位元相同的多列 GEMV
@@ -102,11 +101,10 @@ GEMV（§4）。
 
 - **標準順序。** 每個單元 u 依 u 遞增累加到 slice `u % 32`，使用相同的浮點運算式；32 個 slice 以固定的 xor 樹（16、8、4、2、1）合併。
   1-token kernel 使用相同的程式路徑（`QDN<T>::dot<1>`），所以「1 列」只是 n = 1 的情形。
-- 2–16 列的**多 token dp4 kernel** 由巨集產生；從 6 列起，每個 wave 處理 2 列並共用已載入的 activation。Matmul 時間：T=1
-  25.35 → 25.0 ms、T=8 42 → 36、T=11 64 → 41、T=16 100 → 53 ms（在下面的 WMMA 版本之前）。
+- 2–16 列的**多 token dp4 kernel** 由巨集產生；從 6 列起，每個 wave 處理 2 列並共用已載入的 activation。
 - **常設檢查 `checkGemvBitwise`：** 每種型別 × 列數 2..16 × 每個 kernel 變體（以及 output head）都必須與 1-token 結果逐位元相等。
 
-在這些批次大小下 WMMA GEMM 太慢了（16 列一步約 158 ms），所以 ≤ 16 列一律使用 GEMV 式的 kernel。
+在這些批次大小下 WMMA GEMM 太慢了，所以 ≤ 16 列一律使用 GEMV 式的 kernel。
 
 ## <a id="wmma-gemv"></a>3. int8 WMMA 中批次 GEMV（3–16 列，gfx1201）
 
@@ -121,8 +119,7 @@ GEMV（§4）。
 讓它變快的暫存器修正：用 `readfirstlane` 讓 wave 索引成為 uniform（scale 分支變成純量）、一次 16 位元組 header 載入搭配無分支 scale 解碼，以及在每個單元的累加器上用
 `asm volatile` 釘住——沒有這些的話，編譯器會交錯四個單元的 WMMA，用掉 256 個 VGPR 外加數百位元組的溢出。
 
-結果：matmul T=8 36.5 → 30.5 ms、T=16 53.2 → 32.5 ms（T=1 不變）；驗證 n=16 68.3 → 42.8 ms；單一使用者 MTP +6–8%；4–16
-個並行使用者總吞吐量 +16–25%。
+結果：8 列與 16 列的 matmul 與驗證步驟變快（T=1 不變），單一使用者 MTP 與多人並行都受益。
 
 ### 3.1 第二代：管線化的 `gw2` / `gw8`
 
@@ -153,8 +150,7 @@ lane 解碼自己的四個單元 scale，IQ3_S grid 表放在 LDS。
 | IQ3_S | 12 列以下用 dp4，12 起用 v5 |
 | IQ4_NL、Q8_0 | 不變（dp4 / 較早的 WMMA 變體） |
 
-結果：驗證 n=16 41.61 → 39.62 ms（Q4_K_M），MXFP4 T=16 matmul 27.86 → 25.94 ms；四個並行使用者的穩態吞吐量 241.1 → 252.9 tok/s（Q4_K_M）與
-276.7 → 289.8（MXFP4）；單一使用者程式設計基準測試 +3.8%、檔案編輯 +4.4%（Q4_K_M）。16 列相對 1 列的剩餘成本：q4_k 1.09×、q5_k 1.11×、iq4_xs
+結果（27B MXFP4）：T=16 matmul 27.86 → 25.94 ms；四個並行使用者的穩態吞吐量 276.7 → 289.8 tok/s。16 列相對 1 列的剩餘成本：q4_k 1.09×、q5_k 1.11×、iq4_xs
 1.12×、mxfp4 1.16×、q6_k 各層 1.46×、head 1.25×、q3_k 1.9×、iq3_s 2.5×——其餘是每個（列、token、單元）的標準浮點運算式，逐位元相同的要求不允許省略。較差的做法：每個
 block 3–4 個 tile（溢出，−7…−40%）。
 
@@ -192,12 +188,12 @@ gfx1151 的 kernel 集（`kernels/gfx1151/`，一個 code object）沿用 gfx120
 `__builtin_assume` 與整數 offset 都沒幫助；三個 inline 分支更糟。解法：單一矩陣保留原本的入口；群組使用獨立的「雙胞胎」入口，共用的實作是
 `__forceinline__`（有兩個呼叫者時它就不再 inline，達到 248 VGPR + scratch）。雙胞胎用到 11 列（MXFP4 為 13），超過就變差。
 
-| | Q4_K_M 之前 | 之後 | MXFP4 之前 | 之後 |
-|---|---|---|---|---|
-| 每 token 啟動次數 | 740 | 674 | 740 | 596 |
-| Decode 步驟（無 MTP） | 28.09 ms | 27.74（−1.2%） | 25.66 | 25.15（−2.0%） |
-| 驗證 n=3 | 30.99 | 30.22（−2.5%） | 27.70 | 27.26（−1.6%） |
-| 驗證 n=5 | 32.38 | 31.71（−2.1%） | 29.00 | 28.44（−1.9%） |
+| 27B MXFP4 | 之前 | 之後 |
+|---|---|---|
+| 每 token 啟動次數 | 740 | 596 |
+| Decode 步驟（無 MTP） | 25.66 ms | 25.15（−2.0%） |
+| 驗證 n=3 | 27.70 | 27.26（−1.6%） |
+| 驗證 n=5 | 29.00 | 28.44（−1.9%） |
 
 代價：kernel 建置時間 5 → 13 分鐘。混合型別的群組（在 unsloth 檔案中 q/k/v 為 q4_k/q5_k/q5_k）仍然分開啟動。
 
@@ -219,16 +215,15 @@ gfx1151 的 kernel 集（`kernels/gfx1151/`，一個 code object）沿用 gfx120
 - 每次重複後都同步的自動調校量到的是啟動開銷，並偏好融合路徑。改成對一批重複計時、最後只同步一次就修好了。（冷快取調校沒有幫助。）32-bit
   的候選遮罩在 48 個候選時溢位（未定義的位移）→ 改為 64-bit。
 
-第一輪的結果：模型所有 matmul 在 T=4096 跑到 107–108 TFLOPS（約 180 的 59%），最好的純 f16 GEMM 為 119 TFLOPS（約 66%）；prefill
-在 1.1k / 14k / 24k token 為 1,296 / 1,430 / 1,355 tok/s。
+第一輪的結果：模型所有 matmul 在 T=4096 跑到 107–108 TFLOPS（約 180 的 59%），最好的純 f16 GEMM 為 119 TFLOPS（約 66%）。
 
 ### 5.2 批次 bucket
 
 | 變更 | 原因 | 效果 |
 |---|---|---|
 | 2 個 bucket（在 512 與 4096 調校） | 第一版設計 | 85 token 的提示詞被補齊到 256 token 的 tile |
-| + bucket n ≤ 128，在 128 調校 | 85 token 的 FFN-up 用 512 調校的 tile 要 0.791 ms，用既有的 64×128 tile 只要 0.271 ms | 85–89 token 的 prefill 184–188 → 132–133 ms（−29%）；先試過 n ≤ 256，讓 152/231 token 的提示詞慢了 3–4% |
-| 11 個 bucket：≤32、48、64、96、128、192、256、384、≤768（在 512 調校）、769–1024（在 1024 調校）、> 1024（在 4096 調校） | server 以 1024 列為一個 chunk 執行，落在 512 調校的 bucket 中 | 只改調校檔案，server 8k 冷 prefill 就從 1318 → 1441 tok/s（+9.3%） |
+| + bucket n ≤ 128，在 128 調校 | 85 token 的 FFN-up 用 512 調校的 tile 要 0.791 ms，用既有的 64×128 tile 只要 0.271 ms | 短提示詞變快；先試過 n ≤ 256，讓 152/231 token 的提示詞變慢 |
+| 11 個 bucket：≤32、48、64、96、128、192、256、384、≤768（在 512 調校）、769–1024（在 1024 調校）、> 1024（在 4096 調校） | server 以 1024 列為一個 chunk 執行，落在 512 調校的 bucket 中 | 只改調校檔案，server 冷 prefill 就變快 |
 
 Tile 的選擇只改變 M/N 的分塊；K 方向的 WMMA 順序是固定的，所以每種 tile 設定都產生相同的位元。一個常設的不變性檢查會執行每個 GEMM 選項（目前集合中有
 61 個）、每個 MoE token tile 以及 40 列子集，並要求位元相等——這就是讓批次多請求 prefill 等同單獨 prefill 的關鍵。
@@ -239,10 +234,8 @@ Tile 的選擇只改變 M/N 的分塊；K 方向的 WMMA 順序是固定的，�
 wave（TM 2 × TN 8）、單緩衝、以 4 個 token block 為一組做光柵化（rasterization）、16 位元組的收尾儲存。比先前的 f16 kernel 快
 +19.6…+30.2%（約 126–130 TFLOPS），逐位元相同，其他地方的資料佈局都不需改變。用於 n ≥ 512。被否決的變體：activation 直接以 tiled
 形式讀取（+25–31%，但每個 f16 產生者都要改——相對上面的方案不值得）、權重直接以 tiled 形式讀取（+22–28%）、兩者都直接讀（+12–22%）、雙緩衝 /
-512 執行緒 / BK 64（較差）、不做光柵化分組（−9…−49%），以及**把反量化融合進 GEMM 的權重讀取**（逐位元相同但 −10…−13%：Q4_K/Q5_K/Q6_K
+512 執行緒 / BK 64（較差）、不做光柵化分組（−9…−49%），以及**把反量化融合進 GEMM 的權重讀取**（逐位元相同但較慢：K-quant
 解碼的 VALU 工作落在 GEMM 的關鍵路徑上）。
-
-Q4_K_M CLI prefill 在 2k–32k 提升 +9.6…+14.0%，在 128k 提升 +8.1…+8.3%。
 
 ### 5.4 小批次：`gemms` / `gemmsd`
 
@@ -259,7 +252,7 @@ bucket 挑選；沒有任何寫死）：
 兩個 block（activation slab 佔滿 LDS）是目前的上限，而 gfx12 沒有 16 位元組的非同步 global→LDS 載入。較差的做法：更深的暫存器預取（溢出）、activation
 直接從 global 讀取（L2 流量太大）、半個 activation slab、不經 LDS 解碼權重（−20…−66%）。
 
-CLI prefill（Q4_K_M）：88 token 692.7–697.5 → 848.5–867.3 tok/s（+23.4%，TTFT 127 → 103 ms），209 token +9.5%，≥ 493 token 不變。
+端到端受益的是幾百 token 以內的提示詞；≥ 493 token 的提示詞不變。
 
 ### <a id="int8-prefill"></a>5.5 負面結果：gfx1201 上的 int8（W8A8 / 精確 W4A8）prefill
 
@@ -331,8 +324,8 @@ global 餵進 A fragment（183–189 TOPS）或對舊 kernel 做雙緩衝（158�
 `rmsnorm_x8/x16`（RMSNorm 直接寫出下一個 GEMM 的輸入，fp8 + 每 token scale 或 f16）、`silu_mul_x8/x16`（SiLU·mul 寫出 down-projection
 的輸入）、`gated_norm_x8/x16`（DeltaNet gated RMSNorm 寫出 out-projection 的輸入）以及 `gdn_conv_l2n`（causal conv + q/k L2 norm，每個 block
 128 個 channel × 8 個 token，每個輸入列只讀一次）。只有在張量的每個消費者都使用相同 GEMM 輸入格式時才啟用；否則執行未融合的 kernel。全部逐位元相同——這需要
-asm 屏障，因為編譯器把 `x*x` 收縮進第一個 butterfly 加法，並把一個乘法與 f16 轉換合併成 `v_fma_mix`，每個都造成 1-ulp 差異（§12）。8k 下的效果：misc
-191 → 135 ms、norm 73 → 52、DeltaNet norm 53 → 36、DeltaNet prep 86 → 50。
+asm 屏障，因為編譯器把 `x*x` 收縮進第一個 butterfly 加法，並把一個乘法與 f16 轉換合併成 `v_fma_mix`，每個都造成 1-ulp 差異（§12）。8k 下的效果（逐 op profile）：misc、norm、
+DeltaNet norm 與 DeltaNet prep 各類 op 都變快。
 
 僅限速度模式（非逐位元相同，MXFP4 預設）：FFN gate/up 與 DeltaNet qkv/z GEMM 為其逐元素消費者寫出 f16 而非 f32（+5.4…+5.8% 與 +0.6%）。
 
@@ -343,7 +336,7 @@ asm 屏障，因為編譯器把 `x*x` 收縮進第一個 butterfly 加法，並�
 - V 在暫存器中轉置（每個 block 128 個 query 列，256 執行緒）；KV 以 f16 儲存。
 - **延遲 rescale。** 每處理完一個 key tile，累計輸出通常要乘上 `alpha = exp(m_old − m_new)`。當整個 wave 的
   `__builtin_amdgcn_ballot_w32(alpha != 1.f)` 為零時（累計最大值沒有改變——在長上下文深處幾乎總是如此），就跳過這 128 次乘法。乘以 1 是恆等運算，所以結果逐位元相同。每層
-  −4.5%；CLI prefill 在 64k +1.1…+1.3%、在 128k +2.0%。
+  −4.5%。
 - **`attn_kx`。** 在 120k 上下文的分析：kernel 達到 61 TFLOPS；拿掉 K/V 載入會快 70%；PV 那一半最貴，因為 256 VGPR 仍溢出 40 個（o 累加器 128 + Qᵀ
   fragment 64），而且每個 WMMA 都從 LDS 讀取 512 位元組的 fragment。`attn_kx` 每 128 個 query 使用 16 個 wave；兩個相鄰的 wave 共用 16 個 query，各自用原本的
   WMMA 鏈為 16 個 key 計算 Sᵀ，透過 LDS 交換，兩者計算相同的 softmax，各保留 Oᵀ 的一半（64 VGPR，無溢出）；下一個 K/V tile 預取到暫存器。逐位元相同。120k：f16
@@ -364,8 +357,7 @@ asm 屏障，因為編譯器把 `x*x` 收縮進第一個 butterfly 加法，並�
   - **gfx1151（KG-3）。** Radeon 8060S 沒有 `attn_kg`；它的 q8 / q8h / q4 prefill 現在先把 key 反量化成 f16 列（`kv_dq_rows_r[_q4]`），
     再跑 f16 的 `attn_prefill_wmma`；超過暫存容量的 key 交給 `attn_prefill_wmma_s`（softmax 狀態存在 `st_ml` / 輸出裡，同 `attn_kgs`）。
     與舊的 `attn_prefill_wmma_q8` / `_q4` loader 逐位元相同。`_s` 版溢出 56 個 VGPR（一般版 256、無溢出），只在約 139k 以上或設
-    `WHIRL_ATTN_SEG` 時用到。端到端（Qwen3.8-27B Q4_K_M）的變化落在 8060S 連續量測的漂移內（±3%）：q8h 對 f16 8k −0.9%、64k −1.1%
-    （兩輪平均）、128k −0.1%（兩輪反序平均；每對中先跑的快約 4%）；舊 loader 在 8k / 64k 為 −2.1% / −2.2%。kernel bench 的結論不同：它顯示 f16 kernel 比
+    `WHIRL_ATTN_SEG` 時用到。端到端的變化落在 8060S 連續量測的漂移內。kernel bench 的結論不同：它顯示 f16 kernel 比
     int8 loader 慢、key 每 16k–32k 分段可快 26–35%（各格式都是），但端到端都看不到（`WHIRL_ATTN_SEG=32768`：64k 不變）。8060S 的
     attention kernel bench 數字要小心解讀；原因尚未查明（bench 裡的速度取決於一次 launch 涵蓋多少 head / key）。
   - **0.2.0 起 q8 / q8h（Q8P）：`kv_dq_rows` + f16 的 `attn_kg`。** 用隨機 K/V 量（上面的 f16 probe 用常數資料，
@@ -396,21 +388,16 @@ asm 屏障，因為編譯器把 `x*x` 收縮進第一個 butterfly 加法，並�
 
 - **Split-K flash decoding**，split 數量固定，每個 split 在自己範圍內的 64 位置 chunk 上執行 online softmax。Split 範圍在 GPU 上根據常駐裝置端的位置計算，所以
   decode 步驟仍可被 graph 捕捉。評分是每個 lane 一個位置：每個 wave 在一個 64 維切片上為 32 個位置評分，q 從 LDS 廣播，4 個切片的部分和透過 LDS 相加——沒有
-  shuffle。24k 下的 split 數掃描：64 / 128 / 256 個 split = 35.5 / 33.9 / 34.7 ms/token。
+  shuffle。split 數由 24k 上下文的掃描決定。
 - **`attn_wsplit1`（WMMA 群組驗證）。** 一個 block（KV head × split）以 WMMA 處理一*群* query 欄：一個 KV head 的 q heads（GQA）× 同一序列的連續驗證列。Sᵀ =
   K·Qᵀ 且 Oᵀ += Vᵀ·Pᵀ；K fragment 直接從快取讀取；V 由前 128 個執行緒轉置進 LDS；Qᵀ 放在 LDS 以避免溢出。群組只由同一序列、位置連續且 split 大小相同的列組成，≤ 16
   欄（27B：每個 KV head 6 個 q head → 每群 2 列）。每一欄的算術都等同單欄情形（`#pragma clang fp contract(off)` + 明確的 `__builtin_fmaf`），所以群組驗證的一列與單
   token decode 的一列逐位元相同，MTP 維持精確。常設檢查 `checkAttnGroups`（在位置 1000/1023 的隨機 Q/K/V）。
 - 最大 split 數 128 → 64（每個 split 現在更有效率；位置 24000 的 combine：34.7 → 17.4 µs）。位置 24000 的 attention kernel：298 → ~170 µs。
 
-| Decode tok/s（MTP / 一般） | 之前 | 之後 |
-|---|---|---|
-| 27B，12k 上下文 | 55.3 / 31.3 | 64.5 / 33.1 |
-| 27B，24k | 45.5 / 29.8 | 61.5 / 31.9 |
-| Ornith，12k | 165 / 137 | 190 / 158 |
-| Ornith，24k | 137 / 129 | 185 / 150 |
+dense 與 MoE 模型在 12k、24k 上下文的 decode（有無 MTP）都變快。
 
-- 較差的做法：64 欄變體（速度相同；在 gfx1151 上非逐位元相同）；一個對所有 query 只讀一次 KV 的版本（24k MTP 39.5 → 35.6 tok/s——瓶頸是歸約而不是 KV 讀取，而且它
+- 較差的做法：64 欄變體（速度相同；在 gfx1151 上非逐位元相同）；一個對所有 query 只讀一次 KV 的版本（24k MTP 反而變慢——瓶頸是歸約而不是 KV 讀取，而且它
   41 KB 的 LDS 降低了佔用率）。
 - **`attn_wsplit2`（每群最多 32 欄）。** 每群 16 欄時，一個序列的驗證列兩列一組進 attention（27B：每個 KV head 6 個 GQA head），所以每個 split 的 K/V 範圍每 2 列就讀一次，
   而 block 的 4 個 wave 中有 3 個只幫忙搬 Vᵀ。`attn_wsplit2` 是同一個 template 的兩個欄群版本：wave 0 與 wave 1 在同一塊已搬好的 Vᵀ tile 上各算 16 欄（最多 5 列共用一次
@@ -426,7 +413,7 @@ asm 屏障，因為編譯器把 `x*x` 收縮進第一個 butterfly 加法，並�
   | 32k | 4 × 4 | 1.784 ms | 1.162 ms |
   | 32k | 1 × 9 | 1.115 ms | 0.633 ms |
 - **gfx1151 的限制：** 當 P = 0 的項乘上另一個 query 的真實 V 列時，gfx11 WMMA 並不精確，所以在 8060S 上每個群組只放一個 query（kernel 仍會執行，只是不共用 K/V）。
-- 這項工作之後，一般 decode 時間每 1k token 上下文約增加 0.11 ms——正好是以 ~600 GB/s 每 1k token 多讀 64 MiB KV 的時間。Decode attention 已達頻寬；剩下的槓桿是減少 KV
+- 這項工作之後，一般 decode 時間隨上下文增加的速度，正好等於以 ~600 GB/s 多讀那些 KV 位元組的時間。Decode attention 已達頻寬；剩下的槓桿是減少 KV
   位元組。
 - **`attn_wsplit1/2` 的 int8 K（q8、q8h）：magic number 反量化（`kv_dq8`）**。第一版 int8 對每個元素各做一次 `cvt` 與乘法，成本比 K 減半省下的頻寬還多（q8h 在 128k 的 decode 比 f16 慢 5.2%，[kv-and-caching.md](kv-and-caching.md#formats)）。現在改用與 `attn_kg` 相同的轉換：`v_perm` 組出 f16 的
   `0x6400 | (b ^ 0x80)`（= 1152 + q），減去 1152（精確），再以 packed f16 成對乘上 scale；`#pragma clang fp contract(off)` 保留 `(_Float16)q * s` 唯一一次捨入——**位元完全相同**。每一列的 8 個 K scale
@@ -447,9 +434,9 @@ Chunk 邊界從每個 prefill 段落的開頭起算，而 prefill 段落都從 1
   加總）；T 與 M 直接寫成 f16 WMMA A fragment（每個 chunk 與 head 10 KB，取代 80 KB 的 f32 W/U/M）。
 - **Scan**（每個 head 一個 block，每個 wave 擁有 16 個狀態欄）：狀態 S（128×16）以 C fragment 形式留在暫存器中，而且**在 gfx12 上 C 佈局等於 B 佈局**，所以 K·S、Q·S、T·X、M·U
   與 Kᵀ·U 都不需要搬動 S 的資料。每個 wave 每個 chunk 116 次 WMMA。
-- 探測（8192 token，一層）：13.4 ms → 1.9–2.0 ms（6.7×）。相對 f64 逐 token 遞迴的誤差：7e-7（f32 路徑）→ 4.2e-4（f16 輸入）。在 Q4_K_M 搭配 f16 prefill 時，最後
-  token 的 KL 為 4.5e-8 … 1.5e-4（方法本身是精確的）；在 fp8 prefill 下升到 1.2e-4 … 7.0e-2，因為 fp8 activation 會放大任何擾動。僅為 MXFP4 的預設；一個需主動開啟的「relaxed」旗標可讓
-  Q4_K_M 使用它。8k MXFP4 prefill 2212 → 2639 tok/s（+19.3%）。
+- 探測（8192 token，一層）：13.4 ms → 1.9–2.0 ms（6.7×）。相對 f64 逐 token 遞迴的誤差：7e-7（f32 路徑）→ 4.2e-4（f16 輸入）。搭配 f16 prefill 時
+  方法本身是精確的；在 fp8 prefill 下最後 token 的 KL 會變大，因為 fp8 activation 會放大任何擾動。KG-1 起它是 balance 項目 `gdnwmma`，dense 的 K-quant
+  檔案也適用。8k MXFP4 prefill 2212 → 2639 tok/s（+19.3%）。
 - 坑：700 多個溢出的 VGPR 來自編譯器把 32 次 V 讀取與 32 次輸出寫入的 64-bit 位址當作迴圈不變量提到迴圈外。讓 lane offset 在每次迭代都不透明（`asm volatile("" : "+v"(off))`），並把位址拆成
   uniform 的列基底加上 32-bit lane offset，溢出從 700 降到 20。LDS 列有補齊（每列 17 / 9 個 chunk）以避免 bank 衝突。把下一個 chunk 預取到暫存器（S 64 + X/O 64 + V 32 + 預取 64
   VGPR）超過 256 而溢出——未採用。
@@ -457,7 +444,7 @@ Chunk 邊界從每個 prefill 段落的開頭起算，而 prefill 段落都從 1
 ### 9.3 Decode 步驟
 
 `gdn_step_norm` 在一個 kernel 中執行遞迴步驟、gated RMSNorm 與 int8 量化。它的改寫把每一列的 q/k/v/decay/beta 預取進 LDS，相依鏈中每列只留一個屏障（雙緩衝歸約：第 t 列的輸出歸約延後到第
-t+1 列的屏障之後），並在最後一次做 norm + 量化（每列一個 wave，加法順序與之前相同）。逐位元相同——但要加 asm 屏障，因為第一版讓編譯器把 `y*y` 收縮進 shuffle-add 的 fma。驗證 −0.2…−1%。
+t+1 列的屏障之後），並在最後一次做 norm + 量化（每列一個 wave，加法順序與之前相同）。逐位元相同——但要加 asm 屏障，因為第一版讓編譯器把 `y*y` 收縮進 shuffle-add 的 fma。
 
 草稿被拒絕時遞迴狀態如何回滾（快照，然後重播）見 [speculative-decoding.md](speculative-decoding.md#replay)。
 
@@ -465,8 +452,8 @@ t+1 列的屏障之後），並在最後一次做 norm + 量化（每列一個 w
 
 - **路由器（router）：** f32 softmax → 256 選 top-8 → 重新正規化使總和為 1（語意同 llama.cpp 的 `build_moe_ffn`）；共用專家以 `sigmoid(gate_inp_shexp · h)` 縮放。
 - **Decode：** 被選中專家的 gate 與 up 在一個 int8 GEMV 中完成，只讀取 8 個被選中專家的列；down-projection、加權合併、共用專家與殘差在一個 kernel 中完成；沒有 host 同步。
-- **Prefill：** （token, slot）配對在 GPU 上依專家分組，收集成 f16，經過群組 WMMA GEMM 再散回。專家平均少於 48 個 token 時 token tile 為 32，否則為 64。1.1k token 的 prefill
-  ~3300 → ~5000 tok/s。
+- **Prefill：** （token, slot）配對在 GPU 上依專家分組，收集成 f16，經過群組 WMMA GEMM 再散回。專家平均少於 48 個 token 時 token tile 為 32，否則為 64。MXFP4 專家的 GEMM
+  用 fp8 activation（[quantization.md](quantization.md#ornith-mxfp4)）。
 - 融合的 DeltaNet beta/alpha kernel 被一般化了，因為 Ornith 以 Q4_K 儲存 beta/alpha（27B：Q8_0）；沒有它，3 草稿驗證就無法執行。MTP 層的 FFN 也是 MoE。
 - **路由的接近平手無所不在。** 在任兩條同樣有效的 prefill 路徑之間（WMMA 快速版、純量 naive attention、循序 DeltaNet），17–28% 的（token, 層）配對會選到不同的專家集合，從第 0–4
   層就開始；最後 token 的 KL 範圍為 1.2e-4 … 3.4e-2，而 45 個配對的 top-1 全部一致。稠密的 27B 在相同檢查下：KL ~1e-7。因此 MoE 的 KL 門檻必須依實測的路徑雜訊設定（MoE

@@ -27,8 +27,8 @@ Qwen3.8-27B MXFP4 (FreedomAISVR), Swift-1.5 MXFP4 A/B/C, Ornith CyberTiel
 MTPv2 ICE, bge-m3 F16 (bert), DeepSeek-V4 drafter Q2_K, Qwen-Image 2.1 Q8_0
 (no metadata keys). Tensor types covered: f32, f16, bf16, q8_0, q2_K, q3_K,
 q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_nl, iq4_xs, mxfp4 (among others).
-The Qwen3.8 file (15.3 GiB, 866 tensors, 248k-token vocab) is parsed from
-the memory mapping in about 7 ms.
+A 27B file (866 tensors, 248k-token vocab) is parsed straight from the
+memory mapping, without copying.
 
 ## Tokenizer
 
