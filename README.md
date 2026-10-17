@@ -4,6 +4,9 @@
 
 **Windows HIP Inference for RDNA LLMs**
 
+> ### New in 0.2.0: AMD Ryzen AI Max+ 395 (Radeon 8060S) support
+> WHIRL now runs on the **Radeon 8060S** integrated GPU of the **AMD Ryzen AI Max+ 395**, with kernels tuned for it, all three numerics modes, and prompts up to ~250k tokens. On the 8060S it is faster than the official llama.cpp ROCm and Vulkan builds at every prompt length we measured (see the [8060S tables below](#whirl-vs-llamacpp-at-a-glance); max power (80 W), ASUS ROG Flow Z13).
+
 WHIRL is an open-source (Apache-2.0) LLM inference engine for AMD GPUs on Windows: native C++/HIP, every kernel included, no WSL, Docker or ROCm install. **Download the zip, unzip, run; the AMD driver is all it needs.** Version 0.2.0 runs on the **AMD Radeon AI PRO R9700** (RDNA 4, 32 GB) and the **Radeon 8060S** (Ryzen AI Max+ 395), with our two MXFP4 models, **Swift-1.5 27B MXFP4** (dense) and **Ornith-1.5-35B-A3B MXFP4** (MoE). On both GPUs it is **faster than llama.cpp**, ROCm and Vulkan builds alike, in every mode and at every prompt length we measured, from 2k to ~250k tokens.
 
 ## WHIRL vs llama.cpp at a glance

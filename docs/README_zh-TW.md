@@ -4,6 +4,9 @@
 
 **Windows HIP Inference for RDNA LLMs**
 
+> ### 0.2.0 新增：支援 AMD Ryzen AI Max+ 395（Radeon 8060S）
+> WHIRL 現在可以在 **AMD Ryzen AI Max+ 395** 的內建 GPU **Radeon 8060S** 上執行：kernel 針對它調校過，三種數值模式都能用，提示最長約 250k token。在 8060S 上，我們量過的每一種提示長度都比原廠 llama.cpp 的 ROCm 和 Vulkan 版本快（見[下方 8060S 表格](#whirl-對-llamacpp一眼看)；最大功耗 80 W，ASUS ROG Flow Z13）。
+
 WHIRL 是 Windows 上 AMD GPU 的開源（Apache-2.0）LLM 推論引擎：原生 C++／HIP，每一支 kernel 都公開，不需要 WSL、Docker，也不用安裝 ROCm。**下載 zip、解壓縮、執行，只需要 AMD 驅動。** 0.2.0 支援 **AMD Radeon AI PRO R9700**（RDNA 4，32 GB）與 **Radeon 8060S**（Ryzen AI Max+ 395），搭配我們的兩個 MXFP4 模型：**Swift-1.5 27B MXFP4**（稠密）與 **Ornith-1.5-35B-A3B MXFP4**（MoE）。兩張卡上都**比 llama.cpp 快**，ROCm 與 Vulkan 版皆然，三種模式、我們量過的每個提示長度（2k 到 ~250k token）都是如此。
 
 ## WHIRL 對 llama.cpp：一眼看
