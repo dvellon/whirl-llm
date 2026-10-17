@@ -166,7 +166,7 @@ recent session is restored (`kv tier: restoring … from SSD`) instead of being 
 - The MoE model (Ornith-1.5-35B-A3B) needs 22 KiB of f16 KV per token (the 27B dense model: 68 KiB in
   f16, 36.1 KiB in q8h), so its pool holds far more tokens, and it decodes far faster at long context
   (balance, 128k-token document on the R9700: 131.3 vs 53.9 tok/s for Swift 27B,
-  [benchmarks.md](benchmarks.md#4-radeon-ai-pro-r9700)).
+  [benchmarks.md](benchmarks.md#radeon-ai-pro-r9700)).
 - A cold long prompt takes time: Swift 27B MXFP4-A prefills 32k tokens at ~2,800 tok/s (~12 s) and
   the ~250k-token prompt at ~1,150 tok/s (about 3.6 minutes) in balance ([benchmarks.md](benchmarks.md)). After that, the prefix
   cache and tiers make follow-up turns fast.

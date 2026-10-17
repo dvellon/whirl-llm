@@ -144,7 +144,7 @@ pinned RAM，在圖片到來前不佔 VRAM，見[第 5 節](#images)）。
   （`f16`、`q8`、`q8h`、`q8v`、`q4`）只供除錯時強制指定格式。
 - MoE 模型（Ornith-1.5-35B-A3B）的 f16 KV 每 token 22 KiB（27B dense 模型 f16 為 68 KiB、q8h 為 36.1 KiB），
   所以池能放的 token 多得多，長上下文的 decode 也快得多（balance、R9700、128k token 文件：131.3 對 Swift 27B
-  的 53.9 tok/s，[benchmarks.md](guide/zh-TW/benchmarks.md#4-radeon-ai-pro-r9700)）。
+  的 53.9 tok/s，[benchmarks.md](guide/zh-TW/benchmarks.md#radeon-ai-pro-r9700)）。
 - 冷的長提示詞需要時間：balance 模式下 Swift 27B MXFP4-A prefill 32k token 約 2,800 tok/s（約 12 秒），
   約 250k token 的提示約 1,150 tok/s（約 3.6 分鐘）（[benchmarks.md](guide/zh-TW/benchmarks.md)）。之後的回合靠前綴快取與分層就很快。
 - **VRAM。** 伺服器會把 KV 池開到填滿剩餘 VRAM，所以行程永遠顯示幾乎用滿整張卡的專用記憶體——這是預期行為，不是洩漏。要把 VRAM 留給其他程式，

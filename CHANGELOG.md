@@ -8,13 +8,13 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 ### Highlights
 
 <!-- gen:changelog.lead.en -->
-- **Faster than the official llama.cpp b11214 on both GPUs, in every mode and at every measured length (2k to ~250k tokens)**, ROCm and Vulkan builds compared separately, on our two MXFP4 models. WHIRL balance (default) leads, prefill / decode:
-  - R9700, Swift-1.5 27B MXFP4: prefill +139% to +191% over ROCm and +208% to +295% over Vulkan; decode +56% to +80% / +38% to +84%.
-  - R9700, Ornith-1.5-35B-A3B MXFP4: prefill +75% to +188% / +119% to +225%; decode +74% to +107% / +78% to +106% (as shipped: WHIRL MTP vs llama.cpp plain).
-  - Radeon 8060S (max power (80 W), ASUS ROG Flow Z13), Swift: prefill +53% to +65% / +93% to +183%; decode +28% to +46% / +24% to +105%.
-  - Radeon 8060S, Ornith: prefill +64% to +91% / +142% to +199%; decode +41% to +54% / +43% to +57%.
-  - Coding-agent session (Swift, cold): R9700 17.0 s vs 81.0 s / 69.4 s; 8060S 95.7 s vs 145.6 s / 264.4 s.
-  Decode = document QA (explain and rewrite a function quoted in the prompt). Ranges leave out three footnoted kinds of llama.cpp cells (R9700 Swift 8k cold request and ~250k memory spill, 8060S Vulkan 2k prefill); tables: [README](README.md#performance), [benchmarks.md](docs/benchmarks.md).
+- **Faster than the official llama.cpp b11214 on both GPUs (Radeon 8060S and R9700), in every mode and at every measured length (2k to ~250k tokens)**, ROCm and Vulkan builds compared separately, on our two MXFP4 models. WHIRL balance (default) leads, prefill / decode:
+  - Radeon 8060S (max power (80 W), ASUS ROG Flow Z13), Swift-1.5 27B MXFP4: prefill +53% to +65% over ROCm and +93% to +183% over Vulkan; decode +28% to +46% / +24% to +105%.
+  - Radeon 8060S, Ornith-1.5-35B-A3B MXFP4: prefill +64% to +91% / +142% to +199%; decode +41% to +54% / +43% to +57% (as shipped: WHIRL MTP vs llama.cpp plain).
+  - R9700, Swift: prefill +139% to +191% / +208% to +295%; decode +56% to +80% / +38% to +84%.
+  - R9700, Ornith: prefill +75% to +188% / +119% to +225%; decode +74% to +107% / +78% to +106%.
+  - Coding-agent session (Swift, cold): 8060S 95.7 s vs 145.6 s / 264.4 s; R9700 17.0 s vs 81.0 s / 69.4 s.
+  Decode = document QA (explain and rewrite a function quoted in the prompt). Ranges leave out three footnoted kinds of llama.cpp cells (8060S Vulkan 2k prefill, R9700 Swift 8k cold request and ~250k memory spill); tables: [README](README.md#performance), [benchmarks.md](docs/benchmarks.md).
 <!-- /gen -->
 - **Radeon 8060S (Ryzen AI Max+ 395, gfx1151) support, tuned**, with image input and the RAM / SSD cache tiers on by default.
 - **Our MXFP4 models, quantized for WHIRL**: Swift-1.5 27B MXFP4 (dense) and Ornith-1.5-35B-A3B MXFP4 (MoE). fp8 prefill on the R9700, Q8_0 `ssm_alpha` / `ssm_beta` so MTP output stays bitwise identical to plain greedy decoding, and a Q6_K head for fast drafts ([README](README.md#why-whirl-is-fast-with-these-mxfp4-files)).
