@@ -13,6 +13,20 @@ WHIRL 是 Windows 上 AMD GPU 的開源（Apache-2.0）LLM 推論引擎：原生
 
 WHIRL 0.2.0 預設模式（balance）對 ggml-org 官方 llama.cpp **b11214**，**ROCm** 與 **Vulkan** 兩個版本分開列。同一個 GGUF 檔、同一組提示、greedy 解碼、一個使用者。
 
+![Radeon 8060S（Ryzen AI Max+ 395）prefill 速度：WHIRL 0.2.0 對 llama.cpp ROCm 與 Vulkan](images/bench020_prefill_s8.png)
+
+![Radeon 8060S（Ryzen AI Max+ 395）decode 速度：WHIRL 0.2.0 對 llama.cpp ROCm 與 Vulkan](images/bench020_decode_s8.png)
+
+![Radeon AI PRO R9700 prefill 速度：WHIRL 0.2.0 對 llama.cpp ROCm 與 Vulkan](images/bench020_prefill_r97.png)
+
+![Radeon AI PRO R9700 decode 速度：WHIRL 0.2.0 對 llama.cpp ROCm 與 Vulkan](images/bench020_decode_r97.png)
+
+![寫程式 agent 工作階段耗時：WHIRL 0.2.0 對 llama.cpp ROCm 與 Vulkan](images/bench020_agent.png)
+
+![WHIRL 0.2.0 三種模式（precise、balance、fast）的 32k prefill](images/bench020_modes_pp.png)
+
+![WHIRL 0.2.0 三種模式在 32k 文件之後的 decode](images/bench020_modes_tg.png)
+
 <!-- gen:lead.zh -->
 - **Radeon 8060S**（最大功率（80 W），ASUS ROG Flow Z13）：8k prefill Ornith 2,244 tok/s（+75%／+199%）、Swift 470.8（+53%／+101%）；128k token 文件之後的 decode Ornith 58.4（+54%／+57%）、Swift 23.8（+46%／+105%）。
 - **R9700 prefill**：Ornith 35B-A3B 讀 2k token 提示 **11,550 tok/s**（llama.cpp ROCm 4,014、Vulkan 3,551：WHIRL +188%／+225%），~250k token 提示 2,664 tok/s（1,519／1,218：+75%／+119%）。Swift 27B：32k 2,805 tok/s（+163%／+256%），128k 1,715（+139%／+208%）。

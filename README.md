@@ -13,6 +13,20 @@ WHIRL is an open-source (Apache-2.0) LLM inference engine for AMD GPUs on Window
 
 WHIRL 0.2.0 in its default mode (balance) against the official llama.cpp release **b11214** (ggml-org), shown separately for its **ROCm** and its **Vulkan** build. Same GGUF files, same prompts, greedy decoding, one user.
 
+![Prefill speed on the Radeon 8060S (Ryzen AI Max+ 395), WHIRL 0.2.0 vs llama.cpp ROCm and Vulkan](docs/images/bench020_prefill_s8.png)
+
+![Decode speed on the Radeon 8060S (Ryzen AI Max+ 395), WHIRL 0.2.0 vs llama.cpp ROCm and Vulkan](docs/images/bench020_decode_s8.png)
+
+![Prefill speed on the Radeon AI PRO R9700, WHIRL 0.2.0 vs llama.cpp ROCm and Vulkan](docs/images/bench020_prefill_r97.png)
+
+![Decode speed on the Radeon AI PRO R9700, WHIRL 0.2.0 vs llama.cpp ROCm and Vulkan](docs/images/bench020_decode_r97.png)
+
+![Coding-agent session wall time, WHIRL 0.2.0 vs llama.cpp ROCm and Vulkan](docs/images/bench020_agent.png)
+
+![WHIRL 0.2.0 prefill at 32k in precise, balance and fast mode](docs/images/bench020_modes_pp.png)
+
+![WHIRL 0.2.0 decode after a 32k document in precise, balance and fast mode](docs/images/bench020_modes_tg.png)
+
 <!-- gen:lead.en -->
 - **Radeon 8060S** (max power (80 W), ASUS ROG Flow Z13): prefill at 8k Ornith 2,244 tok/s (+75% / +199%), Swift 470.8 (+53% / +101%); decode after a 128k-token document Ornith 58.4 (+54% / +57%), Swift 23.8 (+46% / +105%).
 - **Prefill, R9700**: Ornith 35B-A3B reads a 2k-token prompt at **11,550 tok/s** (llama.cpp ROCm 4,014, Vulkan 3,551: WHIRL +188% / +225%) and a ~250k-token prompt at 2,664 tok/s (1,519 / 1,218: +75% / +119%). Swift 27B: 2,805 tok/s at 32k (+163% / +256%) and 1,715 at 128k (+139% / +208%).
