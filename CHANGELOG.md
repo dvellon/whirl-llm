@@ -3,7 +3,7 @@
 All notable changes to WHIRL are listed here. Versions follow `project(whirl VERSION ...)` in
 `CMakeLists.txt`.
 
-## 0.2.0 — {{RELEASE_DATE}}
+## 0.2.0 — 2026-10-17
 
 ### Highlights
 
