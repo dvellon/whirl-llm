@@ -2534,7 +2534,6 @@ int cmdDevices() {
     for (const hip::DeviceInfo& d : devs) {
         std::string tags;
         if (!haveKernels(d)) tags += "  [no GPU kernels for this architecture in this build]";
-        else if (hip::archFor(d.gcn_arch) == hip::Arch::gfx1151) tags += "  [supported: preview, untuned]";
         else tags += "  [supported]";
         if (d.integrated) tags += " [integrated: memory shared with the CPU]";
         if (d.index == def) tags += " [default]";

@@ -102,16 +102,7 @@ prompt, end of generation, `think-open`, a long system message, a prefix shared 
 which is why the reused count is a bit below the common prefix. Keep the start of the prompt stable:
 a system prompt with a changing timestamp or a reordered tool list forces a full prefill.
 
-**A real session** (Swift-1.5 27B MXFP4-A on the R9700, Hermes agent with 25 tools, sampling at
-temperature 0.6, default server options):
-
-| What | Measured |
-|---|---|
-| Context of a turn | ~31k tokens: 29,460 of 31,067 tokens reused from the prefix cache, 1,607 prefilled |
-| Time to first token | 0.89 s |
-| Decode, that turn | 78.6 tok/s (sampling, MTP + n-gram) |
-| Decode, another turn at ~29k context | 98 tok/s, peaking at 112 tok/s (MTP + n-gram drafts accepted well) |
-| 4 subagents at once | ~40–48 tok/s each, 180–195 tok/s aggregate |
+**A real session.** Current measurements of a multi-turn coding-agent session (Swift-1.5 27B MXFP4-A, both GPUs, against official llama.cpp) are in [benchmarks.md](benchmarks.md#agent-session).
 
 **Subagents.** Each subagent is its own conversation in its own slot. Subagents usually share the
 system prompt and tool definitions; a system message of ≥ 2048 tokens gets a shared `system`
@@ -124,14 +115,7 @@ cycle and, above 4 slots, one instead of two prefix checkpoints per slot.
 
 **Smooth main stream while subagents send long prompts: `--decode-min-tps`.** While other requests
 prefill long prompts, every streaming request is kept at ≥ N tok/s (default 20). Measured with one
-request streaming at a 25.7k-token context while three 16–19k-token prompts arrive (Swift 27B MXFP4-A):
-
-| `--decode-min-tps` | 0 (off) | 10 | **20 (default)** | 30 | 40 |
-|---|---|---|---|---|---|
-| Streaming request during their prefill, tok/s | 3.3 | 12.0 | **23.0** | 30.7 | 40.5 |
-| Its longest pause, s | 1.22 | 1.13 | **0.47** | 0.46 | 0.48 |
-| Mean TTFT of the 3 prompts, s | 17.8 | 19.3 | **18.6** | 21.3 | 29.0 |
-| Prefill throughput meanwhile, tok/s | 2791 | 2341 | **1862** | 1551 | 1137 |
+request streaming while other long prompts arrive. The measured trade-off (streaming speed, longest pause, TTFT of the other prompts, prefill throughput) for each value is in [server.md](guide/en/server.md#batching).
 
 Use `0` for batch jobs where only total throughput matters, a higher value (30–40) if you watch the
 main agent's stream and the subagents can wait. Outputs are identical for any value

@@ -334,7 +334,7 @@ DeltaNet 層只能從伺服器存過**檢查點**的位置接著跑（細節：[
 
 | 指令 | 用途 |
 |---|---|
-| `whirl devices` | 列出驅動程式回報的 AMD GPU（索引、名稱、架構、記憶體、運算單元）、這個建置有沒有該 GPU 的 kernel（Radeon 8060S 標為 *preview, untuned*）、是否為內顯，以及哪一張是預設。先用它確認驅動程式與 GPU |
+| `whirl devices` | 列出驅動程式回報的 AMD GPU（索引、名稱、架構、記憶體、運算單元）、這個建置有沒有該 GPU 的 kernel、是否為內顯，以及哪一張是預設。先用它確認驅動程式與 GPU |
 | `whirl selftest MODEL.gguf [--device SPEC]` | 用模型本身的權重做 GPU kernel 的逐位元自我檢查：int8 與 f32 GEMV 誤差、多 token GEMV == 單 token GEMV、prefill GEMM 在所有組態下不變、MoE token tile 不變、分組與逐 query 的 decode attention。印出 `selftest: ok` 或 FAIL（結束代碼 1） |
 | `whirl seqtest MODEL.gguf [--decode N] [--device SPEC]` | 在兩個提示上比對多請求（伺服器）路徑與單請求執行：分段 prefill、批次 decode 列、以固定草稿做批次驗證。每個 token 都必須相同；印出 `seqtest: ok` 或 FAIL（結束代碼 1）。`--decode N`：每個序列生成的 token 數（預設 24） |
 | `whirl vis-encode MMPROJ.gguf IMAGE [OUT.f32] [--reps N] [--mode auto\|resident\|stream]` | 診斷用：用視覺編碼器編碼一張圖並回報時間；`OUT.f32` 存投影後的 embedding；`--reps N` 重複編碼 N 次 |

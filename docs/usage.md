@@ -458,7 +458,7 @@ all of this; there is no shutdown endpoint.
 
 | Command | What it does |
 |---|---|
-| `whirl devices` | lists the AMD GPUs the driver reports (index, name, architecture, memory, compute units), whether this build has GPU kernels for each of them (the Radeon 8060S is marked *preview, untuned*), whether it is integrated, and which one is the default. Use it first to check the driver and the GPU |
+| `whirl devices` | lists the AMD GPUs the driver reports (index, name, architecture, memory, compute units), whether this build has GPU kernels for each of them, whether it is integrated, and which one is the default. Use it first to check the driver and the GPU |
 | `whirl selftest MODEL.gguf [--device SPEC]` | bitwise self-checks of the GPU kernels on the model's own weights: int8 vs f32 GEMV error, multi-token GEMV == one-token GEMV, prefill GEMM invariance over all configurations, MoE token-tile invariance, grouped vs per-query decode attention. Prints `selftest: ok` or FAIL (exit code 1) |
 | `whirl seqtest MODEL.gguf [--decode N] [--device SPEC]` | runs the multi-request (server) paths against single-request runs on two prompts: segmented prefill, batched decode rows, batched verify with literal drafts. Every token must match; prints `seqtest: ok` or FAIL (exit code 1). `--decode N`: tokens per sequence (default 24) |
 | `whirl vis-encode MMPROJ.gguf IMAGE [OUT.f32] [--reps N] [--mode auto\|resident\|stream]` | diagnostic: encodes one image with the vision encoder and reports the time; `OUT.f32` receives the projected embeddings; `--reps N` repeats the encode N times |
