@@ -1602,6 +1602,12 @@ int cmdBench(const Args& a) {
     q::Profile prof;
     const bool profiling = envGet("PROFILE").has_value();
     Timer timer;
+    // CLI-ATTN-GAP: the prefill runs on the server's / chat's forwards (serverForwardEnds: gfx1151 dense
+    // 2048 rows, WHIRL_PREFILL_CHUNK applies), as whirl chat and whirl-server run a prompt. It used to run
+    // max_batch (4096) row forwards, which on gfx1151 dense cost 13% at 128k (SRV-PP-DENSE), so bench
+    // under-reported chat / server prefill. WHIRL_BENCH_MAX_BATCH=1: the old max_batch forwards.
+    const bool bench_max_batch = envFlag("BENCH_MAX_BATCH", false);
+    out(fmt("  prefill forwards: %s\n", bench_max_batch ? "max_batch rows (WHIRL_BENCH_MAX_BATCH=1)" : "the server's schedule (as whirl chat / whirl-server)"));
     for (u32 s : sizes) {
         if (s > long_ids.size()) continue;
         const std::span<const u32> pr(long_ids.data(), s);
@@ -1614,14 +1620,18 @@ int cmdBench(const Args& a) {
                 model.prof = rep == reps ? &prof : nullptr;
             }
             timer.begin();
-            std::size_t off = 0;
-            while (off < pr.size()) {
-                const std::size_t n = std::min<std::size_t>(pr.size() - off, model.max_batch);
-                if (has_mtp)
-                    model.prefillMtpChunk(pr, 0, off, n, std::nullopt);
-                else
-                    model.forward(pr.subspan(off, n), static_cast<u32>(off));
-                off += n;
+            if (bench_max_batch) {
+                std::size_t off = 0;
+                while (off < pr.size()) {
+                    const std::size_t n = std::min<std::size_t>(pr.size() - off, model.max_batch);
+                    if (has_mtp)
+                        model.prefillMtpChunk(pr, 0, off, n, std::nullopt);
+                    else
+                        model.forward(pr.subspan(off, n), static_cast<u32>(off));
+                    off += n;
+                }
+            } else {
+                prefillLikeServer(model, tok, pr, has_mtp);
             }
             (void)model.beginDecode(s);
             const double ms = timer.end();
