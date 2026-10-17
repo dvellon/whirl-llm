@@ -1,0 +1,2 @@
+# benchmark inputs are kept byte-for-byte as measured (the coding-chat prompt has CRLF line ends)
+*.txt -text
