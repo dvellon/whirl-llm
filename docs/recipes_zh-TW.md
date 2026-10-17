@@ -92,7 +92,8 @@ pinned RAM，在圖片到來前不佔 VRAM，見[第 5 節](#images)）。
 系統訊息、和其他工作階段共用的前綴）——所以重用的 token 數會比共同前綴少一點。讓提示詞開頭保持不變：
 系統提示詞裡放會變的時間戳記，或工具清單換了順序，都會迫使整段重新 prefill。
 
-**一次真實工作階段。** 多輪寫程式 agent 工作階段的最新量測（Swift-1.5 27B MXFP4-A，兩張卡，對照原廠 llama.cpp）見 [benchmarks](guide/zh-TW/benchmarks.md#agent-session)。
+**一次真實工作階段。** 多輪寫程式 agent 工作階段的最新量測（Swift-1.5 27B MXFP4-A，兩張卡，對照原廠 llama.cpp）
+見 [benchmarks.md 第 6 節](guide/zh-TW/benchmarks.md#agent-session)。
 
 **子 agent。** 每個子 agent 是獨立的對話，佔一個 slot。子 agent 通常共用系統提示詞和工具定義；≥ 2048 token
 的系統訊息會得到共用的 `system` 檢查點，多個工作階段共有的前綴會得到共用的 `prefix` 檢查點，所以新的子 agent
@@ -101,7 +102,8 @@ pinned RAM，在圖片到來前不佔 VRAM，見[第 5 節](#images)）。
 分到的草稿越少，而且超過 4 個 slot 時每個 slot 的前綴檢查點從 2 個變 1 個。
 
 **子 agent 送長提示詞時讓主串流保持順暢：`--decode-min-tps`。** 其他請求在 prefill 長提示詞時，每個串流中的
-請求都保持 ≥ N tok/s（預設 20）。各設定值的實測取捨（串流速度、最長停頓、其他提示詞的首 token 時間、prefill 吞吐量）見 [server.md](guide/zh-TW/server.md#batching)。
+請求都保持 ≥ N tok/s（預設 20）。各設定值的實測取捨（一個請求串流時來了三個長的子 agent 提示詞；
+串流速度、最長停頓、其他提示詞的首 token 時間、prefill 吞吐量）見 [server.md 第 6 節](guide/zh-TW/server.md#batching)。
 
 只在意總吞吐量的批次工作用 `0`；如果你盯著主 agent 的串流、子 agent 可以等，就用較高的值（30–40）。任何值的
 輸出都相同（[server.md](guide/zh-TW/server.md#batching)）。

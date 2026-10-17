@@ -102,7 +102,8 @@ prompt, end of generation, `think-open`, a long system message, a prefix shared 
 which is why the reused count is a bit below the common prefix. Keep the start of the prompt stable:
 a system prompt with a changing timestamp or a reordered tool list forces a full prefill.
 
-**A real session.** Current measurements of a multi-turn coding-agent session (Swift-1.5 27B MXFP4-A, both GPUs, against official llama.cpp) are in [benchmarks.md](benchmarks.md#agent-session).
+**A real session.** Current measurements of a multi-turn coding-agent session (Swift-1.5 27B
+MXFP4-A, both GPUs, against official llama.cpp) are in [benchmarks.md §6](benchmarks.md#agent-session).
 
 **Subagents.** Each subagent is its own conversation in its own slot. Subagents usually share the
 system prompt and tool definitions; a system message of ≥ 2048 tokens gets a shared `system`
@@ -114,8 +115,10 @@ the main agent plus 4 or more subagents at the same time. More slots means fewer
 cycle and, above 4 slots, one instead of two prefix checkpoints per slot.
 
 **Smooth main stream while subagents send long prompts: `--decode-min-tps`.** While other requests
-prefill long prompts, every streaming request is kept at ≥ N tok/s (default 20). Measured with one
-request streaming while other long prompts arrive. The measured trade-off (streaming speed, longest pause, TTFT of the other prompts, prefill throughput) for each value is in [server.md](guide/en/server.md#batching).
+prefill long prompts, every streaming request is kept at ≥ N tok/s (default 20). The measured
+trade-off for each value, with one request streaming while three long subagent prompts arrive
+(streaming speed, longest pause, TTFT of the other prompts, prefill throughput), is in
+[server.md §6](guide/en/server.md#batching).
 
 Use `0` for batch jobs where only total throughput matters, a higher value (30–40) if you watch the
 main agent's stream and the subagents can wait. Outputs are identical for any value
