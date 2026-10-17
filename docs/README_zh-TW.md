@@ -59,11 +59,11 @@ WHIRL 0.2.0 預設模式（balance）對 ggml-org 官方 llama.cpp **b11214**，
 - **Decode，文件問答**：每個長度問同一個問題（說明文件開頭附近引用的一個函式，並寫出修正版，256 token）。部分回答可以照抄提示裡的程式碼，這對每個使用投機草稿的引擎都有幫助。
 - **Decode，寫程式對話（全新撰寫）**：一個寫程式問題，回答（說明與程式碼）全部是新寫的，提示裡沒有可照抄的內容，對投機草稿是困難的情況。512 token。
 - **各引擎怎麼解碼**：WHIRL 用自己的 MTP（+ n-gram）草稿。llama.cpp 在 Swift 27B 用 MTP + n-gram（`--spec-type draft-mtp,ngram-mod`），是它在這個模型上最快的模式；在 Ornith **不用**投機解碼，因為我們量到它的 MTP 在這個 MoE 模型上比一般解碼慢。所以 Ornith 的 decode 列是兩邊**各自出廠設定**的對比，不是同條件對比。
-- R9700 每格都是單次量測，差距小於約 5% 視為雜訊。三種 WHIRL 模式的完整表格：[效能](#效能)。
+- R9700 每格都是單次量測（WHIRL 的寫程式對話除外：3 次中位數），差距小於約 5% 視為雜訊。三種 WHIRL 模式的完整表格：[效能](#效能)。
 
 ### 真實的 coding agent 工作階段
 
-Swift 27B，WHIRL balance。一段工作階段＝約 20k token 的系統＋工具提示（coding agent 指示加上 skills／MCP 工具手冊）、一次 `read_file` 工具呼叫回傳約 3.6k token 的 C++ 原始檔，接著四輪使用者提問（說明這個檔案、找出最複雜的函式、改寫該函式、審查使用者送來的修改版），每次呼叫都重送完整歷史，每個回答最多 384 token。測試資料在 repo 裡（[benchmarks.md §5](guide/zh-TW/benchmarks.md#agent-session)）。
+Swift 27B，WHIRL balance。一段工作階段＝約 20k token 的系統＋工具提示（coding agent 指示加上 skills／MCP 工具手冊）、一次 `read_file` 工具呼叫回傳約 3.6k token 的 C++ 原始檔，接著四輪使用者提問（說明這個檔案、找出最複雜的函式、改寫該函式、審查使用者送來的修改版），每次呼叫都重送完整歷史，每個回答最多 384 token。測試資料在 repo 裡（[benchmarks.md §6](guide/zh-TW/benchmarks.md#agent-session)）。
 
 **R9700：**
 
@@ -335,12 +335,14 @@ Ryzen AI Max+ 395。WHIRL 每格單次量測（2026-10-17）；llama.cpp 為 1 �
 | R9700 · Ornith 35B-A3B | 191.2 | **241.5** | 219.0 | 118.9 (一般解碼) | 115.1 (一般解碼) | +103% | +110% |
 | 8060S · Swift 27B | 36.3 | **34.2** | 42.1 | 27.6 (MTP+n-gram) | 28.3 (MTP+n-gram) | +24% | +21% |
 | 8060S · Ornith 35B-A3B | 94.5 | **106.0** | 102.8 | 70.6 (一般解碼) | 72.9 (一般解碼) | +50% | +45% |
+
+8060S 寫程式對話：WHIRL 每個模式單次量測。草稿被接受多少取決於各模式寫出的文字，所以這次 Swift 27B 的 precise（36.3）高於 balance（34.2）。
 <!-- /gen -->
 
 ### WHIRL 領先不多的地方
 
 <!-- gen:small.zh -->
-- **領先最少：8060S 短上下文的稠密模型 decode。** Swift 27B 在 2k token 文件之後：31.2 對 llama.cpp Vulkan 25.1 tok/s（+24%）；31.2 對 llama.cpp ROCm 24.4 tok/s（+28%）。那裡的稠密 decode 受記憶體頻寬限制，領先來自投機解碼。
+- **領先最少：8060S 的稠密模型 decode。** Swift 27B 寫程式對話（全新撰寫）：34.2 對 llama.cpp Vulkan 28.3 tok/s（+21%），對 ROCm 27.6（+24%）；2k token 文件之後：31.2 對 llama.cpp Vulkan 25.1 tok/s（+24%）；31.2 對 llama.cpp ROCm 24.4 tok/s（+28%）。那裡的稠密 decode 受記憶體頻寬限制，領先來自投機解碼。
 <!-- /gen -->
 - **Ornith 的 decode 是各自出廠設定的對比**：WHIRL 用 MTP 草稿，llama.cpp 不用投機解碼（它的 MTP 在這個模型上較慢）。
 - **不用投機的一般解碼**在每個引擎都受記憶體頻寬限制；WHIRL 大部分的 decode 領先來自 MTP + n-gram 投機解碼。

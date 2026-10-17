@@ -3,7 +3,7 @@
 # Kernels
 
 > **Status.** Every kernel family below is in `kernels/*.hip` for gfx1201 (R9700); the gfx1151
-> (8060S) set is in `kernels/gfx1151/` (preview, untuned; see [3.2](#gfx1151)). Numbers are R9700 (gfx1201) unless marked 8060S (gfx1151; those come
+> (8060S) set is in `kernels/gfx1151/` (supported and tuned since 0.2.0; see [3.2](#gfx1151)). Numbers are R9700 (gfx1201) unless marked 8060S (gfx1151; those come
 > from the research build). "Bit-exact" always means identical output bits, verified by a permanent
 > check, not "within tolerance".
 

@@ -105,8 +105,7 @@ pinned RAM，在圖片到來前不佔 VRAM，見[第 5 節](#images)）。
 
 **子 agent。** 每個子 agent 是獨立的對話，佔一個 slot。子 agent 通常共用系統提示詞和工具定義；≥ 2048 token
 的系統訊息會得到共用的 `system` 檢查點，多個工作階段共有的前綴會得到共用的 `prefix` 檢查點，所以新的子 agent
-能跳過這段 prefill（新對話重用 26k token 的系統提示詞：這個模型 TTFT 0.12 s，
-[benchmarks.md](guide/zh-TW/benchmarks.md#8-冷-prefill快取前綴與-kv-還原ttft)）。同時超過 4 個請求時，其餘的會排隊；
+能跳過這段 prefill（[kv-and-caching.md 第 6 節](guide/zh-TW/kv-and-caching.md#system-ckpt)）。同時超過 4 個請求時，其餘的會排隊；
 如果主 agent 加上 4 個以上子 agent 會同時跑，就把 `-np` 調高（最多 16）。slot 越多，每個 slot 每個 cycle
 分到的草稿越少，而且超過 4 個 slot 時每個 slot 的前綴檢查點從 2 個變 1 個。
 
@@ -125,10 +124,11 @@ pinned RAM，在圖片到來前不佔 VRAM，見[第 5 節](#images)）。
 輸出都相同（[server.md](guide/zh-TW/server.md#batching)）。
 
 **RAM 層大小。** 閒置的工作階段會複製到 pinned RAM（再從那裡寫到 SSD），被擠出 VRAM 的工作階段、或重啟前的
-工作階段就能直接還原，不必重新 prefill。RAM 層預設大小：從 v0.1.2 起約為系統 RAM 的 1/4（8–32 GB）；v0.1.1
-約 9 GB——用 `--kv-ram-mb` 自行指定。一筆項目約每 256 token 13 MiB（q8v KV，dense 模型的預設；f16 為 17 MiB），
-再加每個 DeltaNet 檢查點約 150 MiB（啟動時的 `kv tier:` 行會印出你的模型的這兩個數字），所以 30k token 的
-工作階段約 1.8–2.6 GiB。給 RAM 層足夠容納你常切換的那幾個工作階段；`--kv-ram-mb 0` 會同時關閉兩個主機層。
+工作階段就能直接還原，不必重新 prefill。RAM 層預設大小：R9700 主機約為系統 RAM 的 1/4（8–32 GB），Radeon 8060S
+為作業系統可見 RAM 的 1/8（上限 16 GiB，低於 32 GB 則關閉）——用 `--kv-ram-mb` 自行指定（[usage.md](guide/zh-TW/usage.md)）。
+27B dense 模型一筆項目約每 256 token 9 MiB（q8h KV，balance；precise 的 f16 KV 為 17 MiB），再加每個 DeltaNet
+檢查點約 150 MiB（啟動時的 `kv tier:` 行會印出你的模型的這兩個數字）。給 RAM 層足夠容納你常切換的那幾個工作階段；
+`--kv-ram-mb 0` 會同時關閉兩個主機層。
 
 ```powershell
 .\whirl-server.exe $model --alias swift-27b --kv-ram-mb 16384 --kv-ssd-gb 128   # 加大分層
@@ -138,7 +138,7 @@ pinned RAM，在圖片到來前不佔 VRAM，見[第 5 節](#images)）。
 項目會寫出（最多 10 秒；log 顯示 `shutdown: tier writes done …`）。再按一次 Ctrl+C 或 `taskkill /F` 會跳過這步；
 關閉主控台視窗也會正常停止，但 Windows 約 5 秒後就會結束行程。用**相同的模型、執行檔和影響數值的選項**
 （KV 格式、MTP 開關）再次啟動：啟動時會掃描 SSD 索引，最近工作階段的下一回合會被還原（log 為
-`kv tier: restoring … from SSD`）——這個模型 25.7k token 的工作階段 TTFT 0.73 s。不同建置或不同數值設定寫入的
+`kv tier: restoring … from SSD`），不必重新 prefill。不同建置或不同數值設定寫入的
 項目會被忽略。
 
 ## <a id="long-context"></a>3. 長上下文（最多 256k token）
@@ -149,18 +149,20 @@ pinned RAM，在圖片到來前不佔 VRAM，見[第 5 節](#images)）。
 
 - `--ctx-per-slot` 是單一請求的最長上下文（預設 131,072，最大 262,144）。只有一個使用者時，`-np 1` 把整個
   KV 池留給他。
-- KV 格式自動選擇，啟動時會連同原因印出。dense 模型取 **f16 → q8v → q8h** 中第一個放得下所需池大小的：
-  `-np 1` 搭預設上下文得到 f16，預設 4 個 slot 得到 q8v，`--ctx-per-slot 262144` 得到 q8h。在我們的成對 QA
-  （350 題，上下文最長 70k）中，沒有任何格式和 f16 有可量測的差異
-  （[kv-and-caching.md](guide/zh-TW/kv-and-caching.md#formats)）。要強制指定，啟動前設 `$env:WHIRL_KV = "q8v"`
-  （或 `f16`、`q8`、`q8h`）。
-- MoE 模型（Ornith-1.5-35B-A3B）一律用 f16 KV，每 token 22 KiB（27B dense 模型 f16 為 68 KiB），所以預設池就有
-  約 414k token，長上下文的 decode 也快得多（16k token 之後 301.5 對 69.5 tok/s，
-  [benchmarks.md](guide/zh-TW/benchmarks.md#6-16k-token-context-之後的-decode)）。
+- KV 格式依模式與模型類型固定，不隨上下文長度或 slot 數改變，啟動時會印出
+  （[usage.md 數值模式](guide/zh-TW/usage.md#modes)）：27B dense 模型 precise 用 f16、balance（預設）用 q8h
+  （int8，q / k 先做 Hadamard 旋轉）、fast 用 q4（Radeon 8060S 上 fast 的 dense 模型維持 q8h）；MoE 模型
+  precise 與 balance 用 f16、fast 用 q4。WHIRL 絕不自行改用更低精度的格式：放不下時，沒指定就降低上下文並警告，
+  有指定 `--ctx-per-slot` 就停止（結束代碼 5）。所以 32 GB 卡上 27B 要 `--ctx-per-slot 262144` 需用 balance 或
+  fast（precise 的 f16 池約可放 190k token）。在我們的成對 QA（350 題，上下文最長 70k）中，int8 格式和 f16
+  沒有可量測的差異（[kv-and-caching.md](guide/zh-TW/kv-and-caching.md#formats)）。`$env:WHIRL_KV`
+  （`f16`、`q8`、`q8h`、`q8v`、`q4`）只供除錯時強制指定格式。
+- MoE 模型（Ornith-1.5-35B-A3B）的 f16 KV 每 token 22 KiB（27B dense 模型 f16 為 68 KiB、q8h 為 36.1 KiB），
+  所以池能放的 token 多得多，長上下文的 decode 也快得多（balance、R9700、128k token 文件：131.3 對 Swift 27B
+  的 53.9 tok/s，[benchmarks.md](guide/zh-TW/benchmarks.md#4-radeon-ai-pro-r9700)）。
 - 冷的長提示詞需要時間：balance 模式下 Swift 27B MXFP4-A prefill 32k token 約 2,800 tok/s（約 12 秒），
   約 250k token 的提示約 1,150 tok/s（約 3.6 分鐘）（[benchmarks.md](guide/zh-TW/benchmarks.md)）。之後的回合靠前綴快取與分層就很快。
-- **VRAM。** 伺服器會把 KV 池開到填滿剩餘 VRAM，所以行程永遠顯示約 30–31 GiB 專用記憶體
-  （[benchmarks.md 第 9 節](guide/zh-TW/benchmarks.md#9-vram)）——這是預期行為，不是洩漏。要把 VRAM 留給其他程式，
+- **VRAM。** 伺服器會把 KV 池開到填滿剩餘 VRAM，所以行程永遠顯示幾乎用滿整張卡的專用記憶體——這是預期行為，不是洩漏。要把 VRAM 留給其他程式，
   用 `-c N`（token 數）限制池大小。工作管理員裡 8–16 GiB 的「共用 GPU 記憶體」是 pinned RAM 層，不是溢出的 VRAM。
 
 ## <a id="multi-user"></a>4. 多使用者或多 slot
@@ -172,9 +174,8 @@ pinned RAM，在圖片到來前不佔 VRAM，見[第 5 節](#images)）。
 - `-np N`（1–16，預設 4）是同時服務的請求數；更多的會排隊（log 裡的 `queued (…)`）。所有 slot 共用一個 KV 池：
   slot 隨上下文變長取用頁面，池滿時最久沒用的*閒置* slot 會被逐出——先溢出到 RAM／SSD 層，所以那位使用者
   回來時會被還原。
-- 4 個並行使用者的合計吞吐量（約 1.1k token 提示詞、每個生成 256 token、含 prefill）：Swift 27B MXFP4-A
-  **198.6 tok/s**、Ornith MoE MXFP4 **396.7 tok/s**
-  （[benchmarks.md 第 7 節](guide/zh-TW/benchmarks.md#7-server-併發)）。每個並行輸出都和同一請求單獨執行時相同。
+- 4 個並行使用者的合計吞吐量（Swift 27B MXFP4、約 1.1k token 提示詞、每個生成 256 token、含 prefill）：
+  **190.3–190.7 tok/s**（[server.md 第 6 節](guide/zh-TW/server.md#batching)）。每個並行輸出都和同一請求單獨執行時相同。
 - 推測解碼的草稿和使用者在同一次驗證中競爭，所以同時 decode 的使用者越多，每人的加速越少；到 16 個使用者時
   MTP 已經沒有幫助。
 - `--host 0.0.0.0` 會在所有網路上聆聽且沒有驗證：只在你信任的網路上使用（Windows 防火牆可能會詢問一次）。
@@ -201,8 +202,7 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -Conten
 
 - 永遠不會去抓 `http(s)` 圖片 URL。本機路徑／`file://` URL 只有加 `--allow-local-images` 才接受。
 - 成本：編碼器權重放在 pinned RAM（約 0.9 GiB），圖片到來前不佔 VRAM。預設的 27B 設定 VRAM 很緊，所以每張圖
-  會串流權重：在我們的 USB4 eGPU 上每張約 0.26–0.29 s，第一次編碼 0.30–0.54 s
-  （[benchmarks.md 第 10 節](guide/zh-TW/benchmarks.md#10-visionswift-mxfp4-a-搭配-f16-mmproj)）。連續
+  會串流權重：在我們的 USB4 eGPU 上每張約 260 ms 的權重傳輸，視系統而定（[vision.md](guide/zh-TW/vision.md)）。連續
   `--vis-idle-s`（預設 60）秒沒有圖片就會釋放編碼器。
 - 同一張圖再出現（之後的回合或其他請求）不會重新編碼：embedding 依內容雜湊快取（`--vis-cache-mb`，預設 1024），
   前綴快取也會重用圖片之後的 KV。
@@ -259,7 +259,7 @@ I kv tier | RAM 6.10 / 9.00 GiB in 4 entries, SSD 12.40 GiB in 9 entries | spill
 | 結束代碼 **2** | 命令列錯誤（未知選項、缺模型路徑、`--host` 不是這台電腦的位址）：`.\whirl-server.exe --help` |
 | 結束代碼 **3** | GPU／驅動問題：安裝 AMD Software: Adrenalin Edition 26.8.1 或更新版；用 `.\whirl.exe devices` 檢查 |
 | 結束代碼 **4** | 模型檔問題：檔案不存在、不是 GGUF、架構不是 `qwen35`／`qwen35moe`、不支援的 tensor 型別、下載不完整 |
-| 結束代碼 **5**（GPU 記憶體不足） | 關掉其他使用 GPU 的程式（兩個大型 GPU 行程會讓 Windows 把兩者都移到慢速共用記憶體）；用 `-c 131072` 限制池大小；縮短 `--ctx-per-slot`；減少 slot（`-np 2`）；`$env:WHIRL_KV = "q8v"`（或 `q8h`） |
+| 結束代碼 **5**（GPU 記憶體不足） | 關掉其他使用 GPU 的程式（兩個大型 GPU 行程會讓 Windows 把兩者都移到慢速共用記憶體）；用 `-c 131072` 限制池大小；縮短 `--ctx-per-slot`；減少 slot（`-np 2`）；dense 模型改用 balance 而不是 `--precise`（int8 KV 取代 f16 KV） |
 | 結束代碼 **6**（連接埠被佔用） | 另一個程式在聽那個連接埠；改用 `--port 8081`，或用 `Get-Process -Id (Get-NetTCPConnection -LocalPort 8080).OwningProcess` 找出是誰 |
 | 用戶端說「找不到模型」或列表是空的 | 用 `/v1` base URL、OpenAI 相容供應者類型，模型 id 填 `--alias` |
 | 用戶端太早截斷長對話 | 它不知道上下文長度：把 `--ctx-per-slot`（預設 131072）填進它的 context window |

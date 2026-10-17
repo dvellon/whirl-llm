@@ -3,8 +3,8 @@
 # Architecture
 
 > **Status (WHIRL 0.1.0).** This document describes the design as implemented in this repository:
-> C++20 host code and HIP C++ device code for the R9700 (gfx1201) and, as a preview (correct, not yet
-> tuned), the Radeon 8060S (gfx1151). Some measurements were taken with the research build that preceded the C++ engine; the
+> C++20 host code and HIP C++ device code for the R9700 (gfx1201) and, supported and tuned since 0.2.0,
+> the Radeon 8060S (gfx1151). Some measurements were taken with the research build that preceded the C++ engine; the
 > C++ engine reproduces its outputs token for token ([benchmarking.md](benchmarking.md#gates)).
 
 **Who this helps:** anyone deciding whether a model-specific, GPU-specific engine is worth
@@ -38,7 +38,7 @@ generic fallback path that would silently run slower or produce different numeri
 | GPU | ISA | Role | Measured limits (our probes, not spec sheets) |
 |---|---|---|---|
 | AMD Radeon AI PRO R9700 (RDNA 4, Navi 48) | gfx1201 | primary target | 32 GB GDDR6, 256-bit, 640 GB/s spec; GEMV streaming 604–626 GB/s; WMMA f16→f32 180–184 TFLOPS; WMMA iu8 343–374 TOPS |
-| AMD Radeon 8060S (Ryzen AI Max, RDNA 3.5) | gfx1151 | secondary target (preview, untuned) | unified memory; streaming read 238 GB/s; WMMA f16 43 TFLOPS; WMMA int8 45 TOPS (same rate as f16) |
+| AMD Radeon 8060S (Ryzen AI Max, RDNA 3.5) | gfx1151 | second target (supported and tuned since 0.2.0) | unified memory; streaming read 238 GB/s; WMMA f16 43 TFLOPS; WMMA int8 45 TOPS (same rate as f16) |
 
 The development R9700 is attached as a **USB4 eGPU**. Its host link measures
 3.78–3.81 GB/s (D2H) and 3.84–3.86 GB/s (H2D). Everything that moves data between host and

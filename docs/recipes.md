@@ -116,8 +116,8 @@ temperature 0.6, default server options):
 **Subagents.** Each subagent is its own conversation in its own slot. Subagents usually share the
 system prompt and tool definitions; a system message of ≥ 2048 tokens gets a shared `system`
 checkpoint and prefixes common to several sessions get a shared `prefix` checkpoint, so a new
-subagent skips that part of the prefill (a new conversation reusing a 26k-token system prompt:
-0.12 s TTFT on this model, [benchmarks.md](benchmarks.md#8-cold-prefill-cached-prefixes-and-kv-restore-ttft)).
+subagent skips that part of the prefill
+([kv-and-caching.md §6](guide/en/kv-and-caching.md#system-ckpt)).
 With more than 4 concurrent requests, the rest wait in a queue; raise `-np` (up to 16) if you run
 the main agent plus 4 or more subagents at the same time. More slots means fewer drafts per slot per
 cycle and, above 4 slots, one instead of two prefix checkpoints per slot.
@@ -139,11 +139,12 @@ main agent's stream and the subagents can wait. Outputs are identical for any va
 
 **RAM tier sizing.** Idle sessions are copied to pinned RAM (and from there to the SSD) so that a
 session pushed out of VRAM, or a session from before a restart, is restored instead of prefilled
-again. The default RAM tier is about 1/4 of system RAM (8–32 GB) from v0.1.2; v0.1.1 uses ~9 GB — set
-`--kv-ram-mb` to override. One entry costs about 13 MiB per 256 tokens (q8v KV, the dense default;
-17 MiB with f16) plus ~150 MiB per DeltaNet checkpoint (the startup `kv tier:` line prints both for
-your model), so a 30k-token session is roughly 1.8–2.6 GiB. Give the tier enough for the sessions you
-switch between; `--kv-ram-mb 0` turns both host tiers off.
+again. The default RAM tier is about 1/4 of system RAM (8–32 GB) on an R9700 host and 1/8 of the
+OS-visible RAM on the Radeon 8060S (at most 16 GiB, off under 32 GB) — set `--kv-ram-mb` to override
+([usage.md](usage.md)). For the dense 27B model one entry costs about 9 MiB per 256 tokens with q8h KV
+(balance; 17 MiB with f16 KV in precise) plus ~150 MiB per DeltaNet checkpoint (the startup `kv tier:`
+line prints both for your model). Give the tier enough for the sessions you switch between;
+`--kv-ram-mb 0` turns both host tiers off.
 
 ```powershell
 .\whirl-server.exe $model --alias swift-27b --kv-ram-mb 16384 --kv-ssd-gb 128   # bigger tiers
@@ -154,8 +155,7 @@ running ones finish, and every RAM-tier entry that is not on the SSD yet is writ
 the log says `shutdown: tier writes done …`). A second Ctrl+C or `taskkill /F` skips this; closing
 the console window also stops gracefully, but Windows ends the process after about 5 s. Start the server again with **the same model, executable and options that
 affect numerics** (KV format, MTP on/off): the SSD index is scanned at startup and the next turn of a
-recent session is restored (`kv tier: restoring … from SSD`) — 0.73 s TTFT for a 25.7k-token session
-on this model. Entries written by a different build or numerical configuration are ignored.
+recent session is restored (`kv tier: restoring … from SSD`) instead of being prefilled again. Entries written by a different build or numerical configuration are ignored.
 
 ## <a id="long-context"></a>3. Long context (up to 256k tokens)
 
@@ -165,20 +165,26 @@ on this model. Entries written by a different build or numerical configuration a
 
 - `--ctx-per-slot` is the longest single request (default 131,072, maximum 262,144). With one user,
   `-np 1` leaves the whole KV pool to that user.
-- The KV format is chosen automatically and printed at startup with its reason. Dense models use the
-  first of **f16 → q8v → q8h** whose required pool fits: `-np 1` at the default context gets f16, the
-  default 4 slots get q8v, `--ctx-per-slot 262144` gets q8h. In our paired QA (350 items, up to 70k
-  contexts) no format differed measurably from f16
-  ([kv-and-caching.md](guide/en/kv-and-caching.md#formats)). Force one with `$env:WHIRL_KV = "q8v"`
-  (or `f16`, `q8`, `q8h`) before starting the server.
-- The MoE model (Ornith-1.5-35B-A3B) always uses f16 KV at 22 KiB per token (the 27B dense model:
-  68 KiB in f16), so its default pool already holds ~414k tokens, and it decodes far faster at long
-  context (301.5 vs 69.5 tok/s after 16k tokens, [benchmarks.md](benchmarks.md#6-decode-after-a-16k-token-context)).
+- The KV format is fixed by the mode and the model type, the same for every context and slot count,
+  and printed at startup ([usage.md, numerics modes](usage.md#modes)): the dense 27B uses f16 in
+  precise, q8h (int8, Hadamard-rotated q / k) in balance, the default, and q4 in fast (on the Radeon
+  8060S fast keeps q8h for the dense model); the MoE model uses f16 in precise and balance and q4 in
+  fast. WHIRL never switches to a lower-precision format by itself: if the format cannot hold the
+  context, the context is lowered with a warning, or the server stops (exit code 5) when you gave
+  `--ctx-per-slot`. For the 27B on a 32 GB card, `--ctx-per-slot 262144` therefore needs balance or
+  fast (the precise f16 pool holds about 190k tokens). In our paired QA (350 items, up to 70k
+  contexts) no int8 format differed measurably from f16
+  ([kv-and-caching.md](guide/en/kv-and-caching.md#formats)). `$env:WHIRL_KV` (`f16`, `q8`, `q8h`,
+  `q8v`, `q4`) forces a format for debugging only.
+- The MoE model (Ornith-1.5-35B-A3B) needs 22 KiB of f16 KV per token (the 27B dense model: 68 KiB in
+  f16, 36.1 KiB in q8h), so its pool holds far more tokens, and it decodes far faster at long context
+  (balance, 128k-token document on the R9700: 131.3 vs 53.9 tok/s for Swift 27B,
+  [benchmarks.md](benchmarks.md#4-radeon-ai-pro-r9700)).
 - A cold long prompt takes time: Swift 27B MXFP4-A prefills 32k tokens at ~2,800 tok/s (~12 s) and
   the ~250k-token prompt at ~1,150 tok/s (about 3.6 minutes) in balance ([benchmarks.md](benchmarks.md)). After that, the prefix
   cache and tiers make follow-up turns fast.
-- **VRAM.** The server sizes its KV pool to fill the free VRAM, so the process always shows about
-  30–31 GiB dedicated ([benchmarks.md §9](benchmarks.md#9-vram)) — that is expected, not a leak. To
+- **VRAM.** The server sizes its KV pool to fill the free VRAM, so the process always shows almost
+  all of the card's dedicated memory in use — that is expected, not a leak. To
   leave VRAM for other programs, cap the pool with `-c N` (tokens). Task Manager's "shared GPU memory"
   of 8–16 GiB is the pinned RAM tier, not spilled VRAM.
 
@@ -192,10 +198,9 @@ on this model. Entries written by a different build or numerical configuration a
   (`queued (…)` in the log). All slots share one KV pool: a slot takes pages as its context grows, and
   when the pool is full the least recently used *idle* slot is evicted — spilled to the RAM / SSD
   tiers first, so it is restored when that user returns.
-- Aggregate throughput, 4 concurrent users (~1.1k-token prompts, 256 tokens each, prefill included):
-  Swift 27B MXFP4-A **198.6 tok/s**, Ornith MoE MXFP4 **396.7 tok/s**
-  ([benchmarks.md §7](benchmarks.md#7-server-concurrency)). Every concurrent output
-  equals the same request run alone.
+- Aggregate throughput, 4 concurrent users (Swift 27B MXFP4, ~1.1k-token prompts, 256 tokens each,
+  prefill included): **190.3–190.7 tok/s** ([server.md §6](guide/en/server.md#batching)).
+  Every concurrent output equals the same request run alone.
 - Speculative drafts compete with users inside one verify pass, so the gain per user shrinks as more
   users decode at once; at 16 users MTP no longer helps.
 - `--host 0.0.0.0` listens on every network with no authentication: use it only on a network you
@@ -223,8 +228,8 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -Conten
   `--allow-local-images`.
 - Cost: the encoder weights live in pinned RAM (~0.9 GiB) and nothing goes to VRAM until an image
   arrives. With the default 27B configuration VRAM is tight, so the weights are streamed per image:
-  about 0.26–0.29 s per image on our USB4 eGPU, 0.30–0.54 s for the first encode
-  ([benchmarks.md §10](benchmarks.md#10-vision-swift-mxfp4-a-with-mmproj-f16)). The encoder is
+  about 260 ms of weight transfer per image on our USB4 eGPU, depending on the system
+  ([vision.md](guide/en/vision.md)). The encoder is
   released after `--vis-idle-s` (default 60) seconds without images.
 - The same image again (in a later turn or another request) is not re-encoded: embeddings are cached
   by content hash (`--vis-cache-mb`, default 1024), and the prefix cache reuses the KV after it.
@@ -283,7 +288,7 @@ same numbers ([server.md](guide/en/server.md#logging)).
 | exit code **2** | bad command line (unknown option, missing model path, a `--host` that is not this computer's): `.\whirl-server.exe --help` |
 | exit code **3** | GPU / driver problem: install AMD Software: Adrenalin Edition 26.8.1 or newer; check `.\whirl.exe devices` |
 | exit code **4** | model file problem: file missing, not a GGUF, architecture not `qwen35` / `qwen35moe`, unsupported tensor type, truncated download |
-| exit code **5** (out of GPU memory) | close other programs using the GPU (two large GPU processes make Windows move both to slow shared memory); cap the pool with `-c 131072`; shorten `--ctx-per-slot`; use fewer slots (`-np 2`); `$env:WHIRL_KV = "q8v"` (or `q8h`) |
+| exit code **5** (out of GPU memory) | close other programs using the GPU (two large GPU processes make Windows move both to slow shared memory); cap the pool with `-c 131072`; shorten `--ctx-per-slot`; use fewer slots (`-np 2`); for the dense model, run balance instead of `--precise` (int8 instead of f16 KV) |
 | exit code **6** (port in use) | another program listens on that port; use `--port 8081`, or find it with `Get-Process -Id (Get-NetTCPConnection -LocalPort 8080).OwningProcess` |
 | client says "model not found" or lists nothing | use the `/v1` base URL, the OpenAI-compatible provider type, and the `--alias` as model id |
 | client cuts long conversations early | it does not know the context length: enter `--ctx-per-slot` (default 131072) as its context window |

@@ -3,7 +3,7 @@
 # 架構
 
 > **狀態（WHIRL 0.1.0）。** 本文件描述的是本儲存庫中已實作的設計：C++20 host 程式碼與 HIP C++ device 程式碼，
-> 目標為 R9700（gfx1201），以及預覽版（結果正確、尚未調校）的 Radeon 8060S（gfx1151）。部分數字是在 C++ 引擎之前的研究建置上量測的；
+> 目標為 R9700（gfx1201），以及自 0.2.0 起正式支援並已調校的 Radeon 8060S（gfx1151）。部分數字是在 C++ 引擎之前的研究建置上量測的；
 > C++ 引擎的輸出與其逐 token 相同（[benchmarking.md](benchmarking.md#gates)）。
 
 **對誰有幫助**：正在評估「針對特定模型、特定 GPU 的引擎」是否值得打造的人，以及想知道 WHIRL 各部分放在哪裡、為何長成這樣的人。
@@ -22,7 +22,7 @@ WHIRL **不是**「Qwen 引擎」。它一次加入一種模型架構，並針�
 | GPU | ISA | 角色 | 實測極限（我們自己的探測，非規格表） |
 |---|---|---|---|
 | AMD Radeon AI PRO R9700（RDNA 4，Navi 48） | gfx1201 | 主要目標 | 32 GB GDDR6，256-bit，規格 640 GB/s；GEMV 串流 604–626 GB/s；WMMA f16→f32 180–184 TFLOPS；WMMA iu8 343–374 TOPS |
-| AMD Radeon 8060S（Ryzen AI Max，RDNA 3.5） | gfx1151 | 次要目標（預覽、未調校） | 統一記憶體；串流讀取 238 GB/s；WMMA f16 43 TFLOPS；WMMA int8 45 TOPS（與 f16 同速率） |
+| AMD Radeon 8060S（Ryzen AI Max，RDNA 3.5） | gfx1151 | 第二目標（自 0.2.0 起正式支援並已調校） | 統一記憶體；串流讀取 238 GB/s；WMMA f16 43 TFLOPS；WMMA int8 45 TOPS（與 f16 同速率） |
 
 開發用的 R9700 是以 **USB4 eGPU** 連接。其主機連結實測為 3.78–3.81 GB/s（D2H）與 3.84–3.86 GB/s（H2D）。在這台機器上，所有在主機與 GPU 之間搬移資料的動作（載入、RAM/SSD KV 層、視覺權重串流）都受限於這條連結。多數使用者有直接的 PCIe 插槽，主機頻寬會高得多；我們在整份文件中把 eGPU 造成的效應標示為*環境限制*，且沒有為它們撰寫變通做法。
 

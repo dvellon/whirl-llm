@@ -59,11 +59,11 @@ What the rows measure (exact prompts and commands: [benchmarks.md](docs/benchmar
 - **Decode, document QA**: the same question at every length (explain one function quoted near the start of the document and write a corrected version, 256 tokens). Part of the answer can copy code from the prompt, which helps speculative drafts in every engine that uses them.
 - **Decode, coding chat (new text)**: a coding question whose answer (explanation and code) is all newly written, with nothing in the prompt to copy: a hard case for speculative drafts. 512 tokens.
 - **How each engine decodes**: WHIRL uses its MTP (+ n-gram) drafts. llama.cpp decodes Swift 27B with MTP + n-gram (`--spec-type draft-mtp,ngram-mod`), its fastest mode on this model. On Ornith it decodes **without** speculation, because its MTP was slower than plain decoding on this MoE model in our measurements; the Ornith decode rows therefore compare both engines **as shipped**, not like for like.
-- Every R9700 cell is a single run; treat differences under about 5% as noise. Full tables, with all three WHIRL modes: [Performance](#performance).
+- Every R9700 cell is a single run, except WHIRL's coding-chat cells (median of 3); treat differences under about 5% as noise. Full tables, with all three WHIRL modes: [Performance](#performance).
 
 ### A real coding-agent session
 
-Swift 27B, WHIRL balance. One session = a ~20k-token system + tools prompt (coding-agent instructions plus skills / MCP tool manuals), a `read_file` tool call that returns a ~3.6k-token C++ source file, then four user turns (explain the file, find its most complex function, rewrite that function, review an edited copy of the file), with the full history resent on every call, at most 384 tokens per answer. The fixture is in the repository ([benchmarks.md §5](docs/benchmarks.md#agent-session)).
+Swift 27B, WHIRL balance. One session = a ~20k-token system + tools prompt (coding-agent instructions plus skills / MCP tool manuals), a `read_file` tool call that returns a ~3.6k-token C++ source file, then four user turns (explain the file, find its most complex function, rewrite that function, review an edited copy of the file), with the full history resent on every call, at most 384 tokens per answer. The fixture is in the repository ([benchmarks.md §6](docs/benchmarks.md#agent-session)).
 
 **R9700:**
 
@@ -335,12 +335,14 @@ Ryzen AI Max+ 395. WHIRL one run per cell (2026-10-17); llama.cpp median of 1 to
 | R9700 · Ornith 35B-A3B | 191.2 | **241.5** | 219.0 | 118.9 (plain) | 115.1 (plain) | +103% | +110% |
 | 8060S · Swift 27B | 36.3 | **34.2** | 42.1 | 27.6 (MTP+n-gram) | 28.3 (MTP+n-gram) | +24% | +21% |
 | 8060S · Ornith 35B-A3B | 94.5 | **106.0** | 102.8 | 70.6 (plain) | 72.9 (plain) | +50% | +45% |
+
+8060S coding chat: one run per WHIRL mode. How many drafts are accepted depends on the text each mode writes, so in this run Swift 27B precise (36.3) came out above balance (34.2).
 <!-- /gen -->
 
 ### Where WHIRL does not lead by much
 
 <!-- gen:small.en -->
-- **Smallest lead: dense decode on the Radeon 8060S at short context.** Swift 27B after a 2k-token document: 31.2 vs 25.1 tok/s on llama.cpp Vulkan (+24%); 31.2 vs 24.4 tok/s on llama.cpp ROCm (+28%). Dense decode there is limited by memory bandwidth, and the lead comes from speculative decoding.
+- **Smallest leads: dense decode on the Radeon 8060S.** Swift 27B in the coding chat (new text): 34.2 vs 28.3 tok/s on llama.cpp Vulkan (+21%) and 34.2 vs 27.6 on ROCm (+24%); after a 2k-token document: 31.2 vs 25.1 tok/s on llama.cpp Vulkan (+24%); 31.2 vs 24.4 tok/s on llama.cpp ROCm (+28%). Dense decode there is limited by memory bandwidth, and the lead comes from speculative decoding.
 <!-- /gen -->
 - **Ornith decode is compared as shipped**: WHIRL with MTP drafts, llama.cpp without speculation (its MTP was slower on this model).
 - **Plain decoding without speculation** is memory-bandwidth bound in every engine; most of WHIRL's decode lead comes from MTP + n-gram speculative decoding.

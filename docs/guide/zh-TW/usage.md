@@ -52,13 +52,13 @@ K-quant 檔（混用多種 tensor 型別）會久一些。結果會快取起來�
 `WHIRL_MODE=precise|balance|fast`，命令列優先）。`chat`、`bench`、`selftest`、`seqtest` 與伺服器都適用，R9700 與 Radeon 8060S 都一樣。
 沒指定模式時跑 **balance**；`--precise` 與 `--fast` 需要明確指定（`--balance` 仍可用）。
 
-**KV 快取格式：依模式與模型類型固定**，每張卡（32 GB、16 GB、8060S）都一樣，`chat`、`bench` 與伺服器也一樣：
+**KV 快取格式：依模式與模型類型固定**，每張卡（32 GB、16 GB、8060S；fast 有一個例外，見表）都一樣，`chat`、`bench` 與伺服器也一樣：
 
 | 模式 | dense 模型 | MoE 模型 |
 |---|---|---|
 | precise | f16 | f16 |
 | balance（預設） | q8h（K、V 都是 int8，每 32 個值一個 f16 scale，q / k 先做 Hadamard 旋轉；在 128k 通過相對 f16 的 balance KL 門檻，KL-1） | f16 |
-| fast | q4 | q4 |
+| fast | q4（Radeon 8060S：q8h，在那裡 decode 比 q4 快） | q4 |
 
 格式不會因為放不放得下而切換：選定的格式放不下要求的 context 時，沒有指定 context 就降低 context 並發出警告；
 有指定（`--ctx`、`--ctx-per-slot`）就停止並說明（結束代碼 5）。絕不自行改用更低精度的格式。20 GiB 以下的卡只會預設一個伺服器 slot 並保留 VRAM 給桌面。
@@ -78,7 +78,7 @@ K-quant 檔（混用多種 tensor 型別）會久一些。結果會快取起來�
 | `gdnwmma` | balance | DeltaNet prefill 區塊用 f16 WMMA，取代 f32 區塊路徑 | MXFP4 模型，以及任何權重格式的 dense 模型（Q4_K_M、Q5_K、Q6_K、IQ4_XS 等；KG-1）；MoE 模型只限 MXFP4 | 略過（還沒有 kernel） |
 | `h16` | balance | FFN / DeltaNet 的 GEMM 輸出先存成 f16 再進逐元素運算 | MXFP4 模型，以及任何權重格式的 dense 模型（KG-1）；MoE 模型只限 MXFP4 | MXFP4 模型，只有 f16 權重 |
 | `kvq8` | balance | dense 模型一律用 q8h KV（不是 f16 放不下才換）；MoE 模型維持 f16 | dense 模型 | dense 模型 |
-| `kvq4` | fast | 4-bit KV（int4，每 32 個值一個 f16 scale，q / k 先做 Hadamard 旋轉）；8060S 的 decode attention 用 `attn_dq4` 讀取（約 180 GB/s）：Ornith-1.5-35B-A3B MXFP4 decode 128k 58.5 tok/s（f16 KV 32.7）、64k 67.0（46.4）；R9700（FAST-1c）Swift-1.5 27B 在 131k 的 decode：plain 30.98 tok/s（f16 KV 25.08）、MTP 68.79（63.12），128k prefill −1.9%；對 f16 的 KL 在 fast 門檻內 | dense 與 MoE | dense 與 MoE |
+| `kvq4` | fast | 4-bit KV（int4，每 32 個值一個 f16 scale，q / k 先做 Hadamard 旋轉）；8060S 的 decode attention 用 `attn_dq4` 讀取（約 180 GB/s）：Ornith-1.5-35B-A3B MXFP4 decode 128k 58.5 tok/s（f16 KV 32.7）、64k 67.0（46.4）；R9700（FAST-1c）Swift-1.5 27B 在 131k 的 decode：plain 30.98 tok/s（f16 KV 25.08）、MTP 68.79（63.12），128k prefill −1.9%；對 f16 的 KL 在 fast 門檻內 | dense 與 MoE | MoE（dense 模型在 fast 維持 q8h KV：那裡 decode 較快） |
 | `relaxacc` | fast | 寬鬆推測接受（只對 MTP draft；n-gram draft 維持精確接受）。放寬接受若會讓結尾的 6-gram 與最近 4096 個 token 內重複，就不接受（重複防護）。greedy：draft 不是驗證列的 argmax 時，只要它在該列前 `WHIRL_RELAX_K` 名（預設 4）且 p(draft) >= `WHIRL_RELAX_ALPHA` × p(argmax)（預設 0.1）就保留；最後一個保留的 draft 之後那個 token 一定是目標模型自己的 argmax。temperature > 0：typical acceptance（Medusa）：在請求過濾後的分布上 p(draft) >= min(`WHIRL_RELAX_EPS` 0.09, `WHIRL_RELAX_DELTA` 0.3 × exp(−熵)) 就保留（此時不用 `specsample`）。**會改變 greedy 輸出**：fast 的 greedy 不等於 plain greedy，MTP ≠ plain；同樣的 prompt、seed、設定仍是確定的（此時 draft 數量策略改用固定的合成週期成本，不看牆鐘時間；並發請求共用 draft 數量，可能互相影響輸出）。`WHIRL_RELAX=0` 關閉；MoE 模型略過（每輪只有一個 MTP draft，量不到收益；`WHIRL_RELAX=1` 強制開） | dense MTP 模型 | dense MTP 模型 |
 | `headq`、`moeskip`、`a8`、`a4` | fast | 低位元輸出頭、略過 MoE 專家、W4A8 / W4A4 prefill | 尚未實作 | 尚未實作 |
 | `q8dec` | balance、fast | decode / verify GEMV 的 activation 用 int8（每 32 個值一個 f32 scale，同 llama.cpp 的 q8_1；balance 與 fast 一律包含） | 開 | 開 |
@@ -192,7 +192,7 @@ whirl serve  MODEL.gguf [選項]      （同一支程式）
 | `--precise` / `--balance` / `--fast` / `--mode M` | 數值模式（預設 balance；`--precise`：f16 KV；f16 池放不下一個完整請求時，會降低每個請求的 context 並警告；若有指定 `--ctx` / `--ctx-per-slot` 則拒絕啟動）。見[數值模式](#modes) |
 | `--mtp-drafts N` | 每回合固定的 MTP 草稿數，1～10（預設：依模型類型由成本模型決定） |
 | `--decode-min-tps N` | decode 保底速度：其他請求在 prefill 時，每個串流中（decode 中）的請求至少維持 N tok/s；做法是縮短 prefill forward、穿插 decode cycle（預設 20；`0` = 關閉，prefill forward 不受限）。任何 N 的輸出都相同（[server.md](server.md#batching)） |
-| `--kv-ram-mb N` | 前綴快取的主記憶體層，單位 MiB 的 pinned 記憶體（預設：實體記憶體的 1/4，至少 8 GiB 或一個完整長度 session（若更大；27B 模型約 9 GiB），最多 32 GiB，且不超過啟動時可用記憶體的一半；64 GB 的電腦為 16 GiB；整合式 GPU（Radeon 8060S）：作業系統可見記憶體的 1/8，下限為一個最大 context 的條目（27B 模型在 262k 約 6 GiB），上限 16 GiB，且不超過啟動時可用記憶體的 1/4；作業系統可見記憶體低於 32 GB 則關閉（BIOS 的 VRAM 保留區不計；64 GB 的電腦為 8 GiB））。啟動日誌會印出選定的大小與原因。閒置 session 會複製到這裡，下次直接還原而不必重新 prefill。`0` 會關閉兩個 host 層。**Radeon 8060S**（內顯）：預設開啟，大小如上（KV pool 是 BIOS 保留區，主記憶體層是另外 pin 住的作業系統記憶體；128k 的 session 從 RAM 還原 0.3 s、從 SSD 還原 2 s，不必重新 prefill）；`--kv-ram-mb 0` 關閉兩個 host 層，`--kv-ssd-gb 0` / `--kv-ssd-mode off` 只關 SSD 層 |
+| `--kv-ram-mb N` | 前綴快取的主記憶體層，單位 MiB 的 pinned 記憶體（預設：實體記憶體的 1/4，至少 8 GiB 或一個完整長度 session（若更大；27B 模型約 9 GiB），最多 32 GiB，且不超過啟動時可用記憶體的一半；64 GB 的電腦為 16 GiB；整合式 GPU（Radeon 8060S）：作業系統可見記憶體的 1/8，下限為一個最大 context 的條目（27B 模型在 262k 約 6 GiB），上限 16 GiB，且不超過啟動時可用記憶體的 1/4；作業系統可見記憶體低於 32 GB 則關閉（BIOS 的 VRAM 保留區不計；64 GB 的電腦為 8 GiB））。啟動日誌會印出選定的大小與原因。閒置 session 會複製到這裡，下次直接還原而不必重新 prefill。`0` 會關閉兩個 host 層。**Radeon 8060S**（內顯）：預設開啟，大小如上（KV pool 是 BIOS 保留區，主記憶體層是另外 pin 住的作業系統記憶體；128k 的 session 從 RAM 或 SSD 還原，不必重新 prefill）；`--kv-ram-mb 0` 關閉兩個 host 層，`--kv-ssd-gb 0` / `--kv-ssd-mode off` 只關 SSD 層 |
 | `--kv-ssd-dir PATH` | SSD 層目錄（預設 `%LOCALAPPDATA%\whirl\kvcache`） |
 | `--kv-ssd-gb N` | SSD 層容量上限，GiB（預設 64；`0` = 不用 SSD 層） |
 | `--kv-ssd-mode M` | SSD 層何時寫入：`shutdown`（預設；只寫重用過的項目：關閉 WHIRL 時——Ctrl+C、關閉主控台視窗、登出、作業系統關機，後三者只有約 5 秒——、主記憶體層必須擠出時，以及閒置約 5 分鐘後；一次性的 prompt 永遠不寫）、`always`（閒置超過 `--kv-ssd-delay` 後寫入）、`off`（不寫 SSD 檔案）。見[SSD 層如何儲存 session](#ssd-tier) |
@@ -273,7 +273,7 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -Conten
 
 DeltaNet 層只能從伺服器存過**檢查點**的位置接著跑（細節：[kv-and-caching.md](kv-and-caching.md#checkpoints)）。每個 slot 保存：提示詞結尾（`prompt-end`：同一個提示詞再來一次，例如重新生成）、回答結尾（`gen-end`：聊天或代理的下一回合），以及 0.2.0 起每個 4096 token 以上提示詞結尾附近的**尾端檢查點**。跨 session 共用的有：長 system 訊息，以及與先前 session 共同的前綴。
 
-**長文件問答。** 對同一份長文件問好幾個問題、每題一個請求（同一則 user 訊息裡放「文件＋問題」、沒有 system 訊息）：第二題會從第一題的尾端檢查點（最後一個 1024-token chunk 的起點，距提示詞結尾 257 到 1280 個 token）接著跑，只 prefill 剩下的部分，而不是整份文件。128k 文件約為 1.1k token 取代 131k（R9700：估計 1–2 秒，先前實測 107 秒）。條件：問題只在該點之後不同（約 256 token 以內的問題一定符合；更長的問題，或把文件放進 2048 token 以上的 system 訊息），且每個 slot 保留 3 個以上檢查點（預設：1 個 slot 時 4、2 到 4 個 slot 時 3）。輸出與不用快取時相同：尾端檢查點落在冷啟動的 chunk 排程上（precise 與 balance 與冷啟動逐位元一致）。每個 slot 檢查點佔 VRAM：Qwen3.8-27B 150.6 MiB、Ornith-1.5-35B-A3B 63.8 MiB；啟動日誌會列出數量與大小，VRAM 估算在 KV pool 會太小時把數量降到 2（尾端檢查點關閉）。`WHIRL_TAIL_CK=0` 可關閉（除錯用）。
+**長文件問答。** 對同一份長文件問好幾個問題、每題一個請求（同一則 user 訊息裡放「文件＋問題」、沒有 system 訊息）：第二題會從第一題的尾端檢查點（最後一個 1024-token chunk 的起點，距提示詞結尾 257 到 1280 個 token）接著跑，只 prefill 剩下的部分，而不是整份文件。128k 文件約為 1.1k token 取代 131k。條件：問題只在該點之後不同（約 256 token 以內的問題一定符合；更長的問題，或把文件放進 2048 token 以上的 system 訊息），且每個 slot 保留 3 個以上檢查點（預設：1 個 slot 時 4、2 到 4 個 slot 時 3）。輸出與不用快取時相同：尾端檢查點落在冷啟動的 chunk 排程上（precise 與 balance 與冷啟動逐位元一致）。每個 slot 檢查點佔 VRAM：Qwen3.8-27B 150.6 MiB、Ornith-1.5-35B-A3B 63.8 MiB；啟動日誌會列出數量與大小，VRAM 估算在 KV pool 會太小時把數量降到 2（尾端檢查點關閉）。`WHIRL_TAIL_CK=0` 可關閉（除錯用）。
 
 ### <a id="ssd-tier"></a>SSD 層如何儲存 session
 

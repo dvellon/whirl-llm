@@ -232,6 +232,8 @@ WHIRL one run per cell; llama.cpp median of 1 to 3 runs.
 | R9700 · Ornith 35B-A3B | 191.2 | **241.5** | 219.0 | 118.9 (plain) | 115.1 (plain) | +103% | +110% |
 | 8060S · Swift 27B | 36.3 | **34.2** | 42.1 | 27.6 (MTP+n-gram) | 28.3 (MTP+n-gram) | +24% | +21% |
 | 8060S · Ornith 35B-A3B | 94.5 | **106.0** | 102.8 | 70.6 (plain) | 72.9 (plain) | +50% | +45% |
+
+8060S coding chat: one run per WHIRL mode. How many drafts are accepted depends on the text each mode writes, so in this run Swift 27B precise (36.3) came out above balance (34.2).
 <!-- /gen -->
 
 ## <a id="agent-session"></a>6. Coding-agent session (R9700 and Radeon 8060S)

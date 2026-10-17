@@ -22,7 +22,7 @@ WHIRL treats a model file in one of two ways:
 | Outputs across optimizations | bit-identical where the previous build was | may change when the speed path changes |
 | MTP == plain greedy, concurrent == solo | yes | yes |
 
-Speed mode applies automatically when the file contains MXFP4 tensors: fp8 prefill GEMMs, f16-WMMA
+Speed mode applies automatically when the file contains MXFP4 tensors, in the balance (default) and fast numerics modes; `--precise` keeps f16 prefill activations for every file ([usage.md](../../usage.md#modes)). It means fp8 prefill GEMMs, f16-WMMA
 DeltaNet chunks and f16 GEMM outputs for element-wise consumers. On the R9700 the last two (balance items `gdnwmma`, `h16`) also apply to dense models in other formats (K-quants such as Q4_K_M load and use them); their GEMMs keep f16 activations. `WHIRL_FP8=0` returns MXFP4
 prefill to f16 activations (most of the MXFP4 prefill speed comes from fp8, not from the format). Decode is exact in both modes (int8 GEMV with the same per-unit arithmetic).
 
@@ -39,7 +39,7 @@ prefill dominates; decode also gets faster in proportion to the smaller weight b
 Decode and prefill kernels exist for: F32 and F16 (small tensors), Q8_0, Q3_K, Q4_K, Q5_K, Q6_K,
 IQ3_S, IQ4_NL, IQ4_XS, MXFP4; BF16 for the vision projector. Any other type (for example NVFP4)
 stops the load — there is no generic dequantize-to-f16 fallback. MXFP4 is implemented for dense
-`qwen35` and for MoE experts (`qwen35moe`, [section 6](#ornith-mxfp4)). On gfx1151 (8060S, preview)
+`qwen35` and for MoE experts (`qwen35moe`, [section 6](#ornith-mxfp4)). On gfx1151 (Radeon 8060S)
 MXFP4 runs on the same int8 decode GEMVs and is dequantized to f16 for prefill (gfx1151 has no fp8
 WMMA, so MXFP4 prefill there uses f16 activations; the MoE experts take the generic paths).
 

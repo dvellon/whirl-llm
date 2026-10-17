@@ -19,7 +19,7 @@ WHIRL 會以兩種方式之一看待一個模型檔案：
 | 各項優化之間的輸出 | 前一版逐位元相同之處維持逐位元相同 | 速度路徑改變時可能改變 |
 | MTP == 純 greedy、並行 == 單獨執行 | 是 | 是 |
 
-當檔案包含 MXFP4 tensor 時，速度模式會自動套用：fp8 prefill（提示詞預填）GEMM、f16-WMMA DeltaNet chunk，以及供逐元素運算使用者讀取的 f16 GEMM 輸出。在 R9700 上，後兩項（balance 項目 `gdnwmma`、`h16`）也用在其他格式的 dense 模型（Q4_K_M 等 K-quant 檔案可載入並使用這兩項）；這些模型的 GEMM 仍用 f16 activation。`WHIRL_FP8=0` 會讓 MXFP4 prefill 回到 f16 activation（MXFP4 prefill 的速度主要來自 fp8，而非格式本身）。兩種模式下 decode（逐 token 生成）都是精確的（int8 GEMV，每個單元的算術相同）。
+當檔案包含 MXFP4 tensor 時，在 balance（預設）與 fast 數值模式下速度模式會自動套用（`--precise` 對所有檔案都維持 f16 prefill activation，見 [usage.md](usage.md#modes)）：fp8 prefill（提示詞預填）GEMM、f16-WMMA DeltaNet chunk，以及供逐元素運算使用者讀取的 f16 GEMM 輸出。在 R9700 上，後兩項（balance 項目 `gdnwmma`、`h16`）也用在其他格式的 dense 模型（Q4_K_M 等 K-quant 檔案可載入並使用這兩項）；這些模型的 GEMM 仍用 f16 activation。`WHIRL_FP8=0` 會讓 MXFP4 prefill 回到 f16 activation（MXFP4 prefill 的速度主要來自 fp8，而非格式本身）。兩種模式下 decode（逐 token 生成）都是精確的（int8 GEMV，每個單元的算術相同）。
 
 兩個 MXFP4 模型公開的速度數據見 [benchmarks.md](benchmarks.md)。在 MXFP4 內部，fp8 對 f16 prefill 有用 350 題成對 QA 比較（WHIRL，greedy）：答對 256 對 253，McNemar p = 0.58。
 
@@ -27,7 +27,7 @@ WHIRL 會以兩種方式之一看待一個模型檔案：
 
 ## 2. WHIRL 接受的 tensor 類型
 
-以下類型有 decode 與 prefill kernel：F32 和 F16（小型 tensor）、Q8_0、Q3_K、Q4_K、Q5_K、Q6_K、IQ3_S、IQ4_NL、IQ4_XS、MXFP4；視覺 projector 則有 BF16。任何其他類型（例如 NVFP4）會中止載入——沒有通用的反量化到 f16 的退路。MXFP4 已為 dense `qwen35` 與 MoE 專家（`qwen35moe`，[第 6 節](#ornith-mxfp4)）實作。在 gfx1151（8060S，預覽）上 MXFP4 走同樣的 int8 decode GEMV，prefill 先反量化成 f16（gfx1151 沒有 fp8 WMMA，所以那裡的 MXFP4 prefill 用 f16 activation；MoE 專家走通用路徑）。
+以下類型有 decode 與 prefill kernel：F32 和 F16（小型 tensor）、Q8_0、Q3_K、Q4_K、Q5_K、Q6_K、IQ3_S、IQ4_NL、IQ4_XS、MXFP4；視覺 projector 則有 BF16。任何其他類型（例如 NVFP4）會中止載入——沒有通用的反量化到 f16 的退路。MXFP4 已為 dense `qwen35` 與 MoE 專家（`qwen35moe`，[第 6 節](#ornith-mxfp4)）實作。在 gfx1151（Radeon 8060S）上 MXFP4 走同樣的 int8 decode GEMV，prefill 先反量化成 f16（gfx1151 沒有 fp8 WMMA，所以那裡的 MXFP4 prefill 用 f16 activation；MoE 專家走通用路徑）。
 
 ### 2.1 混合格式的 K-quant 檔案
 
