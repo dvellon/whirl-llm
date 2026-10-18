@@ -30,6 +30,41 @@ constexpr u32 moe_bn = 64;
 // smallest batch that takes gemmh_f16 instead of the tuned f16 GEMM
 constexpr u32 gemmh_min = 512;
 
+// attn_dq4 (kernels/gfx1151/attn.hip dq_per, DQ_NW 8, DQ_MAXS 128): keys per split for n_keys keys
+// under a grid of n_split splits; keep in step with the kernel.
+i32 dq4Per(i32 n_keys, u32 n_split) {
+    const i32 ns = static_cast<i32>(std::min<u32>(n_split, 128));
+    return std::max<i32>(8 * 32, (n_keys + ns * 64 - 1) / (ns * 64) * 64);
+}
+// a row's attn_dq4 key partition under n_split: {window branch, per, splits carrying keys}
+std::array<i32, 3> dq4Part(i32 n_pos, i32 win, u32 n_split) {
+    if (win != 0 && n_split > 1) {
+        const i32 w = (win & 0xffff) * 64, min_pos = (win >> 16) * 1024;
+        const i32 w0 = std::max<i32>(256, (n_pos - w) & ~63);
+        if (n_pos >= min_pos && w0 > 256) {
+            const i32 per = dq4Per(n_pos - w0, n_split - 1);
+            return {1, per, 1 + (n_pos - w0 + per - 1) / per};
+        }
+    }
+    const i32 per = dq4Per(n_pos, n_split);
+    return {0, per, (n_pos + per - 1) / per};
+}
+// smallest split count (8, 16, ... < full) with every row's partition equal to full's; else full
+u32 dq4Splits(std::span<const i32> row_pos, i32 win, u32 full) {
+    for (u32 s = 8; s < full; s *= 2) {
+        bool same = true;
+        for (const i32 p : row_pos) {
+            const auto a = dq4Part(p + 1, win, s), b = dq4Part(p + 1, win, full);
+            if (a[0] != b[0] || a[1] != b[1] || a[2] > static_cast<i32>(s)) {
+                same = false;
+                break;
+            }
+        }
+        if (same) return s;
+    }
+    return full;
+}
+
 // attn_split / attn_wsplit split size for n_pos positions (whole FD_CH chunks).
 i32 awPer(i32 n_pos, u32 n_split) {
     const i32 span = static_cast<i32>(n_split * fd_chunk);
@@ -608,6 +643,8 @@ void Model::decodeStep() {
 }
 
 void Model::decodeStepLaunches() {
+    // device positions (argmax advances pos_buf): the host row positions are not known here
+    row_n = 0;
     // vision: device positions (argmax advances pos_buf): RoPE position = pos - delta
     visBegin();
     if (const VisMap* vm = visOf(cur_seq)) {
@@ -713,8 +750,15 @@ void Model::attnBlock(const AttnW& a, const KvLayer& lkv, u32 n) {
         const bool ws4_path = attn_ws4 && k.attn_ws4 != nullptr && k.attn_ws4g[0] != nullptr && k.attn_ws4g[1] != nullptr &&
                               k.attn_ws4g[2] != nullptr && k.attn_wsplit1 != nullptr && !kv_q4 && hd == ws4::kD && grp_q <= 16 &&
                               (dbg_flags & 2) == 0;
-        const u32 n_split = ws4_path ? std::min<u32>(ws4::kNs, (max_ctx + fd_chunk - 1) / fd_chunk)
-                                     : std::min(fd_splits, (max_ctx + fd_chunk - 1) / fd_chunk);
+        u32 n_split = ws4_path ? std::min<u32>(ws4::kNs, (max_ctx + fd_chunk - 1) / fd_chunk)
+                               : std::min(fd_splits, (max_ctx + fd_chunk - 1) / fd_chunk);
+        // FAST-8S-1 (gfx1151, q4 KV through attn_dq4): the fixed grid of fd_splits (256) splits makes
+        // attn_combine(_q8) walk 256 partials per head even when only a few carry keys (2k: 8). Launch
+        // the smallest split count whose key partition (dq_per) is the same as fd_splits' for every row:
+        // same partials, same combine order (empty splits are skipped there), so bitwise the same output.
+        if (!ws4_path && kv_q4 && attn_dq4 && dq4_dyn && k.attn_dq4 != nullptr && k.caps.attn_group1 && grp_q <= 8 && row_n == n &&
+            (dbg_flags & 2) == 0)
+            n_split = dq4Splits(std::span<const i32>(row_pos.data(), n), kva.win, n_split);
         if (ws4_path) {
             // groups: consecutive rows of one sequence at consecutive positions whose split ranges
             // (per and draft-window ranges, ws4::block_range of their n_pos) are the same

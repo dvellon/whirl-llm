@@ -1019,6 +1019,7 @@ void applyRuntimeEnv(q::Model& m) {
     if (envGet("NAIVE_ATTN")) m.naive_attn = true;
     if (auto v = envGet("ATTN_WIDE"); v && *v == "0") m.attn_wide = false;
     if (auto v = envGet("ATTN_DQ4"); v && *v == "0") m.attn_dq4 = false;
+    if (auto v = envGet("DQ4_DYN"); v && *v == "0") m.dq4_dyn = false;
     if (auto v = envGet("ATTN_WS4"); v && *v == "0") m.attn_ws4 = false;
     if (auto v = envU32("MOE_BN")) m.moe_bn_force = *v;
     if (envGet("GDN_SEQ")) m.gdn_chunked = false;
