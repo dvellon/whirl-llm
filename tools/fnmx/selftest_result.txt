@@ -1,0 +1,13 @@
+random gaussian                              x^2     rows  256  weighted err ref 4.337084e-03  patched 3.363999e-03 (-22.44%)  MSE ref 5.204092e-06 patched 5.021517e-06 (-3.51%)  exp changed 13.9%  rows-worse 0 -> PASS
+random gaussian                              imatrix rows  256  weighted err ref 3.470628e-01  patched 3.091124e-01 (-10.93%)  MSE ref 5.204092e-06 patched 5.014646e-06 (-3.64%)  exp changed 10.3%  rows-worse 0 -> PASS
+random heavy-tail                            x^2     rows  256  weighted err ref 4.275383e-01  patched 2.581954e-01 (-39.61%)  MSE ref 2.153182e-05 patched 2.117088e-05 (-1.68%)  exp changed 16.0%  rows-worse 0 -> PASS
+random heavy-tail                            imatrix rows  256  weighted err ref 4.683877e+00  patched 3.281983e+00 (-29.93%)  MSE ref 2.153182e-05 patched 2.097628e-05 (-2.58%)  exp changed 11.8%  rows-worse 0 -> PASS
+blk.10.ffn_up_exps.weight.e7.bin             x^2     rows  256  weighted err ref 8.110271e-04  patched 5.443968e-04 (-32.88%)  MSE ref 2.176496e-06 patched 2.008709e-06 (-7.71%)  exp changed 26.1%  rows-worse 0 -> PASS
+blk.10.ffn_up_exps.weight.e7.bin             imatrix rows  256  weighted err ref 8.651522e-03  patched 7.203518e-03 (-16.74%)  MSE ref 2.176496e-06 patched 1.998361e-06 (-8.18%)  exp changed 23.4%  rows-worse 0 -> PASS
+blk.30.ffn_down_exps.weight.e300.bin         x^2     rows  256  weighted err ref 1.996727e-04  patched 1.428262e-04 (-28.47%)  MSE ref 2.223604e-06 patched 2.053909e-06 (-7.63%)  exp changed 25.7%  rows-worse 0 -> PASS
+blk.30.ffn_down_exps.weight.e300.bin         imatrix rows  256  weighted err ref 1.020027e-04  patched 8.639426e-05 (-15.30%)  MSE ref 2.223604e-06 patched 2.044320e-06 (-8.06%)  exp changed 23.2%  rows-worse 0 -> PASS
+blk.10.attn_qkv.weight.bin                   x^2     rows  256  weighted err ref 1.974921e-02  patched 1.030820e-02 (-47.80%)  MSE ref 6.419801e-06 patched 6.164822e-06 (-3.97%)  exp changed 17.2%  rows-worse 0 -> PASS
+blk.10.attn_qkv.weight.bin                   imatrix rows  256  weighted err ref 1.433804e-01  patched 8.871268e-02 (-38.13%)  MSE ref 6.419801e-06 patched 6.131346e-06 (-4.49%)  exp changed 15.8%  rows-worse 0 -> PASS
+blk.46.ssm_out.weight.bin                    x^2     rows  256  weighted err ref 7.545691e-02  patched 5.218820e-02 (-30.84%)  MSE ref 6.619969e-06 patched 6.344274e-06 (-4.16%)  exp changed 18.4%  rows-worse 0 -> PASS
+blk.46.ssm_out.weight.bin                    imatrix rows  256  weighted err ref 6.937001e-02  patched 5.851650e-02 (-15.65%)  MSE ref 6.619969e-06 patched 6.530241e-06 (-1.36%)  exp changed 14.7%  rows-worse 0 -> PASS
+SELFTEST PASS

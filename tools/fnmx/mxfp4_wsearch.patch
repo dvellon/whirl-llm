@@ -1,0 +1,91 @@
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index 7750a72..d5e206e 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -2300,10 +2300,83 @@ size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+     return nrow * row_size;
+ }
+ 
++// FNMX patch: weighted search of the MXFP4 block exponent (E8M0 scale).
++// For each 32-element block, try e0-1, e0, e0+1 where e0 = floor(log2(amax)) - 2 is the
++// reference choice, quantize every element to the nearest FP4 value at that scale (same
++// best_index_mxfp4 / kvalues_mxfp4 as the reference), and keep the exponent with the lowest
++// weighted squared error. Weights: qw[j] * sqrt(sigma2 + x[j]^2) with an importance matrix
++// (ggml k-quant convention, sigma2 = mean x^2 of the row), else x[j]^2.
++// Output is the standard block_mxfp4; quantize_row_mxfp4_ref (runtime path) is unchanged.
++static void quantize_row_mxfp4_wsearch(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t n_per_row, const float * GGML_RESTRICT qw) {
++    const int qk = QK_MXFP4;
++    const int nb = (int)(n_per_row / qk);
++
++    float sum_x2 = 0.0f;
++    for (int64_t j = 0; j < n_per_row; ++j) {
++        sum_x2 += x[j]*x[j];
++    }
++    const float sigma2 = sum_x2 / (float)n_per_row;
++
++    float w[QK_MXFP4];
++    uint8_t idx[QK_MXFP4];
++    uint8_t best_idx[QK_MXFP4];
++
++    for (int i = 0; i < nb; i++) {
++        const float * xb = x + (int64_t)i*qk;
++        float amax = 0.0f;
++        for (int j = 0; j < qk; j++) {
++            amax = MAX(amax, fabsf(xb[j]));
++        }
++        if (amax == 0.0f) {
++            // identical to the reference for an all-zero block
++            quantize_row_mxfp4_ref(xb, y + i, qk);
++            continue;
++        }
++        for (int j = 0; j < qk; j++) {
++            w[j] = qw ? qw[(int64_t)i*qk + j] * sqrtf(sigma2 + xb[j]*xb[j]) : xb[j]*xb[j];
++        }
++        const int e0 = (int)floorf(log2f(amax)) - 2 + 127;
++        int   best_e   = -1;
++        float best_err = 0.0f;
++        // e0 first, so a tie keeps the reference exponent
++        static const int order[3] = { 0, -1, 1 };
++        for (int c = 0; c < 3; ++c) {
++            int e = e0 + order[c];
++            if (e < 0 || e > 254) {
++                continue;
++            }
++            const float d = GGML_E8M0_TO_FP32_HALF((uint8_t) e);
++            float err = 0.0f;
++            for (int j = 0; j < qk; j++) {
++                idx[j] = (uint8_t) best_index_mxfp4(xb[j], d);
++                const float diff = kvalues_mxfp4[idx[j]]*d - xb[j];
++                err += w[j]*diff*diff;
++            }
++            if (best_e < 0 || err < best_err) {
++                best_e = e;
++                best_err = err;
++                memcpy(best_idx, idx, sizeof(idx));
++            }
++        }
++        if (best_e < 0) {
++            quantize_row_mxfp4_ref(xb, y + i, qk);
++            continue;
++        }
++        y[i].e = (uint8_t) best_e;
++        for (int j = 0; j < qk/2; ++j) {
++            y[i].qs[j] = best_idx[j] | (best_idx[qk/2 + j] << 4);
++        }
++    }
++}
++
+ size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+-    GGML_UNUSED(quant_weights);
+-    quantize_row_mxfp4_ref(src, dst, (int64_t)nrow*n_per_row);
+-    return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
++    const size_t row_size = ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
++    char * qrow = (char *) dst;
++    for (int64_t row = 0; row < nrow; ++row) {
++        quantize_row_mxfp4_wsearch(src + row*n_per_row, (block_mxfp4 *) qrow, n_per_row, quant_weights);
++        qrow += row_size;
++    }
++    return nrow * row_size;
+ }
+ 
+ size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
