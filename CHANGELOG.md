@@ -3,6 +3,18 @@
 All notable changes to WHIRL are listed here. Versions follow `project(whirl VERSION ...)` in
 `CMakeLists.txt`.
 
+## Unreleased
+
+### Faster
+
+- Radeon 8060S, fast mode (q4 KV) decode: `attn_dq4` launches only as many attention splits as the rows' keys use
+  (same key partition as the fixed 256-split grid, so the output is bitwise unchanged); the split combine no longer
+  walks 256 partials per head. Ornith-1.5-35B-A3B MXFP4 verify cycle 2.3% to 3.7% shorter at 2k to 128k
+  (`WHIRL_DQ4_DYN=0`: the fixed grid). FAST-8S-1.
+- Radeon 8060S, MoE models: the embedded 64k draft-head vocabulary subset is now the default there too (it was dense
+  only); output text unchanged in every mode (verify decides it), Ornith decode +2% to +4% in balance, +2% to +9% in
+  fast (`WHIRL_DRAFT_VOCAB=off`: the full head). The R9700 MoE default is unchanged. FAST-8S-1.
+
 ## 0.2.0 — 2026-10-17
 
 ### Highlights
