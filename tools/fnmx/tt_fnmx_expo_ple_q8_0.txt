@@ -1,0 +1,9 @@
+per_layer_token_embd=q8_0
+ffn_gate_inp=f32
+ffn_gate_exps=mxfp4
+ffn_up_exps=mxfp4
+ffn_down_exps=mxfp4
+hc_.*inject=f32
+ple_conv1d=f32
+indexer=bf16
+\.weight$=q8_0
