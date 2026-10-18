@@ -392,7 +392,7 @@ def main():
     ap.add_argument("--theory", action="store_true")
     ap.add_argument("--fl1a", action="store_true", help="analyze the four FL-1a 8060S captures")
     ap.add_argument("--device", choices=["8s", "r97"], default="8s")
-    ap.add_argument("--model", choices=["dense", "moe"], default="dense")
+    ap.add_argument("--model", choices=["dense", "moe", "swift"], default="dense")
     ap.add_argument("--phase", choices=["decode", "verify", "prefill"], default="decode")
     ap.add_argument("--ctx", type=int, default=None, help="KV depth (decode) / chunk start depth (prefill)")
     ap.add_argument("--rows", type=int, default=None, help="verify rows (default 4) / prefill chunk rows (default 2048)")
