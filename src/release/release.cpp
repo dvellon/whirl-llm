@@ -4,6 +4,7 @@
 // Written for WHIRL.
 
 #include "release/release.h"
+#include "release/dll_deps.h"
 
 #include "whirl/common.h"
 #include "whirl/gguf.h"
@@ -131,10 +132,17 @@ int gpuPreflight() {
     const DWORD err = h == nullptr ? GetLastError() : 0;
     SetErrorMode(old_mode);
     if (h == nullptr) {
-        std::fprintf(stderr,
-                     "error: the AMD GPU runtime (%s) %s, so WHIRL cannot use the GPU.\n"
-                     "  It is installed by the AMD graphics driver.\n%s",
-                     k_gpu_runtime_dll, err == ERROR_MOD_NOT_FOUND ? "was not found" : "could not be loaded", k_driver_advice);
+        if (err == ERROR_MOD_NOT_FOUND) {
+            // 126 = the DLL or a DLL it imports is missing: tell them apart and name the missing one
+            // (issue #2: the ROCm 10.1 driver's amdhip64_7.dll needs rocm_kpack.dll, which it does not install)
+            std::fputs(dlldeps::message126(k_gpu_runtime_dll, dlldeps::diagnose(L"amdhip64_7.dll"), k_driver_advice).c_str(),
+                       stderr);
+        } else {
+            std::fprintf(stderr,
+                         "error: the AMD GPU runtime (%s) could not be loaded, so WHIRL cannot use the GPU.\n"
+                         "  It is installed by the AMD graphics driver.\n%s",
+                         k_gpu_runtime_dll, k_driver_advice);
+        }
         return exit_gpu;
     }
     // keep it loaded: the delay-load stub binds to this module

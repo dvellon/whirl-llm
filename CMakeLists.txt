@@ -7,7 +7,7 @@
 cmake_minimum_required(VERSION 3.24)
 # The project version is the single version source: --version texts, the
 # Windows VERSIONINFO resources and the release package name derive from it.
-project(whirl VERSION 0.2.1 LANGUAGES CXX)
+project(whirl VERSION 0.2.2 LANGUAGES CXX)
 if(MSVC)
   enable_language(RC)
   # static C++ runtime (/MT): the executables need no Visual C++ redistributable
@@ -149,6 +149,10 @@ target_link_libraries(whirl-tool PRIVATE whirl)
 
 add_executable(whirl-tests tests/unit/unit_tests.cpp)
 target_link_libraries(whirl-tests PRIVATE whirl)
+# GPU runtime load-failure diagnosis (release front-end, issue #2), CPU-only
+target_sources(whirl-tests PRIVATE src/release/dll_deps.cpp)
+target_include_directories(whirl-tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(whirl-tests PRIVATE WHIRL_TEST_DLL_DEPS=1)
 
 if(WHIRL_LLAMACPP_SRC)
   add_subdirectory(tests/template_oracle)

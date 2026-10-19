@@ -12,3 +12,4 @@ src/vision/stb_image.h -text
 *.png binary
 *.ico binary
 *.bin binary
+*.dll binary

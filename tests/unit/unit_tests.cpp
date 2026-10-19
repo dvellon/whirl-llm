@@ -16,6 +16,9 @@
 #include "whirl/uma_mem.h"
 #include "whirl/vram_limit.h"
 #include "whirl/value_scope.h"
+#if WHIRL_TEST_DLL_DEPS
+#include "release/dll_deps.h"
+#endif
 
 #include "../../kernels/gemm_small_addr.h"
 
@@ -1807,8 +1810,80 @@ void testUmaCheck() {
     CHECK(h.find("Armoury Crate") != std::string::npos);
 }
 
+#if WHIRL_TEST_DLL_DEPS
+// Issue #2: amdhip64_7.dll present but its import rocm_kpack.dll missing (error 126) must not be
+// reported as "amdhip64_7.dll was not found". Optional real case: WHIRL_TEST_HIP3684 = path of a copy
+// of the ROCm 10.1 driver's amdhip64_7.dll (10.0.3684) in a folder without rocm_kpack.dll.
+void testDllDeps() {
+    namespace dd = whirl::app::dlldeps;
+    auto has = [](const std::vector<std::string>& v, const char* name) {
+        for (const std::string& s : v)
+            if (_stricmp(s.c_str(), name) == 0) return true;
+        return false;
+    };
+    wchar_t self[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, self, MAX_PATH);
+    CHECK(n > 0 && n < MAX_PATH);
+    const std::vector<std::string> imp = dd::peImports(self);
+    CHECK(has(imp, "KERNEL32.dll"));
+    CHECK(dd::peImports(L"C:\\no\\such\\file_whirl_test.dll").empty());
+    CHECK(!dd::findDll(L"kernel32.dll").empty());
+    CHECK(dd::findDll(L"no_such_dll_whirl_test.dll").empty());
+
+    // the DLL itself is missing: the old wording, with the driver advice
+    dd::Diagnosis none = dd::diagnose(L"no_such_dll_whirl_test.dll");
+    CHECK(none.found_at.empty());
+    std::string m = dd::message126("amdhip64_7.dll", none, "ADVICE\n");
+    CHECK(m.find("amdhip64_7.dll) was not found") != std::string::npos);
+    CHECK(m.find("ADVICE") != std::string::npos);
+
+    // present, rocm_kpack.dll missing: names it and says where to put it, no driver advice
+    dd::Diagnosis k;
+    k.found_at = L"C:\\Windows\\System32\\amdhip64_7.dll";
+    k.missing = {"rocm_kpack.dll"};
+    m = dd::message126("amdhip64_7.dll", k, "ADVICE\n");
+    CHECK(m.find("was found at C:\\Windows\\System32\\amdhip64_7.dll") != std::string::npos);
+    CHECK(m.find("missing: rocm_kpack.dll") != std::string::npos);
+    CHECK(m.find("next to whirl.exe") != std::string::npos);
+    CHECK(m.find("was not found") == std::string::npos);
+    CHECK(m.find("ADVICE") == std::string::npos);
+
+    // rocm_kpack.dll present, but the Visual C++ runtime it needs is missing
+    dd::Diagnosis v;
+    v.found_at = L"C:\\Windows\\System32\\amdhip64_7.dll";
+    v.missing = {"VCRUNTIME140.dll", "MSVCP140.dll"};
+    m = dd::message126("amdhip64_7.dll", v, "ADVICE\n");
+    CHECK(m.find("missing: VCRUNTIME140.dll, MSVCP140.dll") != std::string::npos);
+    CHECK(m.find("vc_redist.x64.exe") != std::string::npos);
+
+    // present, nothing identifiable: still says "found", plus the driver advice
+    dd::Diagnosis u;
+    u.found_at = L"C:\\x\\amdhip64_7.dll";
+    m = dd::message126("amdhip64_7.dll", u, "ADVICE\n");
+    CHECK(m.find("was found at C:\\x\\amdhip64_7.dll") != std::string::npos);
+    CHECK(m.find("ADVICE") != std::string::npos);
+
+    // a present DLL whose imports all load: nothing missing
+    dd::Diagnosis ok = dd::diagnose(self);
+    CHECK(!ok.found_at.empty());
+    CHECK(ok.missing.empty());
+
+    if (const char* p = std::getenv("WHIRL_TEST_HIP3684"); p && *p) {
+        const std::wstring wp(p, p + std::strlen(p));
+        CHECK(has(dd::peImports(wp), "rocm_kpack.dll"));
+        const dd::Diagnosis r = dd::diagnose(wp);
+        CHECK(!r.found_at.empty());
+        CHECK(has(r.missing, "rocm_kpack.dll"));
+        std::printf("dll_deps: real 3684 case checked (%s)\n", p);
+    }
+}
+#endif
+
 int main() {
     whirl::test::clearWhirlEnv();  // FR-TEST P3-11
+#if WHIRL_TEST_DLL_DEPS
+    testDllDeps();
+#endif
     testRelaxAccept();
     testJson();
     testUnicode();

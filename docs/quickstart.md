@@ -14,13 +14,13 @@ PowerShell.
 | Driver | **AMD Software: Adrenalin Edition 26.8.1 (driver 32.0.31041.1004) or newer**, for both GPUs; older drivers are untested |
 | Nothing else | no HIP SDK, no ROCm, no Visual C++ redistributable, no Python, no WSL |
 
-The driver installs the two AMD runtime files WHIRL uses (`amdhip64_7.dll`, `amd_comgr_3.dll`).
+The driver installs the two AMD runtime files WHIRL uses (`amdhip64_7.dll`, `amd_comgr_3.dll`). The zip also carries AMD's `rocm_kpack.dll`: the GPU runtime of the Adrenalin Edition for ROCm 10.1 driver needs it and that driver does not install it, so keep it next to `whirl.exe`.
 
 ## 2. Download
 
-1. `whirl-0.2.0-windows-x64.zip` from the [WHIRL releases page](https://github.com/tsaipifong/whirl-llm/releases).
+1. `whirl-0.2.1-windows-x64.zip` from the [WHIRL releases page](https://github.com/tsaipifong/whirl-llm/releases).
    Compare its SHA-256 with the value published next to it:
-   `Get-FileHash .\whirl-0.2.0-windows-x64.zip -Algorithm SHA256`.
+   `Get-FileHash .\whirl-0.2.1-windows-x64.zip -Algorithm SHA256`.
 2. A supported GGUF model (list in the [README](../README.md#supported-models)). The fastest choice is our own
    MXFP4 quantization
    [`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF);
@@ -31,9 +31,9 @@ The driver installs the two AMD runtime files WHIRL uses (`amdhip64_7.dll`, `amd
 Open PowerShell in your Downloads folder and paste:
 
 ```powershell
-Unblock-File .\whirl-0.2.0-windows-x64.zip
-Expand-Archive .\whirl-0.2.0-windows-x64.zip -DestinationPath C:\whirl
-cd C:\whirl\whirl-0.2.0-windows-x64
+Unblock-File .\whirl-0.2.1-windows-x64.zip
+Expand-Archive .\whirl-0.2.1-windows-x64.zip -DestinationPath C:\whirl
+cd C:\whirl\whirl-0.2.1-windows-x64
 .\whirl.exe devices
 .\whirl.exe chat C:\models\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf "Explain TCP slow start in two sentences." --max-tokens 400
 ```

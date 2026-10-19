@@ -21,6 +21,8 @@ compile_commands.json
 *.exp
 *.exe
 *.dll
+# redistributed AMD DLL shipped in the release zip (redist/rocm_kpack/SOURCE.md)
+!redist/rocm_kpack/rocm_kpack.dll
 *.pdb
 *.ilk
 *.res
