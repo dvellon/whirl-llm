@@ -638,6 +638,10 @@ bool Engine::onSchedule(std::span<const std::uint32_t> toks, std::size_t a) cons
     return sched::onSchedule(toks.size(), sysSplit(toks), ct_.thinkOpenSplit(toks), imgs, a);
 }
 
+bool Engine::resumeOk(std::span<const std::uint32_t> toks, std::uint32_t pos, std::uint8_t kind) const {
+    return !opt_.cold_resume || (kind != ckKindCode("gen-end") && onSchedule(toks, pos));
+}
+
 Spe* Engine::speMatch(std::span<const std::uint32_t> toks) {
     const int i = pc_->matchShared(spes_, toks, [&](std::size_t a) { return onSchedule(toks, a); });
     return i < 0 ? nullptr : &spes_[static_cast<std::size_t>(i)];
@@ -870,7 +874,9 @@ bool Engine::waitsForTier(Job& job) {
         if (!r) continue;
         const cache::Tier::Entry x = tier_view_->find(r->entry_id);
         if (!x) continue;
-        const auto [reuse, kind] = pc_->matchTierEntry(x, toks);
+        const auto [reuse, kind] =
+            opt_.cold_resume ? pc_->matchTierEntry(x, toks, [&](std::uint32_t p, std::uint8_t k) { return resumeOk(toks, p, k); })
+                             : pc_->matchTierEntry(x, toks);
         if (reuse < t->cfg.min_tokens) continue;
         if (kind >= 4 && !onSchedule(toks, reuse)) continue;
         std::uint32_t vr = 0;
@@ -894,7 +900,8 @@ void Engine::prefetchFor(Job& job) {
     job.pf_checked = true;
     if (!job.params.cache_prompt || opt_.no_prefix_cache) return;
     const std::span<const std::uint32_t> toks = job.tokens;
-    const auto mt = t->lookup(toks);
+    const auto mt = opt_.cold_resume ? t->lookup(toks, [&](std::uint32_t p, std::uint8_t k) { return resumeOk(toks, p, k); })
+                                     : t->lookup(toks);
     if (!mt) return;
     tier::Entry* x = mt->e;
     if (x->in_ram || x->loading || x->io_busy) return;
@@ -913,6 +920,14 @@ void Engine::prefetchFor(Job& job) {
 }
 
 Engine::CacheMatch Engine::cacheMatch(Slot& sl, std::span<const std::uint32_t> toks) {
+    if (opt_.cold_resume) {
+        // COLD-RESUME: the checkpoints a cold-exact resume may use (same indices, the others marked invalid)
+        std::vector<cache::CkptKey> ks(sl.ckpts.begin(), sl.ckpts.end());
+        for (cache::CkptKey& k : ks)
+            if (k.valid && !resumeOk(toks, k.pos, ckKindCode(k.kind))) k.valid = false;
+        const cache::SlotMatch m = pc_->matchSlot(sl.cache_tokens, ks, toks);
+        return {m.reuse, m.ck < 0 ? nullptr : &sl.ckpts[static_cast<std::size_t>(m.ck)], m.lcp};
+    }
     const cache::SlotMatch m = pc_->matchSlot(sl.cache_tokens, sl.ckpts, toks);
     return {m.reuse, m.ck < 0 ? nullptr : &sl.ckpts[static_cast<std::size_t>(m.ck)], m.lcp};
 }
@@ -1218,7 +1233,8 @@ bool Engine::startJob(Slot& sl, Job& job) {
     sl.reuse = mt.reuse;
     // the state at reuse is the cold one (a shared checkpoint is cold-exact)
     sl.on_sched = mt.reuse == 0 || spe_hit != nullptr ||
-                  (mt.ck != nullptr && ckKindCode(mt.ck->kind) >= 4 && onSchedule(toks, mt.reuse));
+                  (mt.ck != nullptr && ckKindCode(mt.ck->kind) >= 4 && onSchedule(toks, mt.reuse)) ||
+                  (opt_.cold_resume && mt.ck != nullptr);  // COLD-RESUME: every accepted checkpoint is cold-exact
     // positions >= reuse are rewritten: pages a spill still reads, or that
     // are shared, are replaced (copy on write), never waited for
     bool spill = false;
@@ -2654,7 +2670,8 @@ bool Engine::tryRestore(Slot& sl, Job& job) {
     const std::uint32_t nd_max = draftRoom();
     if (toks.size() + nd_max + 2 >= ctx_ || toks.size() + nd_max + 2 >= static_cast<std::uint64_t>(pool_pages_) * kv_page)
         return false;
-    const auto mt = t->lookup(toks);
+    const auto mt = opt_.cold_resume ? t->lookup(toks, [&](std::uint32_t p, std::uint8_t k) { return resumeOk(toks, p, k); })
+                                     : t->lookup(toks);
     if (!mt) return false;
     // item S: a shared prefix entry off this prompt's schedule would not give
     // the cold result; one already in VRAM needs no restore

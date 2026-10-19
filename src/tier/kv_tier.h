@@ -343,7 +343,10 @@ public:
     void fence(Entry* e, Event extra /*nullable*/);
 
     // Longest usable prefix of toks among the entries (RAM or SSD).
-    std::optional<Match> lookup(std::span<const std::uint32_t> toks);
+    // accept (optional): a checkpoint (position, kind code) may be resumed from; the longest accepted one
+    // per entry is the match (COLD-RESUME: --precise accepts only cold-exact checkpoints)
+    std::optional<Match> lookup(std::span<const std::uint32_t> toks,
+                                const std::function<bool(std::uint32_t, std::uint8_t)>& accept = {});
 
     // Start restoring entry e (nullptr: cannot). Poll with pumpRestore.
     Restore* beginRestore(Entry* e, std::span<const Span> spans, std::size_t n_main_spans);

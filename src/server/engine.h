@@ -325,6 +325,10 @@ struct EngineOptions {
     std::uint32_t ng_snap_sets = 0;
     bool no_prefix_cache = false;
     bool verify_cache = false;
+    // COLD-RESUME (--precise): resume only from checkpoints whose state is bitwise the cold prefill's: on the
+    // new prompt's chunk schedule and produced by prefill (never 'gen-end', whose history came from the decode /
+    // verify kernels). Off (balance / fast): the longest checkpoint, as before. WHIRL_COLD_RESUME=0/1 overrides.
+    bool cold_resume = false;
     bool seg_prefill = true;
     bool timing_reset = true;
     bool ngram = true;
@@ -468,6 +472,8 @@ private:
     std::vector<std::uint32_t> imgSplits(std::span<const std::uint32_t> toks) const;
     std::size_t schedFloor(std::span<const std::uint32_t> toks, std::size_t lim) const;
     bool onSchedule(std::span<const std::uint32_t> toks, std::size_t a) const;
+    // COLD-RESUME: may a request with these tokens resume from a checkpoint (position, kind code)?
+    bool resumeOk(std::span<const std::uint32_t> toks, std::uint32_t pos, std::uint8_t kind) const;
     Spe* speMatch(std::span<const std::uint32_t> toks);
     void dropSpe(Spe& s);
     void createSpe(Slot& sl, std::span<const std::uint32_t> toks_all, std::uint32_t pos, const char* kind,

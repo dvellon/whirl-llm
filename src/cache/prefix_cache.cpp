@@ -110,7 +110,7 @@ public:
         return -1;
     }
 
-    TierResume matchTierEntry(Tier::Entry e, Tokens toks) const override {
+    TierResume matchTierEntry(Tier::Entry e, Tokens toks, const ResumePred& accept) const override {
         const Tier& t = *tier_;
         const Tokens all = t.tokens(e);
         const Tokens et = all.subspan(0, std::min<std::size_t>(t.nTok(e), all.size()));
@@ -121,6 +121,7 @@ public:
             const TierCk c = t.ck(e, k);
             if (c.valid == 0 || c.pos == 0 || c.pos > lcp || c.pos > toks.size()) continue;
             if (c.pos == toks.size() && c.has_logits == 0) continue;
+            if (accept && !accept(c.pos, c.kind)) continue;
             if (c.pos > r.reuse) {
                 r.reuse = c.pos;
                 r.kind = c.kind;

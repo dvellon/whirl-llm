@@ -789,7 +789,7 @@ void Tier::fence(Entry* e, Event extra) {
 
 // ---- lookup ---------------------------------------------------------------------
 
-std::optional<Match> Tier::lookup(std::span<const std::uint32_t> toks) {
+std::optional<Match> Tier::lookup(std::span<const std::uint32_t> toks, const std::function<bool(std::uint32_t, std::uint8_t)>& accept) {
     std::optional<Match> best;
     for (Entry* e : entries) {
         if (e->n_tok == 0) continue;
@@ -805,6 +805,7 @@ std::optional<Match> Tier::lookup(std::span<const std::uint32_t> toks) {
             const CkMeta& c = e->ck[k];
             if (c.valid == 0 || c.pos == 0 || c.pos > lcp || c.pos > toks.size()) continue;
             if (c.pos == toks.size() && c.has_logits == 0) continue;
+            if (accept && !accept(c.pos, c.kind)) continue;
             if (!ck || c.pos > e->ck[*ck].pos) ck = k;
         }
         if (!ck) continue;

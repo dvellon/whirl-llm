@@ -347,6 +347,16 @@ static void testLookup(MockDeviceOps& ops) {
     auto longer = prefixPlus(toks, 512, 600, 3);
     auto m = t->lookup(longer);
     CHECK(m && m->e == e && m->reuse == 512 && m->ck == 1 && m->lcp == 512);
+    // COLD-RESUME: a refused checkpoint (here: kind gen-end at 512) falls back to the next accepted one
+    const std::uint8_t kind1 = e->ck[1].kind;
+    e->ck[1].kind = 3;
+    m = t->lookup(longer, [](std::uint32_t, std::uint8_t k) { return k != 3; });
+    CHECK(m && m->reuse == 256 && m->ck == 0);
+    m = t->lookup(longer, [](std::uint32_t, std::uint8_t) { return false; });
+    CHECK(!m);
+    m = t->lookup(longer);  // no predicate: the longest, as before
+    CHECK(m && m->reuse == 512 && m->ck == 1);
+    e->ck[1].kind = kind1;
     // full length: allowed only with logits
     m = t->lookup(toks);
     CHECK(m && m->reuse == 512 && m->ck == 1);

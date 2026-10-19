@@ -130,6 +130,9 @@ struct Victim {
 using PosPred = std::function<bool(std::size_t)>;          // position is on the chunk schedule
 using FloorFn = std::function<std::size_t(std::size_t)>;   // schedule floor at or below a position
 using SlotPred = std::function<bool(std::size_t)>;         // slot index may be evicted
+// a checkpoint (position, kind code: 1 prompt-end, 2 think-open, 3 gen-end, 4 system, 5 prefix) may be resumed
+// from (COLD-RESUME: --precise accepts only states bitwise equal to a cold prefill); empty = any
+using ResumePred = std::function<bool(std::uint32_t, std::uint8_t)>;
 
 class PrefixCache {
 public:
@@ -145,7 +148,7 @@ public:
     virtual SlotMatch matchSlot(Tokens cached, View<const CkptKey> cks, Tokens toks) const = 0;
     virtual int matchShared(View<const SpeKey> spes, Tokens toks, const PosPred& on_schedule) const = 0;
     virtual int findShared(View<const SpeKey> spes, Tokens prefix) const = 0;
-    virtual TierResume matchTierEntry(Tier::Entry e, Tokens toks) const = 0;
+    virtual TierResume matchTierEntry(Tier::Entry e, Tokens toks, const ResumePred& accept = {}) const = 0;
     virtual std::uint64_t findTierShared(Tokens prefix) const = 0;  // tier id of a 1-checkpoint copy, 0 none
     virtual std::uint32_t lcpTarget(View<const SlotCache> slots, View<const SpeKey> spes, Tokens toks,
                                     std::uint32_t reuse, std::uint32_t sys, const FloorFn& floor) const = 0;

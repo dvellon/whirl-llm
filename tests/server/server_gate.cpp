@@ -437,6 +437,9 @@ bool relaxAccOn(const std::optional<std::string>& mode, const std::optional<std:
 }
 
 // Do the servers run in precise mode? (WHIRL_MODE as the servers see it; unset = the default, balance)
+bool preciseMode(const std::optional<std::string>& mode);
+// the servers' mode is precise (--server-env WHIRL_MODE, else this process's environment)
+bool serversPrecise();
 bool preciseMode(const std::optional<std::string>& mode) {
     if (!mode) return false;
     try {
@@ -464,6 +467,11 @@ std::optional<CacheVerify> parseCacheVerify(const std::string& line) {
 // R9700, Swift-1.5 27B MXFP4-A (requant 2026-10-19), tier p1 gen-end state vs cold: balance KL 9e-5..2e-4,
 // precise KL 1e-8..7e-8; a wrong or mismatched restore is far above it.
 constexpr double kCacheVerifyMaxKl = 1e-2;
+bool serversPrecise() {
+    auto it = g.server_env.find("WHIRL_MODE");
+    const char* em = std::getenv("WHIRL_MODE");
+    return preciseMode(it != g.server_env.end() ? std::optional<std::string>(it->second) : (em ? std::optional<std::string>(em) : std::nullopt));
+}
 bool cacheVerifyOk(const CacheVerify& v) { return v.top1_same && v.kl <= kCacheVerifyMaxKl; }
 
 const json::Value* path(const json::Value& v, std::initializer_list<const char*> keys) {
@@ -1170,6 +1178,11 @@ void tierMode(const std::string& mode) {
             record("tier/" + mode + "/" + ss.name + "/1", a.text());
             record("tier/" + mode + "/" + ss.name + "/2", b.text());
         }
+        // COLD-RESUME: a precise server never continues a conversation from the end of a generated reply
+        if (serversPrecise())
+            check(std::format("tier {}: precise: no turn resumed from a 'gen-end' checkpoint", mode),
+                  s->logCount(R"(reused \d+ tok \(checkpoint 'gen-end')") == 0,
+                  std::format("{} gen-end resumes logged", s->logCount(R"(reused \d+ tok \(checkpoint 'gen-end')")));
     }
     const std::string ssd = g.work + "\\tier_gate_ssd";
     std::error_code ec;
@@ -1224,7 +1237,7 @@ void tierMode(const std::string& mode) {
             // CLOSE-COV: the content check alone passes on a cold prefill too; the restored prefix must cover at
             // least what the never-evicted run reused (its turn 1), which only the session's SSD entry can give
             check(std::format("tier {}: {} turn 2 after restart restored from SSD (cached >= never-evicted)", mode, ss.name),
-                  rb.cached > 0 && b.cached >= rb.cached, std::format("cached {} (ref {}), prompt {}", b.cached, rb.cached, b.prompt));
+                  b.cached > 0 && b.cached >= rb.cached, std::format("cached {} (ref {}), prompt {}", b.cached, rb.cached, b.prompt));
         }
         const std::size_t n_ssd = s->logCount(R"(kv tier: restored \d+ tok from SSD)");
         check(std::format("tier {}: SSD restores logged (one per session)", mode), n_ssd >= S.size(),
@@ -1246,17 +1259,18 @@ void tierMode(const std::string& mode) {
         const std::size_t n_ssd = s->logCount(R"(kv tier: restored \d+ tok from SSD)");
         check("tier p1: verify run: every session restored from SSD, one verify line each", n_ssd >= S.size() && v.size() == S.size(),
               std::format("{} SSD restores, {} verify lines, {} sessions", n_ssd, v.size(), S.size()));
+        // precise (COLD-RESUME): bitwise, max abs diff 0; balance / fast: numerically equivalent (KL bound, same top-1)
+        const bool precise_v = serversPrecise();
         for (std::size_t i = 0; i < S.size() && i < v.size(); ++i)
-            check(std::format("tier p1: {} turn 2 SSD-restored state == from-scratch prefill (KL <= {:.0e}, same top-1)", S[i].name,
-                              kCacheVerifyMaxKl),
-                  cacheVerifyOk(v[i]), std::format("max abs diff {:.4f}, KL {:.2e}, top1 {}", v[i].maxd, v[i].kl, v[i].top1_same ? "same" : "DIFFERENT"));
+            check(precise_v ? std::format("tier p1: {} turn 2 SSD-restored state == from-scratch prefill, bitwise (precise)", S[i].name)
+                            : std::format("tier p1: {} turn 2 SSD-restored state == from-scratch prefill (KL <= {:.0e}, same top-1)",
+                                          S[i].name, kCacheVerifyMaxKl),
+                  precise_v ? (v[i].maxd == 0 && v[i].kl == 0 && v[i].top1_same) : cacheVerifyOk(v[i]),
+                  std::format("max abs diff {:.4f}, KL {:.2e}, top1 {}", v[i].maxd, v[i].kl, v[i].top1_same ? "same" : "DIFFERENT"));
     }
     fs::remove_all(widen(ssd), ec);
     if (p1) {
-        auto it = g.server_env.find("WHIRL_MODE");
-        const char* em = std::getenv("WHIRL_MODE");
-        const bool precise = preciseMode(it != g.server_env.end() ? std::optional<std::string>(it->second)
-                                                                  : (em ? std::optional<std::string>(em) : std::nullopt));
+        const bool precise = serversPrecise();
         ServerLease s("tier_p1_nocache", {"--parallel", "1", "--kv-ram-mb", "0"}, {{"WHIRL_NO_PREFIX_CACHE", "1"}});
         for (const auto& ss : S) {
             auto b = chat(t2msg(ss, t1[ss.name]), greedy(96) + thinkKw(ss.think));
@@ -1265,10 +1279,11 @@ void tierMode(const std::string& mode) {
             check(std::format("tier p1: {} turn 2 verify run (from-scratch prefill) == no prefix cache", ss.name),
                   sameContent(b, fresh[ss.name]) && b.reasoning == fresh[ss.name].reasoning,
                   std::format("cached {} vs {}", fresh[ss.name].cached, b.cached));
-            // CACHE-1: continuing after a restart (SSD restore) == a run with no prefix cache at all. Gated in
-            // precise only (gen-end KL ~1e-8 there, measured); in balance / fast the decode-produced history is
-            // numerically equivalent only (KL ~1e-4 on the R9700, Swift requant), so the greedy text can differ
-            // a few tokens in: the KL check above is the gate, this line is information.
+            // CACHE-1: continuing after a restart (SSD restore) == a run with no prefix cache at all. A gate in
+            // precise (COLD-RESUME: only cold-exact checkpoints are resumed, so this is bitwise by construction); in
+            // balance / fast a next turn resumes from the end of the generated reply, whose history the decode kernels
+            // produced: numerically equivalent only (KL ~2e-4 on the R9700, Swift requant), so the greedy text can
+            // differ a few tokens in: the KL check above is the gate, this line is information.
             const std::string name = std::format("tier p1: {} turn 2 after restart (SSD restore) == no prefix cache", ss.name);
             const bool same = sameContent(b, after[ss.name]) && b.reasoning == after[ss.name].reasoning;
             const std::string d = std::format("cached {} vs {}", after[ss.name].cached, b.cached);

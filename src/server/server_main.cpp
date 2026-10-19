@@ -1015,6 +1015,8 @@ int serveMain(int argc, char** argv, const char* program) {
         eo.ng_snap_sets = lit_snap_sets;
         eo.no_prefix_cache = no_pc;
         eo.verify_cache = env("PREFIX_CACHE_VERIFY").has_value();
+        // COLD-RESUME: --precise resumes only from cold-exact checkpoints (output bitwise equal to a cold prefill)
+        eo.cold_resume = envOn("COLD_RESUME", nreq.mode == numerics::Mode::precise);
         eo.seg_prefill = envOn("SEG_PREFILL", true);
         eo.timing_reset = envOn("TIMING_RESET", true);
         eo.ngram = envOn("NGRAM", true);
@@ -1216,6 +1218,10 @@ int serveMain(int argc, char** argv, const char* program) {
                              (1024.0 * 1024.0);
         if (no_pc) logI("prefix cache: disabled (WHIRL_NO_PREFIX_CACHE)");
         else logI("prefix cache: {} checkpoint(s) per slot x {:.1f} MiB ({} DeltaNet layers of recurrent state + logits row)", n_ck, ck_mb, n_gdn);
+        if (!no_pc && eo.cold_resume)
+            logI("prefix cache: cold-exact resume (precise): a request resumes only at a checkpoint on its own chunk schedule "
+                 "that prefill produced (never the end of a generated reply), so its output is bitwise the cold run's; a next "
+                 "turn re-prefills from the previous prompt's last schedule point (WHIRL_COLD_RESUME=0: longest checkpoint)");
         if (!no_pc) {
             if (!eo.tail_ck)
                 logW("prefix cache: tail checkpoint off (WHIRL_TAIL_CK=0, debug override): a second question about the same long "

@@ -211,6 +211,13 @@ static void testTier() {
     req[5000] = 1;
     TierResume r = pc->matchTierEntry(t.find(11), req);
     CHECK(r.reuse == 4096 && r.kind == 1);
+    // COLD-RESUME: an accept predicate skips refused checkpoints and falls back to the longest accepted one
+    r = pc->matchTierEntry(t.find(11), req, [](std::uint32_t, std::uint8_t k) { return k != 1; });
+    CHECK(r.reuse == 2048 && r.kind == 4);
+    r = pc->matchTierEntry(t.find(11), req, [](std::uint32_t, std::uint8_t) { return false; });
+    CHECK(r.reuse == 0);
+    r = pc->matchTierEntry(t.find(11), req, [](std::uint32_t p, std::uint8_t) { return p % 2048 == 0; });
+    CHECK(r.reuse == 4096 && r.kind == 1);
     r = pc->matchTierEntry(t.find(11), seq(6000));
     CHECK(r.reuse == 6000 && r.kind == 0);  // has logits at the full length
     t.entries[0].cks[2].has_logits = 0;
