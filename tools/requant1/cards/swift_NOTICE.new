@@ -1,0 +1,86 @@
+Swift 1.5 Qwen3.8-27B
+Copyright 2026 UkisAI
+
+UkisAI's contribution (the "Swift Contribution") is licensed under the
+Swift Open License v1.0. See LICENSE.
+
+This model is a Derivative Work of Qwen3.8-27B
+  https://huggingface.co/Qwen/Qwen3.8-27B
+  Copyright 2026 Alibaba Cloud
+  Licensed under the Apache License, Version 2.0. See LICENSE-APACHE-2.0.
+
+Swift 1.5 continues UkisAI's Swift 1.0 model, itself a Qwen3.8-27B
+derivative. The full release incorporates the Qwen3.8-27B Base Model and
+UkisAI's Swift 1.0 and Swift 1.5 contributions.
+
+Changes made by UkisAI (Apache License 2.0, Section 4(b) change notice):
+  - model-*.safetensors, model.safetensors.index.json: the model weights from
+    Swift 1.0 were further adapted by UkisAI using additional post-training
+    methods.
+  - README.md: replaced. LICENSE and NOTICE added.
+  - All other files (config.json, generation_config.json, chat_template.jinja,
+    tokenizer.json, tokenizer_config.json, vocab.json, merges.txt,
+    preprocessor_config.json, video_preprocessor_config.json) are retained from
+    the parent model and remain available under Apache License, Version 2.0.
+
+--------------------------------------------------------------------------------
+Changes in this redistribution (2026-10-01)
+--------------------------------------------------------------------------------
+
+This repository is an unofficial community redistribution. It is not
+affiliated with, endorsed by, or supported by UkisAI or Alibaba Cloud.
+
+  Copyright 2026 UkisAI. Swift Contribution licensed under the Swift Open
+  License v1.0 (https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b/blob/main/LICENSE).
+  Derivative of Qwen3.8-27B, Copyright 2026 Alibaba Cloud, Apache License 2.0.
+
+Files changed or added relative to ukisai/Swift-1.5-Qwen3.8-27b:
+
+  - Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf
+    Swift-1.5-Qwen3.8-27B-MXFP4-B-outQ8_0.gguf
+    Swift-1.5-Qwen3.8-27B-MXFP4-C-outQ4_K.gguf
+    The upstream BF16 model-*.safetensors weights were converted to a BF16
+    GGUF with llama.cpp's convert_hf_to_gguf.py (--outtype bf16; the MTP /
+    nextn layer was kept, 866 tensors), then quantized with llama.cpp
+    llama-quantize (build 11214, commit 2ebd9ae62) to MXFP4 for the large
+    matrices, Q8_0 for token_embd, ssm_alpha, ssm_beta and the whole MTP layer
+    (blk.64), and Q6_K / Q8_0 / Q4_K respectively for the output head. Norms
+    and other small tensors are F32. An importance matrix published by
+    bartowski (ukisai_Swift-1.5-Qwen3.8-27b-imatrix.gguf) was passed to
+    llama-quantize. The tokenizer and chat template were embedded into the
+    GGUF metadata by the conversion script.
+  - mmproj-Swift-1.5-Qwen3.8-27B-F16.gguf: the vision encoder / projector,
+    converted from the same BF16 weights with convert_hf_to_gguf.py
+    (--mmproj --outtype f16), without further quantization.
+  - README.md: replaced with a model card describing these quantized files.
+  - NOTICE: this section appended.
+  - LICENSE and LICENSE-APACHE-2.0: unmodified copies of the upstream files.
+
+--------------------------------------------------------------------------------
+Changes in this redistribution (2026-10-19 rebuild)
+--------------------------------------------------------------------------------
+
+  - Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf
+    Swift-1.5-Qwen3.8-27B-MXFP4-B-outQ8_0.gguf
+    Swift-1.5-Qwen3.8-27B-MXFP4-C-outQ4_K.gguf
+    Re-made from the same upstream BF16 weights (ukisai/Swift-1.5-Qwen3.8-27b,
+    revision b4c84d42903a8646b25857eb2827288d92ed85a4; weights unchanged since
+    the initial release) with llama.cpp build b11719 (commit 5aeac37a3):
+    convert_hf_to_gguf.py --outtype bf16 (866 tensors, MTP layer kept), then
+    llama-quantize built from that commit plus mxfp4_wsearch.patch (an
+    importance-matrix-weighted search of the MXFP4 block scale; quantize-time
+    code only, standard MXFP4 output). Same tensor types as the 2026-10-01
+    files: MXFP4 for the large matrices of the 64 main layers, Q8_0 for
+    token_embd, ssm_alpha, ssm_beta and the MTP layer (blk.64), Q6_K / Q8_0 /
+    Q4_K for the output head, F32 for norms and small tensors. Importance
+    matrix: ukisai_Swift-1.5-Qwen3.8-27b-imatrix.gguf by bartowski
+    (bartowski/ukisai_Swift-1.5-Qwen3.8-27b-GGUF, revision
+    ce202c7d9a5d71969c60bf62a4f1c3e41747520c, SHA256
+    125d4e6838a1a62cabf9c48aebdfa47e497e95db590a993ee94e12aaf28a268b).
+  - mxfp4_wsearch.patch: added (the quantizer change, a diff against
+    llama.cpp 5aeac37a3, ggml/src/ggml-quants.c; llama.cpp is MIT-licensed).
+  - RECIPE.md, SOURCE_SHA256.txt, SHA256SUMS: added (reproduction commands,
+    source file hashes, hashes of the files in this repository).
+  - README.md: updated for the rebuild.
+  - mmproj-Swift-1.5-Qwen3.8-27B-F16.gguf, LICENSE, LICENSE-APACHE-2.0:
+    unchanged.
