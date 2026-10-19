@@ -1,6 +1,6 @@
 # REQUANT-1: start whirl-server on the 8060S, run wtests.py, stop it (only the PID we started).
 #   pwsh -File serve_test.ps1 -Model M.gguf -Tag NAME [-Mmproj P] [-Mode balance] [-Plain] [-TextOnly]
-param([Parameter(Mandatory)][string]$Model, [Parameter(Mandatory)][string]$Tag, [string]$Mmproj = '', [string]$Mode = 'balance', [switch]$Plain, [switch]$TextOnly)
+param([Parameter(Mandatory)][string]$Model, [Parameter(Mandatory)][string]$Tag, [string]$Mmproj = '', [string]$Mode = 'balance', [switch]$Plain, [switch]$TextOnly, [switch]$VisionOnly)
 $ErrorActionPreference = 'Stop'
 $exe = 'C:\ClaudeWorkspace\whirl-work\wt_rel020f\build\Release\whirl-server.exe'
 $LG = 'C:\ClaudeWorkspace\models\requant1\logs\wsrv'; New-Item -ItemType Directory -Force $LG | Out-Null
@@ -22,6 +22,7 @@ try {
   if (-not (Select-String -Path $log -Pattern 'gfx1151' -Quiet)) { throw "device check: gfx1151 not in $log" }
   $a = @('C:\ClaudeWorkspace\whirl-work\wt_requant1\tools\requant1\wtests.py', $port, "$LG\$Tag.json")
   if ($TextOnly) { $a += '--text-only' }
+  if ($VisionOnly) { $a += '--vision-only' }
   & 'C:\ClaudeWorkspace\tools\pyref\Scripts\python.exe' @a
   if ($LASTEXITCODE -ne 0) { throw "wtests failed $LASTEXITCODE" }
 } finally {

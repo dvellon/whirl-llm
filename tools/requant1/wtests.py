@@ -18,6 +18,9 @@ tests = {
   "vision_en": [{"role": "user", "content": [img(E + r"\img_shapes_en.png"), {"type": "text", "text": "Describe this image. Quote any text exactly."}]}],
   "vision_zh": [{"role": "user", "content": [img(E + r"\img_sign_zh.png"), {"type": "text", "text": "請逐字讀出圖片中的所有文字，然後用一句話說明這是什麼。"}]}],
 }
+if "--vision-only" in sys.argv:  # vision only, plus the 2026-10-03 card image (itemVIS shapes.png, 640x360, "WHIRL 42")
+    tests = {k: v for k, v in tests.items() if "vision" in k}
+    tests["vision_en_1003"] = [{"role": "user", "content": [img(r"C:\ClaudeWorkspace\whirl-work\itemVIS\img\shapes.png"), {"type": "text", "text": "Describe this image. Quote any text exactly."}]}]
 if "--text-only" in sys.argv:
     tests = {k: v for k, v in tests.items() if "code" in k}
 res = {}

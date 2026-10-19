@@ -36,7 +36,9 @@ if (( START <= 4 && STOP >= 4 )); then
   say "imatrix start (Vulkan0 = 8060S)"
   /c/ClaudeWorkspace/tools/llamacpp_fn_bin/vulkan/llama-imatrix.exe -m $Q8 -f $R/imatrix/orn_calib.txt -o $IMX --process-output --parse-special \
      -c 512 -b 2048 -ub 512 -ngl 99 --device Vulkan0 -t 16 > $L/imatrix_ornith.log 2>&1 || { say "IMATRIX FAILED"; exit 1; }
-  grep -q "Vulkan0" $L/imatrix_ornith.log && grep -q "8060S" $L/imatrix_ornith.log || { say "IMATRIX DEVICE CHECK FAILED"; exit 1; }
+  # llama-imatrix b11719 does not print the device in its log: check the enumeration instead (Vulkan0 must be the 8060S)
+  /c/ClaudeWorkspace/tools/llamacpp_fn_bin/vulkan/llama-imatrix.exe --list-devices > $L/imatrix_devices.txt 2>&1
+  grep -q "Vulkan0: AMD Radeon(TM) 8060S" $L/imatrix_devices.txt || { say "IMATRIX DEVICE CHECK FAILED"; exit 1; }
   say "imatrix done $(stat -c %s $IMX) bytes sha $(sha256sum $IMX | cut -c1-16); $(grep -E 'Final estimate|chunks' $L/imatrix_ornith.log | tail -2 | tr '\n' ' ')"
 fi
 if (( START <= 5 && STOP >= 5 )); then
