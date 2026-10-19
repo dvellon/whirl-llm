@@ -1,0 +1,14 @@
+blk\.64\.=q8_0
+ssm_alpha=q8_0
+ssm_beta=q8_0
+token_embd=q8_0
+attn_gate=mxfp4
+attn_qkv=mxfp4
+attn_q\.=mxfp4
+attn_k\.=mxfp4
+attn_v\.=mxfp4
+attn_output=mxfp4
+ffn_gate=mxfp4
+ffn_up=mxfp4
+ffn_down=mxfp4
+ssm_out=mxfp4
