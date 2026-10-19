@@ -24,6 +24,15 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
   to set, instead of failing with hipError 719 (GitHub issue #7); a carve-out that holds the model but not the default
   262,144-token KV cache gets a smaller cache. A hipError 719 on the 8060S now prints the same hint. Output is
   unchanged; R9700 output and memory sizing are unchanged. UMA-1.
+- Server: `WHIRL_PREFIX_CACHE_VERIFY=1` (the cache-hit diagnostic) no longer changes the KV tier fingerprint, so a
+  diagnostic run restores the RAM / SSD entries a normal server wrote instead of ignoring them as another build's.
+  Output unchanged. CACHEBAL.
+- Release gate (`srv_cache_balance`): the tier check "turn 2 after a restart == no prefix cache" asserted equal greedy
+  text for a gen-end reuse, which is numerically equivalent to a cold prefill but not bit-identical (decode-produced
+  history; kv-and-caching.md section 5). With the 2026-10-19 Swift-1.5 27B MXFP4-A requant it failed on the R9700 in
+  balance (also with the 0.2.0 exe; the SSD restore itself was bit-exact). The gate now checks the restored state
+  against a from-scratch prefill (KL <= 1e-2 and the same top-1; measured balance KL ~2e-4, precise ~1e-8) and keeps
+  the text check as a gate in precise. CACHEBAL.
 
 ## 0.2.1 — 2026-10-20 (bug fixes)
 

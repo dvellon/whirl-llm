@@ -261,7 +261,7 @@ MXFP4，28.3k token 上下文：完整 prefill TTFT 10.70 s、從 RAM 還原 0.6
 
 ### 8.7 關卡（gate）
 
-- `tier_gate`：一個不帶分層的參考 server 在無逐出情況下跑每個 session 的第 1、2 回合；分層 server 跑完所有第一回合後被強制逐出，再跑第二回合（從 RAM 還原：文字與已快取 token 數必須與參考相同），然後重啟再跑一次（從 SSD 還原）。涵蓋 `--parallel 1`（f16 KV，思考與非思考 session，包括 `think-open`）與 `--parallel 4`（q8v，五個 session）。兩個模型都測。
+- `tier_gate`：一個不帶分層的參考 server 在無逐出情況下跑每個 session 的第 1、2 回合；分層 server 跑完所有第一回合後被強制逐出，再跑第二回合（從 RAM 還原：文字與已快取 token 數必須與參考相同），然後重啟再跑一次（從 SSD 還原）。涵蓋 `--parallel 1`（f16 KV，思考與非思考 session，包括 `think-open`）與 `--parallel 4`（q8v，五個 session）。兩個模型都測。`--parallel 1` 另外以 `WHIRL_PREFIX_CACHE_VERIFY=1` 再從 SSD 還原一次：每個還原的狀態都要和從頭 prefill 相符（KL <= 1e-2、top-1 相同；R9700 Swift MXFP4 實測 balance KL 約 1e-4、precise 約 1e-8），而且從該次從頭 prefill 接續的輸出必須與不開前綴快取的 server 逐字相同。「重啟後文字 == 不開前綴快取」只在 precise 當關卡：還原的歷史屬 gen-end 重用，與冷算數值等價但非逐位元相同（第 5 節），balance 下貪婪解碼的文字可能在幾個 token 後分岔（CACHEBAL，0.2.2）。
 - `sys_gate`：共享系統檢查點重用（cached == B、text == cold）、4 個並行新 session、逐出到 RAM 與還原、重啟後的 SSD、關閉分層、突發，以及 `prefix` 檢查點。
 - `restore_conc_gate`：在 3 個正在 decode 的 slot 旁做 RAM 還原 == 從未被逐出；共享項目在 RAM / SSD 上的突發；為排隊中請求做 SSD 預取。
 - 每個測試 server 都有自己的 SSD 目錄；否則前一個測試寫出的項目會把下一個測試的 prefill 變成還原（fingerprint 相同），改變了受測的內容。

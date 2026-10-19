@@ -523,6 +523,12 @@ the other slots' decode cycles stretch for the duration of the restore. Not opti
   (restored from RAM: text and cached-token count must equal the reference), restarts and runs them
   again (restored from SSD). With `--parallel 1` (f16 KV, thinking and non-thinking sessions,
   including `think-open`) and `--parallel 4` (q8v, five sessions). Both models.
+  With `--parallel 1` the SSD entries are also restored once more with `WHIRL_PREFIX_CACHE_VERIFY=1`: each
+  restored state must match a from-scratch prefill (KL <= 1e-2, same top-1; R9700 Swift MXFP4: balance KL
+  ~1e-4, precise ~1e-8), and the continuation from that fresh prefill must equal a server with no prefix cache
+  exactly. Text after the restart == no prefix cache is gated in precise only: the restored history is a gen-end
+  reuse, numerically equivalent to a cold run, not bit-identical (section 5), and in balance the greedy text can
+  differ a few tokens in (CACHEBAL, 0.2.2).
 - `sys_gate`: shared system checkpoint reuse (cached == B, text == cold), 4 concurrent new sessions,
   eviction to RAM and restore, SSD after restart, tiers off, bursts, and `prefix` checkpoints.
 - `restore_conc_gate`: RAM restore beside 3 decoding slots == never evicted; burst on a shared entry
