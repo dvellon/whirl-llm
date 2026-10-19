@@ -1,4 +1,4 @@
-G model file=Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf bytes=15815469280
+G model file=Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf bytes=15815469376
 G header format=1 suite=ngram decode=24
 G info kv=q4 (4-bit + f16 scale / 32, Hadamard-rotated q/k) max_ctx=8192 mtp=1 fused=1
 G mtp_ngram.cycles drafts=8 cycles=5 accepted=68 ng_cycles=4 ng_accepted=60
