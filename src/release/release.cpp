@@ -9,6 +9,7 @@
 #include "whirl/gguf.h"
 #include "whirl/hip.h"
 #include "whirl/model.h"
+#include "whirl/uma_mem.h"
 #include "whirl/version.h"
 
 #include <cstdio>
@@ -222,6 +223,10 @@ std::string explainText(const std::exception& e, int* exit_code) {
             msg = "the GPU is still in use by another WHIRL process (waited WHIRL_GPU_WAIT seconds).\n"
                   "  Close the other whirl / whirl-server, or set WHIRL_GPU_SHARE=1 to run side by side\n"
                   "  (both then share the GPU's memory and speed).\n";
+        } else if (c == "UmaTooSmall") {
+            // integrated GPU: the carve-out cannot hold the model (UMA-1; the message names the setting)
+            code = exit_vram;
+            msg = what.size() > c.size() + 2 ? what.substr(c.size() + 2) : what;
         } else if (c == "KvDoesNotFit") {
             code = exit_vram;
             msg = (what.size() > c.size() + 2 ? what.substr(c.size() + 2) : what) + "\n";
@@ -242,6 +247,10 @@ std::string explainText(const std::exception& e, int* exit_code) {
             code = exit_vram;
             msg = "out of GPU memory under the simulated VRAM limit (" + what + ").\n" + k_vram_advice +
                   "  Unset WHIRL_VRAM_LIMIT_MB (or raise it) to use all of the GPU's memory.\n";
+        } else if (const std::string h = hc == 719 ? hip::uma719Hint(hip::lastUmaMemory()) : std::string(); !h.empty()) {
+            // hipError 719 on an integrated GPU: most often a carve-out too small for the runtime (UMA-1, issue #7)
+            code = exit_vram;
+            msg = what + "\n" + h;
         } else if (hc == 2 /* hipErrorOutOfMemory */ || op == "hipMalloc" || op == "hipMallocAsync") {
             code = exit_vram;
             msg = "out of GPU memory (" + what + ").\n" + k_vram_advice;

@@ -23,6 +23,7 @@
 #include "whirl/hip.h"
 #include "whirl/model.h"
 #include "whirl/tokenizer.h"
+#include "whirl/uma_mem.h"
 #include "whirl/vram_limit.h"
 #include "release/release.h"
 
@@ -483,7 +484,9 @@ int serveMain(int argc, char** argv, const char* program) {
         hip::setDevice(dev);
         // integrated GPU (Radeon 8060S): the "VRAM" is system memory shared with the CPU
         const bool is_uma = info.integrated;
-        const std::optional<std::uint32_t> pool_req = opt.ctx ? opt.ctx : (is_uma ? std::optional<std::uint32_t>(262144) : std::nullopt);
+        // its real dedicated memory is the BIOS carve-out (DXGI), not info.total_mem (UMA-1)
+        const hip::UmaMem uma = is_uma ? hip::umaMemory(dev) : hip::UmaMem{};
+        std::optional<std::uint32_t> pool_req = opt.ctx ? opt.ctx : (is_uma ? std::optional<std::uint32_t>(262144) : std::nullopt);
         const std::uint32_t cap_max = 262144;
         const std::uint32_t slot_ctx = static_cast<std::uint32_t>(alignUp(
             opt.ctx_per_slot ? *opt.ctx_per_slot : (pool_req ? std::min(*pool_req, ctx_per_slot_default) : ctx_per_slot_default),
@@ -494,8 +497,14 @@ int serveMain(int argc, char** argv, const char* program) {
              cfg.n_embd, cfg.n_ff, cfg.n_vocab, cfg.n_nextn > 0 ? ", MTP (nextn) layer" : "");
         if (cfg.moe)
             logI("experts {} (top {}, ff {}) + shared expert ff {}", cfg.n_expert, cfg.n_expert_used, cfg.n_ff_exp, cfg.n_ff);
-        logI("device {}: {} ({}), {:.1f} GiB VRAM{}", dev, info.name, info.gcn_arch,
-             static_cast<double>(info.total_mem) / (1024.0 * 1024.0 * 1024.0), vram::limitBytes() ? " (simulated limit)" : "");
+        if (uma.known)
+            logI("device {}: {} ({}), {} GPU memory (UMA carve-out from the BIOS / Armoury Crate; the runtime reports {:.1f} GiB, "
+                 "which includes system RAM){}",
+                 dev, info.name, info.gcn_arch, hip::umaSizeText(uma), static_cast<double>(info.total_mem) / (1024.0 * 1024.0 * 1024.0),
+                 vram::limitBytes() ? " (simulated limit)" : "");
+        else
+            logI("device {}: {} ({}), {:.1f} GiB VRAM{}", dev, info.name, info.gcn_arch,
+                 static_cast<double>(info.total_mem) / (1024.0 * 1024.0 * 1024.0), vram::limitBytes() ? " (simulated limit)" : "");
         if (vram::limitBytes()) logI("{}: memory sizes, the WDDM budget and allocations are capped as on a card of that size", vram::limitNote());
         // small cards (< 20 GiB, e.g. a 16 GB RX 9070 XT that also drives the desktop): 1 slot,
         // VRAM headroom for other apps (the KV format is the mode's, as on every card)
@@ -520,7 +529,6 @@ int serveMain(int argc, char** argv, const char* program) {
              chat::templateName(tmpl),
              tmpl == chat::TemplateKind::a ? "reasoning effort, merged system, preserve_thinking" : "system + tools, <think> in history");
 
-        const hip::MemInfo mem0 = hip::memInfo();
         qwen35::LoadStats stats;
         qwen35::LoadOptions lo;
         lo.numerics = nreq;
@@ -670,7 +678,64 @@ int serveMain(int argc, char** argv, const char* program) {
                 logW("VRAM estimate: weights + buffers + checkpoints {:.2f} GiB leave about {} KV tokens of {:.2f} GiB usable "
                      "(at least {} needed); the model may not fit this GPU",
                      plan.need_fixed / g, plan.pool_tokens, av / g, fi.pool_hard_min);
+        } else if (uma.known && hip::umaCheckOn()) {
+            // integrated GPU (UMA-1): weights, buffers, checkpoints and the KV cache must fit the BIOS
+            // carve-out. Too small for one request at the context asked for: refuse now, before the
+            // first device-memory call (a tiny carve-out fails in hipMemGetInfo with hipError 719,
+            // issue #7), naming the setting. Room for less than the default pool: the pool shrinks to
+            // what the carve-out holds instead of spilling into slower system memory.
+            const qwen35::LoadEstimate est = qwen35::estimateLoad(f, cfg, lo.embd_on_host, use_dflash);
+            std::uint64_t n_gdn_c = 0;
+            for (std::uint32_t li = 0; li < cfg.n_layer; ++li)
+                if (!cfg.isAttn(li)) ++n_gdn_c;
+            const std::uint64_t st1 = n_gdn_c * (static_cast<std::uint64_t>(cfg.d_conv - 1) * cfg.convCh() * 4 +
+                                                 static_cast<std::uint64_t>(cfg.n_v_heads) * cfg.d_state * cfg.headV() * 4);
+            const std::uint64_t pend1 = n_gdn_c * (static_cast<std::uint64_t>(qwen35::max_small_batch) * cfg.convCh() * 4 +
+                                                   static_cast<std::uint64_t>(qwen35::max_small_batch) * cfg.n_v_heads *
+                                                       (cfg.d_state + cfg.headV() + 2) * 4);
+            const auto kv_env = env("KV");
+            const numerics::KvKind kv_est =
+                numerics::chooseKv(nreq, cfg.moe, numerics::KvCaps{true, true, true, true},
+                                   kv_env && *kv_env != "auto" ? numerics::kvKindFromName(*kv_env) : std::nullopt)
+                    .kv;
+            const std::uint64_t ck = st1 + static_cast<std::uint64_t>(cfg.n_embd) * 4 + static_cast<std::uint64_t>(cfg.n_vocab) * 4;
+            hip::UmaNeed need;
+            need.weights = est.weights + (use_dflash && dfile ? qwen35::dflashWeightBytes(*dfile) : 0);
+            const std::uint64_t bufs =
+                qwen35::bufferBytes(cfg, lo.max_batch, est.ffs, est.max_elems, qwen35::resolveFdSplits(kv_est == numerics::KvKind::q4));
+            // DeltaNet snapshot sets for MTP verify: one recurrent state per draft (8 dense, 1 MoE: the server log's
+            // "N snapshot sets")
+            const std::uint64_t snaps = std::max<std::uint32_t>(1, qwen35::mtpDefaults(cfg.moe, hip::Arch::gfx1151).drafts) * st1;
+            const std::uint64_t slots_b = opt.parallel * (st1 + pend1) + snaps;
+            const std::uint64_t ck_b = (opt.parallel * n_ck + n_spe_plan) * ck;
+            need.fixed = need.weights + est.state + bufs + slots_b + ck_b + (est.has_mtp ? 65536ull * cfg.n_embd * 5 / 16 : 0) + (256ull << 20);
+            need.fixed += need.fixed / 12;  // +8%: measured fast-mode Swift fixed part 3.9% above the itemized sum
+            need.kv_per_token = kv_est == numerics::KvKind::f16   ? est.kv_f16
+                                : kv_est == numerics::KvKind::q8v ? est.kv_q8v
+                                : kv_est == numerics::KvKind::q4  ? est.kv_q4
+                                                                  : est.kv_q8h;
+            need.min_tokens = opt.ctx ? *opt.ctx : slot_ctx;
+            need.want_tokens = pool_req ? *pool_req : slot_ctx;
+            const double g = 1024.0 * 1024.0 * 1024.0;
+            if (std::string why = hip::umaRefusal(uma, need, info.name); !why.empty()) {
+                if (why.back() == '\n') why.pop_back();
+                throw app::UserError(app::exit_vram, why);
+            }
+            logI("UMA carve-out check (estimate): weights {:.2f} + state and buffers {:.2f} + slots {:.2f} + checkpoints {:.2f} GiB "
+                 "(+8% slack) = {:.2f} GiB, KV {:.1f} KiB/token: {:.1f} GiB for {} tokens, {:.1f} GiB with the {:.1f} GiB reserve, "
+                 "of {:.1f} GiB dedicated",
+                 need.weights / g, (est.state + bufs) / g, slots_b / g, ck_b / g, need.fixed / g, need.kv_per_token / 1024.0,
+                 need.at(need.want_tokens) / g - hip::uma_reserve / g, need.want_tokens, need.at(need.want_tokens) / g,
+                 hip::uma_reserve / g, uma.dedicated / g);
+            if (const std::optional<std::uint32_t> cap = hip::umaPoolCap(uma, need, kv_page); cap && !opt.ctx) {
+                logW("the {:.1f} GiB GPU carve-out holds a KV pool of about {} tokens, not the default {}: pool reduced (a {} GB "
+                     "carve-out holds the full pool; {})",
+                     uma.dedicated / g, *cap, need.want_tokens, hip::umaGbFor(need.at(need.want_tokens)),
+                     "raise the GPU memory / UMA frame buffer size in Armoury Crate or the BIOS");
+                pool_req = *cap;
+            }
         }
+        const hip::MemInfo mem0 = hip::memInfo();
         std::optional<std::size_t> exec_req;  // unset = the device default (prefillExecDefault, after the load)
         if (auto v = env("PREFILL_CHUNK")) {
             try {
@@ -1215,6 +1280,15 @@ int serveMain(int argc, char** argv, const char* program) {
                          msg);
                 else
                     logI("{}", msg);
+            }
+            // integrated GPU: what this process holds of the carve-out now (its GPU "Dedicated Usage"), against
+            // the pre-load estimate (UMA-1)
+            if (uma.known) {
+                const hip::LocalMemSnap s = hip::localMemSnap();
+                if (s.pdh_ok)
+                    logI("UMA carve-out use after load: {:.2f} GiB of {:.1f} GiB dedicated (GPU Dedicated Usage of this process); "
+                         "GPU Shared Usage {:.2f} GiB",
+                         s.dedicated / 1073741824.0, uma.dedicated / 1073741824.0, s.shared / 1073741824.0);
             }
         }
         if (eo.n_spe > 0)

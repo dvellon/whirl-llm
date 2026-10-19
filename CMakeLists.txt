@@ -127,6 +127,7 @@ if(WHIRL_WITH_HIP)
     src/hip/hip_runtime.cpp
     src/hip/wddm_mem.cpp
     src/hip/device_mem.cpp
+    src/hip/uma_mem.cpp
     ${CMAKE_BINARY_DIR}/kernels/embedded_objects.cpp
     ${WHIRL_EMBED_SOURCES})
   target_include_directories(whirl_hip PUBLIC ${CMAKE_SOURCE_DIR}/include)

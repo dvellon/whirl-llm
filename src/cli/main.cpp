@@ -18,6 +18,7 @@
 #include "whirl/model.h"
 #include "whirl/prefill_schedule.h"
 #include "whirl/tokenizer.h"
+#include "whirl/uma_mem.h"
 #include "whirl/vram_limit.h"
 
 #if WHIRL_HAVE_SERVER
@@ -2538,8 +2539,12 @@ int cmdDevices() {
         else tags += "  [supported]";
         if (d.integrated) tags += " [integrated: memory shared with the CPU]";
         if (d.index == def) tags += " [default]";
-        out(fmt("  device %d: %s (%s), %.1f GiB, %d CUs%s\n", d.index, d.name.c_str(), d.gcn_arch.c_str(), d.total_mem / (1024.0 * 1024.0 * 1024.0),
-                d.compute_units, tags.c_str()));
+        // integrated GPU: the carve-out (DXGI), not the runtime's total, which adds a share of system RAM (UMA-1)
+        std::string mem = fmt("%.1f GiB", d.total_mem / (1024.0 * 1024.0 * 1024.0));
+        if (d.integrated)
+            if (const hip::UmaMem u = hip::umaMemory(d.index); u.known) mem = hip::umaSizeText(u);
+        out(fmt("  device %d: %s (%s), %s, %d CUs%s\n", d.index, d.name.c_str(), d.gcn_arch.c_str(), mem.c_str(), d.compute_units,
+                tags.c_str()));
     }
     return 0;
 }

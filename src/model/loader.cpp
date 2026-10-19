@@ -5,6 +5,7 @@
 
 #include "whirl/model.h"
 #include "whirl/vram_limit.h"
+#include "whirl/uma_mem.h"
 
 #include "whirl/common.h"
 
@@ -451,6 +452,25 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
     const Config& cfg = m.cfg;
     // every tensor's type and shape against cfg, before any GPU allocation
     cfg.validateTensors(f);
+    // integrated GPU (Radeon 8060S): the weights, buffers and a minimal KV cache must fit the BIOS
+    // carve-out, checked before the first device-memory call (a tiny carve-out makes the runtime fail
+    // with hipError 719 in hipModuleLoadData; UMA-1). Discrete GPUs: umaMemory reads nothing else.
+    if (hip::umaCheckOn()) {
+        const hip::UmaMem u = hip::umaMemory(hip::getDevice());
+        if (u.integrated && u.known) {
+            const LoadEstimate est = estimateLoad(f, cfg, opt.embd_on_host, opt.no_mtp);
+            hip::UmaNeed n;
+            n.weights = est.weights;
+            n.fixed = est.weights + est.state +
+                      bufferBytes(cfg, std::clamp<u32>(opt.max_batch, 1, max_batch_limit), est.ffs, est.max_elems, resolveFdSplits(true)) +
+                      (256ull << 20);
+            n.kv_per_token = est.kv_f16;
+            n.min_tokens = std::max<u32>(max_ctx_req, 4096);
+            n.want_tokens = n.min_tokens;
+            if (const std::string why = hip::umaRefusal(u, n, hip::describeDevice(hip::getDevice()).name); !why.empty())
+                throw ModelError("UmaTooSmall", why);
+        }
+    }
     std::string co_path = opt.code_object;
     if (co_path.empty()) {
         if (auto v = envGet("CODE_OBJECT")) co_path = *v;
