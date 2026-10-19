@@ -22,7 +22,7 @@ rep("Radeon 8060S) and Radeon AI PRO R9700.\n\n> **Unofficial community quantiza
     "Radeon 8060S) and Radeon AI PRO R9700.\n\n"
     "**Rebuilt 2026-10-19:** the language-model file was re-quantized with an **imatrix-weighted MXFP4 quantizer** and an "
     "importance matrix computed for this exact checkpoint (same tensor layout, same file name). Against the BF16 model its KL "
-    "divergence is 19% lower than the first release (2026-10-02) and its perplexity is lower too; see [Quality](#quality). "
+    "divergence is 19% lower than the first release (2026-10-03) and its perplexity is lower too; see [Quality](#quality). "
     "The vision projector is unchanged.\n\n"
     "> **Unofficial community quantization.**")
 rep("(the only quality measurement here is a perplexity comparison between quantizations, see [Quality](#quality)).",
@@ -35,7 +35,7 @@ rep("| `Ornith-1.5-35B-A3B-MXFP4.gguf` | language model + MTP layer (MXFP4 exper
     f"| `Ornith-1.5-35B-A3B-MXFP4.gguf` | language model + MTP layer (MXFP4, see recipe) | {NEW_SIZE} | `{NEW_SHA}` |")
 rep("The language-model file is 4.46 bits per weight on average and takes 18.45 GiB of VRAM when loaded (plus KV cache). The projector is needed only for image input.",
     "The language-model file is 4.46 bits per weight on average and takes 18.45 GiB of VRAM when loaded (plus KV cache). The projector is needed only for image input.\n\n"
-    "`SHA256SUMS` lists the same hashes. The language-model file is the 2026-10-19 rebuild; the first-release file (2026-10-02) had "
+    "`SHA256SUMS` lists the same hashes. The language-model file is the 2026-10-19 rebuild; the first-release file (2026-10-03) had "
     "the same name, was 448 bytes smaller (metadata only; SHA256 `6735282d…`) and remains in this repository's commit history.")
 # 4. recipe
 rep("1. **Convert** the official BF16 checkpoint with llama.cpp `convert_hf_to_gguf.py --outtype bf16`.",
@@ -59,7 +59,7 @@ rep("""llama-quantize --tensor-type-file tt_orn.txt --output-tensor-type q6_k \\
   ornith-1.5-35b-bf16.gguf Ornith-1.5-35B-A3B-MXFP4.gguf MXFP4_MOE 24
 ```
 
-(`llama-quantize` = the patched build. The first release, 2026-10-02, used the same tensor-type file with upstream `llama-quantize` from build 11214, commit 2ebd9ae62, without an importance matrix. The rebuild has the same 753 tensor names and types; only the MXFP4 block scales / codes and the Q6_K head differ.)""")
+(`llama-quantize` = the patched build. The first release, 2026-10-03, used the same tensor-type file with upstream `llama-quantize` from build 11214, commit 2ebd9ae62, without an importance matrix. The rebuild has the same 753 tensor names and types; only the MXFP4 block scales / codes and the Q6_K head differ.)""")
 rep("3. **Vision projector**: `convert_hf_to_gguf.py --mmproj --outtype f16`",
     "4. **Vision projector** (unchanged from the first release): `convert_hf_to_gguf.py --mmproj --outtype f16`")
 # 5. measured performance: which file
@@ -70,7 +70,7 @@ i = s.index("## Quality\n")
 j = s.index("## License\n")
 quality = """## Quality
 
-KL divergence and perplexity against the **BF16 model** (the unquantized Ornith-1.5-35B-A3B weights converted to a BF16 GGUF), measured with llama.cpp b11719 `llama-perplexity` on the CPU (official release build), `-c 512`, 80 chunks of 512 tokens of a mixed text: a C++/HIP source file with Chinese comments (70,000 characters) plus Chinese technical prose (40,000 characters), the same text and settings as our Swift MXFP4 card. BF16 perplexity on this text: 6.2537 ± 0.1226. Measured 2026-10-20; "first release" = the 2026-10-02 file with the same name. Lower KLD and higher same-top are better.
+KL divergence and perplexity against the **BF16 model** (the unquantized Ornith-1.5-35B-A3B weights converted to a BF16 GGUF), measured with llama.cpp b11719 `llama-perplexity` on the CPU (official release build), `-c 512`, 80 chunks of 512 tokens of a mixed text: a C++/HIP source file with Chinese comments (70,000 characters) plus Chinese technical prose (40,000 characters), the same text and settings as our Swift MXFP4 card. BF16 perplexity on this text: 6.2537 ± 0.1226. Measured 2026-10-20; "first release" = the 2026-10-03 file with the same name. Lower KLD and higher same-top are better.
 
 | File | Mean KLD vs BF16 | 99th-percentile KLD | Same top token as BF16 | PPL | PPL / PPL(BF16) |
 |---|---|---|---|---|---|
@@ -92,7 +92,7 @@ s = s[:i] + quality.replace("CHECKS_EN_PLACEHOLDER", checks_en) + s[j:]
 # 7. credits
 rep("- **llama.cpp / ggml** contributors — conversion, quantization and inference tooling.",
     "- **llama.cpp / ggml** contributors — conversion, quantization and inference tooling.\n"
-    "- **bartowski** — the calibration text calibration_datav6 ([bartowski](https://huggingface.co/bartowski)), which is part of our imatrix calibration data.")
+    "- **[bartowski](https://huggingface.co/bartowski)** — the calibration text calibration_datav6, part of our imatrix calibration data.")
 # 8. zh summary
 rep("- 量化：專家、共享專家與所有稠密矩陣 MXFP4；token_embd、ssm_alpha / beta、整個 MTP 層 Q8_0；router 與 norm 為 F32；輸出頭 Q6_K；不使用 imatrix。平均 4.46 bpw，載入 18.45 GiB。",
     "- **2026-10-19 重新量化**：改用 imatrix 加權的 MXFP4 量化器（[`mxfp4_wsearch.patch`](mxfp4_wsearch.patch)，llama.cpp b11719）與我們針對這個確切版本（`10fbf86fed`）算的 imatrix（llama-imatrix --process-output，982×512 token 校準文字，與品質量測文字不重疊）；張量配置與檔名不變，視覺投影檔沒有變。\n"
@@ -100,6 +100,6 @@ rep("- 量化：專家、共享專家與所有稠密矩陣 MXFP4；token_embd、
 i = s.index("- 品質：困惑度（llama.cpp b11214")
 j = s.index("\n", i)
 s = s[:i] + ("- 品質（對 BF16，llama.cpp b11719 CPU，程式碼＋中文 80×512 token，BF16 困惑度 6.2537）：本版 KLD **0.1316**、與 BF16 同 top-1 **85.81%**、困惑度 6.5151（比 BF16 高 4.3%）；"
-             "第一版（2026-10-02）KLD 0.1618、84.61%、6.6594（高 6.6%）→ KLD 低 19%。單一語料、非下游任務評估。\n" + checks_zh) + s[j:]
+             "第一版（2026-10-03）KLD 0.1618、84.61%、6.6594（高 6.6%）→ KLD 低 19%。單一語料、非下游任務評估。\n" + checks_zh) + s[j:]
 open(p, "w", encoding="utf-8", newline="\n").write(s)
 print("ok")
