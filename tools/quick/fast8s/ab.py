@@ -44,7 +44,8 @@ def run(a, exes, variant, rnd, ctxslot, logdir):
                 break
             except Exception:
                 time.sleep(1)
-        common = ["--url", url, "--engine", label, "--model", a.model, "--mode", mode, "--out", a.out, "--round", str(rnd)]
+        common = ["--url", url, "--engine", label, "--model", a.model, "--mode", mode, "--out", a.out, "--round", str(rnd),
+                  "--expect-device", "gfx1151", "--server-log", slog]
         if a.lengths:
             subprocess.run([PY, B8S, "sweep", *common, "--lengths", a.lengths, "--max-tokens", "256"], check=False)
         if a.chat:
