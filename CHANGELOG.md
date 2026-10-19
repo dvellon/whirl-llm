@@ -15,6 +15,16 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
   only); output text unchanged in every mode (verify decides it), Ornith decode +2% to +4% in balance, +2% to +9% in
   fast (`WHIRL_DRAFT_VOCAB=off`: the full head). The R9700 MoE default is unchanged. FAST-8S-1.
 
+### Fixed
+
+- Radeon 8060S: `whirl devices` and the server log showed the HIP runtime's total (99.7 GiB on a 64 GB carve-out,
+  which adds a share of system RAM) as the GPU's memory. They now show the dedicated memory set in Armoury Crate / the
+  BIOS (the UMA carve-out) and the shared size, e.g. "dedicated 63.8 GiB (+ shared 47.6 GiB)". With a carve-out too
+  small for the model, the server and the CLI stop before loading with a message that names the setting and the size
+  to set, instead of failing with hipError 719 (GitHub issue #7); a carve-out that holds the model but not the default
+  262,144-token KV cache gets a smaller cache. A hipError 719 on the 8060S now prints the same hint. Output is
+  unchanged; R9700 output and memory sizing are unchanged. UMA-1.
+
 ## 0.2.0 — 2026-10-17
 
 ### Highlights

@@ -507,6 +507,8 @@ experiments and measurements.
 | `WHIRL_MOE_MXW=0` | MoE models with MXFP4 experts: use the generic MXFP4 expert decode kernels instead of the whole-block ones (default whole-block). Affects decode / verify |
 | `WHIRL_MOE_WIDE=1` | MoE models, balance / fast: verify batches up to 32 rows (default 16), the 17–32-row batches on the int8 decode experts like a 1-token decode. Same output; about 2% slower at four users on Ornith-1.5-35B-A3B (each row reads its own experts), so off by default |
 | `WHIRL_VRAM_LIMIT_MB=N` | simulate a GPU with N MiB of VRAM (e.g. `16384` on an R9700 for a 16 GB RX 9070 XT): free / total VRAM, the WDDM budget and this process's allocations are capped at N, so loading, KV-pool sizing and the automatic prefill-batch / checkpoint reduction behave as on that card. Off by default |
+| `WHIRL_UMA_CHECK=0` | Radeon 8060S: skip the check that the model, its buffers and the KV cache fit the GPU memory set in Armoury Crate / the BIOS (the dedicated carve-out), and the KV cache cap that keeps it there. Unsupported: memory beyond the carve-out is slower, and with a small carve-out the GPU runtime fails with hipError 719 |
+| `WHIRL_FAKE_DEDICATED_GB=N` | test: pretend the Radeon 8060S has N GiB of dedicated GPU memory (e.g. `0.5`), to see the refusal message or the reduced KV cache without changing the BIOS. Off by default |
 | `WHIRL_EMBD_HOST=0` | keep the token embedding table in VRAM (default: pinned host memory; the server declares its size with the other pinned memory so Shared Usage monitoring can subtract it) |
 | `WHIRL_TUNE_COLD=1` | autotune: evict the cache before each timing *(diagnostic)* |
 | `WHIRL_TUNE_MASK=BITS` | autotune: mask of the candidate GEMM configurations *(diagnostic)* |
