@@ -1345,9 +1345,14 @@ bool Engine::startJob(Slot& sl, Job& job) {
         // where it is on the new prompt's schedule too, as for the shared checkpoints), and only with
         // enough slots that prompt-end / gen-end stay (EngineOptions::tail_ck, tail_ck_slots).
         sl.tail_ck = 0;
-        if (opt_.tail_ck && sl.on_sched && sl.ckpts.size() >= tail_ck_slots && N >= opt_.tail_ck_min) {
+        // COLD-RESUME (precise): the tail checkpoint is what a conversation's next turn resumes from (gen-end is not
+        // cold-exact), so every prompt keeps one, and when the tail point is a forced split of this prompt only (the
+        // think-open split moves with the conversation) it goes one schedule point earlier
+        if (opt_.tail_ck && sl.on_sched && sl.ckpts.size() >= tail_ck_slots && (opt_.cold_resume || N >= opt_.tail_ck_min)) {
             const std::vector<std::uint32_t> imgs = imgSplits(toks);
-            const std::uint32_t t = static_cast<std::uint32_t>(sched::tailPoint(N, sysSplit(toks), ct_.thinkOpenSplit(toks), imgs));
+            std::uint32_t t = static_cast<std::uint32_t>(sched::tailPoint(N, sysSplit(toks), ct_.thinkOpenSplit(toks), imgs));
+            if (opt_.cold_resume && t > 0 && t == sl.pf_split)
+                t = static_cast<std::uint32_t>(sched::schedFloor(N, sysSplit(toks), ct_.thinkOpenSplit(toks), imgs, t - 1));
             if (t > mt.reuse && t != sl.sys_split && t != sl.lcp_ck && t != sl.img_ck && t != sl.pf_split) {
                 sl.tail_ck = t;
                 logI("req {} | slot {} | keeping a tail checkpoint @{} ({} tokens before the prompt end)", job.id, sl.id, t, N - t);
