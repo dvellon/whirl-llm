@@ -61,7 +61,8 @@ endfunction()
 # shared front-end of the shipped executables
 
 if(WHIRL_WITH_HIP)
-  add_library(whirl_release STATIC ${CMAKE_SOURCE_DIR}/src/release/release.cpp)
+  add_library(whirl_release STATIC ${CMAKE_SOURCE_DIR}/src/release/release.cpp
+                                   ${CMAKE_SOURCE_DIR}/src/release/dll_deps.cpp)
   target_include_directories(whirl_release PUBLIC ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include
                                                   ${CMAKE_BINARY_DIR}/generated)
   target_link_libraries(whirl_release PUBLIC whirl ws2_32)
