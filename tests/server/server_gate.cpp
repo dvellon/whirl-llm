@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cwctype>
@@ -434,6 +435,36 @@ bool relaxAccOn(const std::optional<std::string>& mode, const std::optional<std:
         return false;  // the server refuses such a mode: no relaxed acceptance to account for
     }
 }
+
+// Do the servers run in precise mode? (WHIRL_MODE as the servers see it; unset = the default, balance)
+bool preciseMode(const std::optional<std::string>& mode) {
+    if (!mode) return false;
+    try {
+        return numerics::parseMode(*mode, "WHIRL_MODE").mode == numerics::Mode::precise;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+// CACHEBAL: one WHIRL_PREFIX_CACHE_VERIFY=1 log line ("prefix-cache verify: cached vs from-scratch prefill
+// logits: max abs diff D, KL K, top1 same|DIFFERENT (...)"): the logits of the reused (here SSD-restored) state
+// against a from-scratch prefill of the same prompt.
+struct CacheVerify {
+    double maxd = 0, kl = 0;
+    bool top1_same = false;
+};
+std::optional<CacheVerify> parseCacheVerify(const std::string& line) {
+    static const std::regex r(R"(prefix-cache verify: .*max abs diff ([0-9.]+), KL ([0-9.]+(?:e[-+]?[0-9]+)?), top1 (same|DIFFERENT))");
+    std::smatch m;
+    if (!std::regex_search(line, m, r)) return std::nullopt;
+    return CacheVerify{std::stod(m[1].str()), std::stod(m[2].str()), m[3].str() == "same"};
+}
+// The bound: the server's documented diagnostic threshold for a cache hit that is numerically equivalent, not
+// bit-identical (docs/guide/en/kv-and-caching.md section 5: KL <= 1e-2 and the same top-1). Measured on the
+// R9700, Swift-1.5 27B MXFP4-A (requant 2026-10-19), tier p1 gen-end state vs cold: balance KL 9e-5..2e-4,
+// precise KL 1e-8..7e-8; a wrong or mismatched restore is far above it.
+constexpr double kCacheVerifyMaxKl = 1e-2;
+bool cacheVerifyOk(const CacheVerify& v) { return v.top1_same && v.kl <= kCacheVerifyMaxKl; }
 
 const json::Value* path(const json::Value& v, std::initializer_list<const char*> keys) {
     const json::Value* cur = &v;
@@ -1199,15 +1230,50 @@ void tierMode(const std::string& mode) {
         check(std::format("tier {}: SSD restores logged (one per session)", mode), n_ssd >= S.size(),
               std::format("{} SSD restores, {} sessions", n_ssd, S.size()));
     }
+    std::map<std::string, ChatResult> fresh;
+    if (p1) {
+        // CACHEBAL: the SSD-restored state against a from-scratch prefill of the same prompt, compared by the
+        // server itself (WHIRL_PREFIX_CACHE_VERIFY=1: one log line per cache hit with max abs diff / KL / top-1,
+        // then it continues from the from-scratch state). This is the CACHE-1 check "continuing after a restart
+        // == no prefix cache" in the form that holds by design: the restored history is a gen-end reuse, its KV
+        // and DeltaNet state came from the decode / verify kernels, so it is numerically equivalent to a cold
+        // prefill, not bit-identical (kv-and-caching.md section 5).
+        ServerLease s("tier_p1_verify", args, {{"WHIRL_KV_SSD_DIR", ssd}, {"WHIRL_PREFIX_CACHE_VERIFY", "1"}}, false);
+        for (const auto& ss : S) fresh[ss.name] = chat(t2msg(ss, t1[ss.name]), greedy(96) + thinkKw(ss.think));
+        std::vector<CacheVerify> v;
+        for (const auto& l : s->logLines())
+            if (auto c = parseCacheVerify(l)) v.push_back(*c);
+        const std::size_t n_ssd = s->logCount(R"(kv tier: restored \d+ tok from SSD)");
+        check("tier p1: verify run: every session restored from SSD, one verify line each", n_ssd >= S.size() && v.size() == S.size(),
+              std::format("{} SSD restores, {} verify lines, {} sessions", n_ssd, v.size(), S.size()));
+        for (std::size_t i = 0; i < S.size() && i < v.size(); ++i)
+            check(std::format("tier p1: {} turn 2 SSD-restored state == from-scratch prefill (KL <= {:.0e}, same top-1)", S[i].name,
+                              kCacheVerifyMaxKl),
+                  cacheVerifyOk(v[i]), std::format("max abs diff {:.4f}, KL {:.2e}, top1 {}", v[i].maxd, v[i].kl, v[i].top1_same ? "same" : "DIFFERENT"));
+    }
     fs::remove_all(widen(ssd), ec);
     if (p1) {
-        // CACHE-1: continuing after a restart (SSD restore) == a run with no prefix cache at all
+        auto it = g.server_env.find("WHIRL_MODE");
+        const char* em = std::getenv("WHIRL_MODE");
+        const bool precise = preciseMode(it != g.server_env.end() ? std::optional<std::string>(it->second)
+                                                                  : (em ? std::optional<std::string>(em) : std::nullopt));
         ServerLease s("tier_p1_nocache", {"--parallel", "1", "--kv-ram-mb", "0"}, {{"WHIRL_NO_PREFIX_CACHE", "1"}});
         for (const auto& ss : S) {
             auto b = chat(t2msg(ss, t1[ss.name]), greedy(96) + thinkKw(ss.think));
-            check(std::format("tier p1: {} turn 2 after restart (SSD restore) == no prefix cache", ss.name),
-                  sameContent(b, after[ss.name]) && b.reasoning == after[ss.name].reasoning,
-                  std::format("cached {} vs {}", after[ss.name].cached, b.cached));
+            // the verify run continued from its from-scratch prefill, which runs the cold schedule: same bits as
+            // a server with no prefix cache
+            check(std::format("tier p1: {} turn 2 verify run (from-scratch prefill) == no prefix cache", ss.name),
+                  sameContent(b, fresh[ss.name]) && b.reasoning == fresh[ss.name].reasoning,
+                  std::format("cached {} vs {}", fresh[ss.name].cached, b.cached));
+            // CACHE-1: continuing after a restart (SSD restore) == a run with no prefix cache at all. Gated in
+            // precise only (gen-end KL ~1e-8 there, measured); in balance / fast the decode-produced history is
+            // numerically equivalent only (KL ~1e-4 on the R9700, Swift requant), so the greedy text can differ
+            // a few tokens in: the KL check above is the gate, this line is information.
+            const std::string name = std::format("tier p1: {} turn 2 after restart (SSD restore) == no prefix cache", ss.name);
+            const bool same = sameContent(b, after[ss.name]) && b.reasoning == after[ss.name].reasoning;
+            const std::string d = std::format("cached {} vs {}", after[ss.name].cached, b.cached);
+            if (precise) check(name, same, d);
+            else logLine(std::format("INFO {}: {} ({}; not a gate outside precise)", name, same ? "equal" : "differs", d));
         }
     }
 }
@@ -1856,6 +1922,27 @@ int selfTest() {
     check("selftest: WHIRL_MODE=fast + WHIRL_RELAX=0 -> off", !relaxAccOn(OS("fast"), OS("0")));
     check("selftest: balance / unset / invalid -> off",
           !relaxAccOn(OS("balance"), std::nullopt) && !relaxAccOn(std::nullopt, std::nullopt) && !relaxAccOn(OS("bogus"), std::nullopt));
+    check("selftest: WHIRL_MODE=precise -> precise; balance / fast / unset / invalid -> not",
+          preciseMode(OS("precise")) && preciseMode(OS(" PRECISE ")) && !preciseMode(OS("balance")) && !preciseMode(OS("fast")) &&
+              !preciseMode(std::nullopt) && !preciseMode(OS("bogus")));
+    {
+        // CACHEBAL: verify lines as the server writes them (cachebal/e2, e3 server logs, R9700)
+        const auto a = parseCacheVerify("2026-10-20 03:22:10.123 I req 2 | slot 0 | prefix-cache verify: cached vs from-scratch prefill "
+                                        "logits: max abs diff 2.8730, KL 1.70e-04, top1 same (760 vs 760)");
+        const auto b = parseCacheVerify("I req 1 | slot 0 | prefix-cache verify: cached vs from-scratch prefill logits: max abs diff "
+                                        "0.0000, KL 0.00e+00, top1 same (760 vs 760)");
+        const auto c = parseCacheVerify("I req 4 | slot 0 | prefix-cache verify: cached vs from-scratch prefill logits: max abs diff "
+                                        "9.5000, KL 3.10e-01, top1 DIFFERENT (12 vs 760)");
+        const auto e = parseCacheVerify("I req 4 | slot 0 | prefix-cache verify: cached vs from-scratch prefill logits: max abs diff "
+                                        "0.4000, KL 2.00e-02, top1 same (760 vs 760)");
+        check("selftest: verify line balance (KL 1.7e-4, same top-1) -> parsed, ok",
+              a && std::abs(a->maxd - 2.873) < 1e-9 && std::abs(a->kl - 1.7e-4) < 1e-12 && a->top1_same && cacheVerifyOk(*a));
+        check("selftest: verify line exact (KL 0) -> ok", b && b->kl == 0 && cacheVerifyOk(*b));
+        check("selftest: verify line top-1 DIFFERENT -> not ok", c && !c->top1_same && !cacheVerifyOk(*c));
+        check("selftest: verify line KL 2e-2 > 1e-2 (same top-1) -> not ok", e && e->top1_same && !cacheVerifyOk(*e));
+        check("selftest: other log lines -> not a verify line",
+              !parseCacheVerify("I req 2 | slot 0 | kv tier: restored 5615 tok from SSD in 165.1 ms (2.22 GB/s)") && !parseCacheVerify(""));
+    }
     std::printf("== whirl-server-gate --selftest: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
