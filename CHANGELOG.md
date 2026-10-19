@@ -31,8 +31,15 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
   text for a gen-end reuse, which is numerically equivalent to a cold prefill but not bit-identical (decode-produced
   history; kv-and-caching.md section 5). With the 2026-10-19 Swift-1.5 27B MXFP4-A requant it failed on the R9700 in
   balance (also with the 0.2.0 exe; the SSD restore itself was bit-exact). The gate now checks the restored state
-  against a from-scratch prefill (KL <= 1e-2 and the same top-1; measured balance KL ~2e-4, precise ~1e-8) and keeps
-  the text check as a gate in precise. CACHEBAL.
+  against a from-scratch prefill (balance: KL <= 1e-2 and the same top-1, measured KL ~2e-4; precise: bitwise) and
+  keeps the text check as a gate in precise. CACHEBAL.
+- `--precise`: a conversation's next turn (and any cache hit) is now bitwise identical to a cold run, as the README
+  promises. It used to resume at the end of the previous reply, whose history the decode kernels produced (R9700,
+  Swift-1.5 27B MXFP4-A: max abs logit difference 0.016 to 0.029, KL 1e-8 to 7e-8 against a fresh prefill; also in
+  0.2.0). precise now resumes only at checkpoints on the new prompt's chunk schedule that prefill produced, normally
+  the previous prompt's tail checkpoint (kept for every prompt in precise), and re-prefills the rest. Cost: TTFT of a
+  next turn in precise grows by the prefill of up to ~1,280 tokens plus the previous reply. Balance and fast are
+  unchanged. `WHIRL_COLD_RESUME=0/1` overrides. COLD-RESUME.
 
 ## 0.2.1 — 2026-10-20 (bug fixes)
 

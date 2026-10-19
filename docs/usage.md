@@ -347,7 +347,10 @@ DeltaNet layers can only resume where the server saved a **checkpoint** of their
 [kv-and-caching.md](guide/en/kv-and-caching.md#checkpoints)). Per slot: the end of the prompt
 (`prompt-end`: the same prompt again, e.g. regenerate), the end of the answer (`gen-end`: the next
 chat or agent turn) and, since 0.2.0, a **tail checkpoint** near the end of every prompt of 4096
-tokens or more. Shared between sessions: long system messages and prefixes common to earlier
+tokens or more. In `--precise` (since 0.2.2) the next turn does not resume at `gen-end`: it resumes at the
+previous prompt's tail checkpoint (kept for every prompt there) and re-prefills the rest, so the output stays
+bitwise identical to a cold run; in balance / fast it resumes at `gen-end` (faster, numerically equivalent to a
+cold run, not bitwise). Shared between sessions: long system messages and prefixes common to earlier
 sessions.
 
 **Long-document Q&A.** Ask several questions about the same long document, each as its own request

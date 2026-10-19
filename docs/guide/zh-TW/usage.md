@@ -271,7 +271,7 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post -Conten
 
 ### <a id="prefix-cache"></a>前綴快取：新請求會重用什麼
 
-DeltaNet 層只能從伺服器存過**檢查點**的位置接著跑（細節：[kv-and-caching.md](kv-and-caching.md#checkpoints)）。每個 slot 保存：提示詞結尾（`prompt-end`：同一個提示詞再來一次，例如重新生成）、回答結尾（`gen-end`：聊天或代理的下一回合），以及 0.2.0 起每個 4096 token 以上提示詞結尾附近的**尾端檢查點**。跨 session 共用的有：長 system 訊息，以及與先前 session 共同的前綴。
+DeltaNet 層只能從伺服器存過**檢查點**的位置接著跑（細節：[kv-and-caching.md](kv-and-caching.md#checkpoints)）。每個 slot 保存：提示詞結尾（`prompt-end`：同一個提示詞再來一次，例如重新生成）、回答結尾（`gen-end`：聊天或代理的下一回合），以及 0.2.0 起每個 4096 token 以上提示詞結尾附近的**尾端檢查點**。`--precise` 下（0.2.2 起）下一回合不從 `gen-end` 接續，而是從上一個提示詞的尾端檢查點（precise 下每個提示詞都保留一個）接續並重新 prefill 其餘部分，輸出與冷算逐位元相同；balance／fast 則從 `gen-end` 接續（較快，與冷算數值等價、非逐位元）。跨 session 共用的有：長 system 訊息，以及與先前 session 共同的前綴。
 
 **長文件問答。** 對同一份長文件問好幾個問題、每題一個請求（同一則 user 訊息裡放「文件＋問題」、沒有 system 訊息）：第二題會從第一題的尾端檢查點（最後一個 1024-token chunk 的起點，距提示詞結尾 257 到 1280 個 token）接著跑，只 prefill 剩下的部分，而不是整份文件。128k 文件約為 1.1k token 取代 131k。條件：問題只在該點之後不同（約 256 token 以內的問題一定符合；更長的問題，或把文件放進 2048 token 以上的 system 訊息），且每個 slot 保留 3 個以上檢查點（預設：1 個 slot 時 4、2 到 4 個 slot 時 3）。輸出與不用快取時相同：尾端檢查點落在冷啟動的 chunk 排程上（precise 與 balance 與冷啟動逐位元一致）。每個 slot 檢查點佔 VRAM：Qwen3.8-27B 150.6 MiB、Ornith-1.5-35B-A3B 63.8 MiB；啟動日誌會列出數量與大小，VRAM 估算在 KV pool 會太小時把數量降到 2（尾端檢查點關閉）。`WHIRL_TAIL_CK=0` 可關閉（除錯用）。
 

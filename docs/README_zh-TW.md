@@ -160,13 +160,13 @@ WHIRL 0.2.0 有三種數值模式，每個行程選一種（`--precise`、`--bal
 | 模式 | 是什麼 | 輸出保證 |
 |---|---|---|
 | **precise** | **逐位元無損**：除了 GGUF 本身的權重之外，不再量化任何東西；f16 KV 快取，激活值全程 f16／f32 | 輸出與單純 greedy 解碼**逐位元相同**：有沒有投機草稿、單獨跑或和其他使用者合批、命中前綴快取或還原工作階段，位元都相同 |
-| **balance**（預設） | 近乎無損，預設 | MTP／n-gram 草稿、合批、快取還原，輸出的 token 都和 balance 模式下單純 greedy 解碼相同 |
+| **balance**（預設） | 近乎無損，預設 | MTP／n-gram 草稿、合批、快取還原，輸出的 token 都和 balance 模式下單純 greedy 解碼相同；對話的下一回合從上一段回覆結尾的快取接續，與冷算數值等價，但非逐位元相同 |
 | **fast**（自選） | 在通過關卡的可接受損失內求最高速度：balance 再加 4-bit KV 快取與放寬的 MTP 接受規則（Radeon 8060S 上的稠密模型保留 int8 KV 快取，在那張卡上 decode 較快） | 有損，但在公布的 KL 門檻內；文字可能隨草稿與其他使用者而不同 |
 
 實際上代表：
 
 - **precise** 是有逐位元保證的模式：逐位元無損，輸出與單純 greedy 解碼完全相同，兩張卡都一樣。
-- 在 **precise 與 balance**，每一項加速輸出的 token 都和該模式下單純 greedy 解碼相同：MTP 與 n-gram 投機解碼、多人合批、共用系統提示的前綴快取命中、對同一份長文件的第二個問題、從 RAM 或 SSD 層還原的工作階段。常駐測試把關（`whirl selftest`、kernel 測試、server 關卡、兩張卡的 golden 輸出）。
+- 在 **precise 與 balance**，每一項加速輸出的 token 都和該模式下單純 greedy 解碼相同：MTP 與 n-gram 投機解碼、多人合批、共用系統提示的前綴快取命中、對同一份長文件的第二個問題、從 RAM 或 SSD 層還原的工作階段。常駐測試把關（`whirl selftest`、kernel 測試、server 關卡、兩張卡的 golden 輸出）。兩者有一處不同：balance 下，對話的下一回合從上一段回覆結尾的快取接續，那段歷史是 decode kernel 算出來的，所以和把整段對話送給一個新啟動的 server 相比，最後幾個位元可能不同（數值等價，KL 約 2e-4；還原的工作階段仍與從未離開 VRAM 的同一工作階段逐位元相同）。precise 則改從上一個提示詞最後一個 chunk 的起點重新 prefill，與冷算逐位元相同。
 - **precise 與 balance 絕不使用 4-bit KV、3-bit 權重或 fp8 attention。** 只有 fast 可能用到 4-bit KV，而且只在你要求時。
 - **權重**就是你選的 GGUF，WHIRL 照檔案原樣計算。接續對話時沿用上一輪算好的狀態，數值上等價，但和把整段歷史當成一個 prompt 重新處理並非逐位元相同（[kv-and-caching.md](guide/zh-TW/kv-and-caching.md)）。
 
@@ -408,7 +408,7 @@ Ryzen AI Max+ 395。WHIRL 每格單次量測（2026-10-17）；llama.cpp 為 1 �
 
 1. **專為 Windows 上的 AMD GPU 打造**：原生 Windows 的 C++／HIP 推論引擎，針對 RDNA 架構逐一手寫、調校 kernel。不需要 WSL、Docker 或 Linux 虛擬機，裝好 AMD 驅動就能跑。
 2. **完整開源，包含每一支 kernel**：從 host 端排程到 GPU kernel，全部原始碼以 Apache-2.0 公開，沒有封閉的二進位元件。歡迎回報問題、提供量測數據，或直接貢獻程式碼。
-3. **精度優先於速度**：在 precise 與 balance 模式下，所有加速手段（投機解碼、多人合批、前綴快取、快取還原）輸出的 token 都和該模式的單純 greedy 解碼相同，有常駐測試把關。任何損失更多的做法都是自選（`--fast`），並受 KL 與準確度門檻管控。
+3. **精度優先於速度**：在 precise 與 balance 模式下，所有加速手段（投機解碼、多人合批、前綴快取、快取還原）輸出的 token 都和該模式的單純 greedy 解碼相同（balance 下對話的下一回合與冷算數值等價、非逐位元），有常駐測試把關。任何損失更多的做法都是自選（`--fast`），並受 KL 與準確度門檻管控。
 4. **少數模型，做到極致**：針對特定模型與硬體，把效能推到接近硬體極限，支援的架構一個一個加。目前支援 `qwen35`（稠密）與 `qwen35moe`（混合專家）。
 5. **數字透明、可驗證**：所有數字都是實測，量測方法、指令和提示全部公開，包括 WHIRL 領先不多的地方。
 6. **為真實工作流程設計**：以 coding agent 和長上下文為核心場景：長 prompt 快速處理、多人同時使用時主對話不卡頓、VRAM → RAM → SSD 三層快取，server 重啟後對話也能接回來。

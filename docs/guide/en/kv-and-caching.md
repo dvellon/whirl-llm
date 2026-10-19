@@ -272,8 +272,8 @@ makes cached and uncached inputs differ — not worth it. llama.cpp has the same
 | `prefix` checkpoint | **yes** | used only if its position is also a chunk start in the new request's own schedule (§6) |
 | `prompt-end` / `think-open`, **same prompt** | **yes** | the state was produced by the same prefill chunks |
 | RAM / SSD tier restore | **yes** | the same bytes are copied back (§8) |
-| `gen-end` (next turn of a conversation) | **no, by design** | the history's KV **and DeltaNet state** were produced by decode / verify kernels (int8 GEMV, decode attention, `gdn_step`), not by prefill GEMMs |
-| `prompt-end` / `think-open` followed by more tokens | **no, by design** | the continuation's chunk boundaries differ from a cold run's |
+| `gen-end` (next turn of a conversation) | **no, by design** in balance / fast; **never used in precise** (COLD-RESUME, 0.2.2: the turn resumes at the previous prompt's tail checkpoint instead) | the history's KV **and DeltaNet state** were produced by decode / verify kernels (int8 GEMV, decode attention, `gdn_step`), not by prefill GEMMs |
+| `prompt-end` / `think-open` followed by more tokens | **no, by design** in balance / fast; in precise used only when its position is on the new prompt's schedule (then yes) | the continuation's chunk boundaries differ from a cold run's |
 
 The difference is not limited to "the generated tokens' KV": every DeltaNet layer's recurrent state
 carries the whole history, so a decode-produced state differs from a prefill-produced one at every
@@ -524,11 +524,12 @@ the other slots' decode cycles stretch for the duration of the restore. Not opti
   again (restored from SSD). With `--parallel 1` (f16 KV, thinking and non-thinking sessions,
   including `think-open`) and `--parallel 4` (q8v, five sessions). Both models.
   With `--parallel 1` the SSD entries are also restored once more with `WHIRL_PREFIX_CACHE_VERIFY=1`: each
-  restored state must match a from-scratch prefill (KL <= 1e-2, same top-1; R9700 Swift MXFP4: balance KL
-  ~1e-4, precise ~1e-8), and the continuation from that fresh prefill must equal a server with no prefix cache
-  exactly. Text after the restart == no prefix cache is gated in precise only: the restored history is a gen-end
-  reuse, numerically equivalent to a cold run, not bit-identical (section 5), and in balance the greedy text can
-  differ a few tokens in (CACHEBAL, 0.2.2).
+  restored state must match a from-scratch prefill (precise: bitwise, max abs logit difference 0; balance / fast:
+  KL <= 1e-2 and the same top-1, R9700 Swift MXFP4 balance KL ~2e-4), and the continuation from that fresh prefill
+  must equal a server with no prefix cache exactly. Text after the restart == no prefix cache is a gate in precise
+  (COLD-RESUME makes every precise resume cold-exact, and the tier servers must log no `gen-end` resume); in
+  balance the restored history is a gen-end reuse, numerically equivalent to a cold run, not bit-identical
+  (section 5), so the greedy text can differ a few tokens in (CACHEBAL, 0.2.2).
 - `sys_gate`: shared system checkpoint reuse (cached == B, text == cold), 4 concurrent new sessions,
   eviction to RAM and restore, SSD after restart, tiers off, bursts, and `prefix` checkpoints.
 - `restore_conc_gate`: RAM restore beside 3 decoding slots == never evicted; burst on a shared entry

@@ -286,8 +286,10 @@ I batch | slots busy 0/4 (decode 0, prefill 0) | 80 cycles, 3.79 slots/cycle, 11
   不得超過 30 秒；標頭上限 64 KiB / 100 行（`431`）。引擎不會等待任何用戶端：停止讀取回應達 30 秒的
   用戶端會被斷線、其請求停止，其他 slot 不受影響。
 - `system`／`prefix` 檢查點、同一提示的 `prompt-end` 命中，以及分層還原，都與冷執行逐位元相同。接續對話
-  （`gen-end`，或提示檢查點之後再接更多 token）在數值上等價，但不是逐位元相同：歷史的 KV 與 DeltaNet 狀態
-  來自 decode kernel（[kv-and-caching.md](kv-and-caching.md#checkpoints)）。帶有 ≥ 2048 token system message
+  （`gen-end`，或提示檢查點之後再接更多 token）在 balance／fast 下數值上等價，但不是逐位元相同：歷史的 KV 與
+  DeltaNet 狀態來自 decode kernel（[kv-and-caching.md](kv-and-caching.md#checkpoints)）。`--precise` 從不在那裡
+  接續（COLD-RESUME，0.2.2）：只從新提示詞 chunk 排程上、由 prefill 產生的檢查點接續，所以 precise 的每次快取命中
+  都與冷執行逐位元相同。帶有 ≥ 2048 token system message
   的請求會在 system 邊界切開，因此與不切開的執行檔不是逐位元相同。
 - 使用 MoE 模型時，專家路由幾乎平手的情況可能讓有快取的多輪對話與無快取的對話分歧（在一次思考模式
   測試中看過一次）；兩者都是有效的計算。

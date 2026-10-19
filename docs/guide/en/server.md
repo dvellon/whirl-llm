@@ -328,8 +328,10 @@ an idle `kv tier |` summary; `vision:` lines for image input.
   response for 30 s is disconnected and its request stopped, without slowing the other slots.
 - Cache hits on `system` / `prefix` checkpoints, on the same prompt's `prompt-end`, and tier restores
   are bit-identical to a cold run. Continuing a conversation (`gen-end`, or a prompt checkpoint followed
-  by more tokens) is numerically equivalent but not bit-identical: the history's KV and DeltaNet state
-  came from decode kernels ([kv-and-caching.md](kv-and-caching.md#checkpoints)). Requests with
+  by more tokens) is numerically equivalent but not bit-identical in balance / fast: the history's KV and
+  DeltaNet state came from decode kernels ([kv-and-caching.md](kv-and-caching.md#checkpoints)). `--precise`
+  never resumes there (COLD-RESUME, 0.2.2): only at checkpoints on the new prompt's chunk schedule that prefill
+  produced, so every precise cache hit is bit-identical to a cold run. Requests with
   a ≥ 2048-token system message are split at the system boundary and so are not bit-identical to a
   binary that does not split.
 - With the MoE model, near-tied expert routing can make a multi-turn cached conversation diverge from
