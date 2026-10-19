@@ -451,6 +451,9 @@ static void testFingerprint() {
     CHECK(fingerprintEnvKept("whirl_x"));
     CHECK(!fingerprintEnvKept("WHIRL_KV_TIER_MIN"));
     CHECK(!fingerprintEnvKept("WHIRL_TIMER_PROBE"));
+    // CACHEBAL: the cache-hit diagnostic compares, it does not change the stored KV format, so a verify run can
+    // restore the entries a normal server wrote (the tier p1 gate does exactly that)
+    CHECK(!fingerprintEnvKept("WHIRL_PREFIX_CACHE_VERIFY"));
     CHECK(!fingerprintEnvKept("WHIRLX"));
     // the process environment is already filtered
     for (const auto& [k, v] : fingerprintEnv()) CHECK(fingerprintEnvKept(k));
