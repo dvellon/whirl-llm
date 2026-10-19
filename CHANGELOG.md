@@ -3,6 +3,10 @@
 All notable changes to WHIRL are listed here. Versions follow `project(whirl VERSION ...)` in
 `CMakeLists.txt`.
 
+## 0.2.1 — 2026-10-20 (bug fixes)
+
+- With the "AMD Software: Adrenalin Edition for ROCm 10.1" driver, WHIRL stopped with "amdhip64_7.dll was not found": that driver's GPU runtime needs `rocm_kpack.dll`, which the driver does not install. The zip now ships AMD's `rocm_kpack.dll` next to `whirl.exe`, and if a DLL the runtime needs is still missing, the error names it instead of saying "not found". Root cause found by @vvsvvt, reported by @novelsk ([#2](https://github.com/tsaipifong/whirl-llm/issues/2)).
+
 ## 0.2.0 — 2026-10-17
 
 ### Highlights

@@ -118,8 +118,8 @@ Every kernel is open source in this repository; nothing is closed or downloaded 
 
 | | |
 |---|---|
-| **Download and run** | Download **`whirl-0.2.0-windows-x64.zip`** from [Releases](https://github.com/tsaipifong/whirl-llm/releases), unzip, run. **Only the AMD driver is needed**: no HIP SDK, no ROCm, no Visual C++ runtime |
-| Driver | **AMD Software: Adrenalin Edition 26.8.1 (driver 32.0.31041.1004) or newer**, for both GPUs. Older drivers are untested |
+| **Download and run** | Download **`whirl-0.2.1-windows-x64.zip`** from [Releases](https://github.com/tsaipifong/whirl-llm/releases), unzip, run. **Only the AMD driver is needed**: no HIP SDK, no ROCm, no Visual C++ runtime |
+| Driver | **AMD Software: Adrenalin Edition 26.8.1 (driver 32.0.31041.1004) or newer**, for both GPUs. Older drivers are untested. With the Adrenalin Edition for ROCm 10.1 driver, keep the `rocm_kpack.dll` from the zip next to `whirl.exe` (that driver's GPU runtime needs it but does not install it) |
 | GPU | **Radeon 8060S** (RDNA 3.5, gfx1151, the AMD Ryzen AI Max+ 395 iGPU) or **AMD Radeon AI PRO R9700** (RDNA 4, gfx1201, 32 GB); one GPU per process |
 | OS | Windows 11, 64-bit |
 | Model | [Swift-1.5 27B MXFP4](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF) or [Ornith-1.5-35B-A3B MXFP4](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF) from Hugging Face ([supported models](#supported-models)) |
@@ -132,13 +132,13 @@ Our R9700 is connected as a USB4 / Thunderbolt eGPU; that works. A card in a dir
 
 ## Quick start
 
-1. Download `whirl-0.2.0-windows-x64.zip` from [Releases](https://github.com/tsaipifong/whirl-llm/releases) and a model, for example [`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF) saved in `C:\models\`.
+1. Download `whirl-0.2.1-windows-x64.zip` from [Releases](https://github.com/tsaipifong/whirl-llm/releases) and a model, for example [`Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf`](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF) saved in `C:\models\`.
 2. Unzip and run, in PowerShell:
 
 ```powershell
-Unblock-File .\whirl-0.2.0-windows-x64.zip
-Expand-Archive .\whirl-0.2.0-windows-x64.zip -DestinationPath C:\whirl
-cd C:\whirl\whirl-0.2.0-windows-x64
+Unblock-File .\whirl-0.2.1-windows-x64.zip
+Expand-Archive .\whirl-0.2.1-windows-x64.zip -DestinationPath C:\whirl
+cd C:\whirl\whirl-0.2.1-windows-x64
 .\whirl.exe devices                                    # lists the Radeon 8060S (gfx1151) and/or the R9700 (gfx1201)
 .\whirl.exe chat C:\models\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf "Explain TCP slow start in two sentences." --max-tokens 400
 .\whirl-server.exe C:\models\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf --port 8080      # default mode: balance
