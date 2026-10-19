@@ -15,6 +15,12 @@
 # Before packing it checks that each executable reports that version and that its
 # imports are only Windows system DLLs plus the AMD driver's amdhip64_7.dll (no
 # Visual C++ runtime, no HIP SDK DLL), so the zip runs with just the driver.
+#
+# Since 0.2.1 the zip also carries AMD's rocm_kpack.dll (redist\rocm_kpack, MIT), the one
+# non-system DLL allowed in it: the ROCm 10.1 driver's amdhip64_7.dll imports it but does not
+# install it (issue #2). Its SHA-256 must match redist\rocm_kpack\SOURCE.md and its own imports
+# may only be Windows system DLLs, the Universal CRT and the Visual C++ 2015-2022 runtime that the
+# AMD driver installs.
 
 param(
     [string]$BuildDir = "",
@@ -86,11 +92,27 @@ foreach ($e in $exes) {
     }
 }
 
+# ---- redistributed AMD DLL (issue #2): exact file, allowed imports only
+$kpack = Join-Path $repo "redist\rocm_kpack\rocm_kpack.dll"
+$kpackSha = "2e9734ffe6f6eefe1ff660a55dc85fffbcd2d66f794fce4878c6d95a55787b48"
+if (-not (Test-Path $kpack)) { throw "missing $kpack" }
+$h = (Get-FileHash $kpack -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($h -ne $kpackSha) { throw "rocm_kpack.dll sha256 $h, expected $kpackSha (redist\rocm_kpack\SOURCE.md)" }
+if (-not (Select-String -Path (Join-Path $repo "redist\rocm_kpack\SOURCE.md") -SimpleMatch $kpackSha -Quiet)) { throw "SOURCE.md does not record $kpackSha" }
+$kpackAllowed = @("kernel32.dll", "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+foreach ($i in (Get-PeImports $kpack)) {
+    $d = $i.dll.ToLowerInvariant()
+    $ok = ($kpackAllowed -contains $d) -or $d.StartsWith("api-ms-win-crt-")
+    Write-Host ("  rocm_kpack.dll: {0}{1}" -f $i.dll, $(if ($ok) { "" } else { "   <-- not allowed" }))
+    if (-not $ok) { throw "rocm_kpack.dll imports $($i.dll), not a system / VC++ runtime DLL" }
+}
+
 # ---- stage
 $stage = Join-Path $OutDir $name
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $stage | Out-Null
 foreach ($e in $exes) { Copy-Item (Join-Path $BuildDir $e) $stage }
+Copy-Item $kpack $stage
 Copy-Item (Join-Path $repo "LICENSE") $stage
 Copy-Item (Join-Path $repo "NOTICE") $stage
 Copy-Item (Join-Path $repo "THIRD_PARTY_NOTICES.md") $stage
@@ -124,8 +146,12 @@ no Visual C++ runtime).
   .\whirl.exe chat MODEL.gguf "Explain TCP slow start in two sentences." --max-tokens 400
   .\whirl-server.exe MODEL.gguf --port 8080     (OpenAI API at http://127.0.0.1:8080/v1)
 
+rocm_kpack.dll is part of AMD's ROCm runtime (MIT). Keep it next to whirl.exe: the GPU runtime
+of the "Adrenalin Edition for ROCm 10.1" driver needs it and that driver does not install it.
+With other drivers it is not used.
+
 Read next:
-  README.md                      overview, supported models, performance
+  README.md                     overview, supported models, performance
   docs\quickstart.md             step-by-step first run
   docs\usage.md                  every option, environment variable and exit code
   docs\windows_security.md       SmartScreen / Smart App Control (the programs are unsigned)
