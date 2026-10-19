@@ -864,7 +864,10 @@ void suiteBasic() {
                                    ",\"content\":\"{\\\"city\\\": \\\"Taipei\\\", \\\"temp_c\\\": 24, \\\"sky\\\": \\\"light rain\\\"}\"}";
             ChatResult r2 = chat(arr({m1, am, tm}), tk);
             check("basic: tool result -> final answer", r2.status == 200 && !r2.content.empty() && r2.tool_calls.empty(), brief(r2));
-            check("basic: tool round trip reuses the prefix", r2.cached > 0, std::format("cached {}", r2.cached));
+            // COLD-RESUME: precise resumes only at cold-exact checkpoints; a prompt this short has none past 0
+            if (serversPrecise())
+                logLine(std::format("INFO basic: tool round trip reuses the prefix: cached {} (precise: cold-exact resumes only; not a gate)", r2.cached));
+            else check("basic: tool round trip reuses the prefix", r2.cached > 0, std::format("cached {}", r2.cached));
             record("basic/tool_answer", r2.text());
         }
     }
@@ -884,7 +887,15 @@ void suiteBasic() {
             msgs.push_back(msg("assistant", r.content));
             prev = r;
         }
-        check("basic: multi-turn reuses the whole previous conversation", ok, detail);
+        if (serversPrecise()) {
+            // COLD-RESUME: precise never continues from the end of a reply (its history came from the decode kernels)
+            logLine(std::format("INFO basic: multi-turn reuse {}(precise: cold-exact resumes only; not a gate)", detail));
+            const std::size_t ge = (*s_opt)->logCount(R"(reused \d+ tok \(checkpoint 'gen-end')");
+            check("basic: precise: no request resumed from a 'gen-end' checkpoint (tool round trip, multi-turn)", ge == 0,
+                  std::format("{} gen-end resumes logged", ge));
+        } else {
+            check("basic: multi-turn reuses the whole previous conversation", ok, detail);
+        }
     }
     // concurrency: different prompts at once == solo. Fast mode with relaxed acceptance only
     // guarantees quality within its gate, not concurrent == solo text (the draft cadence depends on
