@@ -37,9 +37,11 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
   promises. It used to resume at the end of the previous reply, whose history the decode kernels produced (R9700,
   Swift-1.5 27B MXFP4-A: max abs logit difference 0.016 to 0.029, KL 1e-8 to 7e-8 against a fresh prefill; also in
   0.2.0). precise now resumes only at checkpoints on the new prompt's chunk schedule that prefill produced, normally
-  the previous prompt's tail checkpoint (kept for every prompt in precise), and re-prefills the rest. Cost: TTFT of a
-  next turn in precise grows by the prefill of up to ~1,280 tokens plus the previous reply. Balance and fast are
-  unchanged. `WHIRL_COLD_RESUME=0/1` overrides. COLD-RESUME.
+  the previous prompt's tail checkpoint (kept for every prompt in precise), and re-prefills the rest (up to ~1,280
+  tokens plus the previous reply). Cost, Swift-1.5 27B MXFP4-A, a 7k-token file and 3 follow-up questions (2 rounds,
+  same exe, `WHIRL_COLD_RESUME=0` as the old behaviour): next-turn TTFT R9700 0.82-0.85 s instead of 0.06-0.30 s,
+  Radeon 8060S 2.6-3.0 s instead of 0.16-0.17 s; first turn unchanged; texts identical in this session. Balance and
+  fast are unchanged. `WHIRL_COLD_RESUME=0/1` overrides. COLD-RESUME.
 
 ## 0.2.1 — 2026-10-20 (bug fixes)
 
