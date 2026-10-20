@@ -432,3 +432,106 @@ __device__ void gemvw_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, co
         }
     }
 }
+
+// Experimental gfx1151 MXFP4 NT=11/r2 geometry: one 16-row tile, but 16
+// waves rather than the legacy eight.  Waves 0..7 own quarter pair (0, 1)
+// for superblock residues 0..7; waves 8..15 own pair (2, 3).  This keeps a
+// single weight pass while halving each wave's accumulator footprint.  The
+// two pair planes are joined before the established eight-residue reduction,
+// so each (row, token) result retains exactly
+//   ((q0 + q1) + (q2 + q3)) and then ((r0 + r1) + ...) rounding.
+// Keep this a separate symbol until end-to-end timing proves that the extra
+// waves beat the legacy 256-thread kernel.
+__device__ __forceinline__ void gemvw_mx_nt11_r2_w16_impl(
+    const uint8_t *__restrict__ W, uint64_t row_bytes, const int8_t *__restrict__ xq,
+    const float *__restrict__ xd, float *__restrict__ y, int ncols, int nrows, int accumulate,
+    const int *__restrict__ skip, int bid = -1) {
+    constexpr int NT = 11;
+    constexpr int NTV = 6;
+    constexpr int ROWS = 16;
+    __shared__ float red[2][8][NT][ROWS];
+    if (skip != nullptr && *skip) return;
+
+    const int lane = threadIdx.x % WARP;
+    const int wave = threadIdx.x / WARP;
+    const int pair = wave >> 3;
+    const int residue = wave & 7;
+    const int h = lane >> 4;
+    const int n = lane & 15;
+    const int r0 = (bid < 0 ? (int)blockIdx.x : bid) * ROWS;
+    const uint8_t *wr = W + (size_t)min(r0 + n, nrows - 1) * row_bytes;
+    const bool tok_ok = n < NT;
+    const int8_t *xt = xq + (size_t)(tok_ok ? n : 0) * ncols;
+    const uint32_t *xp = (const uint32_t *)xd;
+    const int nb32 = ncols / 32;
+    const int nsb = ncols / 256;
+    const int8v zero = {0, 0, 0, 0, 0, 0, 0, 0};
+    float acc[2][NTV];
+#pragma unroll
+    for (int qh = 0; qh < 2; ++qh)
+#pragma unroll
+        for (int v = 0; v < NTV; ++v) acc[qh][v] = 0.f;
+
+    for (int sb = residue; sb < nsb; sb += 8) {
+#pragma unroll
+        for (int qh = 0; qh < 2; ++qh) {
+            const int q = 2 * pair + qh;
+            const int u = 4 * sb + q;
+            const int base = sb * 256 + 64 * q;
+            const int xi = base >> 5;
+            int4v x0 = {0, 0, 0, 0}, x1 = x0, x2 = x0, x3 = x0;
+            if (tok_ok) {
+                x0 = *(const int4v *)(xt + base);
+                x1 = *(const int4v *)(xt + base + 16);
+                x2 = *(const int4v *)(xt + base + 32);
+                x3 = *(const int4v *)(xt + base + 48);
+            }
+
+            WUnit wu;
+            int own[8];
+            wunit_half<QT_MXFP4>(wr, u, h, own, wu);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int oth = xhalf(own[k]);
+                wu.w[k] = h ? oth : own[k];
+                wu.w[8 + k] = h ? own[k] : oth;
+            }
+            const int4v b0 = {wu.w[0], wu.w[1], wu.w[2], wu.w[3]};
+            const int4v b1 = {wu.w[4], wu.w[5], wu.w[6], wu.w[7]};
+            const int4v b2 = {wu.w[8], wu.w[9], wu.w[10], wu.w[11]};
+            const int4v b3 = {wu.w[12], wu.w[13], wu.w[14], wu.w[15]};
+            int8v c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, x0, true, b0, zero, false);
+            c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, x1, true, b1, c0, false);
+            int8v c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, x2, true, b2, zero, false);
+            c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, x3, true, b3, c1, false);
+#pragma unroll
+            for (int v = 0; v < NTV; ++v) {
+                const int t = min(2 * v + h, NT - 1);
+                const uint2 p = *(const uint2 *)(xp + (size_t)t * nb32 + xi);
+                acc[qh][v] = wfold(wfold(acc[qh][v], p.x, wu.s0, wu.m0, c0[v]),
+                                     p.y, wu.s1, wu.m1, c1[v]);
+            }
+        }
+    }
+#pragma unroll
+    for (int v = 0; v < NTV; ++v) {
+        const int t = 2 * v + h;
+        if (t < NT) red[pair][residue][t][n] = acc[0][v] + acc[1][v];
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < NT * ROWS; i += blockDim.x) {
+        const int t = i / ROWS;
+        const int nn = i % ROWS;
+        const int row = r0 + nn;
+        float rv[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) rv[r] = red[0][r][t][nn] + red[1][r][t][nn];
+        const float s = ((rv[0] + rv[1]) + (rv[2] + rv[3])) +
+                        ((rv[4] + rv[5]) + (rv[6] + rv[7]));
+        if (row < nrows) {
+            float *dst = y + (size_t)t * nrows + row;
+            *dst = accumulate ? *dst + s : s;
+        }
+    }
+}

@@ -461,6 +461,10 @@ struct KernelTable {
     PerType<F> moe_gu_f{}, moe_down_f{};  // gemv_<T>_4 / _8 (f32 / f16 only): n = 2..16 bitwise == gemv1 per token
     Nt gemvq_nt{}, gemvq_nt_g{};
     std::array<Nt, 2> gemvq_mr{}, gemvq_mr_g{};      // [R/2 - 1][nt - 2][type], R = 2, 4
+    // Experimental gfx1151 MXFP4 NT=11/r2 16-wave geometry. Optional and
+    // selected only by WHIRL_MXFP4_NT11_W16=1; the legacy r2 entry remains
+    // the default/fallback.
+    F gemvq_nt11r2w16_mxfp4{}, gemvq_nt11r2w16_mxfp4_g{};
     std::array<Nt, kNGemvw> gemvw{}, gemvw_g{};      // [v][nt - 2][type], v = 1..8
     std::array<PerType<F>, kGemmCfgs.size()> gemmc{};
     std::array<PerType<F>, kGemmsCfgs.size()> gemms{}, gemmsh{};

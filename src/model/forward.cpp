@@ -118,6 +118,7 @@ void Model::gemvKernels(std::span<const Mat> ws, std::span<const DevPtr> ys, u32
     hip::Function f = n == 1 ? k.gemvq[t] : k.gemvq_nt[n - 2][t];
     hip::Function fg = n == 1 ? nullptr : k.gemvq_nt_g[n - 2][t];
     u32 rows_per_block = 8;
+    u32 threads_per_block = 256;
     const std::uint8_t wv = n < 2 ? 0 : (w.ty == GgmlType::q6_k && w.ptr == output.ptr) ? gemv_w_head[n] : gemv_w[t % n_types][n];
     const hip::Function wf = wv > 0 ? k.gemvw[wv][n - 2][t] : nullptr;
     if (wf != nullptr) {
@@ -131,6 +132,16 @@ void Model::gemvKernels(std::span<const Mat> ws, std::span<const DevPtr> ys, u32
             fg = k.gemvq_mr_g[gemv_r[n] / 2 - 1][n - 2][t];
             rows_per_block = 8 * static_cast<u32>(gemv_r[n]);
         }
+    }
+    // Opt-in A/B for the gfx1151 MXFP4 NT11/r2 16-wave prototype.  The
+    // optional lookup and environment gate keep old code objects and the
+    // tuned 256-thread path as exact fallbacks.
+    if (n == 11 && w.ty == GgmlType::mxfp4 && gemv_r[n] == 2 &&
+        envFlag("MXFP4_NT11_W16", false) && k.gemvq_nt11r2w16_mxfp4 != nullptr) {
+        f = k.gemvq_nt11r2w16_mxfp4;
+        fg = k.gemvq_nt11r2w16_mxfp4_g;
+        rows_per_block = 16;
+        threads_per_block = 512;
     }
     // one-token entries always take GvArgs (gv_grp); a multi-token group takes the twin
     const bool twin = n >= 2 && ws.size() > 1 && fg != nullptr && n <= gvNmax(w.ty);
@@ -148,11 +159,11 @@ void Model::gemvKernels(std::span<const Mat> ws, std::span<const DevPtr> ys, u32
             g.n[si] = I(wi.nrows);
             nb += (wi.nrows + rows_per_block - 1) / rows_per_block;
         }
-        hip::launch(f, D(nb), D(256), 0, stream, g, xqp, xdp, ncols, acc, gate);
+        hip::launch(f, D(nb), D(threads_per_block), 0, stream, g, xqp, xdp, ncols, acc, gate);
     } else {
         for (std::size_t si = 0; si < ws.size(); ++si) {
             const Mat& wi = ws[si];
-            hip::launch(f, D((wi.nrows + rows_per_block - 1) / rows_per_block), D(256), 0, stream, wi.ptr, wi.row_bytes, xqp, xdp, ys[si],
+            hip::launch(f, D((wi.nrows + rows_per_block - 1) / rows_per_block), D(threads_per_block), 0, stream, wi.ptr, wi.row_bytes, xqp, xdp, ys[si],
                         ncols, I(wi.nrows), acc, gate);
         }
     }

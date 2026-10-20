@@ -344,6 +344,22 @@ GEMVQ_MR_TYPES(15, 4)
 GEMVQ_MR_TYPES(16, 2)
 GEMVQ_MR_TYPES(16, 4)
 
+// Experimental gfx1151 NT=11 MXFP4 r2 entry.  It is deliberately a separate,
+// optional symbol: the production 256-thread gemvq_nt11r2_mxfp4 entry remains
+// the fallback until device timing validates the 16-wave geometry.
+extern "C" __global__ void __launch_bounds__(512)
+    gemvq_nt11r2w16_mxfp4(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
+                          const float *xd, float *y, int ncols, int nrows,
+                          int accumulate, const int *skip) {
+    gemvw_mx_nt11_r2_w16_impl(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
+}
+extern "C" __global__ void __launch_bounds__(512)
+    ggemvq_nt11r2w16_mxfp4(GV_PARAMS) {
+    const GvSel gs = gv_sel(g);
+    gemvw_mx_nt11_r2_w16_impl(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
+                              accumulate, skip, gs.b);
+}
+
 // KLIB-1 (opt-in, WHIRL_Q3K_U16=1): multi-row entries of the Q3_K llama.cpp-split variant
 #define GEMVQ_MR_Q3U(NT) GEMVQ_MR_ENTRY(NT, 2, q3_k16, QT_Q3_K_U16) GEMVQ_MR_ENTRY(NT, 4, q3_k16, QT_Q3_K_U16)
 GEMVQ_MR_Q3U(2)
