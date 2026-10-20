@@ -47,6 +47,16 @@ void check(bool ok, const std::string& what) { check(ok, what.c_str()); }
 
 void testTreeSpecPlan() {
     namespace ts = whirl::tree_spec;
+    check(!ts::ownsKvTail(0) && ts::ownsKvTail(1),
+          "tree spec: primary aliases active KV and only alternate owns a copy-on-write tail");
+    bool bad_branch = false;
+    try {
+        (void)ts::ownsKvTail(ts::branches);
+    } catch (const std::out_of_range&) {
+        bad_branch = true;
+    }
+    check(bad_branch, "tree spec: KV-tail ownership rejects an unknown branch");
+
     ts::Plan p;
     p.depth = 4;
     p.branch[0].n = 4;

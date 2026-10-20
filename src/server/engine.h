@@ -466,9 +466,10 @@ private:
     void reclaimPages(bool force);
     void cowPages(Slot& sl, std::uint32_t reuse, bool spill);
     bool ensurePages(Slot& sl, std::uint64_t n_tok);
-    // Prepare two isolated KV tails for the single-slot beam-2 verify.  Prefix
-    // page-table entries alias the active slot for this cycle; every page the
-    // speculative rows can write is copied and owned by its branch.
+    // Prepare the single-slot beam-2 KV views.  The primary shadow aliases the
+    // active slot's tail (ordinary speculative writes beyond the logical end
+    // are disposable); the alternate owns a copy-on-write tail.  Prefix
+    // page-table entries alias the active slot for both branches.
     bool prepareTreePages(Slot& sl, std::uint32_t rows, std::array<std::vector<std::int32_t>, 2>& branch,
                           std::size_t& first);
     void releaseTreePages(std::array<std::vector<std::int32_t>, 2>& branch);

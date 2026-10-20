@@ -622,20 +622,29 @@ bool Engine::prepareTreePages(Slot& sl, std::uint32_t rows,
     const std::size_t last = static_cast<std::size_t>((static_cast<std::uint64_t>(sl.pos) + rows - 1) / kv_page);
     if (last >= sl.pages.size()) return false;
     const std::span<const std::int32_t> prefix(sl.pages.data(), first);
-    for (std::uint32_t b = 0; b < 2; ++b) {
-        const std::uint32_t shadow = opt_.parallel + b;
-        if (!prefix.empty()) m_.mapPages(shadow, 0, prefix);
-        branch[b].reserve(last - first + 1);
-        for (std::size_t pi = first; pi <= last; ++pi) {
-            const auto p = takePage(&sl);
-            if (!p) {
-                releaseTreePages(branch);
-                return false;
-            }
-            branch[b].push_back(*p);
+    for (std::uint32_t b = 0; b < tree_spec::branches; ++b)
+        if (!prefix.empty()) m_.mapPages(opt_.parallel + b, 0, prefix);
+
+    // Branch zero is the ordinary top-1 continuation.  As in the linear
+    // path, rejected suffix rows may remain past sl.pos and will be
+    // overwritten by a later verify, so no page copy or ownership transfer is
+    // needed for this branch.
+    const std::span<const std::int32_t> primary(sl.pages.data() + first, last - first + 1);
+    m_.mapPages(opt_.parallel, static_cast<std::uint32_t>(first), primary);
+
+    // Only the alternate root needs an isolated copy-on-write tail.
+    constexpr std::uint32_t alternate = 1;
+    static_assert(tree_spec::branches == 2 && tree_spec::ownsKvTail(alternate));
+    branch[alternate].reserve(last - first + 1);
+    for (std::size_t pi = first; pi <= last; ++pi) {
+        const auto p = takePage(&sl);
+        if (!p) {
+            releaseTreePages(branch);
+            return false;
         }
-        m_.mapPages(shadow, static_cast<std::uint32_t>(first), branch[b]);
+        branch[alternate].push_back(*p);
     }
+    m_.mapPages(opt_.parallel + alternate, static_cast<std::uint32_t>(first), branch[alternate]);
     return true;
 }
 
@@ -648,7 +657,14 @@ void Engine::releaseTreePages(std::array<std::vector<std::int32_t>, 2>& branch) 
 
 void Engine::promoteTreePages(Slot& sl, std::array<std::vector<std::int32_t>, 2>& branch, std::size_t first,
                               std::uint32_t winner) {
-    if (winner >= 2 || branch[winner].empty() || first + branch[winner].size() > sl.pages.size())
+    if (winner >= tree_spec::branches)
+        throw std::runtime_error("invalid tree KV promotion");
+    if (!tree_spec::ownsKvTail(winner)) {
+        if (!branch[winner].empty()) throw std::runtime_error("invalid aliased tree KV tail");
+        releaseTreePages(branch);
+        return;
+    }
+    if (branch[winner].empty() || first + branch[winner].size() > sl.pages.size())
         throw std::runtime_error("invalid tree KV promotion");
     const std::size_t n = branch[winner].size();
     std::vector<std::int32_t> old(sl.pages.begin() + static_cast<std::ptrdiff_t>(first),
@@ -1821,14 +1837,14 @@ bool Engine::decodeTreeCycle(Slot& sl) {
     m_.forkMtpDraftHidden();
 
     // The root step may have appended the previous pending tokens to the MTP
-    // KV cache.  Refresh both already-owned tails on the same stream before
-    // the branch steps consume them.
+    // KV cache.  The primary aliases the active tail and is already current;
+    // refresh only the alternate's copy-on-write tail before its branch steps
+    // consume it.
     // Only the live prefix of the current physical page belongs to the common
     // history.  Later pages are fresh branch output; copying all 256 rows (and
     // every attention layer) here would dominate a short decode cycle.
     const std::uint32_t live_rows = static_cast<std::uint32_t>(sl.pos % kv_page) + 1;
-    for (std::uint32_t b = 0; b < 2; ++b)
-        copyPageRows(branch_pages[b][0], sl.pages[first_page], live_rows);
+    copyPageRows(branch_pages[1][0], sl.pages[first_page], live_rows);
 
     std::array<MSeg, 2> branches = {MSeg{shadow0, {}, 0, sl.pos}, MSeg{shadow1, {}, 0, sl.pos}};
     for (std::uint32_t r = 1; r < depth; ++r) {

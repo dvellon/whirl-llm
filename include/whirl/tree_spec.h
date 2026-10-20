@@ -17,6 +17,17 @@ namespace whirl::tree_spec {
 inline constexpr std::uint32_t max_depth = 7;
 inline constexpr std::uint32_t branches = 2;
 
+// The primary verify follows the same token chain as an ordinary linear
+// speculative verify, so it may write its speculative suffix directly into
+// the active slot's already-owned KV pages.  Only the alternate branch needs
+// a private copy-on-write tail: if it wins, that owned tail replaces the
+// active one.  Keeping this rule beside the pure tree plan makes ownership
+// explicit and host-testable.
+inline constexpr bool ownsKvTail(std::uint32_t branch) {
+    if (branch >= branches) throw std::out_of_range("tree branch");
+    return branch == 1;
+}
+
 struct Branch {
     std::array<std::uint32_t, max_depth> drafts{};
     std::uint32_t n = 0;
