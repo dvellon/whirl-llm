@@ -73,6 +73,19 @@ R9700 a run takes 12-19 s with the model files in the OS file cache, and a full 
 about 3 minutes. The Radeon 8060S takes about the same (8-30 s a run). A subset (one model, one
 mode) takes about 30 s.
 
+Suite `server` (ARCH-1, opt-in until its references are recorded on both GPUs): runs
+`whirl-server-gate --suite golden` against `build\Release\whirl-server.exe` (`-ServerExe`, `-GateExe`) and
+records the `G srv.*` lines: prefill on the engine schedule, streaming, thinking, a ~5k-token document, the
+in-VRAM prefix cache, a RAM-tier restore and an SSD-tier restore after a restart; in precise also a server
+with no prefix cache (the restored turn must equal it bitwise) and two concurrent requests (each must equal
+the request alone). The gate checks these relations itself and the runner rejects a run without
+`(ALL PASS)`. Vision joins with `WHIRL_GOLDEN_MMPROJ_<MODEL>` and `WHIRL_GOLDEN_IMAGES`.
+
+Every check and record prints the SHA-256 of the executables and of the reference set (selected
+reference files plus `models.txt`); `golden.ps1 refhash` prints the reference-set hash without a GPU.
+`golden.ps1 check -Impact A..B` (or `-Impact worktree`) runs only the models and suites that
+`tools/impact/impact.py` lists for that diff (see [Impact map](#impact-map)).
+
 `--fast` has its own items (q4 KV, relaxacc on dense models with an MTP head), so the fast
 files differ from the balance files wherever those items apply. `golden.ps1 record` refuses to write
 any reference without a passing KL gate report of the same executable (`-KlReport`, see
@@ -93,6 +106,25 @@ any reference without a passing KL gate report of the same executable (`-KlRepor
   `-KlReport`. record checks the report (pass, exe SHA-256, device, models, modes balance + fast,
   lengths 8k / 32k / 96k / 128k) and otherwise writes nothing (exit 2). The report goes into the
   commit message's `golden update:` note (one line per model: worst KL / top-1 per mode).
+
+## <a id="impact-map"></a>Impact map
+
+`tools/impact_map.json` maps source functions and kernel files to product paths, tests, gates and
+release-matrix cells. It is built from the code (`python tools/impact/impact_build.py`, a few seconds):
+CMake link sets, the include graph, the call graph, and the kernel dispatch table (`kernels_abi.cpp` names
+-> `.hip` files, arch from the `#if __gfx1151__` guards). Path roots, server-gate suites and matrix
+metrics are declared in `impact_build.py` and marked `declared` in the JSON.
+
+```
+python tools/impact/impact.py --worktree           # what to re-run for uncommitted changes
+python tools/impact/impact.py --commit SHA --why   # with the reason for every path
+python tools/impact/impact_build.py --check        # is the committed map current?
+python tools/impact/validate.py                    # replay real fix commits: does the map flag their tests?
+```
+
+The map lists all three modes for every change: a change is shown to be mode-confined only by the
+golden hashes (precise unchanged). Host code that branches on the GPU inside a shared function is listed
+for both GPUs.
 
 ## <a id="kl-gate"></a>KL gate
 
