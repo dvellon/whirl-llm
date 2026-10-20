@@ -143,7 +143,8 @@ const char* kHelpBody =
     "                           experimental single-slot greedy MTP tree: primary depth 4 or 7\n"
     "                           plus a depth-2 alternate root (default off; also\n"
     "                           WHIRL_TREE). Requires a dense text model, fused decode and\n"
-    "                           DeltaNet replay; n-gram drafting is disabled while active\n"
+    "                           DeltaNet replay; n-gram drafting is disabled while active;\n"
+    "                           --fast applies its usual relaxed-greedy acceptance rule\n"
     "  --draft mtp|dflash       draft source of the speculative decode (default mtp). dflash: the DFlash2\n"
     "                           drafter GGUF from --draft-model FILE (block 8: up to 7 drafts per cycle);\n"
     "                           the MTP block is then not loaded; the drafter's weights and context rings\n"
@@ -872,7 +873,7 @@ int serveMain(int argc, char** argv, const char* program) {
         model.gdn_replay = envOn("GDN_REPLAY", true);
         const hip::MemInfo mem_s0 = hip::memInfo();
         const bool tree_shadow_alloc = tree_requested != 0 && opt.parallel == 1 && use_mtp && !use_dflash && !cfg.moe &&
-                                       model.fusedDecode() && !model.relax.on && !(opt.mmproj || env("MMPROJ"));
+                                       model.fusedDecode() && !(opt.mmproj || env("MMPROJ"));
         model.setupSeqs(opt.parallel, slot_ctx, tree_shadow_alloc ? 2u : 0u);
         std::uint32_t tree_depth = tree_requested;
         if (tree_depth != 0) {
@@ -884,7 +885,6 @@ int serveMain(int argc, char** argv, const char* program) {
             else if (!model.fusedDecode()) why = "the fused decode kernels are unavailable";
             else if (!model.gdn_replay) why = "DeltaNet replay is unavailable";
             else if (!model.draftTop2Ok()) why = "the deterministic top-2 draft kernel is unavailable";
-            else if (model.relax.on) why = "relaxacc changes exact greedy acceptance";
             else if (opt.mmproj || env("MMPROJ")) why = "the first prototype is text-only";
             if (!why.empty()) {
                 logW("WHIRL_TREE=beam2:{} ignored: {}; using linear speculative decoding", tree_depth, why);
@@ -1001,7 +1001,8 @@ int serveMain(int argc, char** argv, const char* program) {
         if (eo.tree_depth != 0) {
             if (eo.ngram) logI("prompt-lookup drafting: off in WHIRL_TREE=beam2:{} mode", eo.tree_depth);
             eo.ngram = false;
-            logI("MTP tree speculation: primary depth {}, alternate depth 2, single-slot greedy text requests only", eo.tree_depth);
+            logI("MTP tree speculation: primary depth {}, alternate depth 2, single-slot greedy text requests only{}", eo.tree_depth,
+                 eo.relax.on ? "; fast relaxed-greedy acceptance" : "");
         }
         eo.ngram_min = envU32("NGRAM_MIN", def.ngram_min);
         eo.ngram_slope = def.ngram_slope;

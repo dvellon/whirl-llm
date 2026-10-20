@@ -71,12 +71,20 @@ void testTreeSpecPlan() {
     check(a.branch == 0 && a.accepted == 2 && a.chosen == 90,
           "tree spec: equal accepted prefixes choose branch zero deterministically");
 
+    std::array<std::uint8_t, 10> relaxed{};
+    target = {90, 91, 92, 0, 0, 93, 94, 95, 0, 0};
+    relaxed[0] = 1;
+    relaxed[5] = relaxed[6] = 1;
+    a = ts::accept(p, target, 8, relaxed);
+    check(a.branch == 1 && a.accepted == 2 && a.has_chosen && a.chosen == 95 && a.emitted == 3,
+          "tree spec: relaxed-greedy rows extend each branch and the longest accepted prefix wins");
+
     target = {10, 11, 12, 13, 14, 20, 21, 22, 23, 24};
     a = ts::accept(p, target, 2);
     check(a.branch == 0 && a.accepted == 2 && !a.has_chosen && a.emitted == 2,
           "tree spec: output budget can end inside a matching speculative prefix");
 
-    bool bad_depth = false, stale_tail = false, short_rows = false;
+    bool bad_depth = false, stale_tail = false, short_rows = false, short_relaxed = false;
     try {
         ts::Plan bad = p;
         bad.depth = ts::max_depth + 1;
@@ -96,7 +104,14 @@ void testTreeSpecPlan() {
     } catch (const std::invalid_argument&) {
         short_rows = true;
     }
-    check(bad_depth && stale_tail && short_rows, "tree spec: malformed plans and short target tables fail closed");
+    try {
+        std::array<std::uint8_t, 7> short_mask{};
+        (void)ts::accept(p, target, 8, short_mask);
+    } catch (const std::invalid_argument&) {
+        short_relaxed = true;
+    }
+    check(bad_depth && stale_tail && short_rows && short_relaxed,
+          "tree spec: malformed plans and short target / relaxed tables fail closed");
 }
 
 // Minimal GGUF v3 image builder.

@@ -105,7 +105,7 @@ Engine::Engine(ServerModel& model, tier::DeviceOps& ops, const Tokenizer& tok, c
     if (opt_.tree_depth != 0) {
         const bool depth_ok = opt_.tree_depth == 4 || opt_.tree_depth == 7;
         if (!depth_ok || opt_.parallel != 1 || !opt_.use_mtp || opt_.use_dflash || m_.cfg().moe || !m_.fusedDecode() ||
-            !m_.gdnReplay() || !m_.draftTop2Ok() || opt_.relax.on || opt_.ngram)
+            !m_.gdnReplay() || !m_.draftTop2Ok() || opt_.ngram)
             throw std::runtime_error("invalid tree speculation configuration");
     }
     if (opt_.n_ck == 0 || opt_.no_prefix_cache) opt_.n_spe = 0;
@@ -1843,7 +1843,13 @@ bool Engine::decodeTreeCycle(Slot& sl) {
     if (p && p->events) m_.profileStart(1, 1);
     const std::uint32_t rows = m_.verifyBatchEnqueue(vsegs);
     if (p) m_.profileStop();
+    const std::uint32_t rk = opt_.relax.topk();
+    if (opt_.relax.on) {
+        launchTopk(0, depth, rk, 1.0f, relax_dev_, max_rows, 0);
+        launchTopk(depth + 1, alternate_depth, rk, 1.0f, relax_dev_, max_rows, depth + 1);
+    }
     m_.readCtl(ctl_host_);
+    if (opt_.relax.on) ops_.download(relax_host_.data(), relax_dev_, relax_host_.size());
 
     // One compact readback supplies both draft chains and target rows.  Keep
     // it after verify so drafting and target work remain one GPU submission.
@@ -1864,7 +1870,48 @@ bool Engine::decodeTreeCycle(Slot& sl) {
             target[plan.row0(b) + r] = static_cast<std::uint32_t>(c[qwen35::ctl_rows + r]);
     }
     const std::uint32_t budget = sl.max_tokens > sl.n_gen ? sl.max_tokens - sl.n_gen : 0;
-    tree_spec::Accept accepted = tree_spec::accept(plan, std::span<const std::uint32_t>(target.data(), plan.rows()), budget);
+    std::array<std::uint8_t, 2 * (tree_spec::max_depth + 1)> relaxed{};
+    if (opt_.relax.on) {
+        for (std::uint32_t b = 0; b < 2; ++b) {
+            const std::uint32_t r0 = plan.row0(b);
+            for (std::uint32_t r = 0; r < std::min(plan.branch[b].n, budget); ++r) {
+                const std::uint32_t gr = r0 + r;
+                const std::uint32_t draft = plan.branch[b].drafts[r];
+                if (target[gr] == draft) continue;
+                const auto* rids = reinterpret_cast<const std::int32_t*>(relax_host_.data()) + gr * rk;
+                const auto* rvals =
+                    reinterpret_cast<const float*>(relax_host_.data() + static_cast<std::size_t>(max_rows) * rk * 4) + gr * rk;
+                const auto* rst =
+                    reinterpret_cast<const float*>(relax_host_.data() + static_cast<std::size_t>(max_rows) * rk * 8);
+                if (!relax::acceptGreedy(opt_.relax, std::span<const std::int32_t>(rids, rk),
+                                         std::span<const float>(rvals, rk), rst[2 * gr], draft) ||
+                    relaxRepeats(sl, std::span<const std::uint32_t>(plan.branch[b].drafts.data(), plan.branch[b].n), r))
+                    break;
+                relaxed[gr] = 1;
+            }
+        }
+    }
+    tree_spec::Accept accepted =
+        tree_spec::accept(plan, std::span<const std::uint32_t>(target.data(), plan.rows()), budget,
+                          std::span<const std::uint8_t>(relaxed.data(), plan.rows()));
+    const std::uint32_t row0 = plan.row0(accepted.branch);
+    if (opt_.relax.on) {
+        const auto* rvals =
+            reinterpret_cast<const float*>(relax_host_.data() + static_cast<std::size_t>(max_rows) * rk * 4);
+        const auto* rst =
+            reinterpret_cast<const float*>(relax_host_.data() + static_cast<std::size_t>(max_rows) * rk * 8);
+        const auto* rids = reinterpret_cast<const std::int32_t*>(relax_host_.data());
+        for (std::uint32_t r = 0; r < accepted.accepted; ++r) {
+            const std::uint32_t gr = row0 + r;
+            if (relaxed[gr] == 0) continue;
+            for (std::uint32_t j = 0; j < rk; ++j) {
+                const std::size_t at = static_cast<std::size_t>(gr) * rk + j;
+                if (static_cast<std::uint32_t>(rids[at]) == plan.branch[accepted.branch].drafts[r])
+                    sl.relax_gap += static_cast<double>(rst[2 * gr] - rvals[at]);
+            }
+            sl.relaxed += 1;
+        }
+    }
     std::uint32_t acc = accepted.accepted;
     std::uint32_t chosen = accepted.chosen;
     if (!accepted.has_chosen) {
@@ -1893,7 +1940,6 @@ bool Engine::decodeTreeCycle(Slot& sl) {
     m_.dropPending(loser_seq);
     promoteTreePages(sl, branch_pages, first_page, accepted.branch);
 
-    const std::uint32_t row0 = plan.row0(accepted.branch);
     ops_.copyAsync(m_.seqHid(sl.id), m_.hn() + static_cast<std::uint64_t>(row0) * E * 4,
                    static_cast<std::uint64_t>(acc + 1) * E * 4, m_.stream());
 

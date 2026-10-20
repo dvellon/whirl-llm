@@ -49,18 +49,28 @@ struct Accept {
 };
 
 // target contains one target argmax for each verify row in Plan::row layout.
-// The branch with the longest exact draft prefix wins; ties choose branch 0.
+// The branch with the longest accepted draft prefix wins; ties choose branch
+// 0.  Without a relaxed mask this is the exact-match rule.
 // A budget ending inside an all-matching draft prefix emits no extra target
 // token, which keeps max_tokens handling independent of speculative depth.
-inline Accept accept(const Plan& plan, std::span<const std::uint32_t> target, std::uint32_t budget) {
+// `relaxed` optionally marks draft rows that the caller accepted by the fast
+// mode's relaxed-greedy rule.  Exact matches are always accepted.  Keeping the
+// policy decision outside this host-only planner lets the server apply the
+// same logits and repetition checks as its linear speculative path.
+inline Accept accept(const Plan& plan, std::span<const std::uint32_t> target, std::uint32_t budget,
+                     std::span<const std::uint8_t> relaxed = {}) {
     if (!plan.valid()) throw std::invalid_argument("invalid tree plan");
     if (target.size() < plan.rows()) throw std::invalid_argument("short tree target rows");
+    if (!relaxed.empty() && relaxed.size() < plan.rows()) throw std::invalid_argument("short tree relaxed rows");
 
     std::array<std::uint32_t, branches> matched{};
     for (std::uint32_t b = 0; b < branches; ++b) {
         const std::uint32_t r0 = plan.row0(b);
         const std::uint32_t lim = std::min(plan.branch[b].n, budget);
-        while (matched[b] < lim && target[r0 + matched[b]] == plan.branch[b].drafts[matched[b]]) ++matched[b];
+        while (matched[b] < lim &&
+               (target[r0 + matched[b]] == plan.branch[b].drafts[matched[b]] ||
+                (!relaxed.empty() && relaxed[r0 + matched[b]] != 0)))
+            ++matched[b];
     }
 
     Accept out;
