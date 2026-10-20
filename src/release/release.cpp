@@ -137,6 +137,11 @@ int gpuPreflight() {
             // (issue #2: the ROCm 10.1 driver's amdhip64_7.dll needs rocm_kpack.dll, which it does not install)
             std::fputs(dlldeps::message126(k_gpu_runtime_dll, dlldeps::diagnose(L"amdhip64_7.dll"), k_driver_advice).c_str(),
                        stderr);
+        } else if (err == ERROR_PROC_NOT_FOUND) {
+            // 127 = a DLL it imports lacks a function: likely a DLL shipped next to whirl.exe
+            // (rocm_kpack.dll, the app-local VC++ runtime) shadowing the version a newer driver expects
+            std::fputs(dlldeps::message127(k_gpu_runtime_dll, dlldeps::inspect127(L"amdhip64_7.dll", dlldeps::exeDir())).c_str(),
+                       stderr);
         } else {
             std::fprintf(stderr,
                          "error: the AMD GPU runtime (%s) could not be loaded, so WHIRL cannot use the GPU.\n"
