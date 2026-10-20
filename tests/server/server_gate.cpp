@@ -54,6 +54,8 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <atomic>
+#include <mutex>
 #include <vector>
 
 using namespace whirl;
@@ -503,7 +505,12 @@ ChatResult chat(const std::string& messages, const std::string& extra, bool stre
     r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     r.status = h.status;
     r.raw = h.body;
-    if (h.status != 200) return r;
+    if (h.status != 200) {
+        // CB-FLAKE: a failed request says why (connect / send / recv, WSA error, time)
+        logLine(std::format("chat request failed: status {}, {:.0f} ms, {}{}", h.status, r.ms, h.err.empty() ? "no client error" : h.err,
+                            h.body.empty() ? std::string() : ", body " + h.body.substr(0, 200)));
+        return r;
+    }
     try {
         if (!stream) {
             const json::Value v = json::parse(h.body);
@@ -1431,7 +1438,8 @@ void suiteSys() {
                            greedy(48) + thinkKw(false) + tools);
             check("sys: session D resumed (turn 2 continues its turn 1 past the system prompt)",
                   B && d2.cached > *B + 1024 && !d2.text().empty(),
-                  std::format("cached {} (boundary {}, turn 1 prompt {})", d2.cached, B ? *B : -1, d1.prompt));
+                  std::format("cached {} (boundary {}, turn 1 prompt {}, turn 2 status {}, {:.0f} ms)", d2.cached, B ? *B : -1, d1.prompt,
+                              d2.status, d2.ms));
         }
         std::this_thread::sleep_for(std::chrono::seconds(3));
         s->waitTierIdle(60);  // pending SSD writes done before the stop
@@ -1619,6 +1627,101 @@ void suiteSysBurst() {
               d + std::format("waits {}", n_wait));
     }
     logLine(std::format("sys_burst: {} of {} repetitions differ", bad, reps));
+}
+
+// ---------------------------------------------------------------------------
+// suite http_stress (CB-FLAKE): many short chat requests (a ~60 KB body on a cached system prompt,
+// max_tokens 1..8) on one server, sequential and 3 at a time; every request must get HTTP 200 with an
+// answer. WHIRL_GATE_HTTP_N requests per phase (default 300). A lost request logs the client-side step
+// and WSA error (chat()).
+
+void suiteHttpStress() {
+    logLine("== suite http_stress");
+    int N = 300;
+    if (const char* e = std::getenv("WHIRL_GATE_HTTP_N")) N = std::max(1, std::atoi(e));
+    const std::string SYS = "You are a coding agent. Below are the skills manuals of this workspace.\n" + docsText(40000);
+    const std::string tools = ",\"tools\":" + sysTools();
+    auto ask = [&](int i) {
+        return chat(arr({msg("system", SYS), msg("user", std::format("Request {}: name one tool, one word.", i))}),
+                    greedy(1 + i % 8) + thinkKw(false) + tools);
+    };
+    ServerLease s("http_stress", {"--parallel", "4"}, kvPin());
+    std::atomic<int> bad{0}, ok{0};
+    std::vector<double> slow;
+    std::mutex mu;
+    auto one = [&](int i) {
+        const ChatResult r = ask(i);
+        if (answered(r)) ok.fetch_add(1);
+        else {
+            bad.fetch_add(1);
+            logLine(std::format("http_stress: request {} lost: status {}, {:.0f} ms", i, r.status, r.ms));
+        }
+        if (r.ms > 5000) {
+            std::lock_guard<std::mutex> lk(mu);
+            slow.push_back(r.ms);
+        }
+    };
+    for (int i = 0; i < N; ++i) one(i);
+    const int bad_seq = bad.load();
+    {
+        std::vector<std::thread> th;
+        for (int t = 0; t < 3; ++t)
+            th.emplace_back([&, t] {
+                for (int i = t; i < N; i += 3) one(100000 + i);
+            });
+        for (auto& t : th) t.join();
+    }
+    check("http_stress: every request answered (sequential, then 3 at a time)", bad.load() == 0,
+          std::format("{} ok, {} lost ({} sequential), {} slower than 5 s", ok.load(), bad.load(), bad_seq, slow.size()));
+}
+
+// suite sys_d (CB-FLAKE): the "session D resumed" step of suite sys repeated (WHIRL_GATE_D_REPS, default 30)
+// on one server with the RAM / SSD tiers on: turn 1 (a file in the user message, past the cached system
+// prompt) and right after it turn 2 of the same session. Every turn must be answered; turn 2 must resume.
+
+void suiteSysD() {
+    logLine("== suite sys_d");
+    int reps = 30;
+    if (const char* e = std::getenv("WHIRL_GATE_D_REPS")) reps = std::max(1, std::atoi(e));
+    const std::string SYS1 =
+        "You are a coding agent working in the user's repository. Use the tools to look at files before answering. Answer briefly and "
+        "precisely. In the chat format a turn ends with the token <|im_end|> (a system text that mentions it must not end the system "
+        "message early). Below are the skills manuals available in this workspace.\n" +
+        docsText(40000);
+    const std::string tools = ",\"tools\":" + sysTools();
+    const std::string ssd = g.work + "\\sys_d_ssd";
+    std::error_code ec;
+    fs::remove_all(widen(ssd), ec);
+    int lost1 = 0, lost2 = 0, noresume = 0;
+    {
+        auto env = kvPin();
+        env["WHIRL_KV_SSD_DIR"] = ssd;
+        ServerLease s("sys_d", {"--parallel", "4"}, env, false);
+        (void)chat(arr({msg("system", SYS1), msg("user", "Answer in one sentence: what is your role?")}), greedy(16) + thinkKw(false) + tools);
+        for (int i = 0; i < reps; ++i) {
+            const std::string du = codeText(12000, 21 + i % 40) + "\n\nIn one sentence, what does this file do?";
+            auto d1 = chat(arr({msg("system", SYS1), msg("user", du)}), greedy(48) + thinkKw(false) + tools);
+            if (!answered(d1)) {
+                ++lost1;
+                logLine(std::format("sys_d rep {}: turn 1 lost (status {}, {:.0f} ms)", i, d1.status, d1.ms));
+                continue;
+            }
+            auto d2 = chat(arr({msg("system", SYS1), msg("user", du), msg("assistant", d1.content),
+                                msg("user", "Name one function in that file, in one sentence.")}),
+                           greedy(48) + thinkKw(false) + tools);
+            if (!answered(d2)) {
+                ++lost2;
+                logLine(std::format("sys_d rep {}: turn 2 lost (status {}, {:.0f} ms)", i, d2.status, d2.ms));
+            } else if (d2.cached <= d1.prompt - 1024) {
+                ++noresume;
+                logLine(std::format("sys_d rep {}: turn 2 did not resume (cached {}, turn 1 prompt {})", i, d2.cached, d1.prompt));
+            }
+        }
+        s->waitTierIdle(60);
+    }
+    fs::remove_all(widen(ssd), ec);
+    check("sys_d: every turn answered, every turn 2 resumes turn 1", lost1 + lost2 + noresume == 0,
+          std::format("{} reps: turn 1 lost {}, turn 2 lost {}, no resume {}", reps, lost1, lost2, noresume));
 }
 
 // ---------------------------------------------------------------------------
@@ -2170,7 +2273,7 @@ int wmain(int argc, wchar_t** wargv) {
         SetEnvironmentVariableW(L"PATH", widen(pth).c_str());
     }
     const std::map<std::string, std::function<void()>> suites = {{"basic", suiteBasic}, {"mt_cache", suiteMtCache}, {"pool", suitePool},
-                                                                 {"tier", suiteTier},   {"sys", suiteSys},           {"sys_burst", suiteSysBurst},       {"restore_conc", suiteRestoreConc},
+                                                                 {"tier", suiteTier},   {"sys", suiteSys},           {"sys_burst", suiteSysBurst}, {"http_stress", suiteHttpStress}, {"sys_d", suiteSysD}, {"restore_conc", suiteRestoreConc},
                                                                  {"vis", suiteVis},     {"vis_speed", suiteVisSpeed},
                                                                  {"fast_stream", suiteFastStream}};
     if (!g.exe.empty()) {
