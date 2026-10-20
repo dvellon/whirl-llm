@@ -1202,8 +1202,11 @@ bool Tier::waitForDedupBase(const Entry* e) const {
         const std::vector<std::uint32_t>* bt = nullptr;
         bool flight = false;
         if (b->io_busy) {
+            // a write still in jobs_ counts as in flight also when the IO thread has already finished it:
+            // until a tick reaps it, b has no SSD copy and startWrite could not reference it (CB-FLAKE:
+            // the write of a finished, unreaped base used to be missed and the shared prefix written twice)
             for (const Job* j : jobs_)
-                if (j->kind == JobKind::write && j->entry_id == b->id && !j->finished.load(std::memory_order_acquire) && j->snap) {
+                if (j->kind == JobKind::write && j->entry_id == b->id && j->snap) {
                     bt = &j->snap->tokens;
                     break;
                 }
