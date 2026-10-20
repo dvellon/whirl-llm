@@ -207,6 +207,14 @@ try {
         $out = @(Get-Content $log -ErrorAction SilentlyContinue)
         $ok = $false
         try { $ok = [bool](& $s.rule $out $c) } catch { $ok = $false }
+        # CB-FLAKE: a failed step keeps its server logs (server_*.log / *.stdout.txt, small) next to the step log,
+        # so an intermittent failure can be explained afterwards; the SSD tier files are deleted either way
+        if (-not $ok -and (Test-Path $wd)) {
+            $keep = Join-Path $logDir "$($s.name)_server_logs"
+            New-Item -ItemType Directory -Force $keep | Out-Null
+            Get-ChildItem $wd -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "server_*.log" -or $_.Name -like "*.stdout.txt" -or $_.Name -like "*.json" } |
+                Copy-Item -Destination $keep -ErrorAction SilentlyContinue
+        }
         Remove-Item -Recurse -Force $wd -ErrorAction SilentlyContinue  # server gate work dirs (SSD tier files)
         $sec = [int]((Get-Date) - $t0).TotalSeconds
         $last = ($out | Where-Object { $_ -match "\S" -and $_ -notmatch "^:1:" } | Select-Object -Last 1)
