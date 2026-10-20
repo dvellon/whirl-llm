@@ -414,6 +414,49 @@ void testGemv(Ctx& c) {
         if (!first_bad.empty()) r.note = "first " + first_bad;
         c.rep.add(r);
     }
+
+    // Direct real-model coverage for the opt-in gfx1151 output-head shape.
+    // Keep this narrow: one partial row tile, NT=11, and bitwise comparison
+    // against the canonical one-token Q6_K entry for every token.
+    if (c.k.gemvq_nt11r2w16_q6_k != nullptr) {
+        const whirl::gguf::File* f = c.open(c.models.mx);
+        const auto* ht = f ? f->tensor("output.weight") : nullptr;
+        if (ht != nullptr) {
+            constexpr int nt = 11;
+            HostMat head = loadMat(*f, "output.weight", 0, c.quick ? 257 : 1025);
+            if (head.type != QType::q6_k) {
+                c.rep.skip("data", "gemvq_nt11r2w16_q6_k",
+                           "MXFP4 model output.weight is not Q6_K");
+                return;
+            }
+            const int ncols = head.ncols, nrows = head.nrows;
+            Buf w(head.data);
+            const std::vector<float> x = c.randn(static_cast<std::size_t>(nt) * ncols);
+            Buf dx(x), xq(static_cast<std::size_t>(nt) * ncols),
+                xd(static_cast<std::size_t>(nt) * ncols / 32 * 4);
+            hip::launch(c.k.quantize_q8,
+                        {cdiv(static_cast<std::uint64_t>(nt) * ncols, 256), 1, 1},
+                        {256, 1, 1}, 0, c.s, dx.p(), xq.p(), xd.p(), nt * ncols);
+            Buf ref(static_cast<std::size_t>(nt) * nrows * 4),
+                got(static_cast<std::size_t>(nt) * nrows * 4);
+            for (int t = 0; t < nt; ++t)
+                gemvq1(c, QType::q6_k, w, head.row_bytes, nrows,
+                       xq.p() + static_cast<std::uint64_t>(t) * ncols,
+                       xd.p() + static_cast<std::uint64_t>(t) * (ncols / 32) * 4,
+                       ref.p() + static_cast<std::uint64_t>(t) * nrows * 4,
+                       ncols, 0);
+            hip::launch(c.k.gemvq_nt11r2w16_q6_k, {cdiv(nrows, 16), 1, 1},
+                        {512, 1, 1}, 0, c.s, w.p(), head.row_bytes, xq.p(), xd.p(),
+                        got.p(), ncols, nrows, 0, DevPtr{0});
+            c.sync();
+            const std::size_t count = static_cast<std::size_t>(nt) * nrows;
+            c.rep.add(cmpExact("gemvq_nt11r2w16_q6_k output.weight 5120->248320 == 1-token (partial block)",
+                               got.down<float>(count), ref.down<float>(count), Kind::invariant));
+        } else {
+            c.rep.skip("data", "gemvq_nt11r2w16_q6_k",
+                       "MXFP4 model Q6_K output.weight not available");
+        }
+    }
 }
 
 }  // namespace kt

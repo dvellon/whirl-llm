@@ -396,6 +396,8 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
         }
         k.gemvq_nt11r2w16_mxfp4 = L.opt("gemvq_nt11r2w16_mxfp4");
         k.gemvq_nt11r2w16_mxfp4_g = L.opt("ggemvq_nt11r2w16_mxfp4");
+        k.gemvq_nt11r2w16_q6_k = L.opt("gemvq_nt11r2w16_q6_k");
+        k.gemvq_nt11r2w16_q6_k_g = L.opt("ggemvq_nt11r2w16_q6_k");
         k.gdn_ab[i] = L.opt("gdn_ab_mxfp4");
         k.gdn_abconv[i] = L.opt("gdn_abconv_mxfp4");
         // routed experts: generic entries + whole-block decode + fp8 grouped GEMM
