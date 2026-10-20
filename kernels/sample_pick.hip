@@ -179,6 +179,52 @@ extern "C" __global__ void __launch_bounds__(1024)
     draft_pick_body(x, n, tok, prob, ctl, r, n_min, p_min, map);
 }
 
+__device__ __forceinline__ void draft_top2_add(float v, int j, float& a0, int& j0, float& a1, int& j1) {
+    if (j == j0) return;
+    if (v > a0 || (v == a0 && j < j0)) {
+        a1 = a0;
+        j1 = j0;
+        a0 = v;
+        j0 = j;
+    } else if (v > a1 || (v == a1 && j < j1)) {
+        a1 = v;
+        j1 = j;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(1024)
+    draft_pick_top2(const float *x, int n, int *out, int out_stride, const int *map) {
+    __shared__ float v0[1024], v1[1024];
+    __shared__ int i0[1024], i1[1024];
+    float a0 = -INFINITY, a1 = -INFINITY;
+    int j0 = 0x7fffffff, j1 = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) draft_top2_add(x[i], i, a0, j0, a1, j1);
+    v0[threadIdx.x] = a0;
+    i0[threadIdx.x] = j0;
+    v1[threadIdx.x] = a1;
+    i1[threadIdx.x] = j1;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            a0 = v0[threadIdx.x];
+            j0 = i0[threadIdx.x];
+            a1 = v1[threadIdx.x];
+            j1 = i1[threadIdx.x];
+            draft_top2_add(v0[threadIdx.x + s], i0[threadIdx.x + s], a0, j0, a1, j1);
+            draft_top2_add(v1[threadIdx.x + s], i1[threadIdx.x + s], a0, j0, a1, j1);
+            v0[threadIdx.x] = a0;
+            i0[threadIdx.x] = j0;
+            v1[threadIdx.x] = a1;
+            i1[threadIdx.x] = j1;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out[0] = map ? map[i0[0]] : i0[0];
+        out[out_stride] = map ? map[i1[0]] : i1[0];
+    }
+}
+
 // Batched drafts: logits row b belongs to the sequence whose control area
 // starts at ctl_all + area.v[b] (ints; see the control-area layout in the model code).
 extern "C" __global__ void __launch_bounds__(1024)

@@ -120,6 +120,8 @@
 //   argmax_rows(x, n, out); argmax_rows_to(x, n, out, RowIdx dst)
 //   argmax_prob(x, n, int* out_tok, float* out_prob)
 //   draft_pick(x, n, int* tok, float* prob, int* ctl, int r, int n_min, float p_min, const int* map)
+//   draft_pick_top2(x, n, int* out, int out_stride, const int* map): deterministic two largest logits
+//            (descending logit, ties -> smaller vocabulary row), mapped to token ids
 //   draft_pick_rows(x, n, int* ctl_all, RowIdx area, int r, int n_min, float p_min, const int* map)
 //            map (null: identity) = token id of each draft-head row (vocabulary subset)
 //   draft_sample_rows(x, n, int* ctl_all, RowIdx area, int r, const int* map, DSampArgs a, int* qbuf)
@@ -498,7 +500,7 @@ struct KernelTable {
     F gdn_conv_l2{}, gdn_step_norm{}, requant_q6k_q4k{}, requant_q6k_d2{}, requant_q80_q4k{};
     F copy_rows_map{};  // optional
     F dflash_conv{}, dflash_topk{}, dflash_lattice{}, dflash_walk{}, dflash_attn{}, dflash_attn_long{};  // optional (DFlash2 drafter)
-    F set_tokens{}, argmax_rows{}, argmax_prob{}, draft_pick{};
+    F set_tokens{}, argmax_rows{}, argmax_prob{}, draft_pick{}, draft_pick_top2{};
     F set_rows{}, rmsnorm_q8_rows{}, argmax_rows_to{}, draft_pick_rows{};
     F draft_sample_rows{};  // optional (null: specsample skipped)
     F moe_logits_f32{}, moe_topk{}, moe_route{}, moe_gather_f16{}, moe_act_f16{}, moe_combine{}, moe_tiles{};

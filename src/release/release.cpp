@@ -363,6 +363,7 @@ constexpr EnvDoc k_env[] = {
     {"Speculative decoding (output always equals plain greedy)", "NGRAM_MIN=N", "minimum matched suffix for an n-gram draft (default 3)", C | B | S},
     {"Speculative decoding (output always equals plain greedy)", "NGRAM_SLOPE=X", "prior cost of one more n-gram verify row, relative to a 1-draft cycle (default 0.015; Radeon 8060S 0.12)", C | B | S},
     {"Speculative decoding (output always equals plain greedy)", "NGRAM_MAX=N", "most n-gram drafts per cycle (default 15)", C | B | S},
+      {"Speculative decoding (output always equals plain greedy)", "TREE=beam2:4|beam2:7", "server experimental single-slot greedy MTP tree (primary depth 4/7 plus depth-2 alternate; dense text models, fused decode and DeltaNet replay required; disables n-gram drafting)", S},
     {"Speculative decoding (output always equals plain greedy)", "NGRAM_FORCE=1", "take every n-gram proposal", C | B | S},
     {"Speculative decoding (output always equals plain greedy)", "NGRAM_DEBUG=1", "log every decode cycle to stderr", C | B},
 

@@ -193,6 +193,29 @@ void testMisc(Ctx& c) {
         c.sync();
         c.rep.add(cmpExact("argmax_prob token", tok.down<int>(1), std::vector<int>{want[0]}));
         c.rep.add(cmpTolRel("argmax_prob probability vs CPU", prob.down<float>(1), {softmaxTop(x.data(), n)}, 1e-4, 1e-9));
+        // deterministic two-root pick for tree speculation, including an
+        // equal-logit tie and the draft-head vocabulary map
+        if (c.k.draft_pick_top2) {
+            std::vector<float> lg(static_cast<std::size_t>(n), -10.f);
+            lg[5] = 50.f;
+            lg[100] = 50.f;
+            lg[7] = 49.f;
+            std::vector<int> mp(static_cast<std::size_t>(n));
+            for (int i = 0; i < n; ++i) mp[static_cast<std::size_t>(i)] = 200000 + 3 * i;
+            Buf dl(lg), dm(mp), roots(8), mapped(8);
+            hip::launch(c.k.draft_pick_top2, {1, 1, 1}, {1024, 1, 1}, 0, c.s, dl.p(), n, roots.p(), 1, hip::DevPtr{0});
+            hip::launch(c.k.draft_pick_top2, {1, 1, 1}, {1024, 1, 1}, 0, c.s, dl.p(), n, mapped.p(), 1, dm.p());
+            c.sync();
+            const auto hr = roots.down<int>(2);
+            const auto hm = mapped.down<int>(2);
+            const bool ok = hr[0] == 5 && hr[1] == 100 && hm[0] == mp[5] && hm[1] == mp[100];
+            Result r;
+            r.name = "draft_pick_top2 (ordered roots, tie -> lower row, vocabulary map)";
+            r.n = 4;
+            r.mismatches = ok ? 0 : 1;
+            r.pass = ok;
+            c.rep.add(r);
+        }
         // draft_pick chain: p_min cutoff after n_min drafts
         {
             std::vector<float> lg = c.randn(static_cast<std::size_t>(3) * n);

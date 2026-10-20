@@ -72,6 +72,11 @@ public:
     virtual void commitSeq(std::uint32_t s) = 0;
     virtual void dropPending(std::uint32_t s) = 0;
     virtual void setPending(std::uint32_t s, std::uint32_t rows) = 0;
+    virtual void promotePending(std::uint32_t dst, std::uint32_t src, std::uint32_t rows) {
+        (void)dst;
+        (void)src;
+        (void)rows;
+    }
     virtual void restoreSeqSnapshot(std::uint32_t s, std::uint32_t set) = 0;
     virtual void mapPages(std::uint32_t s, std::uint32_t first, std::span<const std::int32_t> phys) = 0;
     virtual void reset() = 0;
@@ -87,6 +92,9 @@ public:
     // ---- speculative decoding
     virtual void setDraftCutoff(float p_min, std::uint32_t n_min) = 0;
     virtual void mtpBatchStepEx(std::span<const MSeg> segs, std::uint32_t r, bool draft) = 0;
+    virtual bool draftTop2Ok() const { return false; }
+    virtual void draftTop2(std::uint32_t s0, std::uint32_t s1) { (void)s0; (void)s1; }
+    virtual void forkMtpDraftHidden() {}
     virtual std::uint32_t verifyBatchEnqueue(std::span<const VSeg> segs) = 0;
     virtual void readCtl(std::span<std::int32_t> dst) = 0;
     // speculative sampling of MTP drafts (numerics item specsample): per sequence, set before the

@@ -8,6 +8,7 @@
 #include "whirl/gguf.h"
 #include "whirl/kernels_abi.h"
 #include "whirl/model.h"
+#include "whirl/tree_spec.h"
 
 #include <algorithm>
 #include <array>
@@ -43,6 +44,60 @@ void check(bool ok, const char* what) {
     }
 }
 void check(bool ok, const std::string& what) { check(ok, what.c_str()); }
+
+void testTreeSpecPlan() {
+    namespace ts = whirl::tree_spec;
+    ts::Plan p;
+    p.depth = 4;
+    p.branch[0].n = 4;
+    p.branch[1].n = 2;
+    p.branch[0].drafts = {10, 11, 12, 13};
+    p.branch[1].drafts = {20, 21, 22, 23};
+    check(p.valid() && p.rows() == 8 && p.row0(0) == 0 && p.row0(1) == 5,
+          "tree spec: beam2 depth4 uses a five-row primary and three-row alternate verify");
+
+    std::array<std::uint32_t, 10> target = {10, 99, 0, 0, 0, 20, 21, 77, 0, 0};
+    auto a = ts::accept(p, target, 8);
+    check(a.branch == 1 && a.accepted == 2 && a.has_chosen && a.chosen == 77 && a.emitted == 3,
+          "tree spec: longer second branch wins and emits its target continuation");
+
+    target = {91, 0, 0, 0, 0, 92, 0, 0, 0, 0};
+    a = ts::accept(p, target, 8);
+    check(a.branch == 0 && a.accepted == 0 && a.has_chosen && a.chosen == 91 && a.emitted == 1,
+          "tree spec: neither branch accepted falls back to the target argmax");
+
+    target = {10, 11, 90, 0, 0, 20, 21, 91, 0, 0};
+    a = ts::accept(p, target, 8);
+    check(a.branch == 0 && a.accepted == 2 && a.chosen == 90,
+          "tree spec: equal accepted prefixes choose branch zero deterministically");
+
+    target = {10, 11, 12, 13, 14, 20, 21, 22, 23, 24};
+    a = ts::accept(p, target, 2);
+    check(a.branch == 0 && a.accepted == 2 && !a.has_chosen && a.emitted == 2,
+          "tree spec: output budget can end inside a matching speculative prefix");
+
+    bool bad_depth = false, stale_tail = false, short_rows = false;
+    try {
+        ts::Plan bad = p;
+        bad.depth = ts::max_depth + 1;
+        (void)ts::accept(bad, target, 8);
+    } catch (const std::invalid_argument&) {
+        bad_depth = true;
+    }
+    try {
+        ts::Plan bad = p;
+        bad.branch[0].n += 1;
+        (void)ts::accept(bad, target, 8);
+    } catch (const std::invalid_argument&) {
+        stale_tail = true;
+    }
+    try {
+        (void)ts::accept(p, std::span<const std::uint32_t>(target.data(), 7), 8);
+    } catch (const std::invalid_argument&) {
+        short_rows = true;
+    }
+    check(bad_depth && stale_tail && short_rows, "tree spec: malformed plans and short target tables fail closed");
+}
 
 // Minimal GGUF v3 image builder.
 struct GgufImage {
@@ -1504,6 +1559,7 @@ void testDraftWindowRestore() {
 
 int main() {
     whirl::test::clearWhirlEnv();  // FR-TEST P3-11
+    testTreeSpecPlan();
     testDraftWindowRestore();
     testFloatGemvDispatch();
     testArchWhitelist();

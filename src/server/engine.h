@@ -307,6 +307,11 @@ struct EngineOptions {
     std::uint32_t parallel = 4;
     chat::TemplateKind tmpl = chat::TemplateKind::a;
     bool use_mtp = false;
+    // Experimental single-slot greedy MTP tree.  Zero keeps the existing
+    // linear speculative path; the server startup gate currently admits only
+    // the two reviewed layouts (beam2:4 and beam2:7).  Request-specific code
+    // must still require Slot::greedy before entering the tree path.
+    std::uint32_t tree_depth = 0;
     // --draft dflash: DFlash2 drafts instead of MTP (the backend has the drafter; use_mtp is false)
     bool use_dflash = false;
     float dfl_p_min = 0;
@@ -455,11 +460,20 @@ private:
     void unrefPages(std::span<const std::int32_t> pages);
     bool sharedFrom(const Slot& sl, std::uint32_t reuse) const;
     void copyPage(std::int32_t dst, std::int32_t src);
+    void copyPageRows(std::int32_t dst, std::int32_t src, std::uint32_t rows);
     std::optional<std::int32_t> takePage(Slot* sl);
     void quarantinePages(std::span<const std::int32_t> pages);
     void reclaimPages(bool force);
     void cowPages(Slot& sl, std::uint32_t reuse, bool spill);
     bool ensurePages(Slot& sl, std::uint64_t n_tok);
+    // Prepare two isolated KV tails for the single-slot beam-2 verify.  Prefix
+    // page-table entries alias the active slot for this cycle; every page the
+    // speculative rows can write is copied and owned by its branch.
+    bool prepareTreePages(Slot& sl, std::uint32_t rows, std::array<std::vector<std::int32_t>, 2>& branch,
+                          std::size_t& first);
+    void releaseTreePages(std::array<std::vector<std::int32_t>, 2>& branch);
+    void promoteTreePages(Slot& sl, std::array<std::vector<std::int32_t>, 2>& branch, std::size_t first,
+                          std::uint32_t winner);
     // shared prefix checkpoints
     std::uint32_t sysSplit(std::span<const std::uint32_t> toks) const;
     static std::size_t schedNext(std::size_t n, std::size_t sys, std::size_t think, std::size_t pos);
@@ -508,6 +522,7 @@ private:
     void finishPrefill(Slot& sl);
     std::uint32_t pickDrafts(std::span<Slot* const> act);
     bool relaxRepeats(const Slot& sl, std::span<const std::uint32_t> dr, std::uint32_t acc) const;
+    bool decodeTreeCycle(Slot& sl);
     void decodeCycle(std::span<Slot* const> act_in);
     void splitDrafts(std::span<Slot* const> act, std::uint32_t nd, std::uint32_t rows, std::span<std::uint32_t> nd_m);
     std::uint32_t draftCap(std::uint32_t A);

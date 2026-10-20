@@ -139,6 +139,11 @@ const char* kHelpBody =
     "                           --balance=fp8,kvq8 picks items; --mode M;\n"
     "                           WHIRL_MODE\n"
     "  --mtp-drafts N           MTP drafts per cycle, 1..10 (fixed count; default: per model type)\n"
+    "  --tree off|beam2:4|beam2:7\n"
+    "                           experimental single-slot greedy MTP tree: primary depth 4 or 7\n"
+    "                           plus a depth-2 alternate root (default off; also\n"
+    "                           WHIRL_TREE). Requires a dense text model, fused decode and\n"
+    "                           DeltaNet replay; n-gram drafting is disabled while active\n"
     "  --draft mtp|dflash       draft source of the speculative decode (default mtp). dflash: the DFlash2\n"
     "                           drafter GGUF from --draft-model FILE (block 8: up to 7 drafts per cycle);\n"
     "                           the MTP block is then not loaded; the drafter's weights and context rings\n"
@@ -195,6 +200,7 @@ struct Options {
     bool parallel_given = false;  // --parallel / -np on the command line
     std::optional<std::uint32_t> ctx_per_slot;
     std::optional<std::uint32_t> mtp_drafts;
+    std::optional<std::string> tree;
     std::string draft = "mtp";
     std::string draft_model;  // --draft-model FILE (wins over WHIRL_DRAFT_MODEL)
     std::optional<std::uint32_t> decode_min_tps;
@@ -310,6 +316,19 @@ bool envOn(std::string_view name, bool def) {
     return def;
 }
 
+// Experimental tree mode deliberately has a tiny, exact surface.  Unknown
+// values never fall back to a nearby layout: startup continues on the proven
+// linear speculative path instead.
+std::uint32_t treeDepth(const std::optional<std::string>& cli) {
+    const auto v = cli ? cli : env("TREE");
+    if (!v || *v == "0" || *v == "off") return 0;
+    if (*v == "beam2:4") return 4;
+    if (*v == "beam2:7") return 7;
+    if (cli) die("invalid --tree " + *v + " (off, beam2:4 or beam2:7)");
+    logW("WHIRL_TREE={} is not one of off, beam2:4, beam2:7; tree speculation is off", *v);
+    return 0;
+}
+
 // Default max drafts per cycle by number of decoding slots (index = slots).
 // wide: verify batches of up to 32 rows (otherwise 16); the cost model picks within the cap.
 std::array<std::uint32_t, gdn_max_seg + 1> defaultBatchDrafts(bool moe, bool wide) {
@@ -406,6 +425,7 @@ int serveMain(int argc, char** argv, const char* program) {
         else if (auto v4b = argValue(args, i, "-np")) { opt.parallel = parseNum<std::uint32_t>(*v4b, "--parallel"); opt.parallel_given = true; }
         else if (auto v5 = argValue(args, i, "--mtp-drafts"))
             opt.mtp_drafts = std::clamp(parseNum<std::uint32_t>(*v5, "--mtp-drafts"), 1u, qwen35::max_drafts);
+        else if (auto vt = argValue(args, i, "--tree")) opt.tree = *vt;
         else if (auto v5d = argValue(args, i, "--draft-model")) opt.draft_model = *v5d;
         else if (auto v5c = argValue(args, i, "--draft")) {
             if (*v5c != "mtp" && *v5c != "dflash") die("invalid --draft " + *v5c + " (mtp or dflash)");
@@ -473,6 +493,12 @@ int serveMain(int argc, char** argv, const char* program) {
 
     try {
         logI("WHIRL serve starting, log file {}", log_path);
+        const std::uint32_t tree_requested = treeDepth(opt.tree);
+        if (tree_requested != 0 && !opt.parallel_given) {
+            opt.parallel = 1;
+            opt.parallel_given = true;
+            logI("tree speculation: selecting one request slot (give --parallel explicitly to override and disable the tree gate)");
+        }
         const TimePoint t_load0 = Clock::now();
         const gguf::File f = gguf::File::open(opt.path);
         const qwen35::Config cfg = qwen35::Config::fromGguf(f);
@@ -845,7 +871,26 @@ int serveMain(int argc, char** argv, const char* program) {
         // slots: KV-cache regions, recurrent state, MTP hidden rows
         model.gdn_replay = envOn("GDN_REPLAY", true);
         const hip::MemInfo mem_s0 = hip::memInfo();
-        model.setupSeqs(opt.parallel, slot_ctx);
+        const bool tree_shadow_alloc = tree_requested != 0 && opt.parallel == 1 && use_mtp && !use_dflash && !cfg.moe &&
+                                       model.fusedDecode() && !model.relax.on && !(opt.mmproj || env("MMPROJ"));
+        model.setupSeqs(opt.parallel, slot_ctx, tree_shadow_alloc ? 2u : 0u);
+        std::uint32_t tree_depth = tree_requested;
+        if (tree_depth != 0) {
+            std::string why;
+            if (opt.parallel != 1) why = "it requires --parallel 1";
+            else if (use_dflash) why = "it is not used with --draft dflash";
+            else if (!use_mtp) why = "the model has no active MTP drafter";
+            else if (cfg.moe) why = "the first prototype is for dense models";
+            else if (!model.fusedDecode()) why = "the fused decode kernels are unavailable";
+            else if (!model.gdn_replay) why = "DeltaNet replay is unavailable";
+            else if (!model.draftTop2Ok()) why = "the deterministic top-2 draft kernel is unavailable";
+            else if (model.relax.on) why = "relaxacc changes exact greedy acceptance";
+            else if (opt.mmproj || env("MMPROJ")) why = "the first prototype is text-only";
+            if (!why.empty()) {
+                logW("WHIRL_TREE=beam2:{} ignored: {}; using linear speculative decoding", tree_depth, why);
+                tree_depth = 0;
+            }
+        }
         if (use_dflash) {
             // per-slot drafter context rings and the draft scratch (before the KV pool: it is sized
             // from the VRAM left after them)
@@ -926,6 +971,7 @@ int serveMain(int argc, char** argv, const char* program) {
         eo.parallel = opt.parallel;
         eo.tmpl = tmpl;
         eo.use_mtp = use_mtp;
+        eo.tree_depth = tree_depth;
         eo.spec_sample = model.num_plan.on(numerics::Item::specsample);
         eo.relax = model.relax;
         eo.use_dflash = use_dflash;
@@ -952,6 +998,11 @@ int serveMain(int argc, char** argv, const char* program) {
         eo.seg_prefill = envOn("SEG_PREFILL", true);
         eo.timing_reset = envOn("TIMING_RESET", true);
         eo.ngram = envOn("NGRAM", true);
+        if (eo.tree_depth != 0) {
+            if (eo.ngram) logI("prompt-lookup drafting: off in WHIRL_TREE=beam2:{} mode", eo.tree_depth);
+            eo.ngram = false;
+            logI("MTP tree speculation: primary depth {}, alternate depth 2, single-slot greedy text requests only", eo.tree_depth);
+        }
         eo.ngram_min = envU32("NGRAM_MIN", def.ngram_min);
         eo.ngram_slope = def.ngram_slope;
         if (auto v = env("NGRAM_SLOPE")) eo.ngram_slope = std::strtof(v->c_str(), nullptr);

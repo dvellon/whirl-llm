@@ -834,10 +834,13 @@ void Model::reset() {
     }
 }
 
-void Model::setupSeqs(u32 n, u32 slot_ctx) {
-    if (n == 0 || n > gdn_max_seg || pool_pages != 0 || slot_ctx < kv_page) throw ModelError("BadSlots");
+void Model::setupSeqs(u32 n, u32 slot_ctx, u32 tree_shadows) {
+    const u32 n_total = n + tree_shadows;
+    if (n == 0 || n_total > gdn_max_seg || pool_pages != 0 || slot_ctx < kv_page ||
+        (tree_shadows != 0 && (tree_shadows != 2 || n != 1)))
+        throw ModelError("BadSlots");
     const u64 E = cfg.n_embd;
-    std::vector<Seq> ss(n);
+    std::vector<Seq> ss(n_total);
     for (u32 si = 0; si < n; ++si) {
         Seq& sq = ss[si];
         if (si == 0) {
@@ -859,6 +862,17 @@ void Model::setupSeqs(u32 n, u32 slot_ctx) {
         sq.hid = allocZero(static_cast<u64>(max_small_batch) * E * 4);
         sq.kv_base = si * ((slot_ctx + kv_page - 1) / kv_page);
     }
+    // Tree shadows branch from sequence zero.  The verify kernels only read
+    // the committed recurrent state and record their candidate rows in each
+    // sequence's replay buffer, so the state views are intentionally shared.
+    // KV is not shared: each shadow receives its own page-table range below.
+    for (u32 si = n; si < n_total; ++si) {
+        Seq& sq = ss[si];
+        sq.conv = ss[0].conv;
+        sq.ssm = ss[0].ssm;
+        sq.hid = ss[0].hid;
+        sq.kv_base = si * ((slot_ctx + kv_page - 1) / kv_page);
+    }
     seqs = std::move(ss);
     // replay needs the replay-mode fused segment kernels (gfx1201 code object)
     if (gdn_replay && !(fusedDecode() && k.caps.gdn_replay)) gdn_replay = false;
@@ -872,10 +886,10 @@ void Model::setupSeqs(u32 n, u32 slot_ctx) {
         for (Seq& sq : seqs) sq.pend = alloc(static_cast<u64>(n_gdn) * pendLayerBytes());
     }
     seq_pages = (slot_ctx + kv_page - 1) / kv_page;
-    ptab = allocZero(static_cast<u64>(n) * seq_pages * 4);
-    out_tok = allocZero(static_cast<u64>(n) * ctl_words * 4);
-    draft_samp.assign(n, spec::DraftSample{});
-    draft_qbuf = mtp ? allocZero(static_cast<u64>(n) * max_drafts * spec::q_words * 4) : DevPtr{0};
+    ptab = allocZero(static_cast<u64>(n_total) * seq_pages * 4);
+    out_tok = allocZero(static_cast<u64>(n_total) * ctl_words * 4);
+    draft_samp.assign(n_total, spec::DraftSample{});
+    draft_qbuf = mtp ? allocZero(static_cast<u64>(n_total) * max_drafts * spec::q_words * 4) : DevPtr{0};
     kvbase_buf = allocZero(static_cast<u64>(max_verify_rows) * 4);
     mtp_in = alloc(static_cast<u64>(max_verify_rows) * E * 4);
     max_ctx = slot_ctx;

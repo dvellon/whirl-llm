@@ -777,11 +777,23 @@ public:
     // ---- KV pool and sequences
     void allocKvPool(std::uint32_t tokens);
     void mapPages(std::uint32_t s, std::uint32_t first, std::span<const std::int32_t> phys);
-    void setupSeqs(std::uint32_t n, std::uint32_t slot_ctx);
+    // Allocate the serving sequences and, for the single-slot tree-spec
+    // prototype, two shadow sequence ids.  Shadows alias sequence zero's
+    // committed recurrent/hidden state but have independent KV page tables,
+    // control areas, and replay buffers.  That lets two speculative branches
+    // run through the ordinary segmented kernels without copying the large
+    // DeltaNet state or weakening branch isolation.
+    void setupSeqs(std::uint32_t n, std::uint32_t slot_ctx, std::uint32_t tree_shadows = 0);
     void selectSeq(std::uint32_t s);
     DevPtr seqCtl(std::uint32_t s, std::uint32_t word) const;
     void commitSeq(std::uint32_t s);
     void setPending(std::uint32_t s, std::uint32_t rows) { seqs[s].npend = rows; }
+    void promotePending(std::uint32_t dst, std::uint32_t src, std::uint32_t rows) {
+        if (!gdn_replay || dst >= seqs.size() || src >= seqs.size()) throw ModelError("BadTreePromotion");
+        std::swap(seqs[dst].pend, seqs[src].pend);
+        seqs[dst].npend = rows;
+        seqs[src].npend = 0;
+    }
     void dropPending(std::uint32_t s) {
         if (s < seqs.size()) seqs[s].npend = 0;
     }
@@ -818,6 +830,13 @@ public:
     std::uint32_t verifyBatchEnqueue(std::span<const VSeg> segs);
     void mtpBatchStep(std::span<const MSeg> segs, std::uint32_t r) { mtpBatchStepEx(segs, r, true); }
     void mtpBatchStepEx(std::span<const MSeg> segs, std::uint32_t r, bool draft);
+    bool draftTop2Ok() const { return k.draft_pick_top2 != nullptr; }
+    // Pick two ordered greedy roots from the draft-head logits left by the
+    // latest MTP step, writing them to sequence s's ordinary draft controls.
+    void draftTop2(std::uint32_t s0, std::uint32_t s1);
+    // The first tree step has one common hidden row.  Fork it into the two
+    // batch rows consumed by the first branched MTP step.
+    void forkMtpDraftHidden();
     void readCtl(std::span<std::int32_t> dst);
     struct Draft {
         std::uint32_t tok;

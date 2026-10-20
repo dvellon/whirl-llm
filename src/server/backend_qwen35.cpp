@@ -66,6 +66,9 @@ public:
     void commitSeq(std::uint32_t s) override { m_.commitSeq(s); }
     void dropPending(std::uint32_t s) override { m_.dropPending(s); }
     void setPending(std::uint32_t s, std::uint32_t rows) override { m_.setPending(s, rows); }
+    void promotePending(std::uint32_t dst, std::uint32_t src, std::uint32_t rows) override {
+        m_.promotePending(dst, src, rows);
+    }
     void restoreSeqSnapshot(std::uint32_t s, std::uint32_t set) override { m_.restoreSeqSnapshot(s, set); }
     void mapPages(std::uint32_t s, std::uint32_t first, std::span<const std::int32_t> phys) override {
         m_.mapPages(s, first, phys);
@@ -88,6 +91,9 @@ public:
     void mtpBatchStepEx(std::span<const MSeg> segs, std::uint32_t r, bool draft) override {
         m_.mtpBatchStepEx(segs, r, draft);
     }
+    bool draftTop2Ok() const override { return m_.draftTop2Ok(); }
+    void draftTop2(std::uint32_t s0, std::uint32_t s1) override { m_.draftTop2(s0, s1); }
+    void forkMtpDraftHidden() override { m_.forkMtpDraftHidden(); }
     std::uint32_t verifyBatchEnqueue(std::span<const VSeg> segs) override { return m_.verifyBatchEnqueue(segs); }
     void readCtl(std::span<std::int32_t> dst) override { m_.readCtl(dst); }
     bool draftSampleOk() const override { return m_.draftSampleOk(); }

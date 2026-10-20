@@ -7,6 +7,7 @@
 #include "cache/tier_adapter.h"
 #include "log.h"
 #include "whirl/dflash_policy.h"
+#include "whirl/tree_spec.h"
 
 #include <algorithm>
 #include <cmath>
@@ -101,6 +102,12 @@ struct CycleProf {
 Engine::Engine(ServerModel& model, tier::DeviceOps& ops, const Tokenizer& tok, const EngineOptions& opt)
     : m_(model), ops_(ops), tok_(tok), ct_(tok), opt_(opt), ctx_(opt.ctx), id_prng_(opt.seed) {
     if (opt_.parallel < 1 || opt_.parallel > gdn_max_seg) throw std::runtime_error("parallel must be 1..16");
+    if (opt_.tree_depth != 0) {
+        const bool depth_ok = opt_.tree_depth == 4 || opt_.tree_depth == 7;
+        if (!depth_ok || opt_.parallel != 1 || !opt_.use_mtp || opt_.use_dflash || m_.cfg().moe || !m_.fusedDecode() ||
+            !m_.gdnReplay() || !m_.draftTop2Ok() || opt_.relax.on || opt_.ngram)
+            throw std::runtime_error("invalid tree speculation configuration");
+    }
     if (opt_.n_ck == 0 || opt_.no_prefix_cache) opt_.n_spe = 0;
     if (opt_.no_prefix_cache) opt_.n_ck = 0;
     // FR-CACHE P2-3: a tier entry, Slot::rs_map / rs_tail and beginRestore's `chosen` hold at most max_ck
@@ -240,7 +247,8 @@ void Engine::allocState() {
     row_host_.assign(V, 0.0f);
     in_cands_.assign(V, 0);
     cands_scratch_.resize(std::max<std::size_t>(V, k_big));
-    ctl_host_.assign(static_cast<std::size_t>(opt_.parallel) * qwen35::ctl_words, 0);
+    const std::size_t ctl_seqs = static_cast<std::size_t>(opt_.parallel) + (opt_.tree_depth != 0 ? 2u : 0u);
+    ctl_host_.assign(ctl_seqs * qwen35::ctl_words, 0);
     if (opt_.relax.on) {
         const std::uint64_t rb = static_cast<std::uint64_t>(max_rows) * opt_.relax.topk() * 8 + max_rows * 8;
         relax_dev_ = ops_.malloc(rb);
@@ -396,7 +404,7 @@ void Engine::dropCache(Slot& sl) {
 // rewrite KV rows the restored state already holds).
 
 std::uint32_t Engine::draftRoom() const {
-    if (opt_.use_mtp) return opt_.n_draft;
+    if (opt_.use_mtp) return std::max(opt_.n_draft, opt_.tree_depth);
     if (opt_.use_dflash) return m_.dflashMaxDrafts();
     return 0;
 }
@@ -477,11 +485,17 @@ bool Engine::sharedFrom(const Slot& sl, std::uint32_t reuse) const {
 }
 
 void Engine::copyPage(std::int32_t dst_p, std::int32_t src_p) {
+    copyPageRows(dst_p, src_p, kv_page);
+}
+
+void Engine::copyPageRows(std::int32_t dst_p, std::int32_t src_p, std::uint32_t rows) {
+    if (rows > kv_page) throw std::runtime_error("invalid KV page row copy");
     const std::uint64_t src = static_cast<std::uint64_t>(src_p);
     const std::uint64_t dst = static_cast<std::uint64_t>(dst_p);
     for (const KvArr& a : kv_arrays_) {
-        const std::uint64_t len = static_cast<std::uint64_t>(kv_page) * a.row;
-        ops_.copyAsync(a.base + dst * len, a.base + src * len, len, m_.stream());
+        const std::uint64_t page_bytes = static_cast<std::uint64_t>(kv_page) * a.row;
+        const std::uint64_t copy_bytes = static_cast<std::uint64_t>(rows) * a.row;
+        ops_.copyAsync(a.base + dst * page_bytes, a.base + src * page_bytes, copy_bytes, m_.stream());
     }
 }
 
@@ -599,6 +613,52 @@ bool Engine::ensurePages(Slot& sl, std::uint64_t n_tok) {
     m_.mapPages(sl.id, static_cast<std::uint32_t>(first),
                 std::span<const std::int32_t>(sl.pages.data() + first, sl.pages.size() - first));
     return sl.pages.size() >= need;
+}
+
+bool Engine::prepareTreePages(Slot& sl, std::uint32_t rows,
+                              std::array<std::vector<std::int32_t>, 2>& branch, std::size_t& first) {
+    if (opt_.tree_depth == 0 || rows == 0 || slots_.size() != 1) return false;
+    first = static_cast<std::size_t>(sl.pos / kv_page);
+    const std::size_t last = static_cast<std::size_t>((static_cast<std::uint64_t>(sl.pos) + rows - 1) / kv_page);
+    if (last >= sl.pages.size()) return false;
+    const std::span<const std::int32_t> prefix(sl.pages.data(), first);
+    for (std::uint32_t b = 0; b < 2; ++b) {
+        const std::uint32_t shadow = opt_.parallel + b;
+        if (!prefix.empty()) m_.mapPages(shadow, 0, prefix);
+        branch[b].reserve(last - first + 1);
+        for (std::size_t pi = first; pi <= last; ++pi) {
+            const auto p = takePage(&sl);
+            if (!p) {
+                releaseTreePages(branch);
+                return false;
+            }
+            branch[b].push_back(*p);
+        }
+        m_.mapPages(shadow, static_cast<std::uint32_t>(first), branch[b]);
+    }
+    return true;
+}
+
+void Engine::releaseTreePages(std::array<std::vector<std::int32_t>, 2>& branch) {
+    for (auto& p : branch) {
+        unrefPages(p);
+        p.clear();
+    }
+}
+
+void Engine::promoteTreePages(Slot& sl, std::array<std::vector<std::int32_t>, 2>& branch, std::size_t first,
+                              std::uint32_t winner) {
+    if (winner >= 2 || branch[winner].empty() || first + branch[winner].size() > sl.pages.size())
+        throw std::runtime_error("invalid tree KV promotion");
+    const std::size_t n = branch[winner].size();
+    std::vector<std::int32_t> old(sl.pages.begin() + static_cast<std::ptrdiff_t>(first),
+                                  sl.pages.begin() + static_cast<std::ptrdiff_t>(first + n));
+    std::copy(branch[winner].begin(), branch[winner].end(), sl.pages.begin() + static_cast<std::ptrdiff_t>(first));
+    m_.mapPages(sl.id, static_cast<std::uint32_t>(first),
+                std::span<const std::int32_t>(sl.pages.data() + first, n));
+    branch[winner].clear();  // ownership moved to the active slot
+    unrefPages(old);
+    releaseTreePages(branch);
 }
 
 // ---------------------------------------------------------------------------
@@ -1730,6 +1790,163 @@ std::uint32_t Engine::pickDrafts(std::span<Slot* const> act) {
     return nd;
 }
 
+bool Engine::decodeTreeCycle(Slot& sl) {
+    if (opt_.tree_depth == 0 || !sl.greedy || slots_.size() != 1) return false;
+    const std::uint32_t depth = opt_.tree_depth;
+    const std::uint32_t alternate_depth = std::min(depth, 2u);
+    const std::uint32_t shadow0 = opt_.parallel;
+    const std::uint32_t shadow1 = opt_.parallel + 1;
+    const std::uint64_t E = m_.cfg().n_embd;
+    const TimePoint t0 = Clock::now();
+
+    std::array<std::vector<std::int32_t>, 2> branch_pages;
+    std::size_t first_page = 0;
+    if (!prepareTreePages(sl, depth + 1, branch_pages, first_page)) return false;
+    struct PageGuard {
+        Engine& e;
+        std::array<std::vector<std::int32_t>, 2>& pages;
+        ~PageGuard() { e.releaseTreePages(pages); }
+    } page_guard{*this, branch_pages};
+
+    // The ordinary replay loop carries the previous cycle's kept rows into
+    // the next verify.  A tree has two verifies, so advance the shared base
+    // once before branching and let each shadow record only its new rows.
+    m_.commitSeq(sl.id);
+    const MSeg root{sl.id, std::span<const std::uint32_t>(sl.pend.data(), sl.n_pend), sl.pend_pos, sl.pos};
+    CycleProf* p = prof_.get();
+    if (p && p->events) m_.profileStart(0, 1);
+    m_.setDraftCutoff(0, 0);
+    m_.mtpBatchStepEx(std::span<const MSeg>(&root, 1), 0, true);
+    m_.draftTop2(shadow0, shadow1);
+    m_.forkMtpDraftHidden();
+
+    // The root step may have appended the previous pending tokens to the MTP
+    // KV cache.  Refresh both already-owned tails on the same stream before
+    // the branch steps consume them.
+    // Only the live prefix of the current physical page belongs to the common
+    // history.  Later pages are fresh branch output; copying all 256 rows (and
+    // every attention layer) here would dominate a short decode cycle.
+    const std::uint32_t live_rows = static_cast<std::uint32_t>(sl.pos % kv_page) + 1;
+    for (std::uint32_t b = 0; b < 2; ++b)
+        copyPageRows(branch_pages[b][0], sl.pages[first_page], live_rows);
+
+    std::array<MSeg, 2> branches = {MSeg{shadow0, {}, 0, sl.pos}, MSeg{shadow1, {}, 0, sl.pos}};
+    for (std::uint32_t r = 1; r < depth; ++r) {
+        if (r < alternate_depth)
+            m_.mtpBatchStepEx(branches, r, true);
+        else
+            m_.mtpBatchStepEx(std::span<const MSeg>(&branches[0], 1), r, true);
+    }
+
+    const std::array<VSeg, 2> vsegs = {VSeg{shadow0, sl.next, depth, sl.pos, {}},
+                                       VSeg{shadow1, sl.next, alternate_depth, sl.pos, {}}};
+    if (p && p->events) m_.profileStart(1, 1);
+    const std::uint32_t rows = m_.verifyBatchEnqueue(vsegs);
+    if (p) m_.profileStop();
+    m_.readCtl(ctl_host_);
+
+    // One compact readback supplies both draft chains and target rows.  Keep
+    // it after verify so drafting and target work remain one GPU submission.
+    tree_spec::Plan plan;
+    plan.depth = depth;
+    for (std::uint32_t b = 0; b < 2; ++b) {
+        plan.branch[b].n = b == 0 ? depth : alternate_depth;
+        const std::int32_t* c = ctl_host_.data() + static_cast<std::size_t>(shadow0 + b) * qwen35::ctl_words;
+        for (std::uint32_t r = 0; r < plan.branch[b].n; ++r)
+            plan.branch[b].drafts[r] = static_cast<std::uint32_t>(c[qwen35::ctl_drafts + r]);
+    }
+    if (!plan.valid()) throw std::runtime_error("invalid tree draft plan");
+
+    std::array<std::uint32_t, 2 * (tree_spec::max_depth + 1)> target{};
+    for (std::uint32_t b = 0; b < 2; ++b) {
+        const std::int32_t* c = ctl_host_.data() + static_cast<std::size_t>(shadow0 + b) * qwen35::ctl_words;
+        for (std::uint32_t r = 0; r <= plan.branch[b].n; ++r)
+            target[plan.row0(b) + r] = static_cast<std::uint32_t>(c[qwen35::ctl_rows + r]);
+    }
+    const std::uint32_t budget = sl.max_tokens > sl.n_gen ? sl.max_tokens - sl.n_gen : 0;
+    tree_spec::Accept accepted = tree_spec::accept(plan, std::span<const std::uint32_t>(target.data(), plan.rows()), budget);
+    std::uint32_t acc = accepted.accepted;
+    std::uint32_t chosen = accepted.chosen;
+    if (!accepted.has_chosen) {
+        if (acc == 0) throw std::runtime_error("tree cycle has no output budget");
+        chosen = plan.branch[accepted.branch].drafts[acc - 1];
+        --acc;
+    }
+
+    // Match the linear path's end-token rule: an accepted stop token becomes
+    // the uncommitted chosen token, and later speculative rows are discarded.
+    if (!sl.ignore_eos) {
+        for (std::uint32_t r = 0; r < acc; ++r) {
+            const std::uint32_t t = plan.branch[accepted.branch].drafts[r];
+            if (t == ct_.im_end || t == ct_.endoftext) {
+                chosen = t;
+                acc = r;
+                break;
+            }
+        }
+    }
+
+    const std::uint32_t winner_seq = shadow0 + accepted.branch;
+    const std::uint32_t loser_seq = shadow0 + (1u - accepted.branch);
+    m_.setPending(winner_seq, acc + 1);
+    m_.commitSeq(winner_seq);
+    m_.dropPending(loser_seq);
+    promoteTreePages(sl, branch_pages, first_page, accepted.branch);
+
+    const std::uint32_t row0 = plan.row0(accepted.branch);
+    ops_.copyAsync(m_.seqHid(sl.id), m_.hn() + static_cast<std::uint64_t>(row0) * E * 4,
+                   static_cast<std::uint64_t>(acc + 1) * E * 4, m_.stream());
+
+    sl.cycles += 1;
+    sl.drafted += depth + alternate_depth;
+    sl.accepted += acc;
+    sl.acc_ema = 0.7f * sl.acc_ema + 0.3f * static_cast<float>(acc);
+    stat_cycles_ += 1;
+    stat_rows_ += rows;
+    stat_slots_ += 1;
+    stat_drafts_ += depth + alternate_depth;
+    n_cycles_ += 1;
+    policy_cycles_ += 1;
+
+    sl.cache_tokens.push_back(sl.next);
+    sl.cache_tokens.insert(sl.cache_tokens.end(), plan.branch[accepted.branch].drafts.begin(),
+                           plan.branch[accepted.branch].drafts.begin() + acc);
+    const std::uint32_t n_before = sl.n_gen;
+    for (std::uint32_t r = 0; r < acc; ++r)
+        if (!sl.done) sl.done = emit(sl, plan.branch[accepted.branch].drafts[r]);
+    if (!sl.done) sl.done = emit(sl, chosen);
+    stat_tokens_ += sl.n_gen - n_before;
+    for (std::uint32_t r = 0; r < acc; ++r) sl.pend[r] = plan.branch[accepted.branch].drafts[r];
+    sl.pend[acc] = chosen;
+    sl.n_pend = acc + 1;
+    sl.pend_pos = sl.pos + 1;
+    sl.next = chosen;
+    sl.pos += acc + 1;
+    sl.last_acc = acc;
+    sl.last_row = row0 + acc;
+    sl.logits_ok = true;
+    flushOut(sl);
+
+    if (p) {
+        if (p->events) m_.profileFlush(1);
+        p->cycles[1] += 1;
+        p->rows[1] += rows;
+        p->drafts[1] += depth + alternate_depth;
+        p->tokens[1] += acc + 1;
+        p->wall_ms[1] += msSince(t0);
+    }
+    if (sl.n_gen >= sl.last_log_n + 100 || msSince(sl.last_log_t) >= 5000) {
+        const double el = msSince(sl.td0);
+        logI("req {} | slot {} | tree beam2:{}x{}: n_gen {}, tg {:.2f} t/s, chosen branch {}, accepted {} ({:.2f} tok/cycle)",
+             sl.reqId(), sl.id, depth, alternate_depth, sl.n_gen, static_cast<double>(sl.n_gen) * 1000.0 / el, accepted.branch, acc,
+             static_cast<double>(sl.accepted + sl.cycles) / sl.cycles);
+        sl.last_log_n = sl.n_gen;
+        sl.last_log_t = Clock::now();
+    }
+    if (sl.done || sl.st.gone) finishJob(sl);
+    return true;
+}
+
 void Engine::decodeCycle(std::span<Slot* const> act_in) {
     const auto& cfg = m_.cfg();
     const std::uint64_t E = cfg.n_embd;
@@ -1756,6 +1973,7 @@ void Engine::decodeCycle(std::span<Slot* const> act_in) {
     }
     const std::size_t A = act.size();
     if (A == 0) return;
+    if (A == 1 && decodeTreeCycle(*act[0])) return;
     // n-gram drafts per slot (history = cache_tokens + next) when they promise
     // more tokens per ms than MTP / DFlash2 drafts. Literal drafts (n-gram, DFlash2) go to the
     // verify from the host: ng_n / ng_d, with dsrc telling which drafter made them.

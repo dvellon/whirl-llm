@@ -1595,6 +1595,21 @@ void Model::mtpBatchStepEx(std::span<const MSeg> segs, u32 r, bool draft) {
     }
 }
 
+void Model::draftTop2(u32 s0, u32 s1) {
+    if (!draftTop2Ok() || s0 >= seqs.size() || s1 >= seqs.size() || s0 == s1) throw ModelError("NoTreeTop2");
+    Mat head = draft_head ? *draft_head : output;
+    if (draft_rows > 0 && draft_d2) head.nrows = draft_rows;
+    else if (draft_vocab > 0 && draft_vocab < head.nrows) head.nrows = draft_vocab;
+    const DevPtr map = draft_rows > 0 && draft_d2 && draft_map ? *draft_map : DevPtr{0};
+    const i32 stride = (static_cast<i32>(s1) - static_cast<i32>(s0)) * static_cast<i32>(ctl_words);
+    hip::launch(k.draft_pick_top2, D(1), D(1024), 0, stream, logits, I(head.nrows), seqCtl(s0, ctl_drafts), I(stride), map);
+}
+
+void Model::forkMtpDraftHidden() {
+    const u64 bytes = static_cast<u64>(cfg.n_embd) * 4;
+    hip::copyAsync(h + bytes, h, bytes, stream);
+}
+
 void Model::readDraftQ(std::span<i32> dst) {
     if (draft_qbuf != 0) hip::download(dst.data(), draft_qbuf, dst.size() * 4);
 }
