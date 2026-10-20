@@ -467,6 +467,37 @@ void testGdn(Ctx& c) {
                 r.note += " (recording run modified the state)";
             }
             c.rep.add(r);
+
+            // The server reuses one pending buffer while a verify both commits
+            // the accepted prefix and records the next speculative suffix.
+            Buf cs_mix(cst0), pend_mix(static_cast<std::size_t>(n) * kCh * 4), out_mix(oa.size() * 4);
+            wk::GdnSegs sm;
+            sm.s[0].state = cs_mix.p();
+            sm.s[0].nrows = n;
+            sm.s[0].pend = pend_mix.p();
+            hip::launch(c.k.gdn_conv_l2, {kCh / 128, 1, 1}, {128, 1, 1}, 0, c.s, dxin.p(), dconvw.p(), out_mix.p(), kCh,
+                        2 * kNk, kEps, sm);
+            sm.s[0].row0 = 4;
+            sm.s[0].nrows = 2;
+            sm.s[0].npend = 4;
+            hip::launch(c.k.gdn_conv_l2, {kCh / 128, 1, 1}, {128, 1, 1}, 0, c.s, dxin.p(), dconvw.p(), out_mix.p(), kCh,
+                        2 * kNk, kEps, sm);
+            c.sync();
+            const bool mixed_base = cs_mix.down<float>(3 * kCh) == cstates[3];
+            const bool mixed_out = out_mix.down<float>(oa.size()) == oa;
+            sm.s[0].row0 = 0;
+            sm.s[0].nrows = 0;
+            sm.s[0].npend = 2;
+            hip::launch(c.k.gdn_conv_l2, {kCh / 128, 1, 1}, {128, 1, 1}, 0, c.s, dxin.p(), dconvw.p(), out_mix.p(), kCh,
+                        2 * kNk, kEps, sm);
+            c.sync();
+            Result rm = cmpExact("gdn_conv_l2 replay+record reuse == state after 6 rows", cs_mix.down<float>(3 * kCh),
+                                 cstates[5], Kind::invariant);
+            if (!mixed_base || !mixed_out) {
+                rm.pass = false;
+                rm.note += !mixed_base ? " (combined launch committed the wrong base)" : " (combined launch output differs)";
+            }
+            c.rep.add(rm);
         }
 
         // delta-rule step + gated norm + q8
@@ -568,6 +599,35 @@ void testGdn(Ctx& c) {
                 r.note += !untouched ? " (recording run modified the state)" : " (recording run output differs)";
             }
             c.rep.add(r);
+
+            // Match the server's steady-state launch: replay the kept prefix
+            // and overwrite the same pending buffer with the next suffix.
+            Buf st_mix(state0), pend_mix(static_cast<std::size_t>(n) * kNv * PW * 4), y_mix(no * 4), q_mix(no),
+                d_mix(no / 32 * 4);
+            wk::GdnSegs sm;
+            sm.s[0].state = st_mix.p();
+            sm.s[0].nrows = n;
+            sm.s[0].pend = pend_mix.p();
+            step(c.k.gdn_step_norm, sm, 1, y_mix.p(), q_mix.p(), d_mix.p());
+            sm.s[0].row0 = 4;
+            sm.s[0].nrows = 2;
+            sm.s[0].npend = 4;
+            step(c.k.gdn_step_norm, sm, 1, y_mix.p(), q_mix.p(), d_mix.p());
+            c.sync();
+            const bool mixed_base = st_mix.down<float>(state0.size()) == sstates[3];
+            const bool mixed_out = y_mix.down<float>(no) == ya;
+            sm.s[0].row0 = 0;
+            sm.s[0].nrows = 0;
+            sm.s[0].npend = 2;
+            step(c.k.gdn_step_norm, sm, 1, y_mix.p(), q_mix.p(), d_mix.p());
+            c.sync();
+            Result rm = cmpExact("gdn_step_norm replay+record reuse == state after 6 rows", st_mix.down<float>(state0.size()),
+                                 sstates[5], Kind::invariant);
+            if (!mixed_base || !mixed_out) {
+                rm.pass = false;
+                rm.note += !mixed_base ? " (combined launch committed the wrong base)" : " (combined launch output differs)";
+            }
+            c.rep.add(rm);
         }
         // two segments (rows 0..2 on state A, rows 3..5 on state B) in one launch == separate
         {

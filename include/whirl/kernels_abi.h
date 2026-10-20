@@ -425,8 +425,8 @@ struct Caps {
     bool kv_q8h = false;       // q8h attention prep (attn_prep_q8h, Hadamard-rotated q / k)
     bool kv_q4 = false;        // q4 KV kernels (attn_prep_q4: 4-bit K / V, Hadamard-rotated q / k)
     bool gemvw = false;        // int8-WMMA mid-batch GEMV (gemvw_nt2v1_q4_k)
-    bool gdn_replay = false;   // fused DeltaNet kernels with replay segments (GdnSeg::pend; ship with
-                               // the gfx1201 set, whose int8-WMMA GEMV is the marker)
+    bool gdn_replay = false;   // fused DeltaNet kernels with replay segments (GdnSeg::pend); gfx1201
+                               // uses gemvw as its legacy marker, gfx1151 uses whirl_cap_gdn_replay
     bool mrope = false;        // multi-section RoPE attention prep (image prompts: attn_prep_m)
     bool xd_sum = false;       // marker whirl_cap_xd_sum: int8 scale words carry the block sum
     bool attn_group1 = false;  // marker whirl_cap_attn_group1: attn_wsplit1 groups of one query

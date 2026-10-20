@@ -139,7 +139,7 @@ Caps Caps::probe(const hip::Module& m) {
     c.kv_q8h = L.opt("attn_prep_q8h") != nullptr;
     c.kv_q4 = L.opt("attn_prep_q4") != nullptr;
     c.gemvw = L.opt("gemvw_nt2v1_q4_k") != nullptr;
-    c.gdn_replay = c.gemvw;
+    c.gdn_replay = c.gemvw || L.opt("whirl_cap_gdn_replay") != nullptr;
     c.mrope = L.opt("attn_prep_m") != nullptr;
     c.xd_sum = L.opt("whirl_cap_xd_sum") != nullptr;
     c.attn_group1 = L.opt("whirl_cap_attn_group1") != nullptr;

@@ -4,6 +4,15 @@
 // self-contained: included in order by kernels/gfx1151/whirl_kernels_gfx1151.hip.
 
 #define D2_XD(p) xdv(p)  // gfx1151 packed scale words
+
+// Map four byte-packed D2 codes (0..3) directly to their signed weights
+// (-3, -1, 1, 3).  The previous path accumulated dot(code, x) and dot(1, x)
+// separately, then formed 2 * code - 3.  gfx1151 can do the same integer
+// arithmetic with one v_perm byte lookup and one signed dot product.
+__device__ __forceinline__ int d2_lut4(uint32_t code4) {
+    constexpr uint32_t lut = 0x0301FFFDu;
+    return (int)__builtin_amdgcn_perm(lut, lut, code4);
+}
 // ---------------------------------------------------------------------------
 // 2-bit MTP draft head ("D2"). Only the draft argmax matters (a wrong draft
 // costs one rejected verify row), and measured acceptance does not depend on
@@ -87,16 +96,14 @@ __device__ void gemv_d2_impl(const uint8_t *__restrict__ W, const int8_t *__rest
             const int4 x0 = *(const int4 *)xt, x1 = *(const int4 *)(xt + 16);
             const int4 x2 = *(const int4 *)(xt + 32), x3 = *(const int4 *)(xt + 48);
             const int xv[16] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w, x2.x, x2.y, x2.z, x2.w, x3.x, x3.y, x3.z, x3.w};
-            int d0 = 0, d1 = 0, e0 = 0, e1 = 0;
+            int d0 = 0, d1 = 0;
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                d0 = dp4(cb[i], xv[i], d0);
-                e0 = dp4(0x01010101, xv[i], e0);
-                d1 = dp4(cb[8 + i], xv[8 + i], d1);
-                e1 = dp4(0x01010101, xv[8 + i], e1);
+                d0 = dp4(d2_lut4(cb[i]), xv[i], d0);
+                d1 = dp4(d2_lut4(cb[8 + i]), xv[8 + i], d1);
             }
             const float *xdt = xd + (size_t)t * nb + 2 * u;
-            acc[t] += s0 * D2_XD(xdt) * (float)(2 * d0 - 3 * e0) + s1 * D2_XD(xdt + 1) * (float)(2 * d1 - 3 * e1);
+            acc[t] += s0 * D2_XD(xdt) * (float)d0 + s1 * D2_XD(xdt + 1) * (float)d1;
         }
     }
 #pragma unroll

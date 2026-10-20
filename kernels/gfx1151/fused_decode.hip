@@ -120,16 +120,28 @@ __device__ __forceinline__ void gdn_conv_l2_impl(const float *xin, const float *
     const int c = cb * 128 + (act ? (int)threadIdx.x : 0);
     float h0 = 0.f, h1 = 0.f, h2 = 0.f;
     float4 wv = make_float4(0.f, 0.f, 0.f, 0.f);
+    float *pend = sg.pend;
     if (act) {
         h0 = state[c];
         h1 = state[(size_t)ch + c];
         h2 = state[(size_t)2 * ch + c];
         wv = *(const float4 *)(w + (size_t)c * 4);
+        if (pend != nullptr && sg.npend > 0) {
+            for (int t = 0; t < sg.npend; ++t) {
+                h0 = h1;
+                h1 = h2;
+                h2 = pend[(size_t)t * ch + c];
+            }
+            state[c] = h0;
+            state[(size_t)ch + c] = h1;
+            state[(size_t)2 * ch + c] = h2;
+        }
     }
     for (int t = 0; t < n_tok; ++t) {
         float v = 0.f;
         if (act) {
             const float xn = xin[(size_t)(r0 + t) * ch + c];
+            if (pend != nullptr) pend[(size_t)t * ch + c] = xn;
             // explicit fmas = the contraction the original kernel compiled to, so the
             // result does not depend on how the compiler contracts it here
             const float acc = __builtin_fmaf(xn, wv.w, __builtin_fmaf(h2, wv.z, __builtin_fmaf(h1, wv.y, h0 * wv.x)));
@@ -150,7 +162,7 @@ __device__ __forceinline__ void gdn_conv_l2_impl(const float *xin, const float *
         }
         if (act) out[(size_t)(r0 + t) * ch + c] = v;
     }
-    if (act) {
+    if (act && pend == nullptr) {
         state[c] = h0;
         state[(size_t)ch + c] = h1;
         state[(size_t)2 * ch + c] = h2;
@@ -184,6 +196,33 @@ extern "C" __global__ void __launch_bounds__(512)
     float S[PER];
 #pragma unroll
     for (int e = 0; e < PER; ++e) S[e] = Sg[(size_t)(qi * PER + e) * DV + j];
+    float *pend = sgm.pend;
+    constexpr int PW = DK + DV + 2;  // pending row width per value head
+    if (pend != nullptr && sgm.npend > 0) {
+        // Apply the rows retained by the previous verify to advance the base
+        // state before recording this verify's speculative rows.
+        for (int tl = 0; tl < sgm.npend; ++tl) {
+            const float *pr = pend + ((size_t)tl * n_v_heads + h) * PW;
+            __syncthreads();
+            if (threadIdx.x < DK) ks[threadIdx.x] = pr[threadIdx.x];
+            __syncthreads();
+            const float decay = pr[DK + DV];
+            float sk = 0.f;
+#pragma unroll
+            for (int e = 0; e < PER; ++e) {
+                S[e] *= decay;
+                sk += S[e] * ks[qi * PER + e];
+            }
+            red[qi][j] = sk;
+            __syncthreads();
+            sk = red[0][j] + red[1][j] + red[2][j] + red[3][j];
+            const float delta = (pr[DK + j] - sk) * pr[DK + DV + 1];
+#pragma unroll
+            for (int e = 0; e < PER; ++e) S[e] += ks[qi * PER + e] * delta;
+        }
+#pragma unroll
+        for (int e = 0; e < PER; ++e) Sg[(size_t)(qi * PER + e) * DV + j] = S[e];
+    }
     for (int tl = 0; tl < n_tok; ++tl) {
         const int t = r0 + tl;
         const float *row = qkv + (size_t)t * qkv_stride;
@@ -204,14 +243,28 @@ extern "C" __global__ void __launch_bounds__(512)
         __syncthreads();
         sk = red[0][j] + red[1][j] + red[2][j] + red[3][j];
         const float v = row[(size_t)2 * n_k_heads * DK + (size_t)h * DV + j];
-        const float delta = (v - sk) * beta[(size_t)t * n_v_heads + h];
+        const float bt = beta[(size_t)t * n_v_heads + h];
+        const float delta = (v - sk) * bt;
+        if (pend != nullptr) {
+            // Save only the recurrence inputs. The host will tell the next
+            // verify how many accepted rows to replay into the base state.
+            float *pr = pend + ((size_t)tl * n_v_heads + h) * PW;
+            if (qi == 0) {
+                pr[j] = ks[j];
+                pr[DK + j] = v;
+            }
+            if (threadIdx.x == 0) {
+                pr[DK + DV] = decay;
+                pr[DK + DV + 1] = bt;
+            }
+        }
         float o = 0.f;
 #pragma unroll
         for (int e = 0; e < PER; ++e) {
             S[e] += ks[qi * PER + e] * delta;
             o += S[e] * qs[qi * PER + e];
         }
-        float *sp = tl < GDN_MAX_SNAP ? sgm.snap[tl] : nullptr;
+        float *sp = pend == nullptr && tl < GDN_MAX_SNAP ? sgm.snap[tl] : nullptr;
         if (sp != nullptr) {
             float *Ss = sp + (size_t)h * DK * DV;
 #pragma unroll
@@ -233,9 +286,15 @@ extern "C" __global__ void __launch_bounds__(512)
             wave_q8(y, xq + (size_t)t * d_inner, xd + (size_t)t * (d_inner / 32), (h * DV + threadIdx.x) >> 5);
         }
     }
+    if (pend == nullptr) {
 #pragma unroll
-    for (int e = 0; e < PER; ++e) Sg[(size_t)(qi * PER + e) * DV + j] = S[e];
+        for (int e = 0; e < PER; ++e) Sg[(size_t)(qi * PER + e) * DV + j] = S[e];
+    }
 }
+
+// Capability marker: this code object implements GdnSeg::pend replay in both
+// fused recurrent kernels. Older gfx1151 objects omit it and remain fail-safe.
+extern "C" __global__ void whirl_cap_gdn_replay() {}
 
 // Dequantize rows `ids[t]` of W into out[t][ncols] (embedding lookup).
 template <int T>

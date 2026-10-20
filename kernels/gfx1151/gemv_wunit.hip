@@ -273,17 +273,25 @@ __device__ void gemvw_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, co
     const uint32_t *xp = (const uint32_t *)xd;
     const int nb32 = ncols / 32;
     const int nsb = ncols / 256;
-    float acc[TILES][4][NTV];
-#pragma unroll
-    for (int tt = 0; tt < TILES; ++tt)
-#pragma unroll
-        for (int q = 0; q < 4; ++q)
-#pragma unroll
-            for (int v = 0; v < NTV; ++v) acc[tt][q][v] = 0.f;
     const int8v zero = {0, 0, 0, 0, 0, 0, 0, 0};
-    for (int sb = w; sb < nsb; sb += 8) {
+    // Four quarter accumulators at once make the MXFP4 verify kernels spill
+    // heavily on gfx1151 (the 7/8-row kernels reached 228 private bytes per
+    // lane).  A quarter's reduction is independent of the other quarters, so
+    // keep one pair live at a time.  The per-quarter accumulation order and
+    // the final (q0 + q1) + (q2 + q3) rounding are unchanged.
+#pragma unroll 1
+    for (int qp = 0; qp < 4; qp += 2) {
+        float acc[TILES][2][NTV];
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
+        for (int tt = 0; tt < TILES; ++tt)
+#pragma unroll
+            for (int qh = 0; qh < 2; ++qh)
+#pragma unroll
+                for (int v = 0; v < NTV; ++v) acc[tt][qh][v] = 0.f;
+        for (int sb = w; sb < nsb; sb += 8) {
+#pragma unroll
+            for (int qh = 0; qh < 2; ++qh) {
+                const int q = qp + qh;
             const int u = 4 * sb + q;
             {
                 const int base = sb * 256 + 64 * q, xi = base >> 5;
@@ -322,19 +330,28 @@ __device__ void gemvw_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, co
                         // valid token's scales and is never stored
                         const int t = min(2 * v + h, NT - 1);
                         const uint2 p = *(const uint2 *)(xp + (size_t)t * nb32 + xi);
-                        acc[tt][q][v] = wfold(wfold(acc[tt][q][v], p.x, wu.s0, wu.m0, c0[v]), p.y, wu.s1, wu.m1, c1[v]);
+                        acc[tt][qh][v] =
+                            wfold(wfold(acc[tt][qh][v], p.x, wu.s0, wu.m0, c0[v]), p.y, wu.s1, wu.m1, c1[v]);
                     }
                 }
             }
         }
-    }
-#pragma unroll
-    for (int tt = 0; tt < TILES; ++tt)
-#pragma unroll
-        for (int v = 0; v < NTV; ++v) {
-            const int t = 2 * v + h;
-            if (t < NT && (!HALF || n < 8)) red[w][t][tt * 16 + n] = (acc[tt][0][v] + acc[tt][1][v]) + (acc[tt][2][v] + acc[tt][3][v]);
         }
+#pragma unroll
+        for (int tt = 0; tt < TILES; ++tt)
+#pragma unroll
+            for (int v = 0; v < NTV; ++v) {
+                const int t = 2 * v + h;
+                if (t < NT && (!HALF || n < 8)) {
+                    const float pair = acc[tt][0][v] + acc[tt][1][v];
+                    float &dst = red[w][t][tt * 16 + n];
+                    if (qp == 0)
+                        dst = pair;
+                    else
+                        dst += pair;
+                }
+            }
+    }
     __syncthreads();
     for (int i = threadIdx.x; i < NT * ROWS; i += blockDim.x) {
         const int t = i / ROWS, nn = i % ROWS, row = r0 + nn;
