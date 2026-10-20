@@ -5,6 +5,8 @@
 #
 #   pwsh tools/golden/golden.ps1 check  [-Arch gfx1201|gfx1151] [-Models swift,moe[,dense]] [-Modes precise,balance,fast] [-Suites single,pair]
 #   pwsh tools/golden/golden.ps1 record [-Arch ...] ...
+#   pwsh tools/golden/golden.ps1 refhash [-Arch ...] [-Models ...] [-Modes ...] [-Suites ...]   (CPU: reference-set hash only)
+#   pwsh tools/golden/golden.ps1 check -Impact A..B|worktree [-Arch ...]   only the cases tools/impact/impact.py lists
 #
 # Exit code: 0 all match, 1 mismatch (first differing step per file printed), 2 a run failed / setup error.
 # Models (SWIFT-GATES): swift = Swift-1.5 27B MXFP4-A (dense, the headline dense model) and moe =
@@ -20,7 +22,16 @@
 # references and models.txt only when every case ran. CPU self-test: tools/golden/golden_selftest.ps1. The runner clears every WHIRL_* environment variable (a stray WHIRL_HIP_DEVICE
 # or WHIRL_MODE would change what is measured; --device selects the GPU) and restores them on exit.
 # Suites: single, pair, ngram (forced n-gram MTP drafts on a copy-the-text prompt); all three are the
-# default for both architectures.
+# default for both architectures. server (ARCH-1): the server paths through whirl-server-gate --suite golden
+# (whirl-server.exe on the engine schedule: prefill, streaming, prefix cache, RAM restore, SSD restore after a
+# restart, and in precise a no-prefix-cache server + two concurrent requests, all cross-checked in the gate);
+# -ServerExe / -GateExe (default build\Release\whirl-server.exe / whirl-server-gate.exe of this checkout). Vision
+# joins when WHIRL_GOLDEN_MMPROJ_<MODEL> (e.g. WHIRL_GOLDEN_MMPROJ_SWIFT) and WHIRL_GOLDEN_IMAGES (folder with
+# shapes.png) are set; record and check must agree on that. server is opt-in (-Suites single,pair,ngram,server)
+# until its references are recorded on both GPUs (after 0.2.2; see progress/arch1.HANDOFF.md).
+# Every check / record prints the SHA-256 of the executables and of the reference set it compares against
+# ("golden: reference set <arch> sha256 ..."): the hash over the sorted relative paths and bytes of the selected
+# reference files plus models.txt; refhash prints it without running anything (release_check can derive it).
 # In-run cross-checks (FIX-TEST-A, FR-TEST P2-7), on every run before it is compared or recorded, so a
 # state where the paths already disagree can never become the reference (exit 2, record writes nothing):
 #   every mode:          stream ids == prefill next + step next (single: short / long4k)
@@ -33,7 +44,7 @@
 # vs precise at 8k / 32k / 96k / 128k) made with the same whirl.exe (SHA-256), on the same GPU family, covering
 # every model being recorded. Without it record writes nothing and exits 2 (docs/dev/testing.md, FIX-TEST-B).
 param(
-    [Parameter(Mandatory = $true, Position = 0)][ValidateSet("check", "record", "xcheck")][string]$Action,
+    [Parameter(Mandatory = $true, Position = 0)][ValidateSet("check", "record", "xcheck", "refhash")][string]$Action,
     [ValidateSet("gfx1201", "gfx1151")][string]$Arch = "gfx1201",
     [string[]]$Models = @("swift", "moe"),
     [string[]]$Modes = @("precise", "balance", "fast"),
@@ -41,12 +52,18 @@ param(
     [string]$Exe = "",
     [string]$Out = "",  # check: also keep the new outputs here (default: a temp folder)
     [string]$GoldenRoot = "",  # reference tree (default tests\golden of this checkout; golden_selftest.ps1 uses a temp one)
-    [string]$KlReport = ""  # record: a passing tools/klgate report (--report) of this exe on this arch, for these models
+    [string]$KlReport = "",  # record: a passing tools/klgate report (--report) of this exe on this arch, for these models
+    [string]$ServerExe = "",  # suite server: whirl-server.exe (default build\Release\whirl-server.exe)
+    [string]$GateExe = "",    # suite server: whirl-server-gate.exe (default build\Release\whirl-server-gate.exe)
+    [int]$Port = 8097,        # suite server: the port of the servers the gate starts
+    [string]$Impact = ""      # check: run only the golden cases tools/impact/impact.py lists for a diff (A..B, or worktree)
 )
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 if (-not $Exe) { $Exe = Join-Path $root "build\Release\whirl.exe" }
-if ($Action -ne "xcheck" -and -not (Test-Path $Exe)) { Write-Host "golden: no executable at $Exe (build first or pass -Exe)"; exit 2 }
+if (-not $ServerExe) { $ServerExe = Join-Path $root "build\Release\whirl-server.exe" }
+if (-not $GateExe) { $GateExe = Join-Path $root "build\Release\whirl-server-gate.exe" }
+if ($Action -notin @("xcheck", "refhash") -and -not (Test-Path $Exe)) { Write-Host "golden: no executable at $Exe (build first or pass -Exe)"; exit 2 }
 # accept comma lists given as one string (pwsh -File passes "a,b" as one element)
 $Models = @($Models | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 $Modes = @($Modes | ForEach-Object { $_ -split "," } | Where-Object { $_ })
@@ -58,13 +75,57 @@ if ($Models.Count -eq 0 -or $Modes.Count -eq 0 -or $Suites.Count -eq 0) {
     Write-Host "golden: empty model / mode / suite list (models=$($Models.Count) modes=$($Modes.Count) suites=$($Suites.Count)): nothing would be checked"
     exit 2
 }
-foreach ($s in $Suites) { if ($s -notin @("single", "pair", "ngram")) { Write-Host "golden: unknown suite '$s'"; exit 2 } }
+# -Impact: the impact map decides which models / suites this change needs on this arch (tools/impact/impact.py)
+if ($Impact) {
+    if ($Action -ne "check") { Write-Host "golden: -Impact is for check only"; exit 2 }
+    $ia = if ($Impact -eq "worktree") { @("--worktree") } else { @("--range", $Impact) }
+    $ij = & python (Join-Path $root "tools\impact\impact.py") @ia --json 2>$null | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not $ij) { Write-Host "golden: tools/impact/impact.py failed for '$Impact'"; exit 2 }
+    $irep = ($ij | ConvertFrom-Json).PSObject.Properties | Select-Object -First 1 -ExpandProperty Value
+    $iline = @($irep.golden | Where-Object { $_ -like "$Arch`:*" })
+    if ($iline.Count -eq 0) {
+        Write-Host "golden: SKIPPED: the impact map lists no golden case on $Arch for '$Impact' (paths: $(@($irep.paths.PSObject.Properties.Name) -join ', '))"
+        exit 0
+    }
+    $mm = [regex]::Match($iline[0], "models (\S+) x modes (\S+) x suites (\S+)")
+    $Models = @($mm.Groups[1].Value -split "," | ForEach-Object { @{ dense = "swift"; moe = "moe" }[$_] })
+    $Suites = @($mm.Groups[3].Value -split ",")
+    Write-Host "golden: impact map for '$Impact' on $Arch`: models $($Models -join ','), suites $($Suites -join ',')"
+}
+foreach ($s in $Suites) { if ($s -notin @("single", "pair", "ngram", "server")) { Write-Host "golden: unknown suite '$s'"; exit 2 } }
+if ($Action -in @("check", "record") -and $Suites -contains "server") {
+    foreach ($x in @($ServerExe, $GateExe)) { if (-not (Test-Path $x)) { Write-Host "golden: suite server needs $x (build first or pass -ServerExe / -GateExe)"; exit 2 } }
+}
 
 $lms = Join-Path $env:USERPROFILE ".lmstudio\models"
 $modelPath = @{
     dense = if ($env:WHIRL_GOLDEN_DENSE) { $env:WHIRL_GOLDEN_DENSE } else { Join-Path $lms "unsloth\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-Q4_K_M.gguf" }
     swift = if ($env:WHIRL_GOLDEN_SWIFT) { $env:WHIRL_GOLDEN_SWIFT } else { Join-Path $lms "ukisai\Swift-1.5-Qwen3.8-27b-MXFP4\Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf" }
     moe   = if ($env:WHIRL_GOLDEN_MOE) { $env:WHIRL_GOLDEN_MOE } else { Join-Path $lms "ornith-ai\Ornith-1.5-35B-A3B-MXFP4\Ornith-1.5-35B-A3B-MXFP4.gguf" }
+}
+# suite server, vision (optional): mmproj per model + the image folder (read before the WHIRL_* variables are cleared)
+$mmprojPath = @{ dense = $env:WHIRL_GOLDEN_MMPROJ_DENSE; swift = $env:WHIRL_GOLDEN_MMPROJ_SWIFT; moe = $env:WHIRL_GOLDEN_MMPROJ_MOE }
+$goldImages = $env:WHIRL_GOLDEN_IMAGES
+# SHA-256 over the selected reference files (sorted relative path + bytes) and models.txt
+function RefSetHash([string]$groot, [string]$arch, [string[]]$models, [string[]]$modes, [string[]]$suites) {
+    $files = @()
+    foreach ($mk in $models) { foreach ($md in $modes) { foreach ($su in $suites) {
+        $f = Join-Path $groot "$arch\$mk\${md}_$su.txt"
+        if (Test-Path $f) { $files += (Resolve-Path $f).Path }
+    } } }
+    $mt = Join-Path $groot "models.txt"
+    if (Test-Path $mt) { $files += (Resolve-Path $mt).Path }
+    $groot = [System.IO.Path]::GetFullPath($groot)
+    $ms = New-Object System.IO.MemoryStream
+    foreach ($f in ($files | Sort-Object)) {
+        $relp = [System.IO.Path]::GetRelativePath($groot, $f).Replace("\", "/")
+        $b = [System.Text.Encoding]::UTF8.GetBytes($relp + "`n")
+        $ms.Write($b, 0, $b.Length)
+        $c = [System.IO.File]::ReadAllBytes($f)
+        $ms.Write($c, 0, $c.Length)
+    }
+    $h = ([BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($ms.ToArray())) -replace "-", "").ToLower()
+    return @{ hash = $h; n = $files.Count }
 }
 # FIX-TEST-B: no reference is recorded without a passing KL gate report for this exe / arch / models
 function KlReportError([string]$path) {
@@ -220,6 +281,14 @@ function CrossCheck([string]$suite, [string]$mode, [string[]]$l) {
     }
     return ,$bad
 }
+$rs = RefSetHash $GoldenRoot $Arch $Models $Modes $Suites
+$rsAll = RefSetHash $GoldenRoot $Arch @("dense", "swift", "moe") @("precise", "balance", "fast") @("single", "pair", "ngram", "server")
+if ($Action -eq "refhash") {
+    Write-Host "golden: reference set $Arch sha256 $($rs.hash) ($($rs.n) files: models $($Models -join ','), modes $($Modes -join ','), suites $($Suites -join ','))"
+    Write-Host "golden: reference set $Arch (all files) sha256 $($rsAll.hash) ($($rsAll.n) files)"
+    foreach ($k in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $savedEnv[$k]) }
+    exit 0
+}
 if ($Action -eq "xcheck") {
     $nf = 0; $nx = 0
     foreach ($mk in $Models) { foreach ($mode in $Modes) { foreach ($suite in $Suites) {
@@ -238,6 +307,12 @@ if ($Action -eq "xcheck") {
 }
 
 $fail = 0; $err = 0; $ran = 0; $t0 = Get-Date
+Write-Host "golden: exe $Exe sha256 $((Get-FileHash -Algorithm SHA256 $Exe).Hash.ToLower())"
+if ($Suites -contains "server") {
+    Write-Host "golden: server exe $ServerExe sha256 $((Get-FileHash -Algorithm SHA256 $ServerExe).Hash.ToLower())"
+    Write-Host "golden: gate exe $GateExe sha256 $((Get-FileHash -Algorithm SHA256 $GateExe).Hash.ToLower())"
+}
+Write-Host "golden: reference set $Arch sha256 $($rs.hash) ($($rs.n) files; all files of $Arch`: $($rsAll.hash))"
 try {
 foreach ($mk in $Models) {
     $mp = $modelPath[$mk]
@@ -256,8 +331,21 @@ foreach ($mk in $Models) {
         foreach ($suite in $Suites) {
             $name = "$mk/${mode}_$suite"
             $ts = Get-Date
-            $raw = & $Exe golden $mp --suite $suite "--$mode" --device $Arch 2>&1 | ForEach-Object { "$_" }
-            $rc = $LASTEXITCODE
+            if ($suite -eq "server") {
+                # whirl-server-gate --suite golden: G srv.* lines; its own in-run checks must all pass
+                $gw = Join-Path $Out "srvwork_$mk`_$mode"
+                $gargs = @("--exe", $ServerExe, "--kind", "whirl", "--model", $mp, "--suite", "golden", "--port", "$Port",
+                           "--work", $gw, "--kv", "auto", "--server-env", "WHIRL_MODE=$mode")
+                if ($Arch -eq "gfx1151") { $gargs += @("--server-env", "WHIRL_DEVICE=8060s", "--server-env", "WHIRL_KV_RAM_MB=8192") }
+                if ($mmprojPath[$mk] -and $goldImages) { $gargs += @("--mmproj", $mmprojPath[$mk], "--images", $goldImages) }
+                $raw = & $GateExe @gargs 2>&1 | ForEach-Object { "$_" }
+                $rc = $LASTEXITCODE
+                if ($rc -eq 0 -and -not ($raw -match "\(ALL PASS\)")) { $rc = 9 }
+                Remove-Item -Recurse -Force $gw -ErrorAction SilentlyContinue
+            } else {
+                $raw = & $Exe golden $mp --suite $suite "--$mode" --device $Arch 2>&1 | ForEach-Object { "$_" }
+                $rc = $LASTEXITCODE
+            }
             $sec = ((Get-Date) - $ts).TotalSeconds
             $glines = @($raw | Where-Object { $_ -like "G *" })
             $lines = @($mline) + $glines
@@ -268,7 +356,7 @@ foreach ($mk in $Models) {
                 Write-Host ("FAIL  {0,-24} whirl exit {1} after {2:N0} s" -f $name, $rc, $sec)
                 $diag | Select-Object -Last 15 | ForEach-Object { Write-Host "      $_" }
                 $err++
-                if ($diag -match "hipError.*719|719.*hip|hip.*719") { Write-Host "golden: hipError 719, stopping"; exit 2 }
+                if ($diag -match "hipError.*719|\b719\b.*hip|hip.*\b719\b") { Write-Host "golden: hipError 719, stopping"; exit 2 }
                 continue
             }
             # a run that printed (almost) nothing must not become, or be compared with, a reference

@@ -10,7 +10,7 @@
 //                     [--work DIR] [--port 8093] [--results OUT.json] [--compare REF.json]
 //                     [--cli EXE] [--no-lock] [--server-env NAME=VALUE ...] [--kv FORMAT]
 //   whirl-server-gate --selftest   (CPU only: the reply-comparison helpers, no server)
-// Suites: basic, mt_cache, pool, tier, sys, restore_conc, vis (see each function;
+// Suites: basic, mt_cache, pool, tier, sys, restore_conc, vis, fast_stream, golden (see each function;
 // vis / vis_speed need --mmproj MMPROJ.gguf and --images DIR).
 // A GPU lock file (WHIRL_GPU_LOCK, default %TEMP%\whirl-gpu.lock, opened with
 // share mode 0) is held while a server runs, unless WHIRL_R9700_LOCK_HELD is set
@@ -1904,6 +1904,145 @@ void suiteVisSpeed() {
 }
 
 // --selftest: CPU-only checks of the comparison helpers (no server, no GPU)
+// ---------------------------------------------------------------------------
+// suite golden (ARCH-1 golden-hash gate): short deterministic server runs whose outputs print as hash lines
+// ("G srv.<case> ..."), recorded and diffed by tools/golden/golden.ps1 (suite server) like the CLI suites.
+// One model x one mode per run (WHIRL_MODE from --server-env). Self-contained prompts (no text root), greedy.
+// Paths: server prefill on the engine schedule (short, thinking, ~5k-token document), streaming, the
+// in-VRAM prefix cache (turn 2 of a session), RAM-tier restore (warm), SSD-tier restore after a restart (cold),
+// and, in precise only, a server with no prefix cache (cold prefill of the same turn) and two concurrent
+// requests (batched decode). Vision when --mmproj and --images are given (shapes.png).
+// In-run relations (checked here, so a run where the paths already disagree can never be recorded):
+//   every mode: the stream == the non-stream reply; turn 2 after the SSD restore == turn 2 after the RAM restore
+//               (the tier copies bytes); each restore really happened (cached > 0 and the restore log line)
+//   precise:    turn 2 restored (RAM, SSD) == turn 2 on a server with no prefix cache (COLD-RESUME: bitwise);
+//               each concurrent reply == the same request alone
+// A G line carries only deterministic fields: completion / prompt / cached token counts, finish reason, and the
+// FNV-1a 64 hash of reasoning + content (+ tool calls).
+
+std::uint64_t fnv64(const std::string& s) {
+    std::uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+void gout(const std::string& name, const ChatResult& r) {
+    std::printf("G srv.%s status=%d n=%lld prompt=%lld cached=%lld finish=%s h=%016llx\n", name.c_str(), r.status,
+                static_cast<long long>(r.completion), static_cast<long long>(r.prompt), static_cast<long long>(r.cached),
+                r.finish.empty() ? "-" : r.finish.c_str(), static_cast<unsigned long long>(fnv64(r.text())));
+    std::fflush(stdout);
+}
+
+// A fixed pseudo-document (deterministic LCG over a word list): the same bytes on every machine and forever.
+// Changing it changes every srv.* reference ("golden update: ..." in the commit).
+std::string goldenDoc(std::uint32_t seed, std::size_t words) {
+    static const char* W[] = {"cache", "kernel", "token", "prefill", "decode", "buffer", "stream", "thread", "slot", "page",
+                              "matrix", "vector", "scale", "block", "layer", "expert", "router", "state", "queue", "batch",
+                              "returns", "updates", "reads", "writes", "checks", "stores", "loads", "maps", "splits", "merges",
+                              "the", "a", "each", "every", "one", "two", "first", "last", "next", "previous"};
+    constexpr std::size_t nw = sizeof(W) / sizeof(W[0]);
+    std::uint32_t x = seed * 2654435761u + 12345u;
+    std::string o;
+    for (std::size_t i = 0; i < words; ++i) {
+        x = x * 1664525u + 1013904223u;
+        if (i % 12 == 0) o += std::format("\nSection {}.{}: function f_{}_{}() ", seed, i / 12, seed, i / 12);
+        o += W[(x >> 16) % nw];
+        o += (i % 12 == 11) ? ". " : " ";
+    }
+    return o;
+}
+
+void suiteGolden() {
+    logLine("== suite golden");
+    const bool precise = serversPrecise();
+    std::printf("G header format=1 suite=server\n");
+    const std::string P_SHORT = "請用繁體中文說明快速排序的原理，並用 C++ 寫一個泛型的 quicksort 函式，程式碼註解用中文。";
+    const std::string P_PAIR_A = "Write a C function that reverses a singly linked list, and explain it.";
+    const std::string P_PAIR_B = "請用繁體中文說明 TCP 三向交握的過程，並用 Python 寫一個簡單的 socket 伺服器。";
+    const std::string doc_long = goldenDoc(1, 2400) + "\n\nIn one sentence: what does function f_1_7 do?";
+    const std::string doc_a = goldenDoc(2, 1500), doc_b = goldenDoc(3, 1500);
+    const std::string q1 = "Name the first function above and what it returns, in one sentence.";
+    const std::string q2 = "Now name the last function above, in one sentence.";
+    auto t1 = [&](const std::string& d) { return arr({msg("user", d + "\n\n" + q1)}); };
+    auto t2 = [&](const std::string& d, const ChatResult& a) {
+        return arr({msg("user", d + "\n\n" + q1), msg("assistant", a.content), msg("user", q2)});
+    };
+    const std::map<std::string, std::string> kv = kvPin();
+    const std::string ssd = g.work + "\\golden_ssd";
+    std::error_code ec;
+    fs::remove_all(widen(ssd), ec);
+    std::vector<std::string> args = {"--parallel", "1"};
+    const bool vis = !g.mmproj.empty() && !g.images.empty() && fs::exists(widen(g.images + "\\shapes.png"));
+    if (vis) args.insert(args.end(), {"--mmproj", g.mmproj});
+    auto env = kv;
+    env["WHIRL_KV_SSD_DIR"] = ssd;
+    ChatResult a1, a2_ram, b1;
+    {
+        ServerLease s("golden_a", args, env, false);
+        const ChatResult sh = chat(arr({msg("user", P_SHORT)}), greedy(48) + thinkKw(false));
+        gout("short", sh);
+        const ChatResult st = chat(arr({msg("user", P_SHORT)}), greedy(48) + thinkKw(false), true);
+        check("golden: stream == non-stream (short)", sameText(st, sh), brief(st));
+        gout("think", chat(arr({msg("user", P_PAIR_A)}), greedy(64) + thinkKw(true)));
+        gout("long", chat(arr({msg("user", doc_long)}), greedy(32) + thinkKw(false)));
+        if (vis) {
+            const ChatResult v = chat(arr({imgMsg({"shapes.png"}, "Describe this image: the shapes and their colors.")}), greedy(32) + thinkKw(false));
+            check("golden: vision request answered", answered(v), brief(v));
+            std::printf("G srv.vis.image file=shapes.png bytes=%llu\n",
+                        static_cast<unsigned long long>(fs::file_size(widen(g.images + "\\shapes.png"))));
+            gout("vis", v);
+        }
+        a1 = chat(t1(doc_a), greedy(32) + thinkKw(false));
+        gout("sessA.t1", a1);
+        b1 = chat(t1(doc_b), greedy(32) + thinkKw(false));  // one slot: A's state leaves VRAM (RAM tier)
+        gout("sessB.t1", b1);
+        const std::size_t ram0 = s->logCount(R"(kv tier: restored \d+ tok from RAM)");
+        a2_ram = chat(t2(doc_a, a1), greedy(32) + thinkKw(false));
+        gout("sessA.t2.ram", a2_ram);
+        check("golden: session A turn 2 restored from the RAM tier (cached > 0, restore logged)",
+              a2_ram.cached > 0 && s->waitLog(R"(kv tier: restored \d+ tok from RAM)", ram0 + 1, 10),
+              std::format("cached {}, RAM restores {}", a2_ram.cached, s->logCount(R"(kv tier: restored \d+ tok from RAM)")));
+        gout("sessB.t2", chat(t2(doc_b, b1), greedy(32) + thinkKw(false)));
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        s->waitTierIdle(60);
+    }
+    ChatResult a2_ssd;
+    {
+        ServerLease s("golden_restart", args, env, false);
+        a2_ssd = chat(t2(doc_a, a1), greedy(32) + thinkKw(false));
+        gout("sessA.t2.ssd", a2_ssd);
+        check("golden: session A turn 2 after a restart restored from the SSD tier (cached > 0, restore logged)",
+              a2_ssd.cached > 0 && s->logCount(R"(kv tier: restored \d+ tok from SSD)") >= 1,
+              std::format("cached {}, SSD restores {}", a2_ssd.cached, s->logCount(R"(kv tier: restored \d+ tok from SSD)")));
+        check("golden: turn 2 after the SSD restore == after the RAM restore", sameText(a2_ssd, a2_ram),
+              std::format("h {:016x} vs {:016x}", fnv64(a2_ssd.text()), fnv64(a2_ram.text())));
+    }
+    fs::remove_all(widen(ssd), ec);
+    if (precise) {
+        auto e2 = kv;
+        e2["WHIRL_NO_PREFIX_CACHE"] = "1";
+        ServerLease s("golden_cold", {"--parallel", "2", "--kv-ram-mb", "0"}, e2);
+        const ChatResult a2_cold = chat(t2(doc_a, a1), greedy(32) + thinkKw(false));
+        gout("sessA.t2.cold", a2_cold);
+        check("golden: precise: turn 2 restored from RAM == no prefix cache (bitwise, COLD-RESUME)", sameText(a2_ram, a2_cold),
+              std::format("h {:016x} vs {:016x}", fnv64(a2_ram.text()), fnv64(a2_cold.text())));
+        check("golden: precise: turn 2 restored from SSD == no prefix cache (bitwise, COLD-RESUME)", sameText(a2_ssd, a2_cold));
+        std::vector<ChatResult> alone = {chat(arr({msg("user", P_PAIR_A)}), greedy(48) + thinkKw(false)),
+                                         chat(arr({msg("user", P_PAIR_B)}), greedy(48) + thinkKw(false))};
+        gout("solo0", alone[0]);
+        gout("solo1", alone[1]);
+        using Job = std::function<ChatResult()>;
+        const std::vector<Job> jobs = {[&] { return chat(arr({msg("user", P_PAIR_A)}), greedy(48) + thinkKw(false)); },
+                                       [&] { return chat(arr({msg("user", P_PAIR_B)}), greedy(48) + thinkKw(false)); }};
+        const auto par = parallel(jobs);
+        std::string d;
+        check("golden: precise: two concurrent requests == each alone (batched decode, no prefix cache)", concSame(par, alone, d), d);
+    }
+}
+
 int selfTest() {
     auto mk = [](int status, std::string content, std::string reasoning = "") {
         ChatResult r;
@@ -1969,6 +2108,13 @@ int selfTest() {
         check("selftest: other log lines -> not a verify line",
               !parseCacheVerify("I req 2 | slot 0 | kv tier: restored 5615 tok from SSD in 165.1 ms (2.22 GB/s)") && !parseCacheVerify(""));
     }
+    // suite golden: its prompts must never change silently (the expected hashes come from an independent Python
+    // replica of goldenDoc / fnv64, ARCH-1 2026-10-20); a change here invalidates every srv.* golden reference
+    check("selftest: golden fnv64 of \"\" is the FNV-1a offset basis", fnv64("") == 1469598103934665603ull);
+    check("selftest: golden document 1 (2400 words) unchanged", fnv64(goldenDoc(1, 2400)) == 0xc1d46b50c56aaea0ull,
+          std::format("{:016x}", fnv64(goldenDoc(1, 2400))));
+    check("selftest: golden documents 2 and 3 (1500 words) unchanged",
+          fnv64(goldenDoc(2, 1500)) == 0x2b9d4e7c2c35cb70ull && fnv64(goldenDoc(3, 1500)) == 0x2efb3273d0550c17ull);
     std::printf("== whirl-server-gate --selftest: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
@@ -2031,7 +2177,9 @@ int wmain(int argc, wchar_t** wargv) {
     }
     if (g.images.empty())
         if (const char* im = std::getenv("WHIRL_GATE_IMAGES")) g.images = im;
-    if (g.text_root.empty() && !g.exe.empty() && !g.model.empty()) {
+    // suite golden is self-contained (fixed prompts); every other suite reads test texts from the text root
+    const bool needs_text = std::any_of(g.suites.begin(), g.suites.end(), [](const std::string& x) { return x != "golden"; });
+    if (g.text_root.empty() && !g.exe.empty() && !g.model.empty() && needs_text) {
         std::fprintf(stderr, "set WHIRL_GATE_TEXT_ROOT to the root of a llama.cpp source checkout (test texts)\n");
         return 2;
     }
@@ -2057,7 +2205,7 @@ int wmain(int argc, wchar_t** wargv) {
     const std::map<std::string, std::function<void()>> suites = {{"basic", suiteBasic}, {"mt_cache", suiteMtCache}, {"pool", suitePool},
                                                                  {"tier", suiteTier},   {"sys", suiteSys},           {"restore_conc", suiteRestoreConc},
                                                                  {"vis", suiteVis},     {"vis_speed", suiteVisSpeed},
-                                                                 {"fast_stream", suiteFastStream}};
+                                                                 {"fast_stream", suiteFastStream}, {"golden", suiteGolden}};
     if (!g.exe.empty()) {
         // a gate that runs nothing must not be green (REVIEW-RC4-C P2-1): no --suite is an error
         if (g.suites.empty()) {

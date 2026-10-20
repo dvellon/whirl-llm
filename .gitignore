@@ -53,3 +53,6 @@ tune4-*.txt
 oracle_build.txt
 oracle_cfg.txt
 *.log
+
+# Python bytecode (tools/impact, tools/quick)
+__pycache__/

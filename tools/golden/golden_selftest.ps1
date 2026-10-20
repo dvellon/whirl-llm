@@ -11,6 +11,8 @@
 #     whose seg prefill lh differs from solo, or whose MTP stream is not an extension of the plain stream,
 #     is an error (exit 2) and record writes nothing; xcheck on such a reference tree exits 2
 #   - record without a KL gate report, with one for another exe, or with a failing one: exit 2, nothing written
+#   - suite server (ARCH-1, fake_gate.cmd): record + check, a changed hash (exit 1), a failing in-run check or a
+#     run without "(ALL PASS)" (exit 2); exe / reference-set hashes printed; refhash follows the reference bytes
 $ErrorActionPreference = "Stop"
 $gate = Join-Path $PSScriptRoot "golden.ps1"
 $fake = Join-Path $PSScriptRoot "fake_whirl.cmd"
@@ -116,6 +118,38 @@ try {
         $r = RunGate "record" $g3 @{} $c[1]
         Expect "record with $($c[0]) is refused and writes nothing" $r 2 { -not (Test-Path (Join-Path $g3 "gfx1201\dense\precise_single.txt")) }
     }
+    # 7) suite server (ARCH-1) through a fake whirl-server-gate: record / check, a hash change, a failing in-run check,
+    #    a gate run without its ALL PASS line; the exe and reference-set hashes are printed; refhash follows the files
+    $fakeGate = Join-Path $PSScriptRoot "fake_gate.cmd"
+    function RunSrv([string]$action, [string]$root, [hashtable]$ge) {
+        foreach ($k in @("FAKEGATE_FAIL", "FAKEGATE_NOPASS", "FAKEGATE_H")) { [Environment]::SetEnvironmentVariable($k, $null) }
+        foreach ($k in $ge.Keys) { [Environment]::SetEnvironmentVariable($k, $ge[$k]) }
+        $env:WHIRL_GOLDEN_DENSE = $model
+        $o = & pwsh -NoProfile -File $gate $action -Models dense -Modes precise -Suites server -Exe $fake -ServerExe $fake -GateExe $fakeGate `
+            -GoldenRoot $root -Out (Join-Path $tmp "out") -KlReport $klGood 2>&1 | ForEach-Object { "$_" }
+        $c = $LASTEXITCODE
+        foreach ($k in @("FAKEGATE_FAIL", "FAKEGATE_NOPASS", "FAKEGATE_H")) { [Environment]::SetEnvironmentVariable($k, $null) }
+        return @{ rc = $c; out = $o }
+    }
+    $g7 = Join-Path $tmp "g7"
+    $r = RunSrv "record" $g7 @{}
+    Expect "suite server: record" $r 0 { Test-Path (Join-Path $g7 "gfx1201\dense\precise_server.txt") }
+    $r = RunSrv "check" $g7 @{}
+    Expect "suite server: check of the same run prints the exe and reference-set hashes" $r 0 {
+        ($r.out -match "golden: exe .* sha256 [0-9a-f]{64}") -and ($r.out -match "golden: gate exe .* sha256 [0-9a-f]{64}") -and
+        ($r.out -match "golden: reference set gfx1201 sha256 [0-9a-f]{64}") }
+    $r = RunSrv "check" $g7 @{ FAKEGATE_H = "2222222222222222" }
+    Expect "suite server: a changed output hash is a mismatch" $r 1 { $r.out -match "DIFF  dense/precise_server" }
+    $r = RunSrv "check" $g7 @{ FAKEGATE_FAIL = "1" }
+    Expect "suite server: a failing in-run check of the gate is an error" $r 2
+    $r = RunSrv "check" $g7 @{ FAKEGATE_NOPASS = "1" }
+    Expect "suite server: a gate run without '(ALL PASS)' is an error" $r 2
+    $h1 = @(& pwsh -NoProfile -File $gate refhash -Models dense -Modes precise -Suites server -GoldenRoot $g7 2>&1 | ForEach-Object { "$_" })
+    $rc1 = $LASTEXITCODE
+    Add-Content (Join-Path $g7 "gfx1201\dense\precise_server.txt") "G srv.extra h=0"
+    $h2 = @(& pwsh -NoProfile -File $gate refhash -Models dense -Modes precise -Suites server -GoldenRoot $g7 2>&1 | ForEach-Object { "$_" })
+    $okh = $rc1 -eq 0 -and $LASTEXITCODE -eq 0 -and ($h1[0] -match "sha256 [0-9a-f]{64} \(2 files") -and $h1[0] -ne $h2[0]
+    Expect "refhash: prints the reference-set hash (2 files) and it follows the reference bytes" @{ rc = $(if ($okh) { 0 } else { 1 }); out = $h1 + $h2 } 0
 } finally {
     $env:WHIRL_GOLDEN_DENSE = $savedDense
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
