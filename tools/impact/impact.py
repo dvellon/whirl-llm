@@ -367,7 +367,8 @@ def main():
         jobs.append((f"commit {git('log', '-1', '--format=%h %s', c).strip()}", git("diff", "-U0", "--no-color", "-M", f"{c}^", c), c, f"{c}^"))
     if a.range:
         x, y = a.range.split("..")
-        jobs.append((f"range {a.range}", git("diff", "-U0", "--no-color", "-M", x, y), y, x))
+        base = git("merge-base", x, y).strip() or x  # A..B = what B adds since it left A (not the reverse of commits A gained)
+        jobs.append((f"range {a.range} (from merge-base {base[:9]})", git("diff", "-U0", "--no-color", "-M", base, y), y, base))
     if a.staged:
         jobs.append(("staged", git("diff", "-U0", "--no-color", "-M", "--cached"), None, "HEAD"))
     if a.worktree:
