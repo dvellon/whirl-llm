@@ -66,6 +66,13 @@ void testTreeSpecPlan() {
     check(p.valid() && p.rows() == 8 && p.row0(0) == 0 && p.row0(1) == 5,
           "tree spec: beam2 depth4 uses a five-row primary and three-row alternate verify");
 
+    ts::Plan p8a1;
+    p8a1.depth = 8;
+    p8a1.branch[0].n = 8;
+    p8a1.branch[1].n = 1;
+    check(p8a1.valid() && p8a1.rows() == 11 && p8a1.row0(1) == 9,
+          "tree spec: beam2 depth8x1 reallocates one alternate node to the primary at the same 11-row budget");
+
     std::array<std::uint32_t, 10> target = {10, 99, 0, 0, 0, 20, 21, 77, 0, 0};
     auto a = ts::accept(p, target, 8);
     check(a.branch == 1 && a.accepted == 2 && a.has_chosen && a.chosen == 77 && a.emitted == 3,
@@ -1536,7 +1543,7 @@ void testFloatGemvDispatch() {
 
 // OVH-G1: graph replay is intentionally one fixed host launch contract.  The
 // token/position upload remains dynamic, but the captured ws4 attention groups
-// must stay exactly [8, 3], on the two fixed tree shadow sequences, with no
+// must stay exactly [8, 3] or [9, 2], on the two fixed tree shadow sequences, with no
 // recurrent replay rows carried in from a previous verify.
 void testTreeVerifyGraphContract() {
     q::TreeVerifyGraphContract c;
@@ -1553,6 +1560,13 @@ void testTreeVerifyGraphContract() {
         c.base[r] = 128;
     }
     check(q::treeVerifyGraphEligible(c), "OVH-G1: exact beam2:7 [8,3] verify is graph eligible");
+    q::TreeVerifyGraphContract p8a1 = c;
+    p8a1.nd = {8, 1};
+    for (std::uint32_t r = 0; r < 9; ++r) p8a1.pos[r] = static_cast<std::int32_t>(1024 + r);
+    for (std::uint32_t r = 9; r < 11; ++r) p8a1.pos[r] = static_cast<std::int32_t>(1024 + r - 9);
+    p8a1.base[8] = 64;
+    p8a1.base[9] = p8a1.base[10] = 128;
+    check(q::treeVerifyGraphEligible(p8a1), "OVH-G1: exact beam2:8x1 [9,2] verify is graph eligible");
     auto bad = c;
     bad.runtime_exact = false;
     check(!q::treeVerifyGraphEligible(bad), "OVH-G1: disabled/non-exact runtime falls back");
@@ -1586,8 +1600,8 @@ void testTreeVerifyGraphContract() {
     std::ifstream sin(std::string(WHIRL_SOURCE_DIR) + "/src/server/server_main.cpp", std::ios::binary);
     const std::string server((std::istreambuf_iterator<char>(sin)), std::istreambuf_iterator<char>());
     check(server.find("model.tree_verify_graph = envOn(\"TREE_VERIFY_GRAPH\", false)") != std::string::npos &&
-              server.find("tree_depth == 7") != std::string::npos,
-          "OVH-G1: server gate is opt-in and fixed to active beam2:7");
+              server.find("tree_depth == 7 || tree_depth == 8") != std::string::npos,
+          "OVH-G1: server gate is opt-in and fixed to active 11-row beam2 layouts");
     std::ifstream lin(std::string(WHIRL_SOURCE_DIR) + "/src/model/loader.cpp", std::ios::binary);
     const std::string loader((std::istreambuf_iterator<char>(lin)), std::istreambuf_iterator<char>());
     const std::size_t restore_seq = loader.find("void Model::restoreSeqSnapshot");

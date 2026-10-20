@@ -139,9 +139,10 @@ const char* kHelpBody =
     "                           --balance=fp8,kvq8 picks items; --mode M;\n"
     "                           WHIRL_MODE\n"
     "  --mtp-drafts N           MTP drafts per cycle, 1..10 (fixed count; default: per model type)\n"
-    "  --tree off|beam2:4|beam2:7\n"
+    "  --tree off|beam2:4|beam2:7|beam2:8x1\n"
     "                           experimental single-slot greedy MTP tree: primary depth 4 or 7\n"
-    "                           plus a depth-2 alternate root (default off; also\n"
+    "                           plus a depth-2 alternate root, or bounded depth 8 plus depth 1\n"
+    "                           reallocation (default off; also\n"
     "                           WHIRL_TREE). Requires a dense text model, fused decode and\n"
     "                           DeltaNet replay; n-gram drafting is disabled while active;\n"
     "                           --fast applies its usual relaxed-greedy acceptance rule\n"
@@ -325,8 +326,9 @@ std::uint32_t treeDepth(const std::optional<std::string>& cli) {
     if (!v || *v == "0" || *v == "off") return 0;
     if (*v == "beam2:4") return 4;
     if (*v == "beam2:7") return 7;
-    if (cli) die("invalid --tree " + *v + " (off, beam2:4 or beam2:7)");
-    logW("WHIRL_TREE={} is not one of off, beam2:4, beam2:7; tree speculation is off", *v);
+    if (*v == "beam2:8x1") return 8;
+    if (cli) die("invalid --tree " + *v + " (off, beam2:4, beam2:7 or beam2:8x1)");
+    logW("WHIRL_TREE={} is not one of off, beam2:4, beam2:7, beam2:8x1; tree speculation is off", *v);
     return 0;
 }
 
@@ -893,10 +895,10 @@ int serveMain(int argc, char** argv, const char* program) {
             }
         }
         if (model.tree_verify_graph) {
-            if (tree_depth == 7)
-                logI("tree verify graph: on (experimental fixed beam2:7 launch replay; dynamic rows stay outside capture)");
+            if (tree_depth == 7 || tree_depth == 8)
+                logI("tree verify graph: on (experimental fixed beam2:{} launch replay; dynamic rows stay outside capture)", tree_depth);
             else {
-                logW("WHIRL_TREE_VERIFY_GRAPH ignored: it requires active WHIRL_TREE=beam2:7");
+                logW("WHIRL_TREE_VERIFY_GRAPH ignored: it requires active WHIRL_TREE=beam2:7 or beam2:8x1");
                 model.tree_verify_graph = false;
             }
         }
@@ -981,6 +983,7 @@ int serveMain(int argc, char** argv, const char* program) {
         eo.tmpl = tmpl;
         eo.use_mtp = use_mtp;
         eo.tree_depth = tree_depth;
+        eo.tree_alt_depth = tree_depth == 8 ? 1u : 2u;
         eo.spec_sample = model.num_plan.on(numerics::Item::specsample);
         eo.relax = model.relax;
         eo.use_dflash = use_dflash;
@@ -1010,8 +1013,8 @@ int serveMain(int argc, char** argv, const char* program) {
         if (eo.tree_depth != 0) {
             if (eo.ngram) logI("prompt-lookup drafting: off in WHIRL_TREE=beam2:{} mode", eo.tree_depth);
             eo.ngram = false;
-            logI("MTP tree speculation: primary depth {}, alternate depth 2, single-slot greedy text requests only{}", eo.tree_depth,
-                 eo.relax.on ? "; fast relaxed-greedy acceptance" : "");
+            logI("MTP tree speculation: primary depth {}, alternate depth {}, single-slot greedy text requests only{}", eo.tree_depth,
+                 eo.tree_alt_depth, eo.relax.on ? "; fast relaxed-greedy acceptance" : "");
         }
         eo.ngram_min = envU32("NGRAM_MIN", def.ngram_min);
         eo.ngram_slope = def.ngram_slope;

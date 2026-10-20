@@ -14,7 +14,7 @@
 
 namespace whirl::tree_spec {
 
-inline constexpr std::uint32_t max_depth = 7;
+inline constexpr std::uint32_t max_depth = 8;
 inline constexpr std::uint32_t branches = 2;
 
 // The primary verify follows the same token chain as an ordinary linear

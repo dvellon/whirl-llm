@@ -1407,10 +1407,10 @@ GdnSegs Model::gdnSegsBatch(const BatchPlan& bp, std::size_t i, bool conv) const
 
 // Batched verify over sequences (see the header).
 bool treeVerifyGraphEligible(const TreeVerifyGraphContract& c) {
-    if (!c.runtime_exact || c.seq != std::array<u32, 2>{1, 2} || c.nd != std::array<u32, 2>{7, 2} ||
-        c.npend != std::array<u32, 2>{0, 0})
+    const bool admitted_shape = c.nd == std::array<u32, 2>{7, 2} || c.nd == std::array<u32, 2>{8, 1};
+    if (!c.runtime_exact || c.seq != std::array<u32, 2>{1, 2} || !admitted_shape || c.npend != std::array<u32, 2>{0, 0})
         return false;
-    constexpr std::array<u32, 3> edge{0, 8, 11};
+    const std::array<u32, 3> edge{0, c.nd[0] + 1, 11};
     for (u32 sg = 0; sg < 2; ++sg) {
         const u32 r0 = edge[sg], r1 = edge[sg + 1];
         const i32 p0 = c.pos[r0], b0 = c.base[r0];
@@ -1428,7 +1428,7 @@ bool treeVerifyGraphEligible(const TreeVerifyGraphContract& c) {
             if (c.pos[r] != p0 + static_cast<i32>(r - r0) || c.base[r] != b0 || key != k0) return false;
         }
     }
-    return c.base[0] != c.base[8] && c.pos[0] == c.pos[8];
+    return c.base[0] != c.base[edge[1]] && c.pos[0] == c.pos[edge[1]];
 }
 
 u32 Model::verifyBatchEnqueue(std::span<const VSeg> segs) {

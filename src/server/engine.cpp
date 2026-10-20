@@ -103,8 +103,10 @@ Engine::Engine(ServerModel& model, tier::DeviceOps& ops, const Tokenizer& tok, c
     : m_(model), ops_(ops), tok_(tok), ct_(tok), opt_(opt), ctx_(opt.ctx), id_prng_(opt.seed) {
     if (opt_.parallel < 1 || opt_.parallel > gdn_max_seg) throw std::runtime_error("parallel must be 1..16");
     if (opt_.tree_depth != 0) {
-        const bool depth_ok = opt_.tree_depth == 4 || opt_.tree_depth == 7;
-        if (!depth_ok || opt_.parallel != 1 || !opt_.use_mtp || opt_.use_dflash || m_.cfg().moe || !m_.fusedDecode() ||
+        const bool shape_ok = (opt_.tree_depth == 4 && opt_.tree_alt_depth == 2) ||
+                              (opt_.tree_depth == 7 && opt_.tree_alt_depth == 2) ||
+                              (opt_.tree_depth == 8 && opt_.tree_alt_depth == 1);
+        if (!shape_ok || opt_.parallel != 1 || !opt_.use_mtp || opt_.use_dflash || m_.cfg().moe || !m_.fusedDecode() ||
             !m_.gdnReplay() || !m_.draftTop2Ok() || opt_.ngram)
             throw std::runtime_error("invalid tree speculation configuration");
     }
@@ -1809,7 +1811,7 @@ std::uint32_t Engine::pickDrafts(std::span<Slot* const> act) {
 bool Engine::decodeTreeCycle(Slot& sl) {
     if (opt_.tree_depth == 0 || !sl.greedy || slots_.size() != 1) return false;
     const std::uint32_t depth = opt_.tree_depth;
-    const std::uint32_t alternate_depth = std::min(depth, 2u);
+    const std::uint32_t alternate_depth = std::min(depth, opt_.tree_alt_depth);
     const std::uint32_t shadow0 = opt_.parallel;
     const std::uint32_t shadow1 = opt_.parallel + 1;
     const std::uint64_t E = m_.cfg().n_embd;

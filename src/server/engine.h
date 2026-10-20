@@ -309,9 +309,11 @@ struct EngineOptions {
     bool use_mtp = false;
     // Experimental single-slot greedy MTP tree.  Zero keeps the existing
     // linear speculative path; the server startup gate currently admits only
-    // the two reviewed layouts (beam2:4 and beam2:7).  Request-specific code
+    // the admitted layouts (beam2:4, beam2:7 and the bounded beam2:8x1
+    // prototype).  Request-specific code
     // must still require Slot::greedy before entering the tree path.
     std::uint32_t tree_depth = 0;
+    std::uint32_t tree_alt_depth = 2;
     // --draft dflash: DFlash2 drafts instead of MTP (the backend has the drafter; use_mtp is false)
     bool use_dflash = false;
     float dfl_p_min = 0;
