@@ -261,7 +261,14 @@ __device__ void gemvw_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, co
                            const int *__restrict__ skip, int bid = -1) {
     constexpr int ROWS = HALF ? 8 : 16 * TILES;
     constexpr int NTV = (NT + 1) / 2;
-    __shared__ float red[8][NT][ROWS];
+    // The full-tile MXFP4 r2 kernels at NT=7..10 are the only variants where
+    // keeping two quarter accumulators live still exhausts gfx1151's VGPR
+    // budget.  Give those four kernels one LDS plane per quarter so they can
+    // keep exactly one quarter live.  The final reduction below still forms
+    // (q0 + q1) + (q2 + q3), preserving the established float rounding.
+    constexpr bool MX_SINGLE_Q = T == QT_MXFP4 && !HALF && TILES == 1 && NT >= 7 && NT <= 10;
+    constexpr int QPLANES = MX_SINGLE_Q ? 4 : 1;
+    __shared__ float red[QPLANES][8][NT][ROWS];
     if (skip != nullptr && *skip) return;
     const int lane = threadIdx.x % WARP, w = threadIdx.x / WARP, h = lane >> 4, n = lane & 15;
     const int r0 = (bid < 0 ? (int)blockIdx.x : bid) * ROWS;
@@ -274,6 +281,58 @@ __device__ void gemvw_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, co
     const int nb32 = ncols / 32;
     const int nsb = ncols / 256;
     const int8v zero = {0, 0, 0, 0, 0, 0, 0, 0};
+    if constexpr (MX_SINGLE_Q) {
+#pragma unroll 1
+        for (int q = 0; q < 4; ++q) {
+            float acc[TILES][NTV];
+#pragma unroll
+            for (int tt = 0; tt < TILES; ++tt)
+#pragma unroll
+                for (int v = 0; v < NTV; ++v) acc[tt][v] = 0.f;
+            for (int sb = w; sb < nsb; sb += 8) {
+                const int u = 4 * sb + q;
+                const int base = sb * 256 + 64 * q, xi = base >> 5;
+                int4v x0 = {0, 0, 0, 0}, x1 = x0, x2 = x0, x3 = x0;
+                if (tok_ok) {
+                    x0 = *(const int4v *)(xt + base);
+                    x1 = *(const int4v *)(xt + base + 16);
+                    x2 = *(const int4v *)(xt + base + 32);
+                    x3 = *(const int4v *)(xt + base + 48);
+                }
+#pragma unroll
+                for (int tt = 0; tt < TILES; ++tt) {
+                    WUnit wu;
+                    int own[8];
+                    wunit_half<T>(wr[tt], u, h, own, wu);
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        const int oth = xhalf(own[k]);
+                        wu.w[k] = h ? oth : own[k];
+                        wu.w[8 + k] = h ? own[k] : oth;
+                    }
+                    const int4v b0 = {wu.w[0], wu.w[1], wu.w[2], wu.w[3]}, b1 = {wu.w[4], wu.w[5], wu.w[6], wu.w[7]};
+                    const int4v b2 = {wu.w[8], wu.w[9], wu.w[10], wu.w[11]}, b3 = {wu.w[12], wu.w[13], wu.w[14], wu.w[15]};
+                    int8v c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, x0, true, b0, zero, false);
+                    c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, x1, true, b1, c0, false);
+                    int8v c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, x2, true, b2, zero, false);
+                    c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, x3, true, b3, c1, false);
+#pragma unroll
+                    for (int v = 0; v < NTV; ++v) {
+                        const int t = min(2 * v + h, NT - 1);
+                        const uint2 p = *(const uint2 *)(xp + (size_t)t * nb32 + xi);
+                        acc[tt][v] = wfold(wfold(acc[tt][v], p.x, wu.s0, wu.m0, c0[v]), p.y, wu.s1, wu.m1, c1[v]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int tt = 0; tt < TILES; ++tt)
+#pragma unroll
+                for (int v = 0; v < NTV; ++v) {
+                    const int t = 2 * v + h;
+                    if (t < NT) red[q][w][t][tt * 16 + n] = acc[tt][v];
+                }
+        }
+    } else {
     // Four quarter accumulators at once make the MXFP4 verify kernels spill
     // heavily on gfx1151 (the 7/8-row kernels reached 228 private bytes per
     // lane).  A quarter's reduction is independent of the other quarters, so
@@ -344,7 +403,7 @@ __device__ void gemvw_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, co
                 const int t = 2 * v + h;
                 if (t < NT && (!HALF || n < 8)) {
                     const float pair = acc[tt][0][v] + acc[tt][1][v];
-                    float &dst = red[w][t][tt * 16 + n];
+                    float &dst = red[0][w][t][tt * 16 + n];
                     if (qp == 0)
                         dst = pair;
                     else
@@ -352,11 +411,21 @@ __device__ void gemvw_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, co
                 }
             }
     }
+    }
     __syncthreads();
     for (int i = threadIdx.x; i < NT * ROWS; i += blockDim.x) {
         const int t = i / ROWS, nn = i % ROWS, row = r0 + nn;
-        const float s = ((red[0][t][nn] + red[1][t][nn]) + (red[2][t][nn] + red[3][t][nn])) +
-                        ((red[4][t][nn] + red[5][t][nn]) + (red[6][t][nn] + red[7][t][nn]));
+        float wave[8];
+#pragma unroll
+        for (int ww = 0; ww < 8; ++ww) {
+            if constexpr (MX_SINGLE_Q)
+                wave[ww] = (red[0][ww][t][nn] + red[1][ww][t][nn]) +
+                           (red[2][ww][t][nn] + red[3][ww][t][nn]);
+            else
+                wave[ww] = red[0][ww][t][nn];
+        }
+        const float s = ((wave[0] + wave[1]) + (wave[2] + wave[3])) +
+                        ((wave[4] + wave[5]) + (wave[6] + wave[7]));
         if (row < nrows) {
             float *dst = y + (size_t)t * nrows + row;
             *dst = accumulate ? *dst + s : s;
