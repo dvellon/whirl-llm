@@ -293,9 +293,9 @@ std::vector<u32> Model::dflashDraft(u32 slot, u32 anchor, u32 pos, float p_min, 
     hip::launch(k.dflash_topk, D(P), D(1024), 0, stream, r.logits, I(output.nrows), I(output.nrows), I(K), r.cand, r.unary);
     g_prof.mark(stream, "da top-k");
     mm(dflash->sel_hidden, e1, r.gate, P, false);
-    const int q8 = dflash->sel_prev.ty == GgmlType::q8_0 ? 1 : 0;
+    const int cb_type = dflash->sel_prev.ty == GgmlType::q8_0 ? 1 : dflash->sel_prev.ty == GgmlType::q4_k ? 2 : 0;
     hip::launch(k.dflash_lattice, D(P, K), D(32 * K), 0, stream, r.cand, r.unary, r.gate, dflash->sel_prev.ptr, dflash->sel_next.ptr,
-                dflash->sel_prev.row_bytes, q8, I(R), I(K), static_cast<i32>(anchor), r.lat);
+                dflash->sel_prev.row_bytes, cb_type, I(R), I(K), static_cast<i32>(anchor), r.lat);
     hip::launch(k.dflash_walk, D(1), D(32), 0, stream, r.lat, r.cand, I(P), I(K), p_min, static_cast<i32>(n_min), r.out);
     g_prof.mark(stream, "db selector+lattice+walk");
     std::vector<i32> o(1 + P);

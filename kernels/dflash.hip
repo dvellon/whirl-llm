@@ -76,12 +76,22 @@ extern "C" __global__ void __launch_bounds__(1024)
     }
 }
 
-// Codebook row element: f32 (q8 = 0) or Q8_0 (q8 = 1: 34-byte blocks of 32).
-__device__ __forceinline__ float dflash_cb(const uint8_t *cb, uint64_t rb, int row, int j, int q8) {
+// Codebook row element: f32 (type 0), Q8_0 (type 1: 34-byte blocks of 32), or
+// Q4_K (type 2: 144-byte blocks of 256).  DFlash2 selector rank is small, so
+// the direct element decoder avoids materializing a second codebook copy.
+__device__ __forceinline__ float dflash_cb(const uint8_t *cb, uint64_t rb, int row, int j, int type) {
     const uint8_t *r = cb + (size_t)row * rb;
-    if (!q8) return ((const float *)r)[j];
-    const uint8_t *b = r + (size_t)(j / 32) * 34;
-    return h2f(b) * (float)((const int8_t *)(b + 2))[j % 32];
+    if (type == 0) return ((const float *)r)[j];
+    if (type == 1) {
+        const uint8_t *b = r + (size_t)(j / 32) * 34;
+        return h2f(b) * (float)((const int8_t *)(b + 2))[j % 32];
+    }
+    const uint8_t *b = r + (size_t)(j / 256) * 144;
+    const int p = j & 255, j64 = p >> 6, in = p & 63, hi = in >> 5, l = in & 31;
+    int s, m;
+    scale_min_k4(2 * j64 + hi, b + 4, s, m);
+    const uint8_t q = b[16 + 32 * j64 + l];
+    return h2f(b) * (float)s * (float)(hi ? q >> 4 : q & 0xF) - h2f(b + 2) * (float)m;
 }
 
 // Selector lattice for draft positions p = 0 .. P-1 (block rows 1 .. P):
@@ -91,7 +101,7 @@ __device__ __forceinline__ float dflash_cb(const uint8_t *cb, uint64_t rb, int r
 // (wave j: candidate j).
 extern "C" __global__ void __launch_bounds__(512)
     dflash_lattice(const int *cand, const float *unary, const float *gate, const uint8_t *prev_cb, const uint8_t *next_cb,
-                   uint64_t cb_rb, int q8, int R, int K, int anchor, float *lat) {
+                   uint64_t cb_rb, int cb_type, int R, int K, int anchor, float *lat) {
 #pragma clang fp contract(off)
     const int p = blockIdx.x, i = blockIdx.y, lane = threadIdx.x % WARP, j = threadIdx.x / WARP;
     if (j >= K) return;
@@ -99,7 +109,7 @@ extern "C" __global__ void __launch_bounds__(512)
     const int nx = cand[p * K + j];
     float s = 0.f;
     for (int r = lane; r < R; r += WARP)
-        s += dflash_cb(prev_cb, cb_rb, pred, r, q8) * gate[(size_t)p * R + r] * dflash_cb(next_cb, cb_rb, nx, r, q8);
+        s += dflash_cb(prev_cb, cb_rb, pred, r, cb_type) * gate[(size_t)p * R + r] * dflash_cb(next_cb, cb_rb, nx, r, cb_type);
     s = warp_sum(s);
     if (lane == 0) lat[((size_t)p * K + i) * K + j] = s + unary[p * K + j];
 }
