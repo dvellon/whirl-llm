@@ -536,6 +536,12 @@ def build(root):
         for s in RELEASE_STEPS:
             if s.startswith("cpu_") and s not in t and "cpu_$(" not in t:
                 errors.append(f"release step {s} not in release_gate.ps1")
+    # every server-gate suite must be declared (a new suite with no paths would never be asked for)
+    sg = os.path.join(root, "tests/server/server_gate.cpp")
+    if os.path.exists(sg):
+        for su in sorted(set(re.findall(r'\{"(\w+)",\s*suite[A-Z]\w*\}', open(sg, encoding="utf-8", errors="replace").read()))):
+            if su not in GATE_SUITES and su not in ("vis_speed",):
+                errors.append(f"server-gate suite '{su}' is not declared in GATE_SUITES (tools/impact/impact_build.py)")
     # gates per path (declared suites + derived CLI gates + derived CPU tests)
     gates = {}
     for p in PATHS:
