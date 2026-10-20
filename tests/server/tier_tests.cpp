@@ -2167,8 +2167,28 @@ static void testDedupFinishedUnreaped(MockDeviceOps& ops, const fs::path& dir) {
             Entry* first = ea->io_busy ? ea : eb;
             Entry* second = ea->io_busy ? eb : ea;
             CHECK(!first->ssd.has_value());
-            // let the IO thread finish the write; no tick runs, so the job is finished but not reaped
-            sleepMs(500);
+            // let the IO thread finish the write; no tick runs, so the job is finished but not reaped.
+            // A fixed sleep could check too early, while the write is still in flight, and then pass without
+            // exercising the race (an in-flight write was always waited for): poll until the first entry's file
+            // carries its valid header (written last) and the IO thread has closed it (an exclusive open succeeds;
+            // the job is marked finished right after CloseHandle), up to 20 s, and fail if it never gets there.
+            bool written = false;
+            for (int ms = 0; ms < 20000 && !written; ms += 20) {
+                sleepMs(20);
+                for (const auto& de : fs::directory_iterator(dir, ec)) {
+                    if (de.path().extension() != ".wkv") continue;
+                    HANDLE h = CreateFileW(de.path().c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+                    if (h == INVALID_HANDLE_VALUE) continue;  // still open on the IO thread
+                    Header hd{};
+                    DWORD got = 0;
+                    const BOOL rd = ReadFile(h, &hd, sizeof hd, &got, nullptr);
+                    CloseHandle(h);
+                    if (rd && got == sizeof hd && hd.valid == 1) written = true;
+                }
+            }
+            std::printf("dedup base finished, not reaped: first write complete and closed: %s\n", written ? "yes" : "NO");
+            CHECK(written);
+            sleepMs(50);  // CloseHandle -> finished.store is a few instructions
             CHECK(first->io_busy);  // not reaped yet
             const bool waits = t->waitForDedupBase(second);
             std::printf("dedup base finished, not reaped: second entry %s\n", waits ? "waits (shares the prefix)" : "does NOT wait");
