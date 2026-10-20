@@ -24,6 +24,11 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
   to set, instead of failing with hipError 719 (GitHub issue #7); a carve-out that holds the model but not the default
   262,144-token KV cache gets a smaller cache. A hipError 719 on the 8060S now prints the same hint. Output is
   unchanged; R9700 output and memory sizing are unchanged. UMA-1.
+- KV tier, SSD block dedup: when one entry's SSD write had just finished but the tier had not processed it yet,
+  another entry sharing its prefix (a common system prompt) could start its write in that moment and store the
+  shared blocks again instead of referencing them (more SSD space and write time; restored output was never
+  affected). It now waits for the finished write like for one still running. Seen as the intermittent server gate
+  failure "sys: SSD entries share the system prompt's KV blocks: 0 of 2" (1 of 24 R9700 runs). CB-FLAKE.
 - Server: `WHIRL_PREFIX_CACHE_VERIFY=1` (the cache-hit diagnostic) no longer changes the KV tier fingerprint, so a
   diagnostic run restores the RAM / SSD entries a normal server wrote instead of ignoring them as another build's.
   Output unchanged. CACHEBAL.

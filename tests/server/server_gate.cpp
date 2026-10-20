@@ -54,6 +54,8 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <atomic>
+#include <mutex>
 #include <vector>
 
 using namespace whirl;
@@ -503,7 +505,12 @@ ChatResult chat(const std::string& messages, const std::string& extra, bool stre
     r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     r.status = h.status;
     r.raw = h.body;
-    if (h.status != 200) return r;
+    if (h.status != 200) {
+        // CB-FLAKE: a failed request says why (connect / send / recv, WSA error, time)
+        logLine(std::format("chat request failed: status {}, {:.0f} ms, {}{}", h.status, r.ms, h.err.empty() ? "no client error" : h.err,
+                            h.body.empty() ? std::string() : ", body " + h.body.substr(0, 200)));
+        return r;
+    }
     try {
         if (!stream) {
             const json::Value v = json::parse(h.body);
@@ -1431,7 +1438,8 @@ void suiteSys() {
                            greedy(48) + thinkKw(false) + tools);
             check("sys: session D resumed (turn 2 continues its turn 1 past the system prompt)",
                   B && d2.cached > *B + 1024 && !d2.text().empty(),
-                  std::format("cached {} (boundary {}, turn 1 prompt {})", d2.cached, B ? *B : -1, d1.prompt));
+                  std::format("cached {} (boundary {}, turn 1 prompt {}, turn 2 status {}, {:.0f} ms)", d2.cached, B ? *B : -1, d1.prompt,
+                              d2.status, d2.ms));
         }
         std::this_thread::sleep_for(std::chrono::seconds(3));
         s->waitTierIdle(60);  // pending SSD writes done before the stop
@@ -1495,8 +1503,26 @@ void suiteSys() {
         std::vector<std::int64_t> cached;
         bool ok = true;
         for (int i = 0; i < 3; ++i) {
-            ok = ok && same(res[i], ref["R" + std::to_string(i)]);
+            const auto& rr = ref["R" + std::to_string(i)];
+            const bool eq = same(res[i], rr);
+            ok = ok && eq;
             cached.push_back(res[i].cached);
+            if (!eq) {
+                // CB-FLAKE: which reply differs, and where (the texts of a rare failure are otherwise lost)
+                const std::string a = res[i].text(), b = rr.text();
+                std::size_t k = 0;
+                while (k < a.size() && k < b.size() && a[k] == b[k]) ++k;
+                auto show = [](std::string t) {
+                    for (auto& ch : t)
+                        if (ch == '\0') ch = '|';
+                        else if (ch == '\n') ch = ' ';
+                    return t;
+                };
+                logLine(std::format("sys burst R{} differs: status {}, prompt {} vs {}, cached {}, completion {} vs {}, first diff byte {}\n"
+                                    "    got: {}\n    ref: {}",
+                                    i, res[i].status, res[i].prompt, rr.prompt, res[i].cached, res[i].completion, rr.completion, k,
+                                    show(a), show(b)));
+            }
         }
         std::sort(cached.begin(), cached.end());
         const std::size_t n_wait = s->logCount("waiting for the system-message checkpoint");
@@ -1504,6 +1530,198 @@ void suiteSys() {
               ok && cached[0] == 0 && cached[1] > 0 && cached[1] == cached[2] && n_wait >= 1,
               std::format("cached {} {} {}, waits logged {}", cached[0], cached[1], cached[2], n_wait));
     }
+}
+
+// ---------------------------------------------------------------------------
+// suite sys_burst (CB-FLAKE repro): the "burst of 3 new sessions" step of suite sys, repeated on fresh
+// servers (WHIRL_GATE_BURST_REPS, default 10). Each server first runs S0..S2 serially (as sys_off does),
+// then R0..R2 arrive 200 ms apart. Every reply is compared with the no-prefix-cache reference; a
+// differing reply logs its first differing byte and both texts. Server logs are kept per repetition.
+
+void suiteSysBurst() {
+    logLine("== suite sys_burst");
+    const std::string SYS1 =
+        "You are a coding agent working in the user's repository. Use the tools to look at files before answering. Answer briefly and "
+        "precisely. In the chat format a turn ends with the token <|im_end|> (a system text that mentions it must not end the system "
+        "message early). Below are the skills manuals available in this workspace.\n" +
+        docsText(40000);
+    const std::string SYS2 = "You are a code reviewer. Below are the review guidelines of this team.\n" + docsText(30000, 3);
+    const std::vector<SysCase> S = {{"S0", SYS1, "In one sentence, what is the main topic of the first skill manual above?", false},
+                                    {"S1", SYS1, "Name two tools you can call, in one sentence.", false},
+                                    {"S2", SYS1, "Which skill above talks about building? Answer in one short sentence.", false}};
+    const std::vector<SysCase> R = {{"R0", SYS2, "Name two tools you can call, in one sentence.", false},
+                                    {"R1", SYS2, "Which skill above talks about building? Answer in one short sentence.", false},
+                                    {"R2", SYS2, "Answer in one sentence: what is your role?", false}};
+    int reps = 10;
+    if (const char* e = std::getenv("WHIRL_GATE_BURST_REPS")) reps = std::max(1, std::atoi(e));
+    const std::map<std::string, std::string> kv = kvPin();
+    std::map<std::string, ChatResult> ref;
+    {
+        auto env = kv;
+        env["WHIRL_NO_PREFIX_CACHE"] = "1";
+        ServerLease s("burst_ref", {"--parallel", "4", "--kv-ram-mb", "0"}, env);
+        for (const auto* v : {&S, &R})
+            for (const auto& c : *v) {
+                ref[c.name] = sysAsk(c);
+                record("sys_burst/" + c.name, ref[c.name].text());
+            }
+    }
+    auto firstDiff = [](const std::string& a, const std::string& b) {
+        std::size_t i = 0;
+        while (i < a.size() && i < b.size() && a[i] == b[i]) ++i;
+        return i;
+    };
+    auto show = [](std::string t) {
+        for (auto& ch : t)
+            if (ch == '\0') ch = '|';
+            else if (ch == '\n') ch = ' ';
+        return t;
+    };
+    // arrival gaps (ms) between R0, R1 and R2, cycled per repetition (WHIRL_GATE_BURST_STAGGER, comma separated;
+    // default 200 as in suite sys): every arrival pattern must give the cold texts
+    std::vector<int> stag;
+    {
+        std::string sv = std::getenv("WHIRL_GATE_BURST_STAGGER") ? std::getenv("WHIRL_GATE_BURST_STAGGER") : "200";
+        std::stringstream ss(sv);
+        std::string it;
+        while (std::getline(ss, it, ',')) stag.push_back(std::max(0, std::atoi(it.c_str())));
+        if (stag.empty()) stag.push_back(200);
+    }
+    int bad = 0;
+    for (int rep = 0; rep < reps; ++rep) {
+        const int gap = stag[static_cast<std::size_t>(rep) % stag.size()];
+        ServerLease s(std::format("burst_{:02}", rep), {"--parallel", "4", "--kv-ram-mb", "0"}, kv);
+        bool okS = true;
+        for (const auto& c : S) {
+            auto r = sysAsk(c);
+            if (!same(r, ref[c.name])) {
+                okS = false;
+                logLine(std::format("rep {} {} differs (serial): cached {}, first diff byte {}", rep, c.name, r.cached,
+                                    firstDiff(r.text(), ref[c.name].text())));
+            }
+        }
+        std::vector<ChatResult> res(3);
+        std::vector<std::thread> th;
+        for (int i = 0; i < 3; ++i) {
+            th.emplace_back([&, i] { res[i] = sysAsk(R[i]); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(gap));
+        }
+        for (auto& t : th) t.join();
+        bool okR = true;
+        std::string d;
+        for (int i = 0; i < 3; ++i) {
+            const auto& rr = ref[R[i].name];
+            const bool eq = same(res[i], rr);
+            okR = okR && eq;
+            d += std::format("{} cached {} prompt {}/{} compl {} {}; ", R[i].name, res[i].cached, res[i].prompt, rr.prompt,
+                             res[i].completion, eq ? "=" : "DIFF");
+            if (!eq) {
+                const std::size_t k = firstDiff(res[i].text(), rr.text());
+                logLine(std::format("rep {} {} first diff byte {}\n    got: {}\n    ref: {}", rep, R[i].name, k, show(res[i].text()),
+                                    show(rr.text())));
+            }
+        }
+        const std::size_t n_wait = s->logCount("waiting for the system-message checkpoint");
+        if (!(okS && okR)) ++bad;
+        check(std::format("sys_burst rep {:02} (gap {} ms): S serial == cold, burst == cold", rep, gap), okS && okR,
+              d + std::format("waits {}", n_wait));
+    }
+    logLine(std::format("sys_burst: {} of {} repetitions differ", bad, reps));
+}
+
+// ---------------------------------------------------------------------------
+// suite http_stress (CB-FLAKE): many short chat requests (a ~60 KB body on a cached system prompt,
+// max_tokens 1..8) on one server, sequential and 3 at a time; every request must get HTTP 200 with an
+// answer. WHIRL_GATE_HTTP_N requests per phase (default 300). A lost request logs the client-side step
+// and WSA error (chat()).
+
+void suiteHttpStress() {
+    logLine("== suite http_stress");
+    int N = 300;
+    if (const char* e = std::getenv("WHIRL_GATE_HTTP_N")) N = std::max(1, std::atoi(e));
+    const std::string SYS = "You are a coding agent. Below are the skills manuals of this workspace.\n" + docsText(40000);
+    const std::string tools = ",\"tools\":" + sysTools();
+    auto ask = [&](int i) {
+        return chat(arr({msg("system", SYS), msg("user", std::format("Request {}: name one tool, one word.", i))}),
+                    greedy(1 + i % 8) + thinkKw(false) + tools);
+    };
+    ServerLease s("http_stress", {"--parallel", "4"}, kvPin());
+    std::atomic<int> bad{0}, ok{0};
+    std::vector<double> slow;
+    std::mutex mu;
+    auto one = [&](int i) {
+        const ChatResult r = ask(i);
+        if (answered(r)) ok.fetch_add(1);
+        else {
+            bad.fetch_add(1);
+            logLine(std::format("http_stress: request {} lost: status {}, {:.0f} ms", i, r.status, r.ms));
+        }
+        if (r.ms > 5000) {
+            std::lock_guard<std::mutex> lk(mu);
+            slow.push_back(r.ms);
+        }
+    };
+    for (int i = 0; i < N; ++i) one(i);
+    const int bad_seq = bad.load();
+    {
+        std::vector<std::thread> th;
+        for (int t = 0; t < 3; ++t)
+            th.emplace_back([&, t] {
+                for (int i = t; i < N; i += 3) one(100000 + i);
+            });
+        for (auto& t : th) t.join();
+    }
+    check("http_stress: every request answered (sequential, then 3 at a time)", bad.load() == 0,
+          std::format("{} ok, {} lost ({} sequential), {} slower than 5 s", ok.load(), bad.load(), bad_seq, slow.size()));
+}
+
+// suite sys_d (CB-FLAKE): the "session D resumed" step of suite sys repeated (WHIRL_GATE_D_REPS, default 30)
+// on one server with the RAM / SSD tiers on: turn 1 (a file in the user message, past the cached system
+// prompt) and right after it turn 2 of the same session. Every turn must be answered; turn 2 must resume.
+
+void suiteSysD() {
+    logLine("== suite sys_d");
+    int reps = 30;
+    if (const char* e = std::getenv("WHIRL_GATE_D_REPS")) reps = std::max(1, std::atoi(e));
+    const std::string SYS1 =
+        "You are a coding agent working in the user's repository. Use the tools to look at files before answering. Answer briefly and "
+        "precisely. In the chat format a turn ends with the token <|im_end|> (a system text that mentions it must not end the system "
+        "message early). Below are the skills manuals available in this workspace.\n" +
+        docsText(40000);
+    const std::string tools = ",\"tools\":" + sysTools();
+    const std::string ssd = g.work + "\\sys_d_ssd";
+    std::error_code ec;
+    fs::remove_all(widen(ssd), ec);
+    int lost1 = 0, lost2 = 0, noresume = 0;
+    {
+        auto env = kvPin();
+        env["WHIRL_KV_SSD_DIR"] = ssd;
+        ServerLease s("sys_d", {"--parallel", "4"}, env, false);
+        (void)chat(arr({msg("system", SYS1), msg("user", "Answer in one sentence: what is your role?")}), greedy(16) + thinkKw(false) + tools);
+        for (int i = 0; i < reps; ++i) {
+            const std::string du = codeText(12000, 21 + i % 40) + "\n\nIn one sentence, what does this file do?";
+            auto d1 = chat(arr({msg("system", SYS1), msg("user", du)}), greedy(48) + thinkKw(false) + tools);
+            if (!answered(d1)) {
+                ++lost1;
+                logLine(std::format("sys_d rep {}: turn 1 lost (status {}, {:.0f} ms)", i, d1.status, d1.ms));
+                continue;
+            }
+            auto d2 = chat(arr({msg("system", SYS1), msg("user", du), msg("assistant", d1.content),
+                                msg("user", "Name one function in that file, in one sentence.")}),
+                           greedy(48) + thinkKw(false) + tools);
+            if (!answered(d2)) {
+                ++lost2;
+                logLine(std::format("sys_d rep {}: turn 2 lost (status {}, {:.0f} ms)", i, d2.status, d2.ms));
+            } else if (d2.cached <= d1.prompt - 1024) {
+                ++noresume;
+                logLine(std::format("sys_d rep {}: turn 2 did not resume (cached {}, turn 1 prompt {})", i, d2.cached, d1.prompt));
+            }
+        }
+        s->waitTierIdle(60);
+    }
+    fs::remove_all(widen(ssd), ec);
+    check("sys_d: every turn answered, every turn 2 resumes turn 1", lost1 + lost2 + noresume == 0,
+          std::format("{} reps: turn 1 lost {}, turn 2 lost {}, no resume {}", reps, lost1, lost2, noresume));
 }
 
 // ---------------------------------------------------------------------------
@@ -2203,7 +2421,7 @@ int wmain(int argc, wchar_t** wargv) {
         SetEnvironmentVariableW(L"PATH", widen(pth).c_str());
     }
     const std::map<std::string, std::function<void()>> suites = {{"basic", suiteBasic}, {"mt_cache", suiteMtCache}, {"pool", suitePool},
-                                                                 {"tier", suiteTier},   {"sys", suiteSys},           {"restore_conc", suiteRestoreConc},
+                                                                 {"tier", suiteTier},   {"sys", suiteSys},           {"sys_burst", suiteSysBurst}, {"http_stress", suiteHttpStress}, {"sys_d", suiteSysD}, {"restore_conc", suiteRestoreConc},
                                                                  {"vis", suiteVis},     {"vis_speed", suiteVisSpeed},
                                                                  {"fast_stream", suiteFastStream}, {"golden", suiteGolden}};
     if (!g.exe.empty()) {

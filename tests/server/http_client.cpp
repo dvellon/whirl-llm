@@ -6,6 +6,7 @@
 #include <ws2tcpip.h>
 
 #include <chrono>
+#include <cstdio>
 #include <format>
 #include <mutex>
 
@@ -29,15 +30,43 @@ HttpResult httpRequest(const std::string& host, std::uint16_t port, std::string_
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* res = nullptr;
-    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) return r;
+    auto fail = [&](const char* step) {
+        r.err = std::format("{} failed, WSA error {}", step, WSAGetLastError());
+        r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) {
+        fail("getaddrinfo");
+        return r;
+    }
     SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (s == INVALID_SOCKET) {
+        fail("socket");
         freeaddrinfo(res);
         return r;
     }
     const DWORD to = static_cast<DWORD>(timeout_s * 1000);
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to), sizeof to);
     if (connect(s, res->ai_addr, static_cast<int>(res->ai_addrlen)) != 0) {
+        fail("connect");
+        // CB-FLAKE: the local port of the failed attempt and every TCP row that names it (a TIME_WAIT
+        // of an earlier connection on the same 4-tuple would explain an unanswered SYN)
+        sockaddr_in la{};
+        int ll = sizeof la;
+        if (getsockname(s, reinterpret_cast<sockaddr*>(&la), &ll) == 0 && ntohs(la.sin_port) != 0) {
+            const unsigned lp = ntohs(la.sin_port);
+            r.err += std::format(", local port {}", lp);
+            if (FILE* p = _popen("netstat -ano -p tcp", "r")) {
+                char line[512];
+                const std::string key = std::format(":{} ", lp);
+                while (std::fgets(line, sizeof line, p))
+                    if (std::string_view(line).find(key) != std::string_view::npos) {
+                        std::string l(line);
+                        while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+                        r.err += "\n      netstat: " + l;
+                    }
+                _pclose(p);
+            }
+        }
         freeaddrinfo(res);
         closesocket(s);
         return r;
@@ -51,7 +80,10 @@ HttpResult httpRequest(const std::string& host, std::uint16_t port, std::string_
     std::size_t off = 0;
     while (off < req.size()) {
         const int n = send(s, req.data() + off, static_cast<int>(req.size() - off), 0);
-        if (n <= 0) break;
+        if (n <= 0) {
+            r.err = std::format("send failed after {} of {} bytes, WSA error {}", off, req.size(), WSAGetLastError());
+            break;
+        }
         off += static_cast<std::size_t>(n);
     }
     std::string resp;
@@ -59,6 +91,7 @@ HttpResult httpRequest(const std::string& host, std::uint16_t port, std::string_
     bool first = true;
     for (;;) {
         const int n = recv(s, buf, sizeof buf, 0);
+        if (n < 0 && r.err.empty()) r.err = std::format("recv failed after {} bytes, WSA error {}", resp.size(), WSAGetLastError());
         if (n <= 0) break;
         if (first) {
             r.first_byte_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -69,7 +102,10 @@ HttpResult httpRequest(const std::string& host, std::uint16_t port, std::string_
     closesocket(s);
     r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     const std::size_t he = resp.find("\r\n\r\n");
-    if (he == std::string::npos) return r;
+    if (he == std::string::npos) {
+        if (r.err.empty()) r.err = std::format("no response header ({} bytes received)", resp.size());
+        return r;
+    }
     r.headers = resp.substr(0, he);
     r.body = resp.substr(he + 4);
     if (r.headers.size() > 12 && r.headers.compare(0, 5, "HTTP/") == 0) r.status = std::atoi(r.headers.c_str() + 9);
