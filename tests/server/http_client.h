@@ -14,7 +14,7 @@ namespace whirl::test {
 struct HttpResult {
     int status = 0;          // 0: connection failed
     std::string headers;
-    std::string body;        // de-chunked if needed (the server never chunks)
+    std::string body;        // without the chunk framing (SSE streams are sent chunked)
     double ms = 0;           // wall time of the request
     double first_byte_ms = 0;
     std::string err;         // which step failed and its WSA error (empty: a response was read)

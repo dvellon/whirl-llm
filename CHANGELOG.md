@@ -17,6 +17,14 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ### Fixed
 
+- Server: a client's next request could hang for 21 s and fail to connect (Windows error 10060), about once in
+  several thousand requests. The server closed every connection first, so each finished connection stayed in
+  TIME_WAIT on the server side for 120 s; when Windows handed the client the same local port again and the earlier
+  request had been large (tens of KB, as agent prompts are), that TIME_WAIT silently dropped the new connection
+  attempt. The server now lets the client close first: after a response whose end the client can see it waits up to
+  200 ms for the client to close, and streamed (SSE) responses are now sent with `Transfer-Encoding: chunked` (as
+  llama.cpp's server does) so clients see where a stream ends without waiting for the server to close. Clients that
+  only stop at the server's close get it 200 ms later. Response bodies and model output are unchanged. HTTP-DROP.
 - Radeon 8060S: `whirl devices` and the server log showed the HIP runtime's total (99.7 GiB on a 64 GB carve-out,
   which adds a share of system RAM) as the GPU's memory. They now show the dedicated memory set in Armoury Crate / the
   BIOS (the UMA carve-out) and the shared size, e.g. "dedicated 63.8 GiB (+ shared 47.6 GiB)". With a carve-out too

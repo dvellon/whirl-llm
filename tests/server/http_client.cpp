@@ -59,6 +59,29 @@ std::string netstatRows(const std::vector<std::string>& keys, bool skip_time_wai
 // within ~2 s; at 4 s the first SYN and its retransmission went unanswered), it records once what
 // the TCP table shows for this local port and the server port, and whether a second, fresh
 // connection to the same server is accepted meanwhile. Returns 0 or the WSA error of the attempt.
+// Chunked transfer coding (RFC 9112 7.1): complete (last chunk and final CRLF seen), partial, or bad.
+enum class Dechunk { complete, partial, bad };
+Dechunk dechunk(std::string_view b, std::string* out) {
+    std::size_t p = 0;
+    for (;;) {
+        const std::size_t eol = b.find("\r\n", p);
+        if (eol == std::string_view::npos) return Dechunk::partial;
+        std::size_t len = 0, i = p;
+        for (; i < eol && std::isxdigit(static_cast<unsigned char>(b[i])); ++i)
+            len = len * 16 + static_cast<std::size_t>(std::isdigit(static_cast<unsigned char>(b[i])) ? b[i] - '0' : (b[i] | 0x20) - 'a' + 10);
+        if (i == p || (i < eol && b[i] != ';')) return Dechunk::bad;
+        p = eol + 2;
+        if (len == 0) {  // last chunk; the server sends no trailers
+            if (b.size() < p + 2) return Dechunk::partial;
+            return b.substr(p, 2) == "\r\n" ? Dechunk::complete : Dechunk::bad;
+        }
+        if (b.size() < p + len + 2) return Dechunk::partial;
+        if (b.substr(p + len, 2) != "\r\n") return Dechunk::bad;
+        if (out) out->append(b.substr(p, len));
+        p += len + 2;
+    }
+}
+
 int watchedConnect(SOCKET s, const sockaddr* addr, int addrlen, std::uint16_t port, std::string& diag) {
     u_long nb = 1;
     ioctlsocket(s, FIONBIO, &nb);
@@ -224,7 +247,8 @@ HttpResult httpRequestFrom(std::uint16_t local_port, const std::string& host, st
     // Content-Length ends after that many body bytes and the client closes the connection then;
     // without one (an SSE stream) it ends when the server closes
     std::size_t want = std::string::npos;  // header + body bytes, once the header is complete
-    bool header_seen = false;
+    bool header_seen = false, chunked = false;
+    std::size_t body_at = 0;
     for (;;) {
         const int n = recv(s, buf, sizeof buf, 0);
         if (n < 0 && r.err.empty()) r.err = std::format("recv failed after {} bytes, WSA error {}", resp.size(), WSAGetLastError());
@@ -241,11 +265,14 @@ HttpResult httpRequestFrom(std::uint16_t local_port, const std::string& host, st
                 std::string h = resp.substr(0, he + 2);
                 for (auto& ch : h) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
                 const std::size_t cl = h.find("\r\ncontent-length:");
-                if (cl != std::string::npos && h.find("\r\ntransfer-encoding:") == std::string::npos)
+                chunked = h.find("\r\ntransfer-encoding: chunked\r\n") != std::string::npos;
+                body_at = he + 4;
+                if (cl != std::string::npos && !chunked)
                     want = he + 4 + static_cast<std::size_t>(std::strtoull(h.c_str() + cl + 17, nullptr, 10));
             }
         }
         if (resp.size() >= want) break;
+        if (chunked && dechunk(std::string_view(resp).substr(body_at), nullptr) == Dechunk::complete) break;
     }
     closesocket(s);
     r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -256,6 +283,13 @@ HttpResult httpRequestFrom(std::uint16_t local_port, const std::string& host, st
     }
     r.headers = resp.substr(0, he);
     r.body = resp.substr(he + 4);
+    if (chunked) {  // the body without its chunk framing
+        std::string plain;
+        const Dechunk d = dechunk(r.body, &plain);
+        if (d != Dechunk::complete && r.err.empty())
+            r.err = d == Dechunk::bad ? "malformed chunked body" : "chunked body ended without its last chunk";
+        r.body = std::move(plain);
+    }
     if (r.headers.size() > 12 && r.headers.compare(0, 5, "HTTP/") == 0) r.status = std::atoi(r.headers.c_str() + 9);
     return r;
 }
