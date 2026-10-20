@@ -42,6 +42,23 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
   same exe, `WHIRL_COLD_RESUME=0` as the old behaviour): next-turn TTFT R9700 0.82-0.85 s instead of 0.06-0.30 s,
   Radeon 8060S 2.6-3.0 s instead of 0.16-0.17 s; first turn unchanged; texts identical in this session. Balance and
   fast are unchanged. `WHIRL_COLD_RESUME=0/1` overrides. COLD-RESUME.
+- Windows zip: it now also carries Microsoft's Visual C++ 2015-2022 x64 runtime (`msvcp140.dll`, `vcruntime140.dll`,
+  `vcruntime140_1.dll`, 14.44.35211.0, unmodified, Visual Studio redistributable terms). `rocm_kpack.dll` (shipped
+  since 0.2.1 for the Adrenalin Edition for ROCm 10.1 driver) and that driver's `amd_comgr_3.dll` import them, so on a
+  PC without the Visual C++ Redistributable the GPU runtime would not load. WHIRL itself still links the C runtime
+  statically; nothing needs to be installed besides the driver, with either driver branch.
+- GPU pre-flight: when the AMD GPU runtime fails with Windows error 127 (a DLL it uses lacks a function), the message
+  now names the likely cause, a DLL shipped next to `whirl.exe` that does not match the driver (for example a future
+  driver that brings its own `rocm_kpack.dll`), and says to rename or remove that file in the WHIRL folder or use the
+  WHIRL release that matches the driver. It used to tell the user to install the driver. The missing-DLL (126) message
+  for the Visual C++ runtime now points at the copies in the zip first.
+- Docs: kv-and-caching.md (en / zh-TW) gave "27B KL <= 9e-5 in practice" for a cache hit; it now gives the measured
+  balance gen-end range per GPU (R9700 9e-5 to 2e-4, Radeon 8060S 9e-7 to 2.1e-5; precise bitwise). The tier gate
+  description said `--parallel 1` runs f16 KV and `--parallel 4` q8v; the suite pins no format (`--kv auto`, the
+  format of the server's mode).
+- Server gate: new suite `mt_cache_precise` (release gate step `srv_mt_precise`): the mt_cache multi-turn sessions in
+  precise must give, request by request, the same replies as a server without the prefix cache, and every resumed state
+  must equal a from-scratch prefill bit for bit (`WHIRL_PREFIX_CACHE_VERIFY=1`: max abs logit difference 0, KL 0).
 
 ## 0.2.1 — 2026-10-20 (bug fixes)
 
