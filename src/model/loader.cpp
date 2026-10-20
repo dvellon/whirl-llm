@@ -234,6 +234,7 @@ struct Loader {
 // ---------------------------------------------------------------------------
 
 Model::~Model() {
+    tree_verify_graph_exec.reset();
     decode_graph.reset();
     if (rpos_buf != 0) hip::free(rpos_buf);
     for (DevPtr p : allocations) hip::free(p);
@@ -835,6 +836,7 @@ void Model::reset() {
 }
 
 void Model::setupSeqs(u32 n, u32 slot_ctx, u32 tree_shadows) {
+    tree_verify_graph_exec.reset();
     const u32 n_total = n + tree_shadows;
     if (n == 0 || n_total > gdn_max_seg || pool_pages != 0 || slot_ctx < kv_page ||
         (tree_shadows != 0 && (tree_shadows != 2 || n != 1)))
@@ -918,6 +920,8 @@ void Model::selectSeq(u32 s) {
 DevPtr Model::seqCtl(u32 s, u32 word) const { return out_tok + 4 * (static_cast<u64>(s) * ctl_words + word); }
 
 void Model::restoreSeqSnapshot(u32 s, u32 set) {
+    // Captured replay kernels hold the exact recurrent-state pointers.
+    tree_verify_graph_exec.reset();
     const Seq& sq = seqs[s];
     for (u32 i = 0; i < cfg.n_layer; ++i) {
         if (sq.ssm[i] == 0) continue;

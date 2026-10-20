@@ -472,6 +472,20 @@ struct BatchPlan {
     std::array<std::uint32_t, gdn_max_seg> snap_base{};
 };
 
+// Host-only contract for the opt-in single-slot beam2:7 verify graph.  The
+// graph may be replayed only while its two attention row groups have the same
+// host-derived shape as the captured launch sequence.
+struct TreeVerifyGraphContract {
+    bool runtime_exact = false;
+    std::array<std::uint32_t, 2> seq{};
+    std::array<std::uint32_t, 2> nd{};
+    std::array<std::uint32_t, 2> npend{};
+    std::array<std::int32_t, 11> pos{};
+    std::array<std::int32_t, 11> base{};
+};
+
+bool treeVerifyGraphEligible(const TreeVerifyGraphContract& c);
+
 // ---------------------------------------------------------------------------
 // the model
 
@@ -506,7 +520,12 @@ public:
     Profile* prof = nullptr;
     hip::Stream stream = nullptr;
     std::unique_ptr<hip::Graph> decode_graph;
+    std::unique_ptr<hip::Graph> tree_verify_graph_exec;
     bool use_graph = true;
+    // Experimental and off by default (WHIRL_TREE_VERIFY_GRAPH=1).  It is
+    // deliberately narrower than use_graph: only the fixed beam2:7 tree
+    // verify is captured, while set_rows remains a normal dynamic launch.
+    bool tree_verify_graph = false;
     bool head_phase = false;
     bool no_fuse = false;
     std::uint32_t row_n = 0;
@@ -790,6 +809,7 @@ public:
     void setPending(std::uint32_t s, std::uint32_t rows) { seqs[s].npend = rows; }
     void promotePending(std::uint32_t dst, std::uint32_t src, std::uint32_t rows) {
         if (!gdn_replay || dst >= seqs.size() || src >= seqs.size()) throw ModelError("BadTreePromotion");
+        tree_verify_graph_exec.reset();
         std::swap(seqs[dst].pend, seqs[src].pend);
         seqs[dst].npend = rows;
         seqs[src].npend = 0;

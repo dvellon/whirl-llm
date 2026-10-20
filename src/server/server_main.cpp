@@ -871,6 +871,7 @@ int serveMain(int argc, char** argv, const char* program) {
 
         // slots: KV-cache regions, recurrent state, MTP hidden rows
         model.gdn_replay = envOn("GDN_REPLAY", true);
+        model.tree_verify_graph = envOn("TREE_VERIFY_GRAPH", false);
         const hip::MemInfo mem_s0 = hip::memInfo();
         const bool tree_shadow_alloc = tree_requested != 0 && opt.parallel == 1 && use_mtp && !use_dflash && !cfg.moe &&
                                        model.fusedDecode() && !(opt.mmproj || env("MMPROJ"));
@@ -889,6 +890,14 @@ int serveMain(int argc, char** argv, const char* program) {
             if (!why.empty()) {
                 logW("WHIRL_TREE=beam2:{} ignored: {}; using linear speculative decoding", tree_depth, why);
                 tree_depth = 0;
+            }
+        }
+        if (model.tree_verify_graph) {
+            if (tree_depth == 7)
+                logI("tree verify graph: on (experimental fixed beam2:7 launch replay; dynamic rows stay outside capture)");
+            else {
+                logW("WHIRL_TREE_VERIFY_GRAPH ignored: it requires active WHIRL_TREE=beam2:7");
+                model.tree_verify_graph = false;
             }
         }
         if (use_dflash) {

@@ -1406,6 +1406,31 @@ GdnSegs Model::gdnSegsBatch(const BatchPlan& bp, std::size_t i, bool conv) const
 }
 
 // Batched verify over sequences (see the header).
+bool treeVerifyGraphEligible(const TreeVerifyGraphContract& c) {
+    if (!c.runtime_exact || c.seq != std::array<u32, 2>{1, 2} || c.nd != std::array<u32, 2>{7, 2} ||
+        c.npend != std::array<u32, 2>{0, 0})
+        return false;
+    constexpr std::array<u32, 3> edge{0, 8, 11};
+    for (u32 sg = 0; sg < 2; ++sg) {
+        const u32 r0 = edge[sg], r1 = edge[sg + 1];
+        const i32 p0 = c.pos[r0], b0 = c.base[r0];
+        const i32 np0 = p0 + 1;
+        const ws4::Range z0 = ws4::block_range(np0, 0, ws4::kNs, 0);
+        const std::array<i32, 3> k0{z0.b1 == ws4::kSink ? z0.b0 - 1 : 0,
+                                    ws4::block_range(np0, 1, ws4::kNs, 0).b0,
+                                    ws4::block_range(np0, 2, ws4::kNs, 0).b0};
+        for (u32 r = r0; r < r1; ++r) {
+            const i32 np = c.pos[r] + 1;
+            const ws4::Range z = ws4::block_range(np, 0, ws4::kNs, 0);
+            const std::array<i32, 3> key{z.b1 == ws4::kSink ? z.b0 - 1 : 0,
+                                         ws4::block_range(np, 1, ws4::kNs, 0).b0,
+                                         ws4::block_range(np, 2, ws4::kNs, 0).b0};
+            if (c.pos[r] != p0 + static_cast<i32>(r - r0) || c.base[r] != b0 || key != k0) return false;
+        }
+    }
+    return c.base[0] != c.base[8] && c.pos[0] == c.pos[8];
+}
+
 u32 Model::verifyBatchEnqueue(std::span<const VSeg> segs) {
     if (segs.empty() || segs.size() > gdn_max_seg) throw ModelError("BadBatch");
     // several sequences need the segment-aware fused DeltaNet kernels
@@ -1487,11 +1512,54 @@ u32 Model::verifyBatchEnqueue(std::span<const VSeg> segs) {
     } reset_flags{*this};
     xq_src = 0;
     x16_src = 0;
-    run(n);
+    TreeVerifyGraphContract graph_contract;
+    graph_contract.runtime_exact = tree_verify_graph && prof == nullptr && arch == hip::Arch::gfx1151 && !cfg.moe && gdn_replay &&
+                                   fusedDecode() && !visAny() && cap_buf == 0 && psegs.empty() && cur_seq == 0 && gate == 0 && attn_win == 0 &&
+                                   attn_ws4 && k.attn_ws4 != nullptr &&
+                                   k.attn_ws4g[0] != nullptr && k.attn_ws4g[1] != nullptr && k.attn_ws4g[2] != nullptr &&
+                                   k.attn_wsplit1 != nullptr && !kv_q4 && cfg.head_dim == ws4::kD && cfg.n_head / cfg.n_head_kv <= 16 &&
+                                   (dbg_flags & 6) == 0 && seqs.size() == 3 && segs.size() == 2 && segs[0].drafts.empty() &&
+                                   segs[1].drafts.empty();
+    if (segs.size() == 2 && segs[0].seq < seqs.size() && segs[1].seq < seqs.size()) {
+        graph_contract.seq = {segs[0].seq, segs[1].seq};
+        graph_contract.nd = {segs[0].nd, segs[1].nd};
+        graph_contract.npend = {seqs[segs[0].seq].npend, seqs[segs[1].seq].npend};
+    }
+    if (n == graph_contract.pos.size()) {
+        std::copy_n(row_pos.begin(), n, graph_contract.pos.begin());
+        std::copy_n(row_base.begin(), n, graph_contract.base.begin());
+    } else {
+        graph_contract.runtime_exact = false;
+    }
+    const bool graph_ok = treeVerifyGraphEligible(graph_contract);
+    auto launches = [&] {
+        run(n);
+        hip::launch(k.argmax_rows_to, D(n), D(1024), 0, stream, logits, I(cfg.n_vocab), out_tok, dst);
+    };
+    if (graph_ok) {
+        if (!tree_verify_graph_exec) {
+            hip::Graph::beginCapture(stream);
+            try {
+                launches();
+            } catch (...) {
+                try {
+                    (void)hip::Graph::endCapture(stream);
+                } catch (...) {
+                }
+                throw;
+            }
+            tree_verify_graph_exec = std::make_unique<hip::Graph>(hip::Graph::endCapture(stream));
+        }
+        tree_verify_graph_exec->launch(stream);
+        // Host launch selection is skipped on replay, so do not retain cache
+        // provenance produced only while the graph was first captured.
+        scratchClobbered();
+    } else {
+        launches();
+    }
     // the kept rows of the previous verify are in the state now
     if (gdn_replay)
         for (const VSeg& sg : segs) seqs[sg.seq].npend = 0;
-    hip::launch(k.argmax_rows_to, D(n), D(1024), 0, stream, logits, I(cfg.n_vocab), out_tok, dst);
     return n;
 }
 
@@ -1738,6 +1806,7 @@ void Model::verify(std::span<const u32> tokens, u32 pos0, std::span<u32> out) {
 void Model::restoreSnapshot(u32 keep) {
     // a captured decode graph holds the old state pointers
     decode_graph.reset();
+    tree_verify_graph_exec.reset();
     // the unfused decode path writes only snapshot 0: any later set would be stale
     if (keep == 0 || keep > snap_sets || (keep > 1 && !fusedDecode())) throw ModelError("SnapshotNotWritten");
     const u32 kk = keep - 1;

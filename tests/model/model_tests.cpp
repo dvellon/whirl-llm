@@ -1534,6 +1534,69 @@ void testFloatGemvDispatch() {
     check(cover, "float dispatch: GEMV loop steps cover n tokens (8 / 4 / 1 by the instances present)");
 }
 
+// OVH-G1: graph replay is intentionally one fixed host launch contract.  The
+// token/position upload remains dynamic, but the captured ws4 attention groups
+// must stay exactly [8, 3], on the two fixed tree shadow sequences, with no
+// recurrent replay rows carried in from a previous verify.
+void testTreeVerifyGraphContract() {
+    q::TreeVerifyGraphContract c;
+    c.runtime_exact = true;
+    c.seq = {1, 2};
+    c.nd = {7, 2};
+    c.npend = {0, 0};
+    for (std::uint32_t r = 0; r < 8; ++r) {
+        c.pos[r] = 1024 + static_cast<std::int32_t>(r);
+        c.base[r] = 64;
+    }
+    for (std::uint32_t r = 8; r < 11; ++r) {
+        c.pos[r] = 1024 + static_cast<std::int32_t>(r - 8);
+        c.base[r] = 128;
+    }
+    check(q::treeVerifyGraphEligible(c), "OVH-G1: exact beam2:7 [8,3] verify is graph eligible");
+    auto bad = c;
+    bad.runtime_exact = false;
+    check(!q::treeVerifyGraphEligible(bad), "OVH-G1: disabled/non-exact runtime falls back");
+    bad = c;
+    bad.npend[0] = 1;
+    check(!q::treeVerifyGraphEligible(bad), "OVH-G1: carried recurrent rows fall back");
+    bad = c;
+    bad.pos[8] += 1;
+    check(!q::treeVerifyGraphEligible(bad), "OVH-G1: branches at different positions fall back");
+    bad = c;
+    bad.base[8] = bad.base[0];
+    check(!q::treeVerifyGraphEligible(bad), "OVH-G1: aliased branch KV bases fall back");
+    bad = c;
+    // ws4 split ranges change at this boundary, so replaying the captured
+    // eight-row grouping would be incorrect even though positions are linear.
+    for (std::uint32_t r = 0; r < 8; ++r) bad.pos[r] = 4092 + static_cast<std::int32_t>(r);
+    for (std::uint32_t r = 8; r < 11; ++r) bad.pos[r] = 4092 + static_cast<std::int32_t>(r - 8);
+    check(!q::treeVerifyGraphEligible(bad), "OVH-G1: ws4 split-key boundary falls back");
+#ifdef WHIRL_SOURCE_DIR
+    std::ifstream in(std::string(WHIRL_SOURCE_DIR) + "/src/model/forward.cpp", std::ios::binary);
+    const std::string fw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::size_t fn = fw.find("u32 Model::verifyBatchEnqueue");
+    const std::size_t set_rows = fw.find("hip::launch(k.set_rows", fn);
+    const std::size_t capture = fw.find("hip::Graph::beginCapture", fn);
+    const std::size_t launch = fw.find("tree_verify_graph_exec->launch", fn);
+    check(fn != std::string::npos && set_rows != std::string::npos && capture != std::string::npos && launch != std::string::npos &&
+              set_rows < capture && capture < launch,
+          "OVH-G1: dynamic set_rows stays outside and before verify graph capture");
+    check(fw.find("tree_verify_graph_exec.reset();", fw.find("void Model::restoreSnapshot")) != std::string::npos,
+          "OVH-G1: pointer-swapping snapshot restore invalidates verify graph");
+    std::ifstream sin(std::string(WHIRL_SOURCE_DIR) + "/src/server/server_main.cpp", std::ios::binary);
+    const std::string server((std::istreambuf_iterator<char>(sin)), std::istreambuf_iterator<char>());
+    check(server.find("model.tree_verify_graph = envOn(\"TREE_VERIFY_GRAPH\", false)") != std::string::npos &&
+              server.find("tree_depth == 7") != std::string::npos,
+          "OVH-G1: server gate is opt-in and fixed to active beam2:7");
+    std::ifstream lin(std::string(WHIRL_SOURCE_DIR) + "/src/model/loader.cpp", std::ios::binary);
+    const std::string loader((std::istreambuf_iterator<char>(lin)), std::istreambuf_iterator<char>());
+    const std::size_t restore_seq = loader.find("void Model::restoreSeqSnapshot");
+    const std::size_t restore_seq_reset = loader.find("tree_verify_graph_exec.reset();", restore_seq);
+    check(restore_seq != std::string::npos && restore_seq_reset != std::string::npos && restore_seq < restore_seq_reset,
+          "OVH-G1: per-sequence state pointer swap invalidates verify graph");
+#endif
+}
+
 // OVH-C1: the MTP draft window (Model::attn_win) is set only around the MTP draft attention and restored
 // when that attention throws. (a) Model::draftAttn, through the attnBlock test hook (throws before any
 // GPU work): the hook sees the draft window, and attn_win is back to its previous value after the throw.
@@ -1586,6 +1649,7 @@ int main() {
     whirl::test::clearWhirlEnv();  // FR-TEST P3-11
     testTreeSpecPlan();
     testDraftWindowRestore();
+    testTreeVerifyGraphContract();
     testFloatGemvDispatch();
     testArchWhitelist();
     testLoadEstimate();
