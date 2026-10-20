@@ -6,6 +6,7 @@
 #include <ws2tcpip.h>
 
 #include <chrono>
+#include <cstdio>
 #include <format>
 #include <mutex>
 
@@ -47,6 +48,25 @@ HttpResult httpRequest(const std::string& host, std::uint16_t port, std::string_
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to), sizeof to);
     if (connect(s, res->ai_addr, static_cast<int>(res->ai_addrlen)) != 0) {
         fail("connect");
+        // CB-FLAKE: the local port of the failed attempt and every TCP row that names it (a TIME_WAIT
+        // of an earlier connection on the same 4-tuple would explain an unanswered SYN)
+        sockaddr_in la{};
+        int ll = sizeof la;
+        if (getsockname(s, reinterpret_cast<sockaddr*>(&la), &ll) == 0 && ntohs(la.sin_port) != 0) {
+            const unsigned lp = ntohs(la.sin_port);
+            r.err += std::format(", local port {}", lp);
+            if (FILE* p = _popen("netstat -ano -p tcp", "r")) {
+                char line[512];
+                const std::string key = std::format(":{} ", lp);
+                while (std::fgets(line, sizeof line, p))
+                    if (std::string_view(line).find(key) != std::string_view::npos) {
+                        std::string l(line);
+                        while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+                        r.err += "\n      netstat: " + l;
+                    }
+                _pclose(p);
+            }
+        }
         freeaddrinfo(res);
         closesocket(s);
         return r;
