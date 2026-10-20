@@ -152,6 +152,62 @@ void testGemv(Ctx& c) {
             c.rep.add(cmpTol("gemvq_" + sfx + " (int8 x) " + m.name, got, ry, rs, 1e-4, 1e-6));
         }
 
+        // gfx1151 MXFP4 NT=11/r2 16-wave prototype: exercise both optional
+        // 512-thread entry points directly.  The plain entry uses a partial
+        // last block and must reproduce the canonical one-token GEMV bits.
+        // The grouped twin uses all three GvArgs segments (also with partial
+        // last blocks) and must reproduce the corresponding row slices.
+        if (m.type == QType::mxfp4 && c.k.gemvq_nt11r2w16_mxfp4 != nullptr &&
+            c.k.gemvq_nt11r2w16_mxfp4_g != nullptr) {
+            constexpr int nt = 11;
+            const int nr = nrows - 7;
+            Buf yp(static_cast<std::size_t>(nt) * nr * 4);
+            hip::launch(c.k.gemvq_nt11r2w16_mxfp4, {cdiv(nr, 16), 1, 1}, {512, 1, 1}, 0, c.s,
+                        w.p(), m.row_bytes, xq.p(), xd.p(), yp.p(), ncols, nr, 0, DevPtr{0});
+            c.sync();
+            std::vector<float> wantp;
+            wantp.reserve(static_cast<std::size_t>(nt) * nr);
+            for (int t = 0; t < nt; ++t)
+                wantp.insert(wantp.end(), ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows,
+                             ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + nr);
+            c.rep.add(cmpExact("gemvq_nt11r2w16_mxfp4 == 1-token (partial block) " + m.name,
+                               yp.down<float>(wantp.size()), wantp, Kind::invariant));
+
+            const int gn[3] = {nrows / 3 - 3, nrows / 3 + 1,
+                               nrows - (nrows / 3 - 3) - (nrows / 3 + 1)};
+            const int ro[3] = {0, gn[0], gn[0] + gn[1]};
+            Buf yg0(static_cast<std::size_t>(nt) * gn[0] * 4);
+            Buf yg1(static_cast<std::size_t>(nt) * gn[1] * 4);
+            Buf yg2(static_cast<std::size_t>(nt) * gn[2] * 4);
+            const DevPtr gy[3] = {yg0.p(), yg1.p(), yg2.p()};
+            wk::GvArgs g;
+            for (int i = 0; i < 3; ++i) {
+                g.w[i] = w.p() + static_cast<std::uint64_t>(ro[i]) * m.row_bytes;
+                g.y[i] = gy[i];
+                g.rb[i] = m.row_bytes;
+                g.n[i] = gn[i];
+            }
+            g.b1 = static_cast<int>(cdiv(gn[0], 16));
+            g.b2 = g.b1 + static_cast<int>(cdiv(gn[1], 16));
+            const unsigned nb = static_cast<unsigned>(g.b2) + cdiv(gn[2], 16);
+            hip::launch(c.k.gemvq_nt11r2w16_mxfp4_g, {nb, 1, 1}, {512, 1, 1}, 0, c.s,
+                        g, xq.p(), xd.p(), ncols, 0, DevPtr{0});
+            c.sync();
+            std::vector<float> gotg, wantg;
+            gotg.reserve(static_cast<std::size_t>(nt) * nrows);
+            wantg.reserve(static_cast<std::size_t>(nt) * nrows);
+            const Buf* ygs[3] = {&yg0, &yg1, &yg2};
+            for (int i = 0; i < 3; ++i) {
+                const auto part = ygs[i]->down<float>(static_cast<std::size_t>(nt) * gn[i]);
+                gotg.insert(gotg.end(), part.begin(), part.end());
+                for (int t = 0; t < nt; ++t)
+                    wantg.insert(wantg.end(), ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + ro[i],
+                                 ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + ro[i] + gn[i]);
+            }
+            c.rep.add(cmpExact("ggemvq_nt11r2w16_mxfp4 (3 segments) == 1-token " + m.name,
+                               gotg, wantg, Kind::invariant));
+        }
+
         // accumulate: y = y0 + v exactly
         {
             std::vector<float> y0 = c.randn(static_cast<std::size_t>(nrows));
