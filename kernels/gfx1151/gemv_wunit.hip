@@ -261,12 +261,12 @@ __device__ void gemvw_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, co
                            const int *__restrict__ skip, int bid = -1) {
     constexpr int ROWS = HALF ? 8 : 16 * TILES;
     constexpr int NTV = (NT + 1) / 2;
-    // The full-tile MXFP4 r2 kernels at NT=7..10 are the only variants where
+    // The full-tile MXFP4 r2 kernels at NT=7..15 are the only variants where
     // keeping two quarter accumulators live still exhausts gfx1151's VGPR
-    // budget.  Give those four kernels one LDS plane per quarter so they can
+    // budget.  Give those kernels one LDS plane per quarter so they can
     // keep exactly one quarter live.  The final reduction below still forms
     // (q0 + q1) + (q2 + q3), preserving the established float rounding.
-    constexpr bool MX_SINGLE_Q = T == QT_MXFP4 && !HALF && TILES == 1 && NT >= 7 && NT <= 10;
+    constexpr bool MX_SINGLE_Q = T == QT_MXFP4 && !HALF && TILES == 1 && NT >= 7 && NT <= 15;
     constexpr int QPLANES = MX_SINGLE_Q ? 4 : 1;
     __shared__ float red[QPLANES][8][NT][ROWS];
     if (skip != nullptr && *skip) return;
