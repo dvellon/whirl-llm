@@ -5,18 +5,13 @@ All notable changes to WHIRL are listed here. Versions follow `project(whirl VER
 
 ## 0.2.2 — unreleased
 
-### Faster
-
-- Radeon 8060S, fast mode (q4 KV) decode: `attn_dq4` launches only as many attention splits as the rows' keys use
-  (same key partition as the fixed 256-split grid, so the output is bitwise unchanged); the split combine no longer
-  walks 256 partials per head. Ornith-1.5-35B-A3B MXFP4 verify cycle 2.3% to 3.7% shorter at 2k to 128k
-  (`WHIRL_DQ4_DYN=0`: the fixed grid). FAST-8S-1.
-- Radeon 8060S, MoE models: the embedded 64k draft-head vocabulary subset is now the default there too (it was dense
-  only); output text unchanged in every mode (verify decides it), Ornith decode +2% to +4% in balance, +2% to +9% in
-  fast (`WHIRL_DRAFT_VOCAB=off`: the full head). The R9700 MoE default is unchanged. FAST-8S-1.
-
 ### Fixed
 
+- Radeon 8060S, fast mode: decode was no faster than balance, at some lengths slower (Ornith-1.5-35B-A3B MXFP4, q4 KV),
+  because `attn_dq4` always launched its fixed 256-split grid and the split combine walked 256 partials per head even
+  when only a few splits held keys (8 at 2k). It now launches only the splits the rows' keys use (the same key
+  partition as the fixed grid, so the output is bitwise unchanged): verify cycle 2.3% to 3.7% shorter at 2k to 128k.
+  R9700 unchanged. `WHIRL_DQ4_DYN=0` restores the fixed grid. FAST-8S-1.
 - Server: a client's next request could hang for 21 s and fail to connect (Windows error 10060), about once in
   several thousand requests. The server closed every connection first, so each finished connection stayed in
   TIME_WAIT on the server side for 120 s; when Windows handed the client the same local port again and the earlier
