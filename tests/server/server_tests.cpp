@@ -875,6 +875,53 @@ void testHttpStuckReader() {
     CHECK_EQ(srv.post("/v1/completions", completionBody(makePrompt(32, 73), 8)).status, 200);
 }
 
+// HTTP-DROP: a connect to the server that is never answered (WSAETIMEDOUT after 21 s, seen in the
+// server gate about once per 200 requests). The server closed every connection first, so the server
+// side of each finished connection sat in TIME_WAIT for 120 s; a new connection from the same client
+// port (Windows hands ephemeral ports out again) whose SYN that TIME_WAIT does not accept -- after a
+// request of tens of KB, as agent prompts are -- is silently dropped, and the client retries for 21 s.
+// Here every request reuses the port of the previous one. A connect must be answered (or refused
+// because the client's own TIME_WAIT holds the 4-tuple: the OS then picks another port) at once, never
+// left waiting; and a finished request must leave no server-side TIME_WAIT behind.
+void testHttpPortReuse() {
+    ServerSetup su = baseSetup();
+    TestServer srv(su);
+    int n = 0, slow = 0, failed = 0, blocked = 0, srv_tw = 0;
+    double worst = 0;
+    const auto big = completionBody(makePrompt(12000, 81), 4);  // ~90 KB body, as the gate's chat requests
+    const auto small = completionBody(makePrompt(64, 82), 4);
+    const auto bigs = completionBody(makePrompt(12000, 83), 4, true);
+    const int reps = std::getenv("WHIRL_TEST_REUSE_REPS") ? std::max(1, std::atoi(std::getenv("WHIRL_TEST_REUSE_REPS"))) : 12;
+    std::uint16_t lp = test::freeLocalPort();
+    CHECK(lp != 0);
+    for (int i = 0; i < reps && failed == 0; ++i) {
+        const std::string& body = i % 3 == 0 ? big : i % 3 == 1 ? small : bigs;
+        auto r = test::httpRequestFrom(lp, "127.0.0.1", srv.port(), "POST", "/v1/completions", body, 60);
+        ++n;
+        if (r.status != 200 && r.err.find("WSA error 10048") != std::string::npos && r.ms < 1000) {
+            ++blocked;  // the 4-tuple is in the client's own TIME_WAIT: refused at once, so take another port
+            lp = test::freeLocalPort();
+            r = test::httpRequestFrom(lp, "127.0.0.1", srv.port(), "POST", "/v1/completions", body, 60);
+        }
+        worst = std::max(worst, r.ms);
+        if (r.status != 200) {
+            ++failed;
+            std::printf("  port reuse: request %d from local port %u failed after %.0f ms: %s\n", i, lp, r.ms, r.err.c_str());
+        } else if (r.ms > 2000) {
+            ++slow;
+        }
+        // the server side of the finished connection: no TIME_WAIT (the client closed first)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        srv_tw += test::tcpRowCount(srv.port(), lp, "TIME_WAIT");
+    }
+    std::printf("  port reuse: %d requests, %d failed, %d slower than 2 s, %d refused at once (client TIME_WAIT), "
+                "%d server-side TIME_WAIT, worst %.0f ms\n",
+                n, failed, slow, blocked, srv_tw, worst);
+    CHECK_EQ(failed, 0);
+    CHECK_EQ(slow, 0);
+    CHECK_EQ(srv_tw, 0);
+}
+
 void testCors() {
     CHECK(isLoopbackOrigin("http://localhost"));
     CHECK(isLoopbackOrigin("http://localhost:5173"));
@@ -3568,6 +3615,7 @@ int main(int argc, char** argv) {
         {"http_limits", testHttpLimits},
         {"http_conn_cap", testHttpConnCap},
         {"http_stuck_reader", testHttpStuckReader},
+        {"http_port_reuse", testHttpPortReuse},
         {"cors", testCors},
         {"greedy_reference", testGreedyMatchesReference},
         {"stream", testStreamEqualsNonStream},
