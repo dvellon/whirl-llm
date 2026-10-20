@@ -2126,6 +2126,66 @@ static void testFlushDedup(MockDeviceOps& ops, const fs::path& dir) {
     }
 }
 
+// CB-FLAKE: the base write has finished on the IO thread but the tick that reaps it has not run yet (the
+// engine's tick reaps first, then starts writes, while the IO thread keeps running). The entry sharing its
+// prefix must still wait for it: the job is still in jobs_ (not reaped), the base has no SSD copy yet, so
+// before the fix waitForDedupBase saw neither an in-flight write nor a file on disk and the second entry
+// wrote the shared prefix in full (server gate sys: "0 of 2 SSD writes with shared blocks", ~1 in 24 runs
+// on the R9700).
+static void testDedupFinishedUnreaped(MockDeviceOps& ops, const fs::path& dir) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    SsdEnv env{dir};
+    const std::uint64_t fp = hashStr(0xcbf29ce484222325ull, "dedupunreaped");
+    std::uint64_t seed = 3900;
+    const auto sys = freshToks(2560, seed);  // 10 pages = 7 whole blocks
+    Sess a(ops, 24), b(ops, 24);
+    for (Sess* s : {&a, &b}) {
+        s->toks = sys;
+        auto tail = freshToks(600 + 300 * static_cast<std::size_t>(s == &b), seed);
+        s->toks.insert(s->toks.end(), tail.begin(), tail.end());
+    }
+    {
+        auto t = Tier::create(ops, 256ull << 20, 39, 0);
+        Config c = env.cfg(4ull << 30);
+        c.ssd_delay_ms = 600000;
+        c.ssd_shutdown_only = true;
+        t->start(c, kLay, fp);
+        spillSess(*t, a, 0);
+        spillSess(*t, b, 0);
+        reuse(*t, a);
+        reuse(*t, b);
+        t->tick();
+        t->flushing = true;
+        t->cfg.ssd_delay_ms = 0;
+        t->tick();  // starts the first write; the other entry waits for it (DEDUP-INV)
+        Entry* ea = t->find(a.id);
+        Entry* eb = t->find(b.id);
+        CHECK(ea != nullptr && eb != nullptr);
+        if (ea && eb) {
+            CHECK(ea->io_busy != eb->io_busy);  // exactly one write running
+            Entry* first = ea->io_busy ? ea : eb;
+            Entry* second = ea->io_busy ? eb : ea;
+            CHECK(!first->ssd.has_value());
+            // let the IO thread finish the write; no tick runs, so the job is finished but not reaped
+            sleepMs(500);
+            CHECK(first->io_busy);  // not reaped yet
+            const bool waits = t->waitForDedupBase(second);
+            std::printf("dedup base finished, not reaped: second entry %s\n", waits ? "waits (shares the prefix)" : "does NOT wait");
+            CHECK(waits);
+        }
+        CHECK(tickIdle(*t));
+        CHECK(t->stats.ssd_writes == 2);
+        std::size_t refs = 0;
+        for (std::uint64_t id : {a.id, b.id})
+            if (const Entry* e = t->find(id); e && e->ssd)
+                for (const BlkRef& r : e->ssd->tbl) refs += r.owner != 0 ? 1 : 0;
+        std::printf("dedup base finished, not reaped: %zu shared block refs\n", refs);
+        CHECK(refs == 7);  // the second file stores the 7 system-prompt blocks as references
+    }
+    fs::remove_all(dir, ec);
+}
+
 // Graceful flush order: most recently used first (a restore counts as use), so when the time bound runs
 // out the oldest sessions are the ones not written. Writes run in submission order on the IO thread.
 static void testFlushOrder(MockDeviceOps& ops, const fs::path& dir) {
@@ -4053,6 +4113,10 @@ int main(int argc, char** argv) {
     if (want("testShutdownFlush")) {
         std::printf("-- %s\n", "testShutdownFlush");
         testShutdownFlush(ops, dir);
+    }
+    if (want("testDedupFinishedUnreaped")) {
+        std::printf("-- %s\n", "testDedupFinishedUnreaped");
+        testDedupFinishedUnreaped(ops, dir);
     }
     if (want("testFlushDedup")) {
         std::printf("-- %s\n", "testFlushDedup");
