@@ -457,13 +457,19 @@ bool preciseMode(const std::optional<std::string>& mode) {
 struct CacheVerify {
     double maxd = 0, kl = 0;
     bool top1_same = false;
+    long long ndiff = -1;  // "bitwise differing logits N" (REVIEW-022 F3); -1: not in the line (older server)
 };
 std::optional<CacheVerify> parseCacheVerify(const std::string& line) {
     static const std::regex r(R"(prefix-cache verify: .*max abs diff ([0-9.]+), KL ([0-9.]+(?:e[-+]?[0-9]+)?), top1 (same|DIFFERENT))");
     std::smatch m;
     if (!std::regex_search(line, m, r)) return std::nullopt;
-    return CacheVerify{std::stod(m[1].str()), std::stod(m[2].str()), m[3].str() == "same"};
+    CacheVerify v{std::stod(m[1].str()), std::stod(m[2].str()), m[3].str() == "same"};
+    static const std::regex rd(R"(bitwise differing logits (\d+))");
+    if (std::smatch md; std::regex_search(line, md, rd)) v.ndiff = std::stoll(md[1].str());
+    return v;
 }
+// precise: bit-identical logits (max abs diff prints 4 decimals and KL can underflow, so the bit count decides)
+bool cacheVerifyBitwise(const CacheVerify& v) { return v.ndiff == 0 && v.maxd == 0 && v.kl == 0 && v.top1_same; }
 // The bound: the server's documented diagnostic threshold for a cache hit that is numerically equivalent, not
 // bit-identical (docs/guide/en/kv-and-caching.md section 5: KL <= 1e-2 and the same top-1). Measured on the
 // R9700, Swift-1.5 27B MXFP4-A (requant 2026-10-19), tier p1 gen-end state vs cold: balance KL 9e-5..2e-4,
@@ -1112,9 +1118,10 @@ bool mtPreciseVerifyOk(const std::vector<CacheVerify>& v, std::size_t hits, std:
     d = std::format("{} verify lines, {} replies with cached > 0", v.size(), hits);
     bool ok = hits > 0 && v.size() == hits;
     for (std::size_t i = 0; i < v.size(); ++i)
-        if (!(v[i].maxd == 0 && v[i].kl == 0 && v[i].top1_same)) {
+        if (!cacheVerifyBitwise(v[i])) {
             ok = false;
-            d += std::format("; #{}: max abs diff {:.4f}, KL {:.2e}, top1 {}", i, v[i].maxd, v[i].kl, v[i].top1_same ? "same" : "DIFFERENT");
+            d += std::format("; #{}: max abs diff {:.4f}, KL {:.2e}, top1 {}, differing logits {}", i, v[i].maxd, v[i].kl,
+                             v[i].top1_same ? "same" : "DIFFERENT", v[i].ndiff);
         }
     return ok;
 }
@@ -1406,8 +1413,9 @@ void tierMode(const std::string& mode) {
             check(precise_v ? std::format("tier p1: {} turn 2 SSD-restored state == from-scratch prefill, bitwise (precise)", S[i].name)
                             : std::format("tier p1: {} turn 2 SSD-restored state == from-scratch prefill (KL <= {:.0e}, same top-1)",
                                           S[i].name, kCacheVerifyMaxKl),
-                  precise_v ? (v[i].maxd == 0 && v[i].kl == 0 && v[i].top1_same) : cacheVerifyOk(v[i]),
-                  std::format("max abs diff {:.4f}, KL {:.2e}, top1 {}", v[i].maxd, v[i].kl, v[i].top1_same ? "same" : "DIFFERENT"));
+                  precise_v ? cacheVerifyBitwise(v[i]) : cacheVerifyOk(v[i]),
+                  std::format("max abs diff {:.4f}, KL {:.2e}, top1 {}, differing logits {}", v[i].maxd, v[i].kl,
+                              v[i].top1_same ? "same" : "DIFFERENT", v[i].ndiff));
     }
     fs::remove_all(widen(ssd), ec);
     if (p1) {
@@ -2305,6 +2313,15 @@ int selfTest() {
         check("selftest: verify line balance (KL 1.7e-4, same top-1) -> parsed, ok",
               a && std::abs(a->maxd - 2.873) < 1e-9 && std::abs(a->kl - 1.7e-4) < 1e-12 && a->top1_same && cacheVerifyOk(*a));
         check("selftest: verify line exact (KL 0) -> ok", b && b->kl == 0 && cacheVerifyOk(*b));
+        {
+            // REVIEW-022 F3: precise needs the bit count; 0.0000 / KL 0 with 3 differing logits is not bitwise
+            const auto z = parseCacheVerify("I req 1 | slot 0 | prefix-cache verify: cached vs from-scratch prefill logits: max abs diff "
+                                            "0.0000, KL 0.00e+00, top1 same (760 vs 760), bitwise differing logits 0");
+            const auto n3 = parseCacheVerify("I req 1 | slot 0 | prefix-cache verify: cached vs from-scratch prefill logits: max abs diff "
+                                             "0.0000, KL 0.00e+00, top1 same (760 vs 760), bitwise differing logits 3");
+            check("selftest: verify line differing logits 0 -> bitwise; 3 -> not; no count (old line) -> not",
+                  z && z->ndiff == 0 && cacheVerifyBitwise(*z) && n3 && n3->ndiff == 3 && !cacheVerifyBitwise(*n3) && b && !cacheVerifyBitwise(*b));
+        }
         check("selftest: verify line top-1 DIFFERENT -> not ok", c && !c->top1_same && !cacheVerifyOk(*c));
         check("selftest: verify line KL 2e-2 > 1e-2 (same top-1) -> not ok", e && e->top1_same && !cacheVerifyOk(*e));
         check("selftest: other log lines -> not a verify line",
@@ -2330,8 +2347,9 @@ int selfTest() {
         check("selftest: mt_cache_precise cold diff, two failed requests -> not equal", !mtColdDiff({err}, {err}).empty());
         check("selftest: mt_cache_precise cold diff, count mismatch / empty -> not equal",
               !mtColdDiff({a}, {cold, cold2}).empty() && !mtColdDiff({}, {}).empty());
-        const CacheVerify exact{0, 0, true}, tiny{0.0001, 1e-9, true}, flip{0, 0, false};
+        const CacheVerify exact{0, 0, true, 0}, tiny{0.0001, 1e-9, true, 7}, flip{0, 0, false, 1}, hidden{0, 0, true, 2};
         std::string vd;
+        check("selftest: mt_cache_precise verify, 0.0000 / KL 0 but 2 differing logits -> not ok", !mtPreciseVerifyOk({hidden}, 1, vd), vd);
         check("selftest: mt_cache_precise verify, 2 exact lines for 2 hits -> ok", mtPreciseVerifyOk({exact, exact}, 2, vd), vd);
         check("selftest: mt_cache_precise verify, KL 1e-9 (not bitwise) -> not ok", !mtPreciseVerifyOk({exact, tiny}, 2, vd), vd);
         check("selftest: mt_cache_precise verify, top-1 different -> not ok", !mtPreciseVerifyOk({flip}, 1, vd), vd);

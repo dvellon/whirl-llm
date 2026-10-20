@@ -82,8 +82,12 @@ public:
         if (framed_out_) *framed_out_ = (framed_ || (chunked_ && finished_)) && !bad_;
     }
     void setCors(std::string h) { cors_ = std::move(h); }
+    // the request was HTTP/1.0: no Transfer-Encoding may be sent (RFC 9112 section 6.1), so a stream goes
+    // out unframed and ends at the server's close, as before HTTP-DROP
+    void setHttp10(bool v) { http10_ = v; }
     bool write(std::string_view data) override {
         if (bad_) return false;
+        std::string head10;  // HTTP/1.0: the first write without its Transfer-Encoding line
         if (!started_) {
             started_ = true;
             // the first write carries the whole response header
@@ -92,7 +96,14 @@ public:
                 std::string h(data.substr(0, he + 2));
                 for (auto& ch : h) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
                 framed_ = h.find("\r\ncontent-length:") != std::string::npos;
-                chunked_ = h.find("\r\ntransfer-encoding: chunked\r\n") != std::string::npos;
+                const std::size_t te = h.find("\r\ntransfer-encoding: chunked\r\n");
+                chunked_ = te != std::string::npos;
+                if (chunked_ && http10_) {
+                    head10.assign(data.substr(0, te + 2));
+                    head10.append(data.substr(te + 2 + std::string_view("transfer-encoding: chunked\r\n").size()));
+                    data = head10;
+                    chunked_ = false;
+                }
             }
             const std::size_t eol = data.find("\r\n");
             if (!cors_.empty() && data.starts_with("HTTP/") && eol != std::string_view::npos) {
@@ -196,6 +207,7 @@ private:
     bool nonblocking_ = false;
     bool stalled_ = false;
     bool* framed_out_ = nullptr;
+    bool http10_ = false;
     bool framed_ = false;
     bool chunked_ = false;
     bool finished_ = false;
@@ -604,6 +616,7 @@ void handleConn(const ConnCtx& cx, SOCKET s) {
     const std::string method(nextTok());
     const std::string_view target = nextTok();
     if (method.empty() || target.empty()) return sendAll(w, errorResponse(400, "malformed request line"));
+    w.setHttp10(nextTok() == "HTTP/1.0");
     std::string path(target.substr(0, target.find('?')));
     std::size_t content_len = 0;
     bool have_len = false;

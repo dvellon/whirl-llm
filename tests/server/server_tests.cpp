@@ -875,6 +875,41 @@ void testHttpStuckReader() {
     CHECK_EQ(srv.post("/v1/completions", completionBody(makePrompt(32, 73), 8)).status, 200);
 }
 
+// REVIEW-022 F2: an HTTP/1.0 request must not get Transfer-Encoding (RFC 9112 section 6.1). Since HTTP-DROP an
+// SSE stream is chunked for HTTP/1.1; for HTTP/1.0 it goes out unframed and ends at the server's close, as
+// before. Both streams carry the events and end with [DONE].
+void testHttpStream10() {
+    ServerSetup su = baseSetup();
+    TestServer srv(su);
+    const std::string body = completionBody(makePrompt(64, 91), 8, true);
+    for (const char* ver : {"HTTP/1.0", "HTTP/1.1"}) {
+        const auto s = test::rawConnect("127.0.0.1", srv.port());
+        CHECK(s != test::kNoSock);
+        if (s == test::kNoSock) continue;
+        test::rawSend(s, std::string("POST /v1/completions ") + ver + "\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: " +
+                             std::to_string(body.size()) + "\r\n\r\n" + body);
+        bool closed = false;
+        const std::string resp = test::rawRecvAll(s, 20, &closed);
+        test::rawClose(s);
+        const std::size_t he = resp.find("\r\n\r\n");
+        std::string h = resp.substr(0, he == std::string::npos ? 0 : he + 2);
+        for (auto& ch : h) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        const bool te = h.find("\r\ntransfer-encoding: chunked\r\n") != std::string::npos;
+        const std::string b = he == std::string::npos ? std::string() : resp.substr(he + 4);
+        CHECK_EQ(rawStatus(resp), 200);
+        CHECK(closed);
+        CHECK(b.find("data: [DONE]") != std::string::npos);
+        if (std::string_view(ver) == "HTTP/1.0") {
+            CHECK(!te);
+            CHECK(b.starts_with("data: "));  // no chunk-size line in front of the events
+        } else {
+            CHECK(te);
+            CHECK(b.ends_with("0\r\n\r\n"));  // the last chunk
+        }
+        if (g_verbose) std::printf("  %s stream: %zu bytes, chunked %d\n", ver, resp.size(), te ? 1 : 0);
+    }
+}
+
 // HTTP-DROP: a connect to the server that is never answered (WSAETIMEDOUT after 21 s, seen in the
 // server gate about once per 200 requests). The server closed every connection first, so the server
 // side of each finished connection sat in TIME_WAIT for 120 s; a new connection from the same client
@@ -3616,6 +3651,7 @@ int main(int argc, char** argv) {
         {"http_conn_cap", testHttpConnCap},
         {"http_stuck_reader", testHttpStuckReader},
         {"http_port_reuse", testHttpPortReuse},
+        {"http_stream10", testHttpStream10},
         {"cors", testCors},
         {"greedy_reference", testGreedyMatchesReference},
         {"stream", testStreamEqualsNonStream},

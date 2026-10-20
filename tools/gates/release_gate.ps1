@@ -123,6 +123,8 @@ AddStep "srv_fast" $true (GateCmd $SW "basic,mt_cache" "fast" $ssdOff) $gateRule
 AddStep "srv_precise_cli" $true (GateCmd $SW "basic" "precise" ($ssdOff + @("--cli", $exe["whirl"]))) $gateRule
 # precise multi-turn sessions with the prefix cache == cold prefill, bitwise (COLD-RESUME; the suite sets WHIRL_MODE=precise)
 AddStep "srv_mt_precise" $true (GateCmd $SW "mt_cache_precise" "" $ssdOff) $gateRule
+# the same for the MoE product model (REVIEW-022 F5: the precise cache-hit guarantee is documented for every model)
+AddStep "srv_mt_precise_moe" $true (GateCmd $MX "mt_cache_precise" "" $ssdOff) $gateRule
 AddStep "srv_fs_swift" $true (GateCmd $SW "fast_stream" "" $ssdOff) $gateRule
 AddStep "srv_fs_moe" $true (GateCmd $MX "fast_stream" "" $ssdOff) $gateRule
 # the cache suites run their own SSD dirs under --work (deleted after the step)

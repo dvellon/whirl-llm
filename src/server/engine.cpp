@@ -1615,7 +1615,9 @@ void Engine::finishPrefill(Slot& sl) {
         float mc = -std::numeric_limits<float>::infinity(), mf = mc;
         std::size_t ac = 0, af = 0;
         float maxd = 0;
+        std::size_t ndiff = 0;  // logits whose bits differ (max abs diff prints 4 decimals, KL can underflow)
         for (std::size_t j = 0; j < V; ++j) {
+            if (std::memcmp(&cached[j], &fresh[j], sizeof(float)) != 0) ++ndiff;
             if (cached[j] > mc) {
                 mc = cached[j];
                 ac = j;
@@ -1638,8 +1640,8 @@ void Engine::finishPrefill(Slot& sl) {
             if (pf > 0) kl += pf * (std::log(pf) - std::log(std::max(pc, 1e-300)));
         }
         logI("req {} | slot {} | prefix-cache verify: cached vs from-scratch prefill logits: max abs diff {:.4f}, KL {:.2e}, "
-             "top1 {} ({} vs {})",
-             job.id, sl.id, maxd, kl, ac == af ? "same" : "DIFFERENT", ac, af);
+             "top1 {} ({} vs {}), bitwise differing logits {}",
+             job.id, sl.id, maxd, kl, ac == af ? "same" : "DIFFERENT", ac, af, ndiff);
         // continue from the from-scratch state (the prompt-end checkpoint below is saved from it)
         if (sl.greedy) {
             first = m_.argmax();
