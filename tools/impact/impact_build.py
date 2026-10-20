@@ -106,6 +106,9 @@ GATE_SUITES = {
     "tier":         ["cache.spill", "cache.restore", "cache.fingerprint", "cache.prefix"],
     "sys":          ["cache.prefix", "cache.spill", "cache.restore"],
     "restore_conc": ["cache.restore", "cache.spill"],
+    "sys_burst":    ["cache.prefix", "server.loop", "http"],      # CB-FLAKE repro suites (diagnostic, not in release_gate)
+    "sys_d":        ["cache.prefix", "cache.restore", "server.loop", "http"],
+    "http_stress":  ["http", "server.loop"],
     "vis":          ["vision"],
     "fast_stream":  ["server.decode", "server.mtp", "http"],
     "golden":       ["server.prefill", "server.decode", "server.mtp", "server.loop", "cache.prefix", "cache.restore", "cache.spill",
