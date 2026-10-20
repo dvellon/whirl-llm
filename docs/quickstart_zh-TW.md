@@ -11,9 +11,9 @@
 | GPU | **AMD Radeon AI PRO R9700**（RDNA 4，gfx1201，32 GB）或 **Radeon 8060S**（RDNA 3.5，gfx1151，Ryzen AI Max+ 395）。一個行程一張 GPU；其他 GPU 不在正式支援範圍 |
 | 作業系統 | Windows 11，64 位元 |
 | 驅動程式 | **AMD Software: Adrenalin Edition 26.8.1（驅動程式 32.0.31041.1004）或更新版**，兩張卡相同；更舊的版本未測試 |
-| 其他都不需要 | 不用 HIP SDK、不用 ROCm、不用 Visual C++ 可轉散發套件、不用 Python、不用 WSL |
+| 其他都不需要 | 不用 HIP SDK、不用 ROCm、不用另外安裝 Visual C++ 可轉散發套件、不用 Python、不用 WSL |
 
-驅動程式會安裝 WHIRL 用到的兩個 AMD runtime 檔（`amdhip64_7.dll`、`amd_comgr_3.dll`）。zip 裡另附 AMD 的 `rocm_kpack.dll`：Adrenalin Edition for ROCm 10.1 驅動的 GPU runtime 需要它，但該驅動沒有安裝，所以請讓它留在 `whirl.exe` 旁邊。
+驅動程式會安裝 WHIRL 用到的兩個 AMD runtime 檔（`amdhip64_7.dll`、`amd_comgr_3.dll`）。zip 裡另附 AMD 的 `rocm_kpack.dll`：Adrenalin Edition for ROCm 10.1 驅動的 GPU runtime 需要它，但該驅動沒有安裝，所以請讓它留在 `whirl.exe` 旁邊；它用到的三個 Microsoft Visual C++ 執行階段 DLL（`msvcp140.dll`、`vcruntime140.dll`、`vcruntime140_1.dll`）也基於同樣原因附在 zip 裡，一併保留。
 
 ## 2. 下載
 
