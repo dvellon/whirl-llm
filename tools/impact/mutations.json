@@ -1,0 +1,29 @@
+{
+  "_doc": "Mutations for tools/impact/mutate.py (audit/ARCH-1_modules.md 8.4). run = the --cmd key that builds and runs the module's tests; expect_test = exe:test the impact map must list for the mutated diff. Add one per module as modules appear (ops, device, config), and one per fixed bug (re-introduce it with kind revert).",
+  "mutations": [
+    {"id": "fingerprint-diag-env", "module": "cache.fingerprint", "kind": "replace", "file": "src/cache/fingerprint.cpp",
+     "find": "\"WHIRL_TIMER_PROBE\", \"WHIRL_PREFIX_CACHE_VERIFY\"};", "replace": "\"WHIRL_TIMER_PROBE\"};",
+     "what": "re-introduce today's bug: the diagnostic WHIRL_PREFIX_CACHE_VERIFY enters the SSD tier fingerprint",
+     "run": "cache", "expect_test": "whirl-cache-tests:testFingerprint"},
+    {"id": "tier-dedup-race", "module": "cache.spill", "kind": "revert", "commit": "bf31527", "file": "src/tier/kv_tier.cpp",
+     "what": "re-introduce today's bug: dedup skips a finished, not yet reaped base write (revert bf31527)",
+     "run": "tier", "expect_test": "whirl-tier-tests:testDedupFinishedUnreaped"},
+    {"id": "prefix-lcp-full-match", "module": "cache.prefix", "kind": "replace", "file": "src/cache/prefix_cache.cpp",
+     "find": "    while (i < n && a[i] == b[i]) ++i;\n    return i;\n}",
+     "replace": "    while (i < n && a[i] == b[i]) ++i;\n    return i > 0 && i == n ? i - 1 : i;\n}",
+     "what": "longest common prefix one short when one token list is a prefix of the other",
+     "run": "cache", "expect_test": "whirl-cache-tests:testMatchSlot"},
+    {"id": "supersede-near-end-inverted", "module": "cache.prefix", "kind": "replace", "file": "src/cache/prefix_cache.cpp",
+     "find": "    return static_cast<double>(tail) < need;", "replace": "    return static_cast<double>(tail) > need;",
+     "what": "supersede rule: near-end divergence (retry / edit) test inverted",
+     "run": "cache", "expect_test": "whirl-cache-tests:testSupersede"},
+    {"id": "tier-verify-blind", "module": "cache.restore", "kind": "replace", "file": "src/tier/kv_tier.cpp",
+     "find": "if (std::memcmp(scratch.data(), host, p.len) != 0) v.bad += 1;", "replace": "if (std::memcmp(scratch.data(), host, p.len) != 0) v.bad += 0;",
+     "what": "restore verification (verifyPieces) never reports a mismatching piece",
+     "run": "tier", "expect_test": "whirl-tier-tests:testRestoreRam"},
+    {"id": "tier-blockhash-constant", "module": "cache.spill", "kind": "replace", "file": "src/tier/kv_tier.cpp",
+     "find": "constexpr std::uint64_t m0 = 0xff51afd7ed558ccdull", "replace": "constexpr std::uint64_t m0 = 0xff51afd7ed558ccfull",
+     "what": "SSD block hash constant changed (files written by an older build no longer match)",
+     "run": "tier", "expect_test": "whirl-tier-tests:testSsd"}
+  ]
+}
