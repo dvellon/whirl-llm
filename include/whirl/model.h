@@ -470,6 +470,9 @@ struct MSeg {
 struct BatchPlan {
     std::span<const VSeg> segs;
     std::array<std::uint32_t, gdn_max_seg> snap_base{};
+    bool tree_dag = false;
+    std::uint32_t tree_alt_row = 0;
+    std::uint32_t tree_alt_base = 0;
 };
 
 // Host-only contract for the opt-in single-slot beam2:7 verify graph.  The
@@ -526,6 +529,9 @@ public:
     // deliberately narrower than use_graph: only the fixed beam2:7 tree
     // verify is captured, while set_rows remains a normal dynamic launch.
     bool tree_verify_graph = false;
+    // Experimental exact tree verifier: computes the shared beam root once
+    // and projects the ten unique rows back to the public 11-row ABI.
+    bool tree_verify_dag = false;
     bool head_phase = false;
     bool no_fuse = false;
     std::uint32_t row_n = 0;

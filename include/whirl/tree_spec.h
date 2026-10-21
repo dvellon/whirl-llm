@@ -49,6 +49,30 @@ struct Plan {
         return b == 0 ? 0u : branch[0].n + 1;
     }
     std::uint32_t rows() const { return branch[0].n + branch[1].n + branches; }
+
+    // Dense target work needs only one copy of the shared root.  The public
+    // row layout above deliberately remains two ordinary linear verifies so
+    // acceptance, diagnostics, and control-buffer ABI do not change.  These
+    // helpers define the lossless DAG projection used by the optimized
+    // verifier: branch 0 is [0 .. n0], branch 1 reuses row 0 and owns
+    // [n0 + 1 .. n0 + n1].
+    std::uint32_t uniqueRows() const {
+        if (!valid()) throw std::invalid_argument("invalid tree plan");
+        return branch[0].n + branch[1].n + 1;
+    }
+    std::uint32_t uniqueRow(std::uint32_t b, std::uint32_t local) const {
+        if (!valid()) throw std::invalid_argument("invalid tree plan");
+        if (b >= branches) throw std::out_of_range("tree branch");
+        if (local > branch[b].n) throw std::out_of_range("tree branch row");
+        if (b == 0 || local == 0) return local;
+        return branch[0].n + local;
+    }
+    std::uint32_t uniqueRowFromExpanded(std::uint32_t row) const {
+        if (!valid()) throw std::invalid_argument("invalid tree plan");
+        if (row >= rows()) throw std::out_of_range("tree expanded row");
+        if (row <= branch[0].n) return row;
+        return uniqueRow(1, row - row0(1));
+    }
 };
 
 struct Accept {

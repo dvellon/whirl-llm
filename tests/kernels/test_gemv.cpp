@@ -207,6 +207,21 @@ void testGemv(Ctx& c) {
             c.rep.add(cmpExact("ggemvq_nt11r2w16_mxfp4 (3 segments) == 1-token " + m.name,
                                gotg, wantg, Kind::invariant));
         }
+        if (m.type == QType::mxfp4 && c.k.gemvq_nt10r2w16_mxfp4 != nullptr) {
+            constexpr int nt = 10;
+            const int nr = nrows - 7;
+            Buf yp(static_cast<std::size_t>(nt) * nr * 4);
+            hip::launch(c.k.gemvq_nt10r2w16_mxfp4, {cdiv(nr, 16), 1, 1}, {512, 1, 1}, 0, c.s,
+                        w.p(), m.row_bytes, xq.p(), xd.p(), yp.p(), ncols, nr, 0, DevPtr{0});
+            c.sync();
+            std::vector<float> wantp;
+            wantp.reserve(static_cast<std::size_t>(nt) * nr);
+            for (int t = 0; t < nt; ++t)
+                wantp.insert(wantp.end(), ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows,
+                             ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + nr);
+            c.rep.add(cmpExact("gemvq_nt10r2w16_mxfp4 == 1-token (partial block) " + m.name,
+                               yp.down<float>(wantp.size()), wantp, Kind::invariant));
+        }
 
         // accumulate: y = y0 + v exactly
         {
@@ -455,6 +470,37 @@ void testGemv(Ctx& c) {
         } else {
             c.rep.skip("data", "gemvq_nt11r2w16_q6_k",
                        "MXFP4 model Q6_K output.weight not available");
+        }
+    }
+    if (c.k.gemvq_nt10r2w16_q6_k != nullptr) {
+        const whirl::gguf::File* f = c.open(c.models.mx);
+        const auto* ht = f ? f->tensor("output.weight") : nullptr;
+        if (ht != nullptr) {
+            constexpr int nt = 10;
+            HostMat head = loadMat(*f, "output.weight", 0, c.quick ? 257 : 1025);
+            if (head.type != QType::q6_k) {
+                c.rep.skip("data", "gemvq_nt10r2w16_q6_k", "MXFP4 model output.weight is not Q6_K");
+                return;
+            }
+            const int ncols = head.ncols, nrows = head.nrows;
+            Buf w(head.data);
+            const std::vector<float> x = c.randn(static_cast<std::size_t>(nt) * ncols);
+            Buf dx(x), xq(static_cast<std::size_t>(nt) * ncols),
+                xd(static_cast<std::size_t>(nt) * ncols / 32 * 4);
+            hip::launch(c.k.quantize_q8, {cdiv(static_cast<std::uint64_t>(nt) * ncols, 256), 1, 1},
+                        {256, 1, 1}, 0, c.s, dx.p(), xq.p(), xd.p(), nt * ncols);
+            Buf ref(static_cast<std::size_t>(nt) * nrows * 4), got(static_cast<std::size_t>(nt) * nrows * 4);
+            for (int t = 0; t < nt; ++t)
+                gemvq1(c, QType::q6_k, w, head.row_bytes, nrows,
+                       xq.p() + static_cast<std::uint64_t>(t) * ncols,
+                       xd.p() + static_cast<std::uint64_t>(t) * (ncols / 32) * 4,
+                       ref.p() + static_cast<std::uint64_t>(t) * nrows * 4, ncols, 0);
+            hip::launch(c.k.gemvq_nt10r2w16_q6_k, {cdiv(nrows, 16), 1, 1}, {512, 1, 1}, 0, c.s,
+                        w.p(), head.row_bytes, xq.p(), xd.p(), got.p(), ncols, nrows, 0, DevPtr{0});
+            c.sync();
+            const std::size_t count = static_cast<std::size_t>(nt) * nrows;
+            c.rep.add(cmpExact("gemvq_nt10r2w16_q6_k output.weight == 1-token (partial block)",
+                               got.down<float>(count), ref.down<float>(count), Kind::invariant));
         }
     }
 }

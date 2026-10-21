@@ -72,6 +72,33 @@ void testTreeSpecPlan() {
     p8a1.branch[1].n = 1;
     check(p8a1.valid() && p8a1.rows() == 11 && p8a1.row0(1) == 9,
           "tree spec: beam2 depth8x1 reallocates one alternate node to the primary at the same 11-row budget");
+    check(p8a1.uniqueRows() == 10 && p8a1.uniqueRow(0, 0) == 0 && p8a1.uniqueRow(0, 8) == 8 &&
+              p8a1.uniqueRow(1, 0) == 0 && p8a1.uniqueRow(1, 1) == 9,
+          "tree DAG: depth8x1 computes ten unique rows and shares the root exactly");
+    constexpr std::array<std::uint32_t, 11> expanded_to_unique{0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 9};
+    bool projection_exact = true;
+    for (std::uint32_t r = 0; r < expanded_to_unique.size(); ++r)
+        projection_exact = projection_exact && p8a1.uniqueRowFromExpanded(r) == expanded_to_unique[r];
+    check(projection_exact, "tree DAG: 11-row public layout projects losslessly onto ten unique target rows");
+
+    bool bad_dag_branch = false, bad_dag_local = false, bad_dag_expanded = false;
+    try {
+        (void)p8a1.uniqueRow(ts::branches, 0);
+    } catch (const std::out_of_range&) {
+        bad_dag_branch = true;
+    }
+    try {
+        (void)p8a1.uniqueRow(1, 2);
+    } catch (const std::out_of_range&) {
+        bad_dag_local = true;
+    }
+    try {
+        (void)p8a1.uniqueRowFromExpanded(p8a1.rows());
+    } catch (const std::out_of_range&) {
+        bad_dag_expanded = true;
+    }
+    check(bad_dag_branch && bad_dag_local && bad_dag_expanded,
+          "tree DAG: invalid branches and row mappings fail closed");
 
     std::array<std::uint32_t, 10> target = {10, 99, 0, 0, 0, 20, 21, 77, 0, 0};
     auto a = ts::accept(p, target, 8);

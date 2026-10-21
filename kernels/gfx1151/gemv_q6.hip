@@ -153,12 +153,12 @@ __device__ void gemvw6_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, c
 // eight-way reduction, retaining exactly
 //   (q0 + q1) + (q2 + q3)
 // and the legacy wave reduction order.
-__device__ __forceinline__ void gemvw6_nt11_r2_w16_impl(
+template<int NT>
+__device__ __forceinline__ void gemvw6_nt_r2_w16_impl(
     const uint8_t *__restrict__ W, uint64_t row_bytes, const int8_t *__restrict__ xq,
     const float *__restrict__ xd, float *__restrict__ y, int ncols, int nrows, int accumulate,
     const int *__restrict__ skip, int bid = -1) {
-    constexpr int NT = 11;
-    constexpr int NTV = 6;
+    constexpr int NTV = (NT + 1) / 2;
     constexpr int ROWS = 16;
     __shared__ float red[2][8][NT][ROWS];
     if (skip != nullptr && *skip) return;
@@ -439,26 +439,52 @@ extern "C" __global__ void __launch_bounds__(512)
     gemvq_nt11r2w16_mxfp4(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
                           const float *xd, float *y, int ncols, int nrows,
                           int accumulate, const int *skip) {
-    gemvw_mx_nt11_r2_w16_impl(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
+    gemvw_mx_nt_r2_w16_impl<11>(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
 }
 extern "C" __global__ void __launch_bounds__(512)
     ggemvq_nt11r2w16_mxfp4(GV_PARAMS) {
     const GvSel gs = gv_sel(g);
-    gemvw_mx_nt11_r2_w16_impl(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
-                              accumulate, skip, gs.b);
+    gemvw_mx_nt_r2_w16_impl<11>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
+                                accumulate, skip, gs.b);
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+    gemvq_nt10r2w16_mxfp4(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
+                          const float *xd, float *y, int ncols, int nrows,
+                          int accumulate, const int *skip) {
+    gemvw_mx_nt_r2_w16_impl<10>(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
+}
+extern "C" __global__ void __launch_bounds__(512)
+    ggemvq_nt10r2w16_mxfp4(GV_PARAMS) {
+    const GvSel gs = gv_sel(g);
+    gemvw_mx_nt_r2_w16_impl<10>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
+                                accumulate, skip, gs.b);
 }
 
 extern "C" __global__ void __launch_bounds__(512)
     gemvq_nt11r2w16_q6_k(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
                          const float *xd, float *y, int ncols, int nrows,
                          int accumulate, const int *skip) {
-    gemvw6_nt11_r2_w16_impl(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
+    gemvw6_nt_r2_w16_impl<11>(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
 }
 extern "C" __global__ void __launch_bounds__(512)
     ggemvq_nt11r2w16_q6_k(GV_PARAMS) {
     const GvSel gs = gv_sel(g);
-    gemvw6_nt11_r2_w16_impl(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
-                            accumulate, skip, gs.b);
+    gemvw6_nt_r2_w16_impl<11>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
+                              accumulate, skip, gs.b);
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+    gemvq_nt10r2w16_q6_k(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
+                         const float *xd, float *y, int ncols, int nrows,
+                         int accumulate, const int *skip) {
+    gemvw6_nt_r2_w16_impl<10>(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
+}
+extern "C" __global__ void __launch_bounds__(512)
+    ggemvq_nt10r2w16_q6_k(GV_PARAMS) {
+    const GvSel gs = gv_sel(g);
+    gemvw6_nt_r2_w16_impl<10>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
+                              accumulate, skip, gs.b);
 }
 
 // KLIB-1 (opt-in, WHIRL_Q3K_U16=1): multi-row entries of the Q3_K llama.cpp-split variant

@@ -101,8 +101,15 @@ struct GdnSeg {
     // applied to the state first and the state is written once (the new base),
     // then the new rows run without writing state or snapshots
     float *pend;
-    int npend, pad_;
+    int npend, row1;
 };
+
+// A positive row1 encodes the exact tree DAG's [shared root, alternate
+// suffix] segment without copying the dense root row.  Ordinary segments keep
+// row1 zero and retain their contiguous layout.
+__device__ __forceinline__ int gdn_row(const GdnSeg &sg, int local) {
+    return sg.row1 > 0 && local > 0 ? sg.row1 + local - 1 : sg.row0 + local;
+}
 struct GdnSegs {
     GdnSeg s[GDN_MAX_SEG];
 };
@@ -116,7 +123,7 @@ __device__ __forceinline__ void gdn_conv_l2_impl(const float *xin, const float *
                                                  float eps, const GdnSegs &segs, int cb, int seg, bool act) {
     const GdnSeg &sg = segs.s[seg];
     float *state = sg.state;
-    const int r0 = sg.row0, n_tok = sg.nrows;
+    const int n_tok = sg.nrows;
     const int c = cb * 128 + (act ? (int)threadIdx.x : 0);
     float h0 = 0.f, h1 = 0.f, h2 = 0.f;
     float4 wv = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -140,7 +147,8 @@ __device__ __forceinline__ void gdn_conv_l2_impl(const float *xin, const float *
     for (int t = 0; t < n_tok; ++t) {
         float v = 0.f;
         if (act) {
-            const float xn = xin[(size_t)(r0 + t) * ch + c];
+            const int row = gdn_row(sg, t);
+            const float xn = xin[(size_t)row * ch + c];
             if (pend != nullptr) pend[(size_t)t * ch + c] = xn;
             // explicit fmas = the contraction the original kernel compiled to, so the
             // result does not depend on how the compiler contracts it here
@@ -160,7 +168,9 @@ __device__ __forceinline__ void gdn_conv_l2_impl(const float *xin, const float *
             const float ss = block_sum(v * v);
             v *= rsqrtf(ss + eps);
         }
-        if (act) out[(size_t)(r0 + t) * ch + c] = v;
+        // The primary segment owns the shared root output.  The alternate
+        // segment replays it only to build its recurrent state and pend row.
+        if (act && !(sg.row1 > 0 && t == 0)) out[(size_t)gdn_row(sg, t) * ch + c] = v;
     }
     if (act && pend == nullptr) {
         state[c] = h0;
@@ -184,7 +194,7 @@ extern "C" __global__ void __launch_bounds__(512)
                   GdnSegs segs) {
     constexpr int DK = 128, DV = 128, QI = 4, PER = DK / QI;
     const GdnSeg &sgm = segs.s[blockIdx.y];
-    const int r0 = sgm.row0, n_tok = sgm.nrows;
+    const int n_tok = sgm.nrows;
     const int h = blockIdx.x;
     const int j = threadIdx.x % DV, qi = threadIdx.x / DV;
     const int kh = h % n_k_heads;
@@ -224,7 +234,7 @@ extern "C" __global__ void __launch_bounds__(512)
         for (int e = 0; e < PER; ++e) Sg[(size_t)(qi * PER + e) * DV + j] = S[e];
     }
     for (int tl = 0; tl < n_tok; ++tl) {
-        const int t = r0 + tl;
+        const int t = gdn_row(sgm, tl);
         const float *row = qkv + (size_t)t * qkv_stride;
         __syncthreads();
         if (threadIdx.x < DK) {
@@ -278,7 +288,7 @@ extern "C" __global__ void __launch_bounds__(512)
         float y = 0.f;
         if (threadIdx.x < DV) y = ov[threadIdx.x];
         const float ss = block_sum(threadIdx.x < DV ? y * y : 0.f);
-        if (threadIdx.x < DV) {
+        if (threadIdx.x < DV && !(sgm.row1 > 0 && tl == 0)) {
             const float r = rsqrtf(ss / DV + eps);
             const float zz = z[(size_t)t * d_inner + (size_t)h * DV + threadIdx.x];
             y = y * r * wn[threadIdx.x] * (zz / (1.f + __expf(-zz)));

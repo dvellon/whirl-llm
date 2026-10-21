@@ -75,6 +75,8 @@
 //   attn_dq4 (gfx1151 / gfx1201, q4 KV; attn_wsplit1 arguments, block 256, one query per group, n_head / n_kv <= 8)
 //   attn_prep[_q8|_q8h|_q8v](qf, kk, vv, qw, kw, KvArgs, pos, n_head, n_kv,
 //            hd, n_rot, theta_scale, eps)
+//   attn_prep_tree[_q8|_q8h|_q8v|_q4](... attn_prep args ..., int alternate_tab):
+//            as the matching attn_prep variant, and stores row zero's K/V into alternate_tab too
 //   attn_prefill_wmma[_q8|_q8v], attn_kx[_q8|_q8v](q, KvArgs, out, n_head,
 //            n_kv, q_stride, pos, n_tok, scale, int h0)
 //   attn_kg6 / attn_kg4 / attn_kg2[_q8|_q8v] (f16 / q8 / q8h / q8v KV; same arguments; grid
@@ -348,7 +350,10 @@ struct GdnSeg {
     std::int32_t nrows = 0;
     DevPtr pend = 0;
     std::int32_t npend = 0;
-    std::int32_t pad_ = 0;
+    // Optional non-contiguous suffix row.  Zero is the ordinary contiguous
+    // layout.  A positive value maps local rows t > 0 to row1 + t - 1 while
+    // local row zero remains row0; the tree DAG uses [root, alternate].
+    std::int32_t row1 = 0;
 };
 struct GdnSegs {
     GdnSeg s[kGdnMaxSeg] = {};
@@ -465,9 +470,11 @@ struct KernelTable {
     // selected only by WHIRL_MXFP4_NT11_W16=1; the legacy r2 entry remains
     // the default/fallback.
     F gemvq_nt11r2w16_mxfp4{}, gemvq_nt11r2w16_mxfp4_g{};
+    F gemvq_nt10r2w16_mxfp4{}, gemvq_nt10r2w16_mxfp4_g{};
     // Experimental gfx1151 Q6_K output-head NT=11/r2 16-wave geometry.
     // Optional and selected only by WHIRL_Q6K_HEAD_NT11_W16=1.
     F gemvq_nt11r2w16_q6_k{}, gemvq_nt11r2w16_q6_k_g{};
+    F gemvq_nt10r2w16_q6_k{}, gemvq_nt10r2w16_q6_k_g{};
     std::array<Nt, kNGemvw> gemvw{}, gemvw_g{};      // [v][nt - 2][type], v = 1..8
     std::array<PerType<F>, kGemmCfgs.size()> gemmc{};
     std::array<PerType<F>, kGemmsCfgs.size()> gemms{}, gemmsh{};
@@ -485,7 +492,7 @@ struct KernelTable {
     std::array<F, kGemmCfgs.size()> gemmch{};
 
     F rmsnorm{}, l2norm{}, add_inplace{}, silu_mul{}, rope_neox{};
-    F attn_decode{}, kv_store{}, attn_split{}, attn_combine{}, attn_prep{}, attn_combine_q8{};
+    F attn_decode{}, kv_store{}, attn_split{}, attn_combine{}, attn_prep{}, attn_prep_tree{}, attn_combine_q8{};
     F attn_wsplit1{}, attn_wsplit2{}, attn_prefill_wmma{}, attn_kx{};
     F attn_dq4{};  // q4 KV decode / verify (gfx1151 / gfx1201; null if not built): attn_wsplit1 arguments, 256 threads
     F attn_ws4{};  // gfx1151 4-wave pipelined attn_wsplit1 (same arguments / bits, one query per group): decode rows (WHIRL_ATTN_WS4=0: old path)

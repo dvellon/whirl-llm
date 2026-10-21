@@ -452,7 +452,7 @@ extern "C" __global__ void attn_combine(const float *part_ml, const float *part_
 template <int Q8, bool ROT = false, bool MR = false>
 __device__ __forceinline__ void attn_prep_impl(float *qf, float *kk, const float *vv, const float *qw, const float *kw, const KvArgs &kv,
               const int *pos, int n_head, int n_kv, int hd, int n_rot, float theta_scale, float eps,
-              const int *rpos = nullptr, int rdelta = 0, int s1 = 0, int s2 = 0) {
+              const int *rpos = nullptr, int rdelta = 0, int s1 = 0, int s2 = 0, int tree_alt_tab = -1) {
     __shared__ float nv[512];
     const int hb = blockIdx.x, t = blockIdx.y;
     const bool isq = hb < n_head;
@@ -517,10 +517,15 @@ __device__ __forceinline__ void attn_prep_impl(float *qf, float *kk, const float
     // single sequence: consecutive positions from pos[0]; batched rows: pos[t]
     const int lp = kv.kvbase == nullptr ? pos[0] + t : pos[t];
     const size_t prow = (size_t)kv_row(kv, kv_tb(kv, t), lp);
+    const size_t aprow = tree_alt_tab >= 0 && t == 0 ? (size_t)kv_row(kv, tree_alt_tab, lp) : prow;
     const float *vr = vv + (size_t)t * row + (size_t)h * hd;
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {  // hd % 32 == 0: whole waves per scale group
         kv_st32<kv_kf(Q8)>(kv.k, kv.ks, prow * row + (size_t)h * hd + d, nv[d]);
         kv_st32<kv_vf(Q8)>(kv.v, kv.vs, prow * row + (size_t)h * hd + d, vr[d]);
+        if (aprow != prow) {
+            kv_st32<kv_kf(Q8)>(kv.k, kv.ks, aprow * row + (size_t)h * hd + d, nv[d]);
+            kv_st32<kv_vf(Q8)>(kv.v, kv.vs, aprow * row + (size_t)h * hd + d, vr[d]);
+        }
     }
 }
 extern "C" __global__ void __launch_bounds__(256)
@@ -534,6 +539,17 @@ extern "C" __global__ void __launch_bounds__(256)
     attn_prep_impl<true>(qf, kk, vv, qw, kw, kv, pos, n_head, n_kv, hd, n_rot, theta_scale, eps);
 }
 
+// Exact beam-tree prep.  Dense Q/K/V projections contain one shared root;
+// write that root's K/V to both branch page tables while rotating/norming Q/K
+// only once.  The remaining unique rows use their ordinary per-row kvbase.
+extern "C" __global__ void __launch_bounds__(256)
+    attn_prep_tree(float *qf, float *kk, const float *vv, const float *qw, const float *kw, KvArgs kv,
+                   const int *pos, int n_head, int n_kv, int hd, int n_rot, float theta_scale, float eps,
+                   int alternate_tab) {
+    attn_prep_impl<false>(qf, kk, vv, qw, kw, kv, pos, n_head, n_kv, hd, n_rot, theta_scale, eps,
+                          nullptr, 0, 0, 0, alternate_tab);
+}
+
 // ROT: rotate every q and k head by the orthonormal Walsh-Hadamard transform after
 // RoPE (q.k unchanged in exact arithmetic): K outlier channels spread over the head,
 // so the per-32 int scales fit better. Every attention path reads q from qf and K
@@ -542,6 +558,21 @@ extern "C" __global__ void __launch_bounds__(256)
 ATTN_PREP_ENTRY(attn_prep_q8h, 1, true)
 ATTN_PREP_ENTRY(attn_prep_q8v, 2, false)  // K f16 (not rotated), V int8
 ATTN_PREP_ENTRY(attn_prep_q4, 3, true)
+
+// Tree-DAG variants use the same cache encodings as the ordinary prep
+// kernels. The only semantic difference is that the unique root is stored
+// into both branch page tables.
+#define ATTN_PREP_TREE_ENTRY(NAME, Q8, ROT)                                                                            \
+    extern "C" __global__ void __launch_bounds__(256)                                                                 \
+        NAME(float *qf, float *kk, const float *vv, const float *qw, const float *kw, KvArgs kv, const int *pos,       \
+             int n_head, int n_kv, int hd, int n_rot, float theta_scale, float eps, int alternate_tab) {               \
+        attn_prep_impl<Q8, ROT>(qf, kk, vv, qw, kw, kv, pos, n_head, n_kv, hd, n_rot, theta_scale, eps,                \
+                                nullptr, 0, 0, 0, alternate_tab);                                                       \
+    }
+ATTN_PREP_TREE_ENTRY(attn_prep_tree_q8, 1, false)
+ATTN_PREP_TREE_ENTRY(attn_prep_tree_q8h, 1, true)
+ATTN_PREP_TREE_ENTRY(attn_prep_tree_q8v, 2, false)
+ATTN_PREP_TREE_ENTRY(attn_prep_tree_q4, 3, true)
 
 // vision: the same five with multi-section RoPE positions (see attn_prep_impl MR);
 // argument ABI as kernels/attn.hip ATTN_PREP_M (s0 unused)

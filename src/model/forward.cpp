@@ -150,6 +150,20 @@ void Model::gemvKernels(std::span<const Mat> ws, std::span<const DevPtr> ys, u32
         rows_per_block = 16;
         threads_per_block = 512;
     }
+    if (n == 10 && w.ty == GgmlType::mxfp4 && gemv_r[n] == 2 &&
+        envFlag("MXFP4_NT10_W16", false) && k.gemvq_nt10r2w16_mxfp4 != nullptr) {
+        f = k.gemvq_nt10r2w16_mxfp4;
+        fg = k.gemvq_nt10r2w16_mxfp4_g;
+        rows_per_block = 16;
+        threads_per_block = 512;
+    }
+    if (n == 10 && w.ty == GgmlType::q6_k && w.ptr == output.ptr && gemv_r[n] == 2 &&
+        envFlag("Q6K_HEAD_NT10_W16", false) && k.gemvq_nt10r2w16_q6_k != nullptr) {
+        f = k.gemvq_nt10r2w16_q6_k;
+        fg = k.gemvq_nt10r2w16_q6_k_g;
+        rows_per_block = 16;
+        threads_per_block = 512;
+    }
     // one-token entries always take GvArgs (gv_grp); a multi-token group takes the twin
     const bool twin = n >= 2 && ws.size() > 1 && fg != nullptr && n <= gvNmax(w.ty);
     if (twin) f = fg;
@@ -705,8 +719,14 @@ void Model::attnBlock(const AttnW& a, const KvLayer& lkv, u32 n) {
         x16_src = 0;
     } else if (k.attn_prep != nullptr && (!no_fuse || kv_q8) && hd <= 512) {
         // q/k norm + RoPE + K/V store in one launch (same arithmetic)
-        hip::launch(k.attn_prep, D(cfg.n_head + cfg.n_head_kv, n), D(256), 0, stream, qf, kv_k, kv_v, a.q_norm, a.k_norm, kva, pos_buf,
-                    I(cfg.n_head), I(cfg.n_head_kv), I(hd), I(cfg.n_rot), theta_scale, cfg.eps);
+        if (bplan != nullptr && bplan->tree_dag) {
+            hip::launch(k.attn_prep_tree, D(cfg.n_head + cfg.n_head_kv, n), D(256), 0, stream, qf, kv_k, kv_v, a.q_norm, a.k_norm, kva,
+                        pos_buf, I(cfg.n_head), I(cfg.n_head_kv), I(hd), I(cfg.n_rot), theta_scale, cfg.eps,
+                        I(bplan->tree_alt_base));
+        } else {
+            hip::launch(k.attn_prep, D(cfg.n_head + cfg.n_head_kv, n), D(256), 0, stream, qf, kv_k, kv_v, a.q_norm, a.k_norm, kva, pos_buf,
+                        I(cfg.n_head), I(cfg.n_head_kv), I(hd), I(cfg.n_rot), theta_scale, cfg.eps);
+        }
         xq_src = 0;
         x16_src = 0;
     } else {
@@ -1388,8 +1408,17 @@ GdnSegs Model::gdnSegsBatch(const BatchPlan& bp, std::size_t i, bool conv) const
         const VSeg& sg = bp.segs[kk];
         const Seq& sq = seqs[sg.seq];
         segs.s[kk].state = conv ? sq.conv[i] : sq.ssm[i];
-        segs.s[kk].row0 = row;
-        segs.s[kk].nrows = static_cast<i32>(sg.nd + 1);
+        if (bp.tree_dag && kk == 1) {
+            // Reuse dense row zero as this branch's recurrent root, then jump
+            // to the alternate suffix.  The fused kernels suppress the
+            // duplicate root output while preserving this branch's pend row.
+            segs.s[kk].row0 = 0;
+            segs.s[kk].nrows = static_cast<i32>(sg.nd + 1);
+            segs.s[kk].row1 = static_cast<i32>(bp.tree_alt_row);
+        } else {
+            segs.s[kk].row0 = row;
+            segs.s[kk].nrows = static_cast<i32>(sg.nd + 1);
+        }
         if (gdn_replay) {
             segs.s[kk].pend = pendPtr(sq, i, conv);
             segs.s[kk].npend = static_cast<i32>(sq.npend);
@@ -1448,17 +1477,31 @@ u32 Model::verifyBatchEnqueue(std::span<const VSeg> segs) {
     } snap_reset{snap_rows};
     BatchPlan plan;
     plan.segs = segs;
+    const bool tree_dag = tree_verify_dag && arch == hip::Arch::gfx1151 && !cfg.moe && gdn_replay && fusedDecode() && !visAny() &&
+                          !mrope_on && k.attn_prep_tree != nullptr && cap_buf == 0 && psegs.empty() && cur_seq == 0 &&
+                          gate == 0 && attn_win == 0 && seqs.size() == 3 && segs.size() == 2 && segs[0].seq == 1 && segs[1].seq == 2 &&
+                          segs[0].nd == 8 && segs[1].nd == 1 && segs[0].next == segs[1].next && segs[0].pos == segs[1].pos &&
+                          segs[0].drafts.empty() && segs[1].drafts.empty() && seqs[1].npend == 0 && seqs[2].npend == 0;
+    plan.tree_dag = tree_dag;
+    if (tree_dag) {
+        plan.tree_alt_row = segs[0].nd + 1;
+        plan.tree_alt_base = seqs[segs[1].seq].kv_base;
+    }
     RowTab tab;
     RowIdx dst;
     u32 n = 0;
+    u32 public_n = 0;
     u32 snaps = 0;
     for (std::size_t kk = 0; kk < segs.size(); ++kk) {
         const VSeg& sg = segs[kk];
         if (sg.pos + sg.nd + 1 > max_ctx) throw ModelError("ContextTooLong");
-        if (sg.nd + 1 > max_small_batch || n + sg.nd + 1 > verifyRows()) throw ModelError("BatchTooLarge");
+        const u32 compute_rows = tree_dag && kk == 1 ? sg.nd : sg.nd + 1;
+        if (sg.nd + 1 > max_small_batch || n + compute_rows > verifyRows()) throw ModelError("BatchTooLarge");
         plan.snap_base[kk] = snaps;
         snaps += sg.nd;
         for (u32 r = 0; r < sg.nd + 1; ++r) {
+            dst.v[public_n++] = static_cast<i32>(sg.seq * ctl_words + ctl_rows + r);
+            if (tree_dag && kk == 1 && r == 0) continue;
             // drafts: the sequence's control area (MTP), or literal tokens (n-gram)
             if (r == 0)
                 tab.tok[n] = lookupId(sg.next);
@@ -1468,7 +1511,6 @@ u32 Model::verifyBatchEnqueue(std::span<const VSeg> segs) {
                 tab.tok[n] = -static_cast<i32>(sg.seq * ctl_words + ctl_drafts + r - 1) - 1;
             tab.pos[n] = static_cast<i32>(sg.pos + r);
             tab.base[n] = static_cast<i32>(seqs[sg.seq].kv_base);
-            dst.v[n] = static_cast<i32>(sg.seq * ctl_words + ctl_rows + r);
             n += 1;
         }
     }
@@ -1525,7 +1567,15 @@ u32 Model::verifyBatchEnqueue(std::span<const VSeg> segs) {
         graph_contract.nd = {segs[0].nd, segs[1].nd};
         graph_contract.npend = {seqs[segs[0].seq].npend, seqs[segs[1].seq].npend};
     }
-    if (n == graph_contract.pos.size()) {
+    if (tree_dag && public_n == graph_contract.pos.size()) {
+        u32 gr = 0;
+        for (const VSeg& sg : segs)
+            for (u32 r = 0; r < sg.nd + 1; ++r) {
+                graph_contract.pos[gr] = static_cast<i32>(sg.pos + r);
+                graph_contract.base[gr] = static_cast<i32>(seqs[sg.seq].kv_base);
+                ++gr;
+            }
+    } else if (n == graph_contract.pos.size()) {
         std::copy_n(row_pos.begin(), n, graph_contract.pos.begin());
         std::copy_n(row_base.begin(), n, graph_contract.base.begin());
     } else {
@@ -1534,7 +1584,18 @@ u32 Model::verifyBatchEnqueue(std::span<const VSeg> segs) {
     const bool graph_ok = treeVerifyGraphEligible(graph_contract);
     auto launches = [&] {
         run(n);
-        hip::launch(k.argmax_rows_to, D(n), D(1024), 0, stream, logits, I(cfg.n_vocab), out_tok, dst);
+        if (tree_dag) {
+            const u64 Vb = static_cast<u64>(cfg.n_vocab) * 4;
+            const u64 Eb = static_cast<u64>(cfg.n_embd) * 4;
+            // Restore [primary root..suffix, alternate root..suffix] only
+            // after all ten-row target work.  Consumers retain the existing
+            // 11-row control/logits/hidden ABI.
+            hip::copyAsync(logits + 10 * Vb, logits + 9 * Vb, Vb, stream);
+            hip::copyAsync(logits + 9 * Vb, logits, Vb, stream);
+            hip::copyAsync(hn + 10 * Eb, hn + 9 * Eb, Eb, stream);
+            hip::copyAsync(hn + 9 * Eb, hn, Eb, stream);
+        }
+        hip::launch(k.argmax_rows_to, D(public_n), D(1024), 0, stream, logits, I(cfg.n_vocab), out_tok, dst);
     };
     if (graph_ok) {
         if (!tree_verify_graph_exec) {
@@ -1560,7 +1621,7 @@ u32 Model::verifyBatchEnqueue(std::span<const VSeg> segs) {
     // the kept rows of the previous verify are in the state now
     if (gdn_replay)
         for (const VSeg& sg : segs) seqs[sg.seq].npend = 0;
-    return n;
+    return public_n;
 }
 
 // Batched MTP draft step r over sequences (see the header).

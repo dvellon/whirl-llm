@@ -296,6 +296,7 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
         {&KernelTable::gated_norm_x8, "gated_norm_x8"},
         {&KernelTable::gated_norm_x16, "gated_norm_x16"},
         {&KernelTable::attn_prep, "attn_prep"},
+        {&KernelTable::attn_prep_tree, "attn_prep_tree"},
         {&KernelTable::attn_combine_q8, "attn_combine_q8"},
         {&KernelTable::attn_wsplit1, "attn_wsplit1"},
         {&KernelTable::attn_wsplit2, "attn_wsplit2"},
@@ -332,6 +333,13 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
         k.attn_prep = L.opt(kv == KvFormat::q8h ? "attn_prep_q8h" : "attn_prep_q8");
         k.attn_wsplit1 = L.opt("attn_wsplit1_q8");
         k.attn_wsplit2 = L.opt("attn_wsplit2_q8");
+    }
+    if (kv != KvFormat::f16) {
+        const char* tree_prep = kv == KvFormat::q8v ? "attn_prep_tree_q8v"
+                                : kv == KvFormat::q4 ? "attn_prep_tree_q4"
+                                : kv == KvFormat::q8h ? "attn_prep_tree_q8h"
+                                                     : "attn_prep_tree_q8";
+        k.attn_prep_tree = L.opt(tree_prep);
     }
     const char* kvs = kv == KvFormat::q8v ? "_q8v" : kv == KvFormat::q4 ? "_q4" : kv == KvFormat::f16 ? "" : "_q8";
     k.attn_kx = L.opt(std::string("attn_kx") + kvs);
@@ -396,8 +404,12 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
         }
         k.gemvq_nt11r2w16_mxfp4 = L.opt("gemvq_nt11r2w16_mxfp4");
         k.gemvq_nt11r2w16_mxfp4_g = L.opt("ggemvq_nt11r2w16_mxfp4");
+        k.gemvq_nt10r2w16_mxfp4 = L.opt("gemvq_nt10r2w16_mxfp4");
+        k.gemvq_nt10r2w16_mxfp4_g = L.opt("ggemvq_nt10r2w16_mxfp4");
         k.gemvq_nt11r2w16_q6_k = L.opt("gemvq_nt11r2w16_q6_k");
         k.gemvq_nt11r2w16_q6_k_g = L.opt("ggemvq_nt11r2w16_q6_k");
+        k.gemvq_nt10r2w16_q6_k = L.opt("gemvq_nt10r2w16_q6_k");
+        k.gemvq_nt10r2w16_q6_k_g = L.opt("ggemvq_nt10r2w16_q6_k");
         k.gdn_ab[i] = L.opt("gdn_ab_mxfp4");
         k.gdn_abconv[i] = L.opt("gdn_abconv_mxfp4");
         // routed experts: generic entries + whole-block decode + fp8 grouped GEMM

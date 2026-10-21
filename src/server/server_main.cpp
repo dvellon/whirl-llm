@@ -874,6 +874,7 @@ int serveMain(int argc, char** argv, const char* program) {
         // slots: KV-cache regions, recurrent state, MTP hidden rows
         model.gdn_replay = envOn("GDN_REPLAY", true);
         model.tree_verify_graph = envOn("TREE_VERIFY_GRAPH", false);
+        model.tree_verify_dag = envOn("TREE_VERIFY_DAG", false);
         const hip::MemInfo mem_s0 = hip::memInfo();
         const bool tree_shadow_alloc = tree_requested != 0 && opt.parallel == 1 && use_mtp && !use_dflash && !cfg.moe &&
                                        model.fusedDecode() && !(opt.mmproj || env("MMPROJ"));
@@ -900,6 +901,14 @@ int serveMain(int argc, char** argv, const char* program) {
             else {
                 logW("WHIRL_TREE_VERIFY_GRAPH ignored: it requires active WHIRL_TREE=beam2:7 or beam2:8x1");
                 model.tree_verify_graph = false;
+            }
+        }
+        if (model.tree_verify_dag) {
+            if (tree_depth == 8 && model.k.attn_prep_tree != nullptr)
+                logI("tree verify DAG: on (exact beam2:8x1, ten unique target rows)");
+            else {
+                logW("WHIRL_TREE_VERIFY_DAG ignored: it requires beam2:8x1 and a matching gfx1151 KV-format DAG kernel");
+                model.tree_verify_dag = false;
             }
         }
         if (use_dflash) {

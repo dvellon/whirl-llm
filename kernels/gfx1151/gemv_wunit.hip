@@ -442,12 +442,12 @@ __device__ void gemvw_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, co
 //   ((q0 + q1) + (q2 + q3)) and then ((r0 + r1) + ...) rounding.
 // Keep this a separate symbol until end-to-end timing proves that the extra
 // waves beat the legacy 256-thread kernel.
-__device__ __forceinline__ void gemvw_mx_nt11_r2_w16_impl(
+template<int NT>
+__device__ __forceinline__ void gemvw_mx_nt_r2_w16_impl(
     const uint8_t *__restrict__ W, uint64_t row_bytes, const int8_t *__restrict__ xq,
     const float *__restrict__ xd, float *__restrict__ y, int ncols, int nrows, int accumulate,
     const int *__restrict__ skip, int bid = -1) {
-    constexpr int NT = 11;
-    constexpr int NTV = 6;
+    constexpr int NTV = (NT + 1) / 2;
     constexpr int ROWS = 16;
     __shared__ float red[2][8][NT][ROWS];
     if (skip != nullptr && *skip) return;
