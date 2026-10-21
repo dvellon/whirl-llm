@@ -164,6 +164,20 @@ void Model::gemvKernels(std::span<const Mat> ws, std::span<const DevPtr> ys, u32
         rows_per_block = 16;
         threads_per_block = 512;
     }
+    if (n == 9 && w.ty == GgmlType::mxfp4 && gemv_r[n] == 2 &&
+        envFlag("MXFP4_NT9_W16", false) && k.gemvq_nt9r2w16_mxfp4 != nullptr) {
+        f = k.gemvq_nt9r2w16_mxfp4;
+        fg = k.gemvq_nt9r2w16_mxfp4_g;
+        rows_per_block = 16;
+        threads_per_block = 512;
+    }
+    if (n == 9 && w.ty == GgmlType::q6_k && w.ptr == output.ptr && gemv_r[n] == 2 &&
+        envFlag("Q6K_HEAD_NT9_W16", false) && k.gemvq_nt9r2w16_q6_k != nullptr) {
+        f = k.gemvq_nt9r2w16_q6_k;
+        fg = k.gemvq_nt9r2w16_q6_k_g;
+        rows_per_block = 16;
+        threads_per_block = 512;
+    }
     // one-token entries always take GvArgs (gv_grp); a multi-token group takes the twin
     const bool twin = n >= 2 && ws.size() > 1 && fg != nullptr && n <= gvNmax(w.ty);
     if (twin) f = fg;

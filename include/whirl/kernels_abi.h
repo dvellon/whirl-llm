@@ -471,10 +471,12 @@ struct KernelTable {
     // the default/fallback.
     F gemvq_nt11r2w16_mxfp4{}, gemvq_nt11r2w16_mxfp4_g{};
     F gemvq_nt10r2w16_mxfp4{}, gemvq_nt10r2w16_mxfp4_g{};
+    F gemvq_nt9r2w16_mxfp4{}, gemvq_nt9r2w16_mxfp4_g{};
     // Experimental gfx1151 Q6_K output-head NT=11/r2 16-wave geometry.
     // Optional and selected only by WHIRL_Q6K_HEAD_NT11_W16=1.
     F gemvq_nt11r2w16_q6_k{}, gemvq_nt11r2w16_q6_k_g{};
     F gemvq_nt10r2w16_q6_k{}, gemvq_nt10r2w16_q6_k_g{};
+    F gemvq_nt9r2w16_q6_k{}, gemvq_nt9r2w16_q6_k_g{};
     std::array<Nt, kNGemvw> gemvw{}, gemvw_g{};      // [v][nt - 2][type], v = 1..8
     std::array<PerType<F>, kGemmCfgs.size()> gemmc{};
     std::array<PerType<F>, kGemmsCfgs.size()> gemms{}, gemmsh{};

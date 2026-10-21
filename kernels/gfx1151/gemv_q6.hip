@@ -462,6 +462,19 @@ extern "C" __global__ void __launch_bounds__(512)
 }
 
 extern "C" __global__ void __launch_bounds__(512)
+    gemvq_nt9r2w16_mxfp4(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
+                         const float *xd, float *y, int ncols, int nrows,
+                         int accumulate, const int *skip) {
+    gemvw_mx_nt_r2_w16_impl<9>(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
+}
+extern "C" __global__ void __launch_bounds__(512)
+    ggemvq_nt9r2w16_mxfp4(GV_PARAMS) {
+    const GvSel gs = gv_sel(g);
+    gemvw_mx_nt_r2_w16_impl<9>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
+                               accumulate, skip, gs.b);
+}
+
+extern "C" __global__ void __launch_bounds__(512)
     gemvq_nt11r2w16_q6_k(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
                          const float *xd, float *y, int ncols, int nrows,
                          int accumulate, const int *skip) {
@@ -485,6 +498,19 @@ extern "C" __global__ void __launch_bounds__(512)
     const GvSel gs = gv_sel(g);
     gemvw6_nt_r2_w16_impl<10>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
                               accumulate, skip, gs.b);
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+    gemvq_nt9r2w16_q6_k(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
+                        const float *xd, float *y, int ncols, int nrows,
+                        int accumulate, const int *skip) {
+    gemvw6_nt_r2_w16_impl<9>(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
+}
+extern "C" __global__ void __launch_bounds__(512)
+    ggemvq_nt9r2w16_q6_k(GV_PARAMS) {
+    const GvSel gs = gv_sel(g);
+    gemvw6_nt_r2_w16_impl<9>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
+                             accumulate, skip, gs.b);
 }
 
 // KLIB-1 (opt-in, WHIRL_Q3K_U16=1): multi-row entries of the Q3_K llama.cpp-split variant
