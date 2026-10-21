@@ -253,6 +253,7 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
         {&KernelTable::requant_q6k_q4k, "requant_q6k_q4k"},
         {&KernelTable::set_tokens, "set_tokens"},
         {&KernelTable::argmax_rows, "argmax_rows"},
+        {&KernelTable::map_ids, "map_ids"},
         {&KernelTable::argmax_prob, "argmax_prob"},
         {&KernelTable::draft_pick, "draft_pick"},
         {&KernelTable::set_rows, "set_rows"},
@@ -283,7 +284,10 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
 
     static constexpr Named optional[] = {
         {&KernelTable::requant_q6k_d2, "requant_q6k_d2"},
+        {&KernelTable::requant_q80_d2, "requant_q80_d2"},
+        {&KernelTable::requant_q80_d3, "requant_q80_d3"},
         {&KernelTable::requant_q80_q4k, "requant_q80_q4k"},
+        {&KernelTable::requant_q80_q5k, "requant_q80_q5k"},
         {&KernelTable::moe_tiles, "moe_tiles"},
         {&KernelTable::gdn_wprep, "gdn_wprep"},
         {&KernelTable::gdn_wscan8, "gdn_wscan8"},
@@ -301,6 +305,7 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
         {&KernelTable::attn_wsplit1, "attn_wsplit1"},
         {&KernelTable::attn_wsplit2, "attn_wsplit2"},
         {&KernelTable::topk_rows, "topk_rows"},
+        {&KernelTable::copy_rows_map2, "copy_rows_map2"},
         {&KernelTable::draft_pick_top2, "draft_pick_top2"},
         {&KernelTable::draft_sample_rows, "draft_sample_rows"},
         {&KernelTable::gdn_gates_ba, "gdn_gates_ba"},
@@ -370,6 +375,7 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
     k.attn_prep_m = L.opt(kv == KvFormat::q8v ? "attn_prep_m_q8v" : kv == KvFormat::q8h ? "attn_prep_m_q8h" : kv == KvFormat::q8 ? "attn_prep_m_q8" : kv == KvFormat::q4 ? "attn_prep_m_q4" : "attn_prep_m");
     k.set_rpos = L.opt("set_rpos");
     for (int nt = 1; nt <= kMaxSmallBatch; ++nt) k.gemv_d2[nt - 1] = L.opt("gemv_d2_nt" + std::to_string(nt));
+    for (int nt = 1; nt <= kMaxSmallBatch; ++nt) k.gemv_d3[nt - 1] = L.opt("gemv_d3_nt" + std::to_string(nt));
     k.copy_rows_map = L.opt("copy_rows_map");
     k.dflash_conv = L.opt("dflash_conv");
     k.dflash_topk = L.opt("dflash_topk");
@@ -410,6 +416,14 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
         k.gemvq_nt9r2w16_mxfp4_g = L.opt("ggemvq_nt9r2w16_mxfp4");
         k.gemvq_nt9r2w16p_mxfp4 = L.opt("gemvq_nt9r2w16p_mxfp4");
         k.gemvq_nt9r2w16p_mxfp4_g = L.opt("ggemvq_nt9r2w16p_mxfp4");
+        k.gemvq_nt10r2w16p_mxfp4 = L.opt("gemvq_nt10r2w16p_mxfp4");
+        k.gemvq_nt10r2w16p_mxfp4_g = L.opt("ggemvq_nt10r2w16p_mxfp4");
+        k.gemvq_nt8r2w16p_mxfp4 = L.opt("gemvq_nt8r2w16p_mxfp4");
+        k.gemvq_nt8r2w16p_mxfp4_g = L.opt("ggemvq_nt8r2w16p_mxfp4");
+        for (int nt = 2; nt <= kMaxSmallBatch; ++nt) {
+            k.gemvq_nt_w16p_mxfp4[nt - 2] = L.opt("gemvq_nt" + std::to_string(nt) + "r2w16p_mxfp4");
+            k.gemvq_nt_w16p_mxfp4_g[nt - 2] = L.opt("ggemvq_nt" + std::to_string(nt) + "r2w16p_mxfp4");
+        }
         k.pack_w16_mxfp4 = L.opt("pack_w16_mxfp4");
         k.unpack_w16_mxfp4 = L.opt("unpack_w16_mxfp4");
         k.gemvq_nt11r2w16_q6_k = L.opt("gemvq_nt11r2w16_q6_k");
@@ -418,6 +432,10 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
         k.gemvq_nt10r2w16_q6_k_g = L.opt("ggemvq_nt10r2w16_q6_k");
         k.gemvq_nt9r2w16_q6_k = L.opt("gemvq_nt9r2w16_q6_k");
         k.gemvq_nt9r2w16_q6_k_g = L.opt("ggemvq_nt9r2w16_q6_k");
+        k.gemvq_nt8r2w16_q6_k = L.opt("gemvq_nt8r2w16_q6_k");
+        k.gemvq_nt8r2w16_q6_k_g = L.opt("ggemvq_nt8r2w16_q6_k");
+        k.gemvq_nt9r2w32_q6_k = L.opt("gemvq_nt9r2w32_q6_k");
+        k.gemvq_nt9r2w32_q6_k_g = L.opt("ggemvq_nt9r2w32_q6_k");
         k.gdn_ab[i] = L.opt("gdn_ab_mxfp4");
         k.gdn_abconv[i] = L.opt("gdn_abconv_mxfp4");
         // routed experts: generic entries + whole-block decode + fp8 grouped GEMM

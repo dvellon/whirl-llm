@@ -269,7 +269,8 @@ void Model::freeAlloc(DevPtr p) {
 void Model::setMxPackedW16(bool packed) {
     if (!envFlag("MXFP4_NT9_INPLACE", false) || mx_w16_inplace == packed) return;
     if (arch != hip::Arch::gfx1151 || k.pack_w16_mxfp4 == nullptr ||
-        k.unpack_w16_mxfp4 == nullptr || k.gemvq_nt9r2w16p_mxfp4 == nullptr || w16 == 0)
+        k.unpack_w16_mxfp4 == nullptr || k.gemvq_nt9r2w16p_mxfp4 == nullptr ||
+        k.gemvq_nt10r2w16p_mxfp4 == nullptr || k.gemvq_nt8r2w16p_mxfp4 == nullptr || w16 == 0)
         throw ModelError("Mxfp4PackedW16Unavailable");
 
     decode_graph.reset();
@@ -1060,7 +1061,49 @@ void Model::requantMtpQ4() {
     MtpW& mw = *mtp;
     if (mw.moe) return;
     Mat* mats[] = {&mw.attn.q, &mw.attn.o, &mw.ffn_gate, &mw.ffn_up, &mw.ffn_down, &mw.eh_proj};
-    for (Mat* w : mats) {
+    if (envFlag("MTP_D3", false)) {
+        for (Mat* w : mats) {
+            if (w->ty != GgmlType::q8_0 || k.requant_q80_d3 == nullptr || w->ncols % 256 != 0) continue;
+            const u64 rb = static_cast<u64>(w->ncols / 2 - w->ncols / 8 + w->ncols / 16);
+            w->draft_d3 = alloc(rb * w->nrows);
+            hip::launch(k.requant_q80_d3, {w->nrows, w->ncols / 256, 1}, {256, 1, 1}, 0, stream, w->ptr, w->row_bytes, w->draft_d3, I(w->ncols));
+        }
+        hip::sync();
+        return;
+    }
+    if (envFlag("MTP_D2", false)) {
+        for (Mat* w : mats) {
+            const hip::Function f = w->ty == GgmlType::q6_k ? k.requant_q6k_d2 : w->ty == GgmlType::q8_0 ? k.requant_q80_d2 : nullptr;
+            if (f == nullptr || w->ncols % 256 != 0) continue;
+            const u64 rb = static_cast<u64>(w->ncols / 4 + w->ncols / 16);
+            w->draft_d2 = alloc(rb * w->nrows);
+            hip::launch(f, {w->nrows, w->ncols / 256, 1}, {256, 1, 1}, 0, stream, w->ptr, w->row_bytes, w->draft_d2, I(w->ncols));
+        }
+        hip::sync();
+        return;
+    }
+    const bool keep_attn_q8 = envFlag("MTP_Q8_ATTN", false);
+    const bool keep_ffn_q8 = envFlag("MTP_Q8_FFN", false);
+    const bool keep_eh_q8 = envFlag("MTP_Q8_EH", false);
+    const bool use_eh_q5 = envFlag("MTP_Q5_EH", false);
+    for (std::size_t mi = 0; mi < std::size(mats); ++mi) {
+        Mat* w = mats[mi];
+        if ((keep_attn_q8 && mi < 2) || (keep_ffn_q8 && mi >= 2 && mi < 5) || (keep_eh_q8 && mi == 5)) continue;
+        if (use_eh_q5 && mi == 5 && w->ty == GgmlType::q8_0 && k.requant_q80_q5k != nullptr && w->ncols % 256 == 0) {
+            const u64 rb = static_cast<u64>(w->ncols / 256) * 176;
+            Mat nw;
+            nw.ptr = alloc(rb * w->nrows);
+            nw.ty = GgmlType::q5_k;
+            nw.ncols = w->ncols;
+            nw.nrows = w->nrows;
+            nw.row_bytes = rb;
+            hip::launch(k.requant_q80_q5k, {w->nrows, w->ncols / 256, 1}, {256, 1, 1}, 0, stream, w->ptr, w->row_bytes, nw.ptr, rb);
+            const DevPtr old = w->ptr;
+            *w = nw;
+            hip::sync();
+            freeAlloc(old);
+            continue;
+        }
         const Mat nw = requantQ4k(*w);
         if (nw.ptr == w->ptr) continue;
         Mat tuned = nw;
@@ -1083,6 +1126,15 @@ void Model::buildDraftHeadEx(DraftHeadKind kind) {
         hip::launch(k.requant_q6k_d2, {w.nrows, w.ncols / 256, 1}, {256, 1, 1}, 0, stream, w.ptr, w.row_bytes, p, I(w.ncols));
         hip::sync();
         draft_d2 = p;
+        verify_d2_head = envFlag("VERIFY_D2_HEAD", false) && k.map_ids != nullptr;
+        if (const auto rk = envGet("DRAFT_RERANK"); rk && k.topk_rows && k.copy_rows_map2) {
+            draft_rerank_k = std::clamp<u32>(static_cast<u32>(std::strtoul(rk->c_str(), nullptr, 10)), 2, 64);
+            const u64 cap = static_cast<u64>(max_small_batch) * draft_rerank_k;
+            draft_rerank_ids = alloc(cap * 4);
+            draft_rerank_vals = alloc(cap * 4);
+            draft_rerank_stats = alloc(static_cast<u64>(max_small_batch) * 2 * 4);
+            draft_rerank_w = alloc(cap * output.row_bytes);
+        }
         return;
     }
     draft_head = requantQ4k(w);
@@ -1090,17 +1142,23 @@ void Model::buildDraftHeadEx(DraftHeadKind kind) {
 }
 
 bool Model::setDraftVocab(std::span<const u32> vocab_ids) {
-    if (!draft_d2 || k.copy_rows_map == nullptr || vocab_ids.empty() || vocab_ids.size() >= output.nrows) return false;
+    if ((!draft_d2 && !draft_head) || k.copy_rows_map == nullptr || vocab_ids.empty() || vocab_ids.size() >= output.nrows) return false;
     const u32 n = static_cast<u32>(vocab_ids.size());
-    const u64 rb = static_cast<u64>(output.ncols / 4 + output.ncols / 16);  // 2-bit codes + f16 scales per row
+    const u64 rb = draft_d2 ? static_cast<u64>(output.ncols / 4 + output.ncols / 16) : draft_head->row_bytes;
+    const DevPtr src = draft_d2 ? *draft_d2 : draft_head->ptr;
     const std::vector<i32> m(vocab_ids.begin(), vocab_ids.end());
     const DevPtr map = alloc(static_cast<u64>(n) * 4);
     hip::upload(map, m.data(), m.size() * 4);
     const DevPtr p = alloc(rb * n);
-    hip::launch(k.copy_rows_map, {n, 1, 1}, {256, 1, 1}, 0, stream, *draft_d2, rb, p, map);
+    hip::launch(k.copy_rows_map, {n, 1, 1}, {256, 1, 1}, 0, stream, src, rb, p, map);
     hip::sync();
-    freeAlloc(*draft_d2);
-    draft_d2 = p;
+    freeAlloc(src);
+    if (draft_d2)
+        draft_d2 = p;
+    else {
+        draft_head->ptr = p;
+        draft_head->nrows = n;
+    }
     draft_rows = n;
     draft_map = map;
     return true;

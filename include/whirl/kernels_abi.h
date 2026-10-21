@@ -475,12 +475,17 @@ struct KernelTable {
     // Same NT=9 arithmetic over a reversible, in-place 16-row-interleaved
     // layout.  The conversion kernels use the existing largest-matrix scratch.
     F gemvq_nt9r2w16p_mxfp4{}, gemvq_nt9r2w16p_mxfp4_g{};
+    F gemvq_nt10r2w16p_mxfp4{}, gemvq_nt10r2w16p_mxfp4_g{};
+    F gemvq_nt8r2w16p_mxfp4{}, gemvq_nt8r2w16p_mxfp4_g{};
+    std::array<F, kMaxSmallBatch - 1> gemvq_nt_w16p_mxfp4{}, gemvq_nt_w16p_mxfp4_g{};  // [nt - 2]
     F pack_w16_mxfp4{}, unpack_w16_mxfp4{};
     // Experimental gfx1151 Q6_K output-head NT=11/r2 16-wave geometry.
     // Optional and selected only by WHIRL_Q6K_HEAD_NT11_W16=1.
     F gemvq_nt11r2w16_q6_k{}, gemvq_nt11r2w16_q6_k_g{};
     F gemvq_nt10r2w16_q6_k{}, gemvq_nt10r2w16_q6_k_g{};
     F gemvq_nt9r2w16_q6_k{}, gemvq_nt9r2w16_q6_k_g{};
+    F gemvq_nt8r2w16_q6_k{}, gemvq_nt8r2w16_q6_k_g{};
+    F gemvq_nt9r2w32_q6_k{}, gemvq_nt9r2w32_q6_k_g{};
     std::array<Nt, kNGemvw> gemvw{}, gemvw_g{};      // [v][nt - 2][type], v = 1..8
     std::array<PerType<F>, kGemmCfgs.size()> gemmc{};
     std::array<PerType<F>, kGemmsCfgs.size()> gemms{}, gemmsh{};
@@ -493,6 +498,7 @@ struct KernelTable {
     F gemvw_head_s{};    // gemvw_nt16v2s_q6_k: 16-token output head over a row range, separate y stride
     F gemvw_head_2p{};   // gemvw_nt16x2s_q6_k: wide-verify output head, both 16-token passes in one launch (optional)
     std::array<F, kMaxSmallBatch> gemv_d2{};       // [nt - 1]
+    std::array<F, kMaxSmallBatch> gemv_d3{};       // [nt - 1]
     std::array<F, kGemm8Cfgs.size()> gemm8{}, gemm8h{};
     std::array<F, kGemm8tCfgs.size()> gemm8t{}, gemm8th{};
     std::array<F, kGemmCfgs.size()> gemmch{};
@@ -517,8 +523,8 @@ struct KernelTable {
     F gdn_chunk_prep{}, gdn_chunk_scan{}, gdn_wprep{}, gdn_wscan8{}, gdn_sx_prep{}, gdn_sx_scan{};
     F rmsnorm_x8{}, rmsnorm_x16{}, silu_mul_x8{}, silu_mul_x16{}, gated_norm_x8{}, gated_norm_x16{};
     F gdn_conv_par{}, gdn_conv_state{}, rmsnorm_q8{}, silu_mul_q8{}, gdn_ab_q8_0{};
-    F gdn_conv_l2{}, gdn_step_norm{}, requant_q6k_q4k{}, requant_q6k_d2{}, requant_q80_q4k{};
-    F copy_rows_map{};  // optional
+    F gdn_conv_l2{}, gdn_step_norm{}, requant_q6k_q4k{}, requant_q6k_d2{}, requant_q80_d2{}, requant_q80_d3{}, requant_q80_q4k{}, requant_q80_q5k{};
+    F copy_rows_map{}, copy_rows_map2{}, map_ids{};  // optional
     F dflash_conv{}, dflash_topk{}, dflash_lattice{}, dflash_walk{}, dflash_attn{}, dflash_attn_long{};  // optional (DFlash2 drafter)
     F set_tokens{}, argmax_rows{}, argmax_prob{}, draft_pick{}, draft_pick_top2{};
     F set_rows{}, rmsnorm_q8_rows{}, argmax_rows_to{}, draft_pick_rows{};

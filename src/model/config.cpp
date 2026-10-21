@@ -81,7 +81,11 @@ GemvR defaultGemvWHead() {
 }
 
 const char* opClassName(OpClass c) {
-    static const char* names[] = {"embed", "norm", "quant", "matmul", "attn", "gdn_prep", "gdn_rec", "gdn_norm", "misc", "head"};
+    static const char* names[] = {
+        "embed", "norm", "quant", "matmul",
+        "mm_gu", "mm_down", "mm_qkv", "mm_out", "mm_gate", "mm_q", "mm_kv",
+        "attn", "gdn_prep", "gdn_rec", "gdn_norm", "misc", "head"
+    };
     return names[static_cast<int>(c)];
 }
 

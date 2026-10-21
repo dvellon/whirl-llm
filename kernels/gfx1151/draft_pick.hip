@@ -25,15 +25,21 @@ __device__ __forceinline__ int d2_lut4(uint32_t code4) {
 //   block b (32 values) has scale s_b: w = s_b * (2c - 3), c in 0..3.
 // Arithmetic is free-form (drafts never have to match anything bitwise).
 // ---------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(256)
-    requant_q6k_d2(const uint8_t *src, uint64_t src_rb, uint8_t *dst, int ncols) {
+template <int T>
+__device__ __forceinline__ void requant_d2_impl(const uint8_t *src, uint64_t src_rb, uint8_t *dst, int ncols) {
     const int row = blockIdx.x, sbi = blockIdx.y, t = threadIdx.x, lane = t & 31, bj = t >> 5;
-    const uint8_t *b = src + (size_t)row * src_rb + (size_t)sbi * 210;
+    constexpr int sb_bytes = T == QT_Q6_K ? 210 : 8 * Q<QT_Q8_0>::bytes;
+    const uint8_t *b = src + (size_t)row * src_rb + (size_t)sbi * sb_bytes;
     uint8_t *o = dst + (size_t)row * (ncols / 4 + ncols / 16);
     __shared__ float v[256];
     __shared__ uint32_t words[16];
     if (t < 16) words[t] = 0;
-    if ((t & 7) == 0) Q<QT_Q6_K>::dec8(b, t, v + t);
+    if ((t & 7) == 0) {
+        if constexpr (T == QT_Q6_K)
+            Q<QT_Q6_K>::dec8(b, t, v + t);
+        else
+            Q<QT_Q8_0>::dec8(b + (t >> 5) * Q<QT_Q8_0>::bytes, t & 31, v + t);
+    }
     __syncthreads();
     const float x = v[t];
     const float amax = warp_max(fabsf(x));
@@ -62,6 +68,121 @@ extern "C" __global__ void __launch_bounds__(256)
     if (t < 16) ((uint32_t *)(o + (size_t)sbi * 64))[t] = words[t];  // 4 units x 4 words
     if (lane == 0) *(_Float16 *)(o + ncols / 4 + 2 * blk) = sh;
 }
+
+extern "C" __global__ void __launch_bounds__(256)
+requant_q6k_d2(const uint8_t *src, uint64_t src_rb, uint8_t *dst, int ncols) {
+    requant_d2_impl<QT_Q6_K>(src, src_rb, dst, ncols);
+}
+extern "C" __global__ void __launch_bounds__(256)
+requant_q80_d2(const uint8_t *src, uint64_t src_rb, uint8_t *dst, int ncols) {
+    requant_d2_impl<QT_Q8_0>(src, src_rb, dst, ncols);
+}
+
+// Draft-only 3-bit symmetric rows. Each 32-value block stores three bitplanes
+// (12 bytes) and one f16 scale: 3.5 bits/weight. Codes map to odd values
+// {-7,-5,-3,-1,1,3,5,7} so zero needs no separate offset.
+extern "C" __global__ void __launch_bounds__(256)
+requant_q80_d3(const uint8_t *src, uint64_t src_rb, uint8_t *dst, int ncols) {
+    const int row = blockIdx.x, sbi = blockIdx.y, t = threadIdx.x, lane = t & 31, bj = t >> 5;
+    const uint8_t *b = src + (size_t)row * src_rb + (size_t)sbi * 8 * Q<QT_Q8_0>::bytes;
+    const size_t codes_rb = (size_t)ncols * 3 / 8;
+    uint8_t *o = dst + (size_t)row * (codes_rb + ncols / 16);
+    __shared__ float v[256];
+    __shared__ uint32_t planes[24];
+    if (t < 24) planes[t] = 0;
+    if ((t & 7) == 0) Q<QT_Q8_0>::dec8(b + (t >> 5) * Q<QT_Q8_0>::bytes, t & 31, v + t);
+    __syncthreads();
+    const float x = v[t];
+    const float amax = warp_max(fabsf(x));
+    const float fs[5] = {1.f, 0.88f, 0.77f, 0.67f, 0.58f};
+    float best_s = amax / 7.f, best_e = INFINITY;
+#pragma unroll
+    for (int i = 0; i < 5; ++i) {
+        const float s = amax / 7.f * fs[i];
+        const int c = s > 0.f ? max(0, min(7, (int)rintf((x / s + 7.f) * 0.5f))) : 3;
+        const float d = x - s * (float)(2 * c - 7);
+        const float e = warp_sum(d * d);
+        if (e < best_e) { best_e = e; best_s = s; }
+    }
+    const _Float16 sh = (_Float16)best_s;
+    const float sf = (float)sh;
+    const int c = sf > 0.f ? max(0, min(7, (int)rintf((x / sf + 7.f) * 0.5f))) : 3;
+    atomicOr(&planes[3 * bj + 0], (uint32_t)(c & 1) << lane);
+    atomicOr(&planes[3 * bj + 1], (uint32_t)((c >> 1) & 1) << lane);
+    atomicOr(&planes[3 * bj + 2], (uint32_t)((c >> 2) & 1) << lane);
+    __syncthreads();
+    if (t < 24) ((uint32_t *)(o + (size_t)sbi * 96))[t] = planes[t];
+    if (lane == 0) *(_Float16 *)(o + codes_rb + 2 * (sbi * 8 + bj)) = sh;
+}
+
+__device__ __forceinline__ uint32_t d3_pack4(uint32_t p0, uint32_t p1, uint32_t p2, int sh) {
+    uint32_t r = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int c = (int)((p0 >> (sh + j)) & 1) | (int)(((p1 >> (sh + j)) & 1) << 1) |
+                      (int)(((p2 >> (sh + j)) & 1) << 2);
+        r |= (uint32_t)(uint8_t)(2 * c - 7) << (8 * j);
+    }
+    return r;
+}
+
+template <int NT>
+__device__ void gemv_d3_impl(const uint8_t *__restrict__ W, const int8_t *__restrict__ xq, const float *__restrict__ xd,
+                             float *__restrict__ y, int ncols, int nrows, const int *__restrict__ skip) {
+    if (skip != nullptr && *skip) return;
+    const int lane = threadIdx.x % WARP;
+    const int row = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
+    if (row >= nrows) return;
+    const size_t codes_rb = (size_t)ncols * 3 / 8;
+    const size_t rb = codes_rb + ncols / 16;
+    const uint8_t *codes = W + (size_t)row * rb;
+    const uint16_t *sc = (const uint16_t *)(codes + codes_rb);
+    const int nu = ncols / 64, nb = ncols / 32;
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+    for (int u = lane; u < nu; u += WARP) {
+        const uint32_t *p = (const uint32_t *)(codes + 24 * u);
+        const float s0 = __half2float(__ushort_as_half(sc[2 * u]));
+        const float s1 = __half2float(__ushort_as_half(sc[2 * u + 1]));
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const int8_t *xt = xq + (size_t)t * ncols + 64 * u;
+            int d0 = 0, d1 = 0;
+#pragma unroll
+            for (int g = 0; g < 8; ++g) d0 = dp4(d3_pack4(p[0], p[1], p[2], 4 * g), ((const int *)xt)[g], d0);
+#pragma unroll
+            for (int g = 0; g < 8; ++g) d1 = dp4(d3_pack4(p[3], p[4], p[5], 4 * g), ((const int *)xt)[8 + g], d1);
+            const float *xdt = xd + (size_t)t * nb + 2 * u;
+            acc[t] += s0 * D2_XD(xdt) * (float)d0 + s1 * D2_XD(xdt + 1) * (float)d1;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const float s = warp_sum(acc[t]);
+        if (lane == 0) y[(size_t)t * nrows + row] = s;
+    }
+}
+#define GEMV_D3_ENTRY(NT)                                                                                   \
+    extern "C" __global__ void __launch_bounds__(256)                                                       \
+        gemv_d3_nt##NT(const uint8_t *W, const int8_t *xq, const float *xd, float *y, int ncols, int nrows, \
+                       const int *skip) { gemv_d3_impl<NT>(W, xq, xd, y, ncols, nrows, skip); }
+GEMV_D3_ENTRY(1)
+GEMV_D3_ENTRY(2)
+GEMV_D3_ENTRY(3)
+GEMV_D3_ENTRY(4)
+GEMV_D3_ENTRY(5)
+GEMV_D3_ENTRY(6)
+GEMV_D3_ENTRY(7)
+GEMV_D3_ENTRY(8)
+GEMV_D3_ENTRY(9)
+GEMV_D3_ENTRY(10)
+GEMV_D3_ENTRY(11)
+GEMV_D3_ENTRY(12)
+GEMV_D3_ENTRY(13)
+GEMV_D3_ENTRY(14)
+GEMV_D3_ENTRY(15)
+GEMV_D3_ENTRY(16)
 
 // y[t][r] = draft-head logits for NT tokens (int8 x, xd per 32), one wave per
 // row, lane per 64-value unit.
@@ -141,6 +262,25 @@ extern "C" __global__ void __launch_bounds__(256) copy_rows_map(const uint8_t *s
     const uint8_t *s = src + (size_t)map[blockIdx.x] * rb;
     uint8_t *d = dst + (size_t)blockIdx.x * rb;
     for (uint64_t i = threadIdx.x; i < rb; i += blockDim.x) d[i] = s[i];
+}
+
+// Gather rows through a shortlist and an optional vocabulary map.  The
+// shortlist is rewritten to final token ids so draft_pick_rows can use it as
+// its result map after the exact rerank.
+extern "C" __global__ void __launch_bounds__(256)
+copy_rows_map2(const uint8_t *src, uint64_t rb, uint8_t *dst, int *ids, const int *vocab_map) {
+    const int i = blockIdx.x;
+    const int row = vocab_map ? vocab_map[ids[i]] : ids[i];
+    const uint8_t *s = src + (size_t)row * rb;
+    uint8_t *d = dst + (size_t)i * rb;
+    for (uint64_t j = threadIdx.x; j < rb; j += blockDim.x) d[j] = s[j];
+    if (threadIdx.x == 0) ids[i] = row;
+}
+
+// Translate compact draft-vocabulary row ids to model token ids in place.
+extern "C" __global__ void map_ids(int *ids, const int *map, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) ids[i] = map[ids[i]];
 }
 
 // Token ids + positions for up to 16 rows without a host copy (a blocking

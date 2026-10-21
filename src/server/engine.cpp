@@ -1734,7 +1734,12 @@ void Engine::finishPrefill(Slot& sl) {
     // The reversible packed verifier layout is global to the model.  Restrict
     // it to the one-slot linear-MTP configuration, where no prefill can race a
     // decode and every target verify has exactly drafts+1 rows.
-    if (opt_.parallel == 1 && opt_.use_mtp && opt_.tree_depth == 0)
+    // The interleaved layout currently has exact verifier kernels only for
+    // 9 and 10 rows (8 or 9 fixed drafts).  Adaptive drafting can choose any
+    // smaller row count; leaving those weights packed would make the generic
+    // canonical-layout kernels read corrupt rows.
+    if (opt_.parallel == 1 && opt_.use_mtp && opt_.tree_depth == 0 && !opt_.mtp_auto && opt_.mtp_adapt == 0 &&
+        (opt_.n_draft == 7 || opt_.n_draft == 8 || opt_.n_draft == 9))
         m_.setDecodeWeightLayout(true);
     sl.td0 = Clock::now();
     sl.last_log_t = sl.td0;

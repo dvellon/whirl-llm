@@ -233,6 +233,85 @@ __device__ __forceinline__ void gemvw6_nt_r2_w16_impl(
     }
 }
 
+// Thirty-two-wave output-head prototype: one wave owns one quarter instead
+// of two.  This halves the live accumulator set again while preserving the
+// exact q0+q1, q2+q3, then eight-residue reduction order.
+template<int NT>
+__device__ __forceinline__ void gemvw6_nt_r2_w32_impl(
+    const uint8_t *__restrict__ W, uint64_t row_bytes, const int8_t *__restrict__ xq,
+    const float *__restrict__ xd, float *__restrict__ y, int ncols, int nrows, int accumulate,
+    const int *__restrict__ skip, int bid = -1) {
+    constexpr int NTV = (NT + 1) / 2;
+    constexpr int ROWS = 16;
+    __shared__ float red[4][8][NT][ROWS];
+    if (skip != nullptr && *skip) return;
+
+    const int lane = threadIdx.x % WARP;
+    const int wave = threadIdx.x / WARP;
+    const int q = wave >> 3;
+    const int ow = wave & 7;
+    const int hn = ow & 1;
+    const int residue = ow >> 1;
+    const int h = lane >> 4;
+    const int n = lane & 15;
+    const int r0 = (bid < 0 ? (int)blockIdx.x : bid) * ROWS;
+    const uint8_t *wr = W + (size_t)min(r0 + n, nrows - 1) * row_bytes;
+    const bool tok_ok = n < NT;
+    const int8_t *xt = xq + (size_t)(tok_ok ? n : 0) * ncols;
+    const uint32_t *xp = (const uint32_t *)xd;
+    const int nb32 = ncols / 32;
+    const int nsb = ncols / 256;
+    const int8v zero = {0, 0, 0, 0, 0, 0, 0, 0};
+    float acc[NTV];
+#pragma unroll
+    for (int v = 0; v < NTV; ++v) acc[v] = 0.f;
+
+    for (int sb = residue; sb < nsb; sb += 4) {
+        const int u = 8 * sb + 4 * hn + q;
+        const int base = sb * 256 + 128 * hn + 32 * q;
+        const int xi = base >> 5;
+        int4v x0 = {0, 0, 0, 0}, x1 = x0;
+        if (tok_ok) {
+            x0 = *(const int4v *)(xt + base);
+            x1 = *(const int4v *)(xt + base + 16);
+        }
+        WUnit6 wu;
+        wunit6(wr, u, wu);
+        const int4v b0 = {wu.w[0], wu.w[1], wu.w[2], wu.w[3]};
+        const int4v b1 = {wu.w[4], wu.w[5], wu.w[6], wu.w[7]};
+        const int8v c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, x0, true, b0, zero, false);
+        const int8v c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, x1, true, b1, zero, false);
+#pragma unroll
+        for (int v = 0; v < NTV; ++v) {
+            const int t = min(2 * v + h, NT - 1);
+            acc[v] = wfold6(acc[v], xp[(size_t)t * nb32 + xi], wu.s0, wu.s1, c0[v], c1[v]);
+        }
+    }
+#pragma unroll
+    for (int v = 0; v < NTV; ++v) {
+        const int t = 2 * v + h;
+        if (t < NT) red[q][ow][t][n] = acc[v];
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < NT * ROWS; i += blockDim.x) {
+        const int t = i / ROWS;
+        const int nn = i % ROWS;
+        const int row = r0 + nn;
+        float rv[8];
+#pragma unroll
+        for (int w = 0; w < 8; ++w)
+            rv[w] = (red[0][w][t][nn] + red[1][w][t][nn]) +
+                    (red[2][w][t][nn] + red[3][w][t][nn]);
+        const float s = ((rv[0] + rv[1]) + (rv[2] + rv[3])) +
+                        ((rv[4] + rv[5]) + (rv[6] + rv[7]));
+        if (row < nrows) {
+            float *dst = y + (size_t)t * nrows + row;
+            *dst = accumulate ? *dst + s : s;
+        }
+    }
+}
+
 template <int T, int NT, int R>
 __device__ void gemvq_mr_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, const int8_t *__restrict__ xq,
                               const float *__restrict__ xd, float *__restrict__ y, int ncols, int nrows, int accumulate,
@@ -545,6 +624,56 @@ extern "C" __global__ void __launch_bounds__(512)
 }
 
 extern "C" __global__ void __launch_bounds__(512)
+    gemvq_nt10r2w16p_mxfp4(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
+                           const float *xd, float *y, int ncols, int nrows,
+                           int accumulate, const int *skip) {
+    gemvw_mx_nt_r2_w16_impl<10, true>(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
+}
+extern "C" __global__ void __launch_bounds__(512)
+    ggemvq_nt10r2w16p_mxfp4(GV_PARAMS) {
+    const GvSel gs = gv_sel(g);
+    gemvw_mx_nt_r2_w16_impl<10, true>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
+                                      accumulate, skip, gs.b);
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+    gemvq_nt8r2w16p_mxfp4(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
+                          const float *xd, float *y, int ncols, int nrows,
+                          int accumulate, const int *skip) {
+    gemvw_mx_nt_r2_w16_impl<8, true>(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
+}
+extern "C" __global__ void __launch_bounds__(512)
+    ggemvq_nt8r2w16p_mxfp4(GV_PARAMS) {
+    const GvSel gs = gv_sel(g);
+    gemvw_mx_nt_r2_w16_impl<8, true>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
+                                     accumulate, skip, gs.b);
+}
+
+#define MXP_W16_ENTRY(NT)                                                                                  \
+extern "C" __global__ void __launch_bounds__(512)                                                        \
+gemvq_nt##NT##r2w16p_mxfp4(const uint8_t *W, uint64_t row_bytes, const int8_t *xq, const float *xd,       \
+                            float *y, int ncols, int nrows, int accumulate, const int *skip) {              \
+    gemvw_mx_nt_r2_w16_impl<NT, true>(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);           \
+}                                                                                                         \
+extern "C" __global__ void __launch_bounds__(512) ggemvq_nt##NT##r2w16p_mxfp4(GV_PARAMS) {              \
+    const GvSel gs = gv_sel(g);                                                                            \
+    gemvw_mx_nt_r2_w16_impl<NT, true>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows, accumulate, skip, gs.b);\
+}
+MXP_W16_ENTRY(2)
+MXP_W16_ENTRY(3)
+MXP_W16_ENTRY(4)
+MXP_W16_ENTRY(5)
+MXP_W16_ENTRY(6)
+MXP_W16_ENTRY(7)
+MXP_W16_ENTRY(11)
+MXP_W16_ENTRY(12)
+MXP_W16_ENTRY(13)
+MXP_W16_ENTRY(14)
+MXP_W16_ENTRY(15)
+MXP_W16_ENTRY(16)
+#undef MXP_W16_ENTRY
+
+extern "C" __global__ void __launch_bounds__(512)
     gemvq_nt11r2w16_q6_k(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
                          const float *xd, float *y, int ncols, int nrows,
                          int accumulate, const int *skip) {
@@ -580,6 +709,32 @@ extern "C" __global__ void __launch_bounds__(512)
     ggemvq_nt9r2w16_q6_k(GV_PARAMS) {
     const GvSel gs = gv_sel(g);
     gemvw6_nt_r2_w16_impl<9>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
+                             accumulate, skip, gs.b);
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+    gemvq_nt8r2w16_q6_k(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
+                        const float *xd, float *y, int ncols, int nrows,
+                        int accumulate, const int *skip) {
+    gemvw6_nt_r2_w16_impl<8>(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
+}
+extern "C" __global__ void __launch_bounds__(512)
+    ggemvq_nt8r2w16_q6_k(GV_PARAMS) {
+    const GvSel gs = gv_sel(g);
+    gemvw6_nt_r2_w16_impl<8>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
+                             accumulate, skip, gs.b);
+}
+
+extern "C" __global__ void __launch_bounds__(1024)
+    gemvq_nt9r2w32_q6_k(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
+                        const float *xd, float *y, int ncols, int nrows,
+                        int accumulate, const int *skip) {
+    gemvw6_nt_r2_w32_impl<9>(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
+}
+extern "C" __global__ void __launch_bounds__(1024)
+    ggemvq_nt9r2w32_q6_k(GV_PARAMS) {
+    const GvSel gs = gv_sel(g);
+    gemvw6_nt_r2_w32_impl<9>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
                              accumulate, skip, gs.b);
 }
 

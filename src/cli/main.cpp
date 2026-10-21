@@ -944,7 +944,10 @@ void printProfile(const char* label, q::Profile& p, std::size_t n_tok) {
     for (std::size_t i = 0; i < q::n_classes; ++i)
         if (p.ms[i] > 0)
             out(fmt("    %-9s %9.1f ms  %7.3f ms/tok  %5.1f%%\n", q::opClassName(static_cast<q::OpClass>(i)), p.ms[i], p.ms[i] / per, 100.0 * p.ms[i] / total));
-    const double mm = p.ms[static_cast<std::size_t>(q::OpClass::matmul)];
+    double mm = 0;
+    for (q::OpClass c : {q::OpClass::matmul, q::OpClass::mm_gu, q::OpClass::mm_down, q::OpClass::mm_qkv,
+                         q::OpClass::mm_out, q::OpClass::mm_gate, q::OpClass::mm_q, q::OpClass::mm_kv})
+        mm += p.ms[static_cast<std::size_t>(c)];
     if (mm > 0) out(fmt("    matmul weight stream %.0f GB/s\n", static_cast<double>(p.matmul_bytes) / (mm * 1e6)));
 }
 

@@ -289,11 +289,6 @@ void applyDraftVocab(qwen35::Model& model, const Tokenizer& tok, const qwen35::D
                      qwen35::draft_vocab_embedded_n_vocab, model.cfg.n_vocab);
             return;
         }
-        if (!model.draft_d2) {
-            if (dv.by_default) logI("draft head: full vocabulary (the vocabulary subset needs the 2-bit draft head)");
-            else logW("WHIRL_DRAFT_VOCAB ignored: it needs the 2-bit draft head (Q6_K output head, WHIRL_DRAFT_HEAD not q4)");
-            return;
-        }
     }
     std::vector<std::uint32_t> req;
     for (const TokenId t : tok.specials())
@@ -310,7 +305,7 @@ void applyDraftVocab(qwen35::Model& model, const Tokenizer& tok, const qwen35::D
     else if (dv.by_default)  // the default only: no warning for a setting the user did not make
         logI("draft head: full vocabulary (no vocabulary subset with this draft head / kernel set)");
     else
-        logW("WHIRL_DRAFT_VOCAB ignored: it needs the 2-bit draft head (Q6_K output head, WHIRL_DRAFT_HEAD not q4)");
+        logW("WHIRL_DRAFT_VOCAB ignored: this draft head / kernel set cannot compact vocabulary rows");
 }
 
 bool envOn(std::string_view name, bool def) {

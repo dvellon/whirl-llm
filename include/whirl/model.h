@@ -192,6 +192,10 @@ struct Config {
 
 struct Mat {
     DevPtr ptr = 0;
+    // Optional draft-only 2-bit copy. Small-batch MTP proposal matmuls may
+    // consume this layout; prefill and target verification keep using ptr.
+    DevPtr draft_d2 = 0;
+    DevPtr draft_d3 = 0;
     // Nonzero only while this matrix's canonical allocation temporarily holds
     // the reversible 16-row verifier layout.
     DevPtr packed_w16 = 0;
@@ -210,7 +214,7 @@ struct Mat {
 // True when b's rows directly follow a's in one allocation (same type and row
 // layout), so [a; b] can be read as one (a.nrows + b.nrows)-row matrix.
 inline bool rowsContiguous(const Mat& a, const Mat& b) {
-    return a.ptr != 0 && a.ty == b.ty && a.ncols == b.ncols && a.row_bytes == b.row_bytes && a.ref == 0 && b.ref == 0 &&
+    return a.ptr != 0 && a.draft_d2 == 0 && b.draft_d2 == 0 && a.draft_d3 == 0 && b.draft_d3 == 0 && a.ty == b.ty && a.ncols == b.ncols && a.row_bytes == b.row_bytes && a.ref == 0 && b.ref == 0 &&
            b.ptr == a.ptr + static_cast<std::uint64_t>(a.nrows) * a.row_bytes;
 }
 
@@ -400,8 +404,12 @@ Kernels loadKernels(const hip::Module& m, bool q8, bool rot, bool kf16, bool q4 
 // ---------------------------------------------------------------------------
 // profiling (WHIRL_PROFILE=1)
 
-enum class OpClass { embed, norm, quant, matmul, attn, gdn_prep, gdn_rec, gdn_norm, misc, head };
-constexpr std::size_t n_classes = 10;
+enum class OpClass {
+    embed, norm, quant, matmul,
+    mm_gu, mm_down, mm_qkv, mm_out, mm_gate, mm_q, mm_kv,
+    attn, gdn_prep, gdn_rec, gdn_norm, misc, head
+};
+constexpr std::size_t n_classes = 17;
 const char* opClassName(OpClass c);
 
 struct Profile {
@@ -700,9 +708,22 @@ public:
     void readDraftQ(std::span<std::int32_t> dst);
     std::optional<Mat> draft_head;
     std::optional<DevPtr> draft_d2;
-    // draft-head vocabulary subset (setDraftVocab): rows of draft_d2 and their token ids on the device
+    // draft-head vocabulary subset (setDraftVocab): compact D2/Q4 rows and their token ids on the device
     std::uint32_t draft_rows = 0;
     std::optional<DevPtr> draft_map;
+    // Experimental greedy draft reranker: exact output-head rows for the top-K
+    // D2 candidates.  All buffers remain device-side.
+    std::uint32_t draft_rerank_k = 0;
+    DevPtr draft_rerank_ids = 0;
+    DevPtr draft_rerank_vals = 0;
+    DevPtr draft_rerank_stats = 0;
+    DevPtr draft_rerank_w = 0;
+    // Fast-mode experiment: use the compact D2 head for verifier argmax rows,
+    // avoiding the full Q6 output-head stream. Trunk verification and state
+    // commit remain unchanged.
+    bool verify_d2_head = false;
+    std::uint32_t last_head_rows = 0;
+    DevPtr last_head_map = 0;
     std::int32_t attn_win = 0;  // KvArgs::win of the current attnBlock (set around the MTP calls only)
     // The MTP draft attention (both MTP call sites, mtpEnqueue and mtpBatchStepEx): attnBlock of the
     // MTP layer with attn_win = the draft window, restored on every exit, also when attnBlock throws

@@ -51,6 +51,18 @@ std::size_t gemm8tCfg(u32 n) { return n <= 32 ? 3 : n <= 48 ? 4 : n <= 64 ? 2 : 
 
 hip::Dim3 D(u64 x, u64 y = 1, u64 z = 1) { return hip::Dim3{static_cast<unsigned>(x), static_cast<unsigned>(y), static_cast<unsigned>(z)}; }
 
+OpClass matmulClass(const Mat& w) {
+    if (w.ty != GgmlType::mxfp4) return OpClass::matmul;
+    if (w.ncols == 5120 && w.nrows == 17408) return OpClass::mm_gu;
+    if (w.ncols == 17408 && w.nrows == 5120) return OpClass::mm_down;
+    if (w.ncols == 5120 && w.nrows == 10240) return OpClass::mm_qkv;
+    if (w.ncols == 6144 && w.nrows == 5120) return OpClass::mm_out;
+    if (w.ncols == 5120 && w.nrows == 6144) return OpClass::mm_gate;
+    if (w.ncols == 5120 && w.nrows == 12288) return OpClass::mm_q;
+    if (w.ncols == 5120 && w.nrows == 1024) return OpClass::mm_kv;
+    return OpClass::matmul;
+}
+
 }  // namespace
 
 void Model::mark(OpClass cls) {
@@ -171,12 +183,12 @@ void Model::gemvKernels(std::span<const Mat> ws, std::span<const DevPtr> ys, u32
         rows_per_block = 16;
         threads_per_block = 512;
     }
-    const bool packed_w16 = n == 9 && w.ty == GgmlType::mxfp4 && gemv_r[n] == 2 &&
+    const bool packed_w16 = n >= 2 && n <= max_small_batch && w.ty == GgmlType::mxfp4 && gemv_r[n] == 2 &&
                             w.packed_w16 != 0 && envFlag("MXFP4_NT9_INPLACE", false) &&
-                            k.gemvq_nt9r2w16p_mxfp4 != nullptr;
+                            k.gemvq_nt_w16p_mxfp4[n - 2] != nullptr;
     if (packed_w16) {
-        f = k.gemvq_nt9r2w16p_mxfp4;
-        fg = k.gemvq_nt9r2w16p_mxfp4_g;
+        f = k.gemvq_nt_w16p_mxfp4[n - 2];
+        fg = k.gemvq_nt_w16p_mxfp4_g[n - 2];
         rows_per_block = 16;
         threads_per_block = 512;
     }
@@ -186,6 +198,20 @@ void Model::gemvKernels(std::span<const Mat> ws, std::span<const DevPtr> ys, u32
         fg = k.gemvq_nt9r2w16_q6_k_g;
         rows_per_block = 16;
         threads_per_block = 512;
+    }
+    if (n == 8 && w.ty == GgmlType::q6_k && w.ptr == output.ptr && gemv_r[n] == 2 &&
+        k.gemvq_nt8r2w16_q6_k != nullptr) {
+        f = k.gemvq_nt8r2w16_q6_k;
+        fg = k.gemvq_nt8r2w16_q6_k_g;
+        rows_per_block = 16;
+        threads_per_block = 512;
+    }
+    if (n == 9 && w.ty == GgmlType::q6_k && w.ptr == output.ptr && gemv_r[n] == 2 &&
+        envFlag("Q6K_HEAD_NT9_W32", false) && k.gemvq_nt9r2w32_q6_k != nullptr) {
+        f = k.gemvq_nt9r2w32_q6_k;
+        fg = k.gemvq_nt9r2w32_q6_k_g;
+        rows_per_block = 16;
+        threads_per_block = 1024;
     }
     // one-token entries always take GvArgs (gv_grp); a multi-token group takes the twin
     const bool twin = n >= 2 && ws.size() > 1 && fg != nullptr && n <= gvNmax(w.ty);
@@ -243,7 +269,7 @@ void Model::matmulGroup(std::span<const Mat> ws, DevPtr xin, std::span<const Dev
         }
         if (prof)
             for (std::size_t j = 0; j < cnt; ++j) prof->matmul_bytes += gw[j].row_bytes * gw[j].nrows;
-        mark(head_phase ? OpClass::head : OpClass::matmul);
+        mark(head_phase ? OpClass::head : matmulClass(w));
     }
 }
 
@@ -257,8 +283,22 @@ void Model::matmul(const Mat& w, DevPtr xin, DevPtr y, u32 n, bool accumulate) {
         if (y == xq_src) xq_src = 0;
         if (y == x16_src) x16_src = 0;
         if (prof) prof->matmul_bytes += w.row_bytes * w.nrows;
-        mark(head_phase ? OpClass::head : OpClass::matmul);
+        mark(head_phase ? OpClass::head : matmulClass(w));
     };
+    const DevPtr draft_low = w.draft_d3 != 0 ? w.draft_d3 : w.draft_d2;
+    const hip::Function draft_gemv = n <= max_small_batch ? (w.draft_d3 != 0 ? k.gemv_d3[n - 1] : k.gemv_d2[n - 1]) : nullptr;
+    if (draft_low != 0 && draft_gemv != nullptr) {
+        if (xq_src != xin || xq_n != n) {
+            const u32 cnt = n * w.ncols;
+            hip::launch(k.quantize_q8, D((cnt + 255) / 256), D(256), 0, stream, xin, xq, xd, I(cnt));
+            xq_src = xin;
+            xq_n = n;
+            mark(OpClass::quant);
+        }
+        hip::launch(draft_gemv, D((w.nrows + 7) / 8), D(256), 0, stream, draft_low, xq, xd, y, ncols, nrows, nullptr);
+        finish();
+        return;
+    }
     const MatmulPath path = matmulPath(w, n);
     if (path == MatmulPath::gemvq) {
         const DevPtr yy[1] = {y};
@@ -1379,10 +1419,10 @@ void Model::mtpEnqueue(DevPtr hidden, std::span<const u32> tokens, DevPtr dev_to
         rmsnorm(last, mw.head_norm, h, E, 1, E, E);
     // draft head over the vocabulary subset (draft_map) or the first draft_vocab rows only
     Mat head = draft_head ? *draft_head : output;
-    if (draft_rows > 0 && draft_d2) head.nrows = draft_rows;
+    if (draft_rows > 0) head.nrows = draft_rows;
     else if (draft_vocab > 0 && draft_vocab < head.nrows) head.nrows = draft_vocab;
     draftHeadMatmul(head, 1);
-    const DevPtr map = draft_rows > 0 && draft_d2 && draft_map ? *draft_map : DevPtr{0};
+    const DevPtr map = draft_rows > 0 && draft_map ? *draft_map : DevPtr{0};
     hip::launch(k.draft_pick, D(1), D(1024), 0, stream, logits, I(head.nrows), ctlSlot(ctl_drafts), ctlSlot(ctl_probs), ctlSlot(ctl_nd),
                 I(draft_slot), I(draft_n_min), draft_p_min, map);
 }
@@ -1734,11 +1774,26 @@ void Model::mtpBatchStepEx(std::span<const MSeg> segs, u32 r, bool draft) {
     xq_n = ns;
     x16_src = 0;
     Mat head = draft_head ? *draft_head : output;
-    if (draft_rows > 0 && draft_d2) head.nrows = draft_rows;
+    if (draft_rows > 0) head.nrows = draft_rows;
     else if (draft_vocab > 0 && draft_vocab < head.nrows) head.nrows = draft_vocab;
     draftHeadMatmul(head, ns);
-    const DevPtr map = draft_rows > 0 && draft_d2 && draft_map ? *draft_map : DevPtr{0};
-    hip::launch(k.draft_pick_rows, D(ns), D(1024), 0, stream, logits, I(head.nrows), out_tok, area, I(r), I(draft_n_min), draft_p_min,
+    DevPtr map = draft_rows > 0 && draft_map ? *draft_map : DevPtr{0};
+    i32 pick_rows = I(head.nrows);
+    if (draft_rerank_k > 0 && ns == 1 && draft_p_min == 0.f && output.ty == GgmlType::q6_k) {
+        const u32 rk = std::min(draft_rerank_k, static_cast<u32>(head.nrows));
+        hip::launch(k.topk_rows, D(1), D(1024), 0, stream, logits, I(head.nrows), I(rk), 1.f,
+                    draft_rerank_ids, draft_rerank_vals, draft_rerank_stats);
+        hip::launch(k.copy_rows_map2, D(rk), D(256), 0, stream, output.ptr, output.row_bytes,
+                    draft_rerank_w, draft_rerank_ids, map);
+        Mat exact = output;
+        exact.ptr = draft_rerank_w;
+        exact.nrows = rk;
+        const DevPtr yy[1] = {logits};
+        gemvKernels(std::span<const Mat>(&exact, 1), std::span<const DevPtr>(yy, 1), 1, 0, xq, xd);
+        pick_rows = I(rk);
+        map = draft_rerank_ids;
+    }
+    hip::launch(k.draft_pick_rows, D(ns), D(1024), 0, stream, logits, pick_rows, out_tok, area, I(r), I(draft_n_min), draft_p_min,
                 map);
     if (draftSampleOk()) {
         // specsample: rows of sampling requests redraw draft r from the filtered draft distribution  by the race
@@ -1768,9 +1823,9 @@ void Model::mtpBatchStepEx(std::span<const MSeg> segs, u32 r, bool draft) {
 void Model::draftTop2(u32 s0, u32 s1) {
     if (!draftTop2Ok() || s0 >= seqs.size() || s1 >= seqs.size() || s0 == s1) throw ModelError("NoTreeTop2");
     Mat head = draft_head ? *draft_head : output;
-    if (draft_rows > 0 && draft_d2) head.nrows = draft_rows;
+    if (draft_rows > 0) head.nrows = draft_rows;
     else if (draft_vocab > 0 && draft_vocab < head.nrows) head.nrows = draft_vocab;
-    const DevPtr map = draft_rows > 0 && draft_d2 && draft_map ? *draft_map : DevPtr{0};
+    const DevPtr map = draft_rows > 0 && draft_map ? *draft_map : DevPtr{0};
     const i32 stride = (static_cast<i32>(s1) - static_cast<i32>(s0)) * static_cast<i32>(ctl_words);
     hip::launch(k.draft_pick_top2, D(1), D(1024), 0, stream, logits, I(head.nrows), seqCtl(s0, ctl_drafts), I(stride), map);
 }
@@ -1811,7 +1866,9 @@ void Model::argmaxRows(u32 n, std::span<u32> out) {
 }
 
 void Model::argmaxRowsEnqueue(u32 n) {
-    hip::launch(k.argmax_rows, D(n), D(1024), 0, stream, logits, I(cfg.n_vocab), ctlSlot(ctl_rows));
+    const u32 rows = last_head_rows > 0 ? last_head_rows : cfg.n_vocab;
+    hip::launch(k.argmax_rows, D(n), D(1024), 0, stream, logits, I(rows), ctlSlot(ctl_rows));
+    if (last_head_map) hip::launch(k.map_ids, D(1), D(32), 0, stream, ctlSlot(ctl_rows), last_head_map, I(n));
 }
 
 void Model::verifyEnqueue(u32 next, u32 n_draft, u32 pos0) { verifyEnqueueEx(next, n_draft, std::nullopt, pos0); }
@@ -2170,7 +2227,31 @@ void Model::run(u32 n) {
     if (!psegs.empty()) return;  // prefillSegs: per-segment logits from x
     if (keep_hidden && all_logits && n <= small_max) {
         head_phase = true;
-        matmul(output, hn, logits, n, false);
+        if (verify_d2_head && draft_d2 && draft_rows > 0 && draft_map && draft_rerank_k > 0 && n <= max_small_batch) {
+            const u32 cnt = n * E;
+            hip::launch(k.quantize_q8, D((cnt + 255) / 256), D(256), 0, stream, hn, xq, xd, I(cnt));
+            xq_src = hn;
+            xq_n = n;
+            hip::launch(k.gemv_d2[n - 1], D((draft_rows + 7) / 8), D(256), 0, stream, *draft_d2, xq, xd, logits, I(E), I(draft_rows), gate);
+            mark(OpClass::head);
+            const u32 rk = std::min(draft_rerank_k, draft_rows);
+            const u32 nr = n * rk;
+            hip::launch(k.topk_rows, D(n), D(1024), 0, stream, logits, I(draft_rows), I(rk), 1.f,
+                        draft_rerank_ids, draft_rerank_vals, draft_rerank_stats);
+            hip::launch(k.copy_rows_map2, D(nr), D(256), 0, stream, output.ptr, output.row_bytes,
+                        draft_rerank_w, draft_rerank_ids, *draft_map);
+            Mat exact = output;
+            exact.ptr = draft_rerank_w;
+            exact.nrows = nr;
+            const DevPtr yy[1] = {logits};
+            gemvKernels(std::span<const Mat>(&exact, 1), std::span<const DevPtr>(yy, 1), n, 0, xq, xd);
+            last_head_rows = nr;
+            last_head_map = draft_rerank_ids;
+        } else {
+            matmul(output, hn, logits, n, false);
+            last_head_rows = 0;
+            last_head_map = 0;
+        }
         head_phase = false;
         return;
     }
@@ -2182,6 +2263,8 @@ void Model::run(u32 n) {
     rmsnorm(last, output_norm, h, E, 1, E, E);
     head_phase = true;
     matmul(output, h, logits, 1, false);
+    last_head_rows = 0;
+    last_head_map = 0;
     head_phase = false;
 }
 

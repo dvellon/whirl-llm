@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    const char* fam_names[] = {"quant", "gemv", "gemm", "attn", "attndq4", "gdn", "moe", "moemx", "moef", "misc", "attnbench",
+    const char* fam_names[] = {"quant", "gemv", "mxpackedbench", "gemm", "attn", "attndq4", "gdn", "moe", "moemx", "moef", "misc", "attnbench",
                                "gemvh", "gemvhbench", "dflash", "ws4", "ws4bench", "ws4g", "ws4gbench", "vision"};  // = fams below
     for (const std::string& f : only) {
         bool known = false;
@@ -155,7 +155,7 @@ int main(int argc, char** argv) {
         const char* name;
         void (*run)(kt::Ctx&);
     };
-    const Fam fams[] = {{"quant", kt::testQuant}, {"gemv", kt::testGemv}, {"gemm", kt::testGemm},
+    const Fam fams[] = {{"quant", kt::testQuant}, {"gemv", kt::testGemv}, {"mxpackedbench", kt::benchMxPacked}, {"gemm", kt::testGemm},
                         {"attn", kt::testAttn},   {"attndq4", kt::testAttnDq4},   {"gdn", kt::testGdn},   {"moe", kt::testMoe},
                         {"moemx", kt::testMoeMx}, {"moef", kt::testMoeF}, {"misc", kt::testMisc},   {"attnbench", kt::benchAttn},
                         {"gemvh", kt::testGemvh}, {"gemvhbench", kt::benchGemvh}, {"dflash", kt::testDflash},
@@ -164,7 +164,7 @@ int main(int argc, char** argv) {
                         {"vision", kt::testVision}};
     for (const Fam& f : fams) {
         if (!only.empty() && !only.count(f.name)) continue;
-        if (only.empty() && (std::string(f.name) == "attnbench" || std::string(f.name) == "gemvhbench" || std::string(f.name) == "ws4bench" || std::string(f.name) == "ws4gbench")) continue;  // timing only, on request
+        if (only.empty() && (std::string(f.name) == "mxpackedbench" || std::string(f.name) == "attnbench" || std::string(f.name) == "gemvhbench" || std::string(f.name) == "ws4bench" || std::string(f.name) == "ws4gbench")) continue;  // timing only, on request
         const auto t0 = std::chrono::steady_clock::now();
         std::printf("== %s\n", f.name);
         std::fflush(stdout);

@@ -130,7 +130,7 @@ public:
     // ---- optional profiling (WHIRL_PROFILE): per-op-class GPU times of the
     // MTP steps (which = 0) and the verify (which = 1) of decode cycles with
     // `slots` decoding slots
-    static constexpr std::size_t n_prof_classes = 10;
+    static constexpr std::size_t n_prof_classes = 17;
     virtual void profileStart(int which, std::size_t slots) { (void)which, (void)slots; }
     virtual void profileStop() {}
     virtual void profileFlush(std::size_t slots) { (void)slots; }

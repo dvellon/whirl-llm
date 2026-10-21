@@ -266,6 +266,50 @@ void testGemv(Ctx& c) {
                 c.rep.add(cmpExact("gemvq_nt9r2w16p_mxfp4 packed == canonical " + m.name,
                                    ypp.down<float>(wantp.size()), wantp, Kind::invariant));
 
+                if (c.k.gemvq_nt10r2w16p_mxfp4 != nullptr && c.k.gemvq_nt10r2w16p_mxfp4_g != nullptr) {
+                    constexpr int nt10 = 10;
+                    Buf yp10(static_cast<std::size_t>(nt10) * nr * 4);
+                    hip::launch(c.k.gemvq_nt10r2w16p_mxfp4, {cdiv(nr, 16), 1, 1}, {512, 1, 1}, 0, c.s,
+                                wp.p(), m.row_bytes, xq.p(), xd.p(), yp10.p(), ncols, nr, 0, DevPtr{0});
+                    c.sync();
+                    std::vector<float> want10;
+                    want10.reserve(static_cast<std::size_t>(nt10) * nr);
+                    for (int t = 0; t < nt10; ++t)
+                        want10.insert(want10.end(), ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows,
+                                      ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + nr);
+                    c.rep.add(cmpExact("gemvq_nt10r2w16p_mxfp4 packed == canonical " + m.name,
+                                       yp10.down<float>(want10.size()), want10, Kind::invariant));
+                }
+                if (c.k.gemvq_nt8r2w16p_mxfp4 != nullptr && c.k.gemvq_nt8r2w16p_mxfp4_g != nullptr) {
+                    constexpr int nt8 = 8;
+                    Buf yp8(static_cast<std::size_t>(nt8) * nr * 4);
+                    hip::launch(c.k.gemvq_nt8r2w16p_mxfp4, {cdiv(nr, 16), 1, 1}, {512, 1, 1}, 0, c.s,
+                                wp.p(), m.row_bytes, xq.p(), xd.p(), yp8.p(), ncols, nr, 0, DevPtr{0});
+                    c.sync();
+                    std::vector<float> want8;
+                    want8.reserve(static_cast<std::size_t>(nt8) * nr);
+                    for (int t = 0; t < nt8; ++t)
+                        want8.insert(want8.end(), ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows,
+                                     ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + nr);
+                    c.rep.add(cmpExact("gemvq_nt8r2w16p_mxfp4 packed == canonical " + m.name,
+                                       yp8.down<float>(want8.size()), want8, Kind::invariant));
+                }
+                for (int ntw : {2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 16}) {
+                    const auto f = c.k.gemvq_nt_w16p_mxfp4[ntw - 2];
+                    if (f == nullptr) continue;
+                    Buf ypn(static_cast<std::size_t>(ntw) * nr * 4);
+                    hip::launch(f, {cdiv(nr, 16), 1, 1}, {512, 1, 1}, 0, c.s,
+                                wp.p(), m.row_bytes, xq.p(), xd.p(), ypn.p(), ncols, nr, 0, DevPtr{0});
+                    c.sync();
+                    std::vector<float> wantn;
+                    wantn.reserve(static_cast<std::size_t>(ntw) * nr);
+                    for (int t = 0; t < ntw; ++t)
+                        wantn.insert(wantn.end(), ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows,
+                                     ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + nr);
+                    c.rep.add(cmpExact("packed MXFP4 all-width NT" + std::to_string(ntw) + " == canonical " + m.name,
+                                       ypn.down<float>(wantn.size()), wantn, Kind::invariant));
+                }
+
                 const int gn[3] = {nrows / 3 - 3, nrows / 3 + 1,
                                    nrows - (nrows / 3 - 3) - (nrows / 3 + 1)};
                 const int ro[3] = {0, gn[0], gn[0] + gn[1]};
@@ -300,6 +344,50 @@ void testGemv(Ctx& c) {
                 }
                 c.rep.add(cmpExact("ggemvq_nt9r2w16p_mxfp4 packed (3 segments) == canonical " + m.name,
                                    gotg, wantg, Kind::invariant));
+                if (c.k.gemvq_nt10r2w16p_mxfp4_g != nullptr) {
+                    constexpr int nt10 = 10;
+                    Buf gy10_0(static_cast<std::size_t>(nt10) * gn[0] * 4);
+                    Buf gy10_1(static_cast<std::size_t>(nt10) * gn[1] * 4);
+                    Buf gy10_2(static_cast<std::size_t>(nt10) * gn[2] * 4);
+                    const DevPtr gy10[3] = {gy10_0.p(), gy10_1.p(), gy10_2.p()};
+                    for (int i = 0; i < 3; ++i) pg.y[i] = gy10[i];
+                    hip::launch(c.k.gemvq_nt10r2w16p_mxfp4_g, {nb, 1, 1}, {512, 1, 1}, 0, c.s,
+                                pg, xq.p(), xd.p(), ncols, 0, DevPtr{0});
+                    c.sync();
+                    std::vector<float> got10, want10;
+                    const Buf* gy10s[3] = {&gy10_0, &gy10_1, &gy10_2};
+                    for (int i = 0; i < 3; ++i) {
+                        const auto part = gy10s[i]->down<float>(static_cast<std::size_t>(nt10) * gn[i]);
+                        got10.insert(got10.end(), part.begin(), part.end());
+                        for (int t = 0; t < nt10; ++t)
+                            want10.insert(want10.end(), ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + ro[i],
+                                          ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + ro[i] + gn[i]);
+                    }
+                    c.rep.add(cmpExact("ggemvq_nt10r2w16p_mxfp4 packed (3 segments) == canonical " + m.name,
+                                       got10, want10, Kind::invariant));
+                }
+                if (c.k.gemvq_nt8r2w16p_mxfp4_g != nullptr) {
+                    constexpr int nt8 = 8;
+                    Buf gy8_0(static_cast<std::size_t>(nt8) * gn[0] * 4);
+                    Buf gy8_1(static_cast<std::size_t>(nt8) * gn[1] * 4);
+                    Buf gy8_2(static_cast<std::size_t>(nt8) * gn[2] * 4);
+                    const DevPtr gy8[3] = {gy8_0.p(), gy8_1.p(), gy8_2.p()};
+                    for (int i = 0; i < 3; ++i) pg.y[i] = gy8[i];
+                    hip::launch(c.k.gemvq_nt8r2w16p_mxfp4_g, {nb, 1, 1}, {512, 1, 1}, 0, c.s,
+                                pg, xq.p(), xd.p(), ncols, 0, DevPtr{0});
+                    c.sync();
+                    std::vector<float> got8, want8;
+                    const Buf* gy8s[3] = {&gy8_0, &gy8_1, &gy8_2};
+                    for (int i = 0; i < 3; ++i) {
+                        const auto part = gy8s[i]->down<float>(static_cast<std::size_t>(nt8) * gn[i]);
+                        got8.insert(got8.end(), part.begin(), part.end());
+                        for (int t = 0; t < nt8; ++t)
+                            want8.insert(want8.end(), ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + ro[i],
+                                         ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + ro[i] + gn[i]);
+                    }
+                    c.rep.add(cmpExact("ggemvq_nt8r2w16p_mxfp4 packed (3 segments) == canonical " + m.name,
+                                       got8, want8, Kind::invariant));
+                }
             }
         }
 
@@ -656,6 +744,26 @@ void testGemv(Ctx& c) {
             const std::size_t count = static_cast<std::size_t>(nt) * nrows;
             c.rep.add(cmpExact("gemvq_nt9r2w16_q6_k output.weight == 1-token (partial block)",
                                got.down<float>(count), ref.down<float>(count), Kind::invariant));
+            if (c.k.gemvq_nt9r2w32_q6_k != nullptr) {
+                Buf got32(static_cast<std::size_t>(nt) * nrows * 4);
+                hip::launch(c.k.gemvq_nt9r2w32_q6_k, {cdiv(nrows, 16), 1, 1}, {1024, 1, 1}, 0, c.s,
+                            w.p(), head.row_bytes, xq.p(), xd.p(), got32.p(), ncols, nrows, 0, DevPtr{0});
+                c.sync();
+                c.rep.add(cmpExact("gemvq_nt9r2w32_q6_k output.weight == 1-token (partial block)",
+                                   got32.down<float>(count), ref.down<float>(count), Kind::invariant));
+            }
+            if (c.k.gemvq_nt8r2w16_q6_k != nullptr) {
+                constexpr int nt8 = 8;
+                Buf got8(static_cast<std::size_t>(nt8) * nrows * 4);
+                hip::launch(c.k.gemvq_nt8r2w16_q6_k, {cdiv(nrows, 16), 1, 1}, {512, 1, 1}, 0, c.s,
+                            w.p(), head.row_bytes, xq.p(), xd.p(), got8.p(), ncols, nrows, 0, DevPtr{0});
+                c.sync();
+                const std::size_t count8 = static_cast<std::size_t>(nt8) * nrows;
+                auto ref8 = ref.down<float>(count);
+                ref8.resize(count8);
+                c.rep.add(cmpExact("gemvq_nt8r2w16_q6_k output.weight == 1-token (partial block)",
+                                   got8.down<float>(count8), ref8, Kind::invariant));
+            }
         }
     }
 }

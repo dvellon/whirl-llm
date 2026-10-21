@@ -15,15 +15,21 @@
 //   block b (32 values) has scale s_b: w = s_b * (2c - 3), c in 0..3.
 // Arithmetic is free-form (drafts never have to match anything bitwise).
 // ---------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(256)
-    requant_q6k_d2(const uint8_t *src, uint64_t src_rb, uint8_t *dst, int ncols) {
+template <int T>
+__device__ __forceinline__ void requant_d2_impl(const uint8_t *src, uint64_t src_rb, uint8_t *dst, int ncols) {
     const int row = blockIdx.x, sbi = blockIdx.y, t = threadIdx.x, lane = t & 31, bj = t >> 5;
-    const uint8_t *b = src + (size_t)row * src_rb + (size_t)sbi * 210;
+    constexpr int sb_bytes = T == QT_Q6_K ? 210 : 8 * Q<QT_Q8_0>::bytes;
+    const uint8_t *b = src + (size_t)row * src_rb + (size_t)sbi * sb_bytes;
     uint8_t *o = dst + (size_t)row * (ncols / 4 + ncols / 16);
     __shared__ float v[256];
     __shared__ uint32_t words[16];
     if (t < 16) words[t] = 0;
-    if ((t & 7) == 0) Q<QT_Q6_K>::dec8(b, t, v + t);
+    if ((t & 7) == 0) {
+        if constexpr (T == QT_Q6_K)
+            Q<QT_Q6_K>::dec8(b, t, v + t);
+        else
+            Q<QT_Q8_0>::dec8(b + (t >> 5) * Q<QT_Q8_0>::bytes, t & 31, v + t);
+    }
     __syncthreads();
     const float x = v[t];
     const float amax = warp_max(fabsf(x));
@@ -51,6 +57,15 @@ extern "C" __global__ void __launch_bounds__(256)
     __syncthreads();
     if (t < 16) ((uint32_t *)(o + (size_t)sbi * 64))[t] = words[t];  // 4 units x 4 words
     if (lane == 0) *(_Float16 *)(o + ncols / 4 + 2 * blk) = sh;
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+requant_q6k_d2(const uint8_t *src, uint64_t src_rb, uint8_t *dst, int ncols) {
+    requant_d2_impl<QT_Q6_K>(src, src_rb, dst, ncols);
+}
+extern "C" __global__ void __launch_bounds__(256)
+requant_q80_d2(const uint8_t *src, uint64_t src_rb, uint8_t *dst, int ncols) {
+    requant_d2_impl<QT_Q8_0>(src, src_rb, dst, ncols);
 }
 
 // y[t][r] = draft-head logits for NT tokens (int8 x, xd per 32), one wave per
@@ -132,4 +147,20 @@ extern "C" __global__ void __launch_bounds__(256) copy_rows_map(const uint8_t *s
     const uint8_t *s = src + (size_t)map[blockIdx.x] * rb;
     uint8_t *d = dst + (size_t)blockIdx.x * rb;
     for (uint64_t i = threadIdx.x; i < rb; i += blockDim.x) d[i] = s[i];
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+copy_rows_map2(const uint8_t *src, uint64_t rb, uint8_t *dst, int *ids, const int *vocab_map) {
+    const int i = blockIdx.x;
+    const int row = vocab_map ? vocab_map[ids[i]] : ids[i];
+    const uint8_t *s = src + (size_t)row * rb;
+    uint8_t *d = dst + (size_t)i * rb;
+    for (uint64_t j = threadIdx.x; j < rb; j += blockDim.x) d[j] = s[j];
+    if (threadIdx.x == 0) ids[i] = row;
+}
+
+
+extern "C" __global__ void map_ids(int *ids, const int *map, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) ids[i] = map[ids[i]];
 }
