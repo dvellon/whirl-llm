@@ -442,7 +442,7 @@ __device__ void gemvw_impl(const uint8_t *__restrict__ W, uint64_t row_bytes, co
 //   ((q0 + q1) + (q2 + q3)) and then ((r0 + r1) + ...) rounding.
 // Keep this a separate symbol until end-to-end timing proves that the extra
 // waves beat the legacy 256-thread kernel.
-template<int NT>
+template<int NT, bool PACKED_W16 = false>
 __device__ __forceinline__ void gemvw_mx_nt_r2_w16_impl(
     const uint8_t *__restrict__ W, uint64_t row_bytes, const int8_t *__restrict__ xq,
     const float *__restrict__ xd, float *__restrict__ y, int ncols, int nrows, int accumulate,
@@ -459,7 +459,7 @@ __device__ __forceinline__ void gemvw_mx_nt_r2_w16_impl(
     const int h = lane >> 4;
     const int n = lane & 15;
     const int r0 = (bid < 0 ? (int)blockIdx.x : bid) * ROWS;
-    const uint8_t *wr = W + (size_t)min(r0 + n, nrows - 1) * row_bytes;
+    const uint8_t *wr = PACKED_W16 ? W : W + (size_t)min(r0 + n, nrows - 1) * row_bytes;
     const bool tok_ok = n < NT;
     const int8_t *xt = xq + (size_t)(tok_ok ? n : 0) * ncols;
     const uint32_t *xp = (const uint32_t *)xd;
@@ -489,7 +489,30 @@ __device__ __forceinline__ void gemvw_mx_nt_r2_w16_impl(
 
             WUnit wu;
             int own[8];
-            wunit_half<QT_MXFP4>(wr, u, h, own, wu);
+            if constexpr (PACKED_W16) {
+                // A packed superblock stores four 16-row exponent planes,
+                // followed by eight (quarter, half) 16x16-byte code planes.
+                // Each half-wave therefore reads one contiguous 256-byte
+                // span instead of sixteen row-strided 16-byte spans.
+                constexpr size_t packed_sb_bytes = 16 * 136;
+                const int tile = (bid < 0 ? (int)blockIdx.x : bid);
+                const uint8_t *pb = wr + (size_t)tile * nsb * packed_sb_bytes +
+                                    (size_t)sb * packed_sb_bytes;
+                const uint16_t ee = *(const uint16_t *)(pb + q * 32 + n * 2);
+                wu.s0 = e8m0_half(ee & 0xFF);
+                wu.s1 = e8m0_half(ee >> 8);
+                wu.m0 = 0.f;
+                wu.m1 = 0.f;
+                const uint4 qa = *(const uint4 *)(pb + 128 + (q * 2 + h) * 256 + n * 16);
+                const uint32_t a[4] = {qa.x, qa.y, qa.z, qa.w};
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    own[k] = mx_lut4(a[k] & 0x0F0F0F0F);
+                    own[4 + k] = mx_lut4((a[k] >> 4) & 0x0F0F0F0F);
+                }
+            } else {
+                wunit_half<QT_MXFP4>(wr, u, h, own, wu);
+            }
 #pragma unroll
             for (int k = 0; k < 8; ++k) {
                 const int oth = xhalf(own[k]);

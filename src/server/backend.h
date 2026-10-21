@@ -86,6 +86,9 @@ public:
     virtual void prefillMtpChunk(std::span<const std::uint32_t> tokens, std::uint32_t pos0, std::size_t off,
                                  std::size_t n, std::optional<DevPtr> prev_hidden) = 0;
     virtual void prefillSegs(std::span<const PSeg> segs, bool with_mtp) = 0;
+    // Optional reversible decode-only weight layout.  Implementations must
+    // finish the transition before returning when enabling it.
+    virtual void setDecodeWeightLayout(bool decode) { (void)decode; }
     virtual void segLogitsToFront(std::uint32_t k) = 0;
     virtual std::uint32_t argmax() = 0;
 

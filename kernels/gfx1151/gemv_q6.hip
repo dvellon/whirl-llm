@@ -474,6 +474,76 @@ extern "C" __global__ void __launch_bounds__(512)
                                accumulate, skip, gs.b);
 }
 
+// Reversible canonical-row <-> 16-row-interleaved MXFP4 conversion.  The
+// host admits only complete 16-row tiles for in-place use, so both layouts
+// have the same byte extent and one existing scratch allocation is enough.
+extern "C" __global__ void __launch_bounds__(256)
+    pack_w16_mxfp4(const uint8_t *src, uint8_t *dst, uint64_t row_bytes, int nrows) {
+    constexpr int rows = 16;
+    constexpr int sb_bytes = rows * 136;
+    const int nsb = (int)(row_bytes / 136);
+    const int tile = (int)blockIdx.x / nsb;
+    const int sb = (int)blockIdx.x - tile * nsb;
+    const uint8_t *drow[rows];
+#pragma unroll
+    for (int r = 0; r < rows; ++r)
+        drow[r] = src + (size_t)min(tile * rows + r, nrows - 1) * row_bytes + (size_t)sb * 136;
+    uint8_t *out = dst + (size_t)tile * nsb * sb_bytes + (size_t)sb * sb_bytes;
+    for (int i = (int)threadIdx.x; i < 128; i += (int)blockDim.x) {
+        const int q = i / 32;
+        const int rem = i - q * 32;
+        const int r = rem / 2;
+        out[i] = drow[r][2 * q + (rem & 1)];
+    }
+    for (int i = (int)threadIdx.x; i < 2048; i += (int)blockDim.x) {
+        const int plane = i / 256;
+        const int rem = i - plane * 256;
+        const int r = rem / 16;
+        const int byte = rem & 15;
+        const int q = plane / 2;
+        const int h = plane & 1;
+        out[128 + i] = drow[r][8 + q * 32 + h * 16 + byte];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    unpack_w16_mxfp4(const uint8_t *src, uint8_t *dst, uint64_t row_bytes, int nrows) {
+    constexpr int rows = 16;
+    constexpr int sb_bytes = rows * 136;
+    const int nsb = (int)(row_bytes / 136);
+    const int tile = (int)blockIdx.x / nsb;
+    const int sb = (int)blockIdx.x - tile * nsb;
+    const uint8_t *in = src + (size_t)tile * nsb * sb_bytes + (size_t)sb * sb_bytes;
+    for (int i = (int)threadIdx.x; i < 128; i += (int)blockDim.x) {
+        const int q = i / 32;
+        const int rem = i - q * 32;
+        const int r = rem / 2;
+        dst[(size_t)(tile * rows + r) * row_bytes + (size_t)sb * 136 + 2 * q + (rem & 1)] = in[i];
+    }
+    for (int i = (int)threadIdx.x; i < 2048; i += (int)blockDim.x) {
+        const int plane = i / 256;
+        const int rem = i - plane * 256;
+        const int r = rem / 16;
+        const int byte = rem & 15;
+        const int q = plane / 2;
+        const int h = plane & 1;
+        dst[(size_t)(tile * rows + r) * row_bytes + (size_t)sb * 136 + 8 + q * 32 + h * 16 + byte] = in[128 + i];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+    gemvq_nt9r2w16p_mxfp4(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
+                          const float *xd, float *y, int ncols, int nrows,
+                          int accumulate, const int *skip) {
+    gemvw_mx_nt_r2_w16_impl<9, true>(W, row_bytes, xq, xd, y, ncols, nrows, accumulate, skip);
+}
+extern "C" __global__ void __launch_bounds__(512)
+    ggemvq_nt9r2w16p_mxfp4(GV_PARAMS) {
+    const GvSel gs = gv_sel(g);
+    gemvw_mx_nt_r2_w16_impl<9, true>(gs.W, gs.rb, xq, xd, gs.y, ncols, gs.nrows,
+                                     accumulate, skip, gs.b);
+}
+
 extern "C" __global__ void __launch_bounds__(512)
     gemvq_nt11r2w16_q6_k(const uint8_t *W, uint64_t row_bytes, const int8_t *xq,
                          const float *xd, float *y, int ncols, int nrows,

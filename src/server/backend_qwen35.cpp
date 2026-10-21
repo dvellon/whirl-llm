@@ -75,12 +75,20 @@ public:
     }
     void reset() override { m_.reset(); }
 
-    void forward(std::span<const std::uint32_t> tokens, std::uint32_t pos0) override { m_.forward(tokens, pos0); }
+    void forward(std::span<const std::uint32_t> tokens, std::uint32_t pos0) override {
+        m_.setMxPackedW16(false);
+        m_.forward(tokens, pos0);
+    }
     void prefillMtpChunk(std::span<const std::uint32_t> tokens, std::uint32_t pos0, std::size_t off, std::size_t n,
                          std::optional<DevPtr> prev_hidden) override {
+        m_.setMxPackedW16(false);
         m_.prefillMtpChunk(tokens, pos0, off, n, prev_hidden);
     }
-    void prefillSegs(std::span<const PSeg> segs, bool with_mtp) override { m_.prefillSegs(segs, with_mtp); }
+    void prefillSegs(std::span<const PSeg> segs, bool with_mtp) override {
+        m_.setMxPackedW16(false);
+        m_.prefillSegs(segs, with_mtp);
+    }
+    void setDecodeWeightLayout(bool decode) override { m_.setMxPackedW16(decode); }
     void segLogitsToFront(std::uint32_t k) override { m_.segLogitsToFront(k); }
     std::uint32_t argmax() override { return m_.argmax(); }
 

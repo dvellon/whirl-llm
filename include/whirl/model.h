@@ -192,6 +192,9 @@ struct Config {
 
 struct Mat {
     DevPtr ptr = 0;
+    // Nonzero only while this matrix's canonical allocation temporarily holds
+    // the reversible 16-row verifier layout.
+    DevPtr packed_w16 = 0;
     // Prefill GEMM choice per batch bucket (tuneBucket): [0, 24) fused dequant
     // with gemm_cfgs[c]; [24, 48) dequantize to f16 first, then f16 GEMM with
     // gemm_cfgs[c - 24]; [48, 56) small-batch GEMM gemms_cfgs[c - 48].
@@ -532,6 +535,8 @@ public:
     // Experimental exact tree verifier: computes the shared beam root once
     // and projects the ten unique rows back to the public 11-row ABI.
     bool tree_verify_dag = false;
+    // Single-slot decode-only reversible MXFP4 layout state.
+    bool mx_w16_inplace = false;
     bool head_phase = false;
     bool no_fuse = false;
     std::uint32_t row_n = 0;
@@ -601,6 +606,7 @@ public:
     // the KV format and why (fixed at load: numerics::chooseKv)
     whirl::numerics::KvChoice kv_choice;
     DevPtr w16 = 0;
+    std::uint64_t w16_bytes = 0;
     DevPtr gc_w = 0, gc_u = 0, gc_m = 0, gc_g = 0;
     std::uint64_t gc_w_bytes = 0, gc_u_bytes = 0, gc_m_bytes = 0;  // (GDN-8S scratch bound checks)
     std::uint32_t fwd_pos0 = 0;
@@ -923,6 +929,7 @@ public:
     DevPtr alloc(std::uint64_t bytes);
     DevPtr allocZero(std::uint64_t bytes);
     void freeAlloc(DevPtr p);
+    void setMxPackedW16(bool packed);
 
     // ---- internals (public for tests; not part of the stable API)
     enum class ActIn { gemv, f32in, fp8, f16 };

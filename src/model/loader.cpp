@@ -266,6 +266,47 @@ void Model::freeAlloc(DevPtr p) {
         }
 }
 
+void Model::setMxPackedW16(bool packed) {
+    if (!envFlag("MXFP4_NT9_INPLACE", false) || mx_w16_inplace == packed) return;
+    if (arch != hip::Arch::gfx1151 || k.pack_w16_mxfp4 == nullptr ||
+        k.unpack_w16_mxfp4 == nullptr || k.gemvq_nt9r2w16p_mxfp4 == nullptr || w16 == 0)
+        throw ModelError("Mxfp4PackedW16Unavailable");
+
+    decode_graph.reset();
+    tree_verify_graph_exec.reset();
+    for (Layer& L : layers) {
+        std::vector<Mat*> mats;
+        if (L.kind == LayerKind::attn)
+            mats = {&L.attn.q, &L.attn.k, &L.attn.v, &L.attn.o};
+        else
+            // beta/alpha are intentionally absent: the fused GDN projection
+            // kernels read their canonical row layout directly instead of
+            // going through gemvKernels' packed dispatch.
+            mats = {&L.gdn.qkv, &L.gdn.gate, &L.gdn.out};
+        if (envFlag("MXFP4_NT9_INPLACE_ALL", false)) {
+            mats.push_back(&L.ffn_gate);
+            mats.push_back(&L.ffn_up);
+            mats.push_back(&L.ffn_down);
+        }
+        for (Mat* w : mats) {
+            if (w->ty != GgmlType::mxfp4) continue;
+            if (w->nrows % 16 != 0 || w->row_bytes % 136 != 0)
+                throw ModelError("Mxfp4PackedW16Shape");
+            const u64 bytes = static_cast<u64>(w->nrows) * w->row_bytes;
+            if (bytes > w16_bytes) throw ModelError("Mxfp4PackedW16Scratch");
+            const hip::Function f = packed ? k.pack_w16_mxfp4 : k.unpack_w16_mxfp4;
+            hip::launch(f, {static_cast<u32>((w->nrows / 16) * (w->ncols / 256)), 1, 1},
+                        {256, 1, 1}, 0, stream, w->ptr, w16, w->row_bytes, I(w->nrows));
+            hip::copyAsync(w->ptr, w16, static_cast<std::size_t>(bytes), stream);
+            w->packed_w16 = packed ? w->ptr : DevPtr{0};
+        }
+    }
+    // This transition deliberately sits outside the generation interval.  A
+    // stream enqueue alone would make the first timed verifier pay for it.
+    hip::sync();
+    mx_w16_inplace = packed;
+}
+
 u64 Model::convBytes() const { return static_cast<u64>(cfg.d_conv - 1) * cfg.convCh() * 4; }
 u64 Model::ssmBytes() const { return static_cast<u64>(cfg.n_v_heads) * cfg.d_state * cfg.headV() * 4; }
 
@@ -669,6 +710,7 @@ std::unique_ptr<Model> Model::load(const gguf::File& f, u32 max_ctx_req, LoadSta
         for (const Layer& L : m.layers)
             for (const Mat& w : m.layerMats(L).slice()) max_elems = std::max(max_elems, static_cast<u64>(w.ncols) * w.nrows);
         m.w16 = m.alloc(max_elems * 2);
+        m.w16_bytes = max_elems * 2;
     }
     {
         const u64 n_chunks = (B + 63) / 64;

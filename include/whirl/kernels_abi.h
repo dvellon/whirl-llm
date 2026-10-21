@@ -472,6 +472,10 @@ struct KernelTable {
     F gemvq_nt11r2w16_mxfp4{}, gemvq_nt11r2w16_mxfp4_g{};
     F gemvq_nt10r2w16_mxfp4{}, gemvq_nt10r2w16_mxfp4_g{};
     F gemvq_nt9r2w16_mxfp4{}, gemvq_nt9r2w16_mxfp4_g{};
+    // Same NT=9 arithmetic over a reversible, in-place 16-row-interleaved
+    // layout.  The conversion kernels use the existing largest-matrix scratch.
+    F gemvq_nt9r2w16p_mxfp4{}, gemvq_nt9r2w16p_mxfp4_g{};
+    F pack_w16_mxfp4{}, unpack_w16_mxfp4{};
     // Experimental gfx1151 Q6_K output-head NT=11/r2 16-wave geometry.
     // Optional and selected only by WHIRL_Q6K_HEAD_NT11_W16=1.
     F gemvq_nt11r2w16_q6_k{}, gemvq_nt11r2w16_q6_k_g{};

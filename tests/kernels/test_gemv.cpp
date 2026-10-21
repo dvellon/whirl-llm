@@ -236,6 +236,71 @@ void testGemv(Ctx& c) {
                              ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + nr);
             c.rep.add(cmpExact("gemvq_nt9r2w16_mxfp4 == 1-token (partial block) " + m.name,
                                yp.down<float>(wantp.size()), wantp, Kind::invariant));
+
+            if (c.k.pack_w16_mxfp4 != nullptr && c.k.unpack_w16_mxfp4 != nullptr &&
+                c.k.gemvq_nt9r2w16p_mxfp4 != nullptr && c.k.gemvq_nt9r2w16p_mxfp4_g != nullptr) {
+                const auto packedBytes = [&](int rows) {
+                    return static_cast<std::size_t>(cdiv(rows, 16) * 16) * m.row_bytes;
+                };
+                const auto pack = [&](DevPtr src, int rows, Buf& dst) {
+                    hip::launch(c.k.pack_w16_mxfp4,
+                                {cdiv(rows, 16) * static_cast<unsigned>(ncols / 256), 1, 1},
+                                {256, 1, 1}, 0, c.s, src, dst.p(), m.row_bytes, rows);
+                };
+
+                Buf wp(packedBytes(nr));
+                pack(w.p(), nr, wp);
+                Buf roundtrip(packedBytes(nr));
+                hip::launch(c.k.unpack_w16_mxfp4,
+                            {cdiv(nr, 16) * static_cast<unsigned>(ncols / 256), 1, 1},
+                            {256, 1, 1}, 0, c.s, wp.p(), roundtrip.p(), m.row_bytes, nr);
+                c.sync();
+                c.rep.add(cmpExact("pack/unpack w16 MXFP4 prefix " + m.name,
+                                   roundtrip.down<std::uint8_t>(static_cast<std::size_t>(nr) * m.row_bytes),
+                                   w.down<std::uint8_t>(static_cast<std::size_t>(nr) * m.row_bytes), Kind::invariant));
+
+                Buf ypp(static_cast<std::size_t>(nt) * nr * 4);
+                hip::launch(c.k.gemvq_nt9r2w16p_mxfp4, {cdiv(nr, 16), 1, 1}, {512, 1, 1}, 0, c.s,
+                            wp.p(), m.row_bytes, xq.p(), xd.p(), ypp.p(), ncols, nr, 0, DevPtr{0});
+                c.sync();
+                c.rep.add(cmpExact("gemvq_nt9r2w16p_mxfp4 packed == canonical " + m.name,
+                                   ypp.down<float>(wantp.size()), wantp, Kind::invariant));
+
+                const int gn[3] = {nrows / 3 - 3, nrows / 3 + 1,
+                                   nrows - (nrows / 3 - 3) - (nrows / 3 + 1)};
+                const int ro[3] = {0, gn[0], gn[0] + gn[1]};
+                Buf gp0(packedBytes(gn[0])), gp1(packedBytes(gn[1])), gp2(packedBytes(gn[2]));
+                Buf gy0(static_cast<std::size_t>(nt) * gn[0] * 4);
+                Buf gy1(static_cast<std::size_t>(nt) * gn[1] * 4);
+                Buf gy2(static_cast<std::size_t>(nt) * gn[2] * 4);
+                Buf* gps[3] = {&gp0, &gp1, &gp2};
+                const DevPtr gy[3] = {gy0.p(), gy1.p(), gy2.p()};
+                wk::GvArgs pg;
+                for (int i = 0; i < 3; ++i) {
+                    pack(w.p() + static_cast<std::uint64_t>(ro[i]) * m.row_bytes, gn[i], *gps[i]);
+                    pg.w[i] = gps[i]->p();
+                    pg.y[i] = gy[i];
+                    pg.rb[i] = m.row_bytes;
+                    pg.n[i] = gn[i];
+                }
+                pg.b1 = static_cast<int>(cdiv(gn[0], 16));
+                pg.b2 = pg.b1 + static_cast<int>(cdiv(gn[1], 16));
+                const unsigned nb = static_cast<unsigned>(pg.b2) + cdiv(gn[2], 16);
+                hip::launch(c.k.gemvq_nt9r2w16p_mxfp4_g, {nb, 1, 1}, {512, 1, 1}, 0, c.s,
+                            pg, xq.p(), xd.p(), ncols, 0, DevPtr{0});
+                c.sync();
+                std::vector<float> gotg, wantg;
+                const Buf* gys[3] = {&gy0, &gy1, &gy2};
+                for (int i = 0; i < 3; ++i) {
+                    const auto part = gys[i]->down<float>(static_cast<std::size_t>(nt) * gn[i]);
+                    gotg.insert(gotg.end(), part.begin(), part.end());
+                    for (int t = 0; t < nt; ++t)
+                        wantg.insert(wantg.end(), ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + ro[i],
+                                     ref1.begin() + static_cast<std::ptrdiff_t>(t) * nrows + ro[i] + gn[i]);
+                }
+                c.rep.add(cmpExact("ggemvq_nt9r2w16p_mxfp4 packed (3 segments) == canonical " + m.name,
+                                   gotg, wantg, Kind::invariant));
+            }
         }
 
         // accumulate: y = y0 + v exactly
@@ -443,6 +508,50 @@ void testGemv(Ctx& c) {
         r.pass = bad == 0 && variants > 0;
         if (!first_bad.empty()) r.note = "first " + first_bad;
         c.rep.add(r);
+    }
+
+    // The packed verifier is used across several target-matrix shapes.  The
+    // ordinary sample set above covers the wide FFN-down input; cover the
+    // remaining attention/GDN/FFN shapes directly.
+    if (c.k.pack_w16_mxfp4 != nullptr && c.k.gemvq_nt9r2w16p_mxfp4 != nullptr) {
+        const whirl::gguf::File* f = c.open(c.models.mx);
+        constexpr const char* names[] = {
+            "blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_out.weight",
+            "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight", "blk.3.attn_q.weight",
+            "blk.3.attn_k.weight", "blk.3.attn_v.weight", "blk.3.attn_output.weight",
+        };
+        for (const char* name : names) {
+            const auto* t = f ? f->tensor(name) : nullptr;
+            if (t == nullptr) continue;
+            constexpr int nt = 9;
+            HostMat m = loadMat(*f, name, 0, 257);
+            if (m.type != QType::mxfp4) continue;
+            const int ncols = m.ncols, nrows = m.nrows;
+            Buf w(m.data);
+            const std::vector<float> x = c.randn(static_cast<std::size_t>(nt) * ncols);
+            Buf dx(x), xq(static_cast<std::size_t>(nt) * ncols),
+                xd(static_cast<std::size_t>(nt) * ncols / 32 * 4);
+            hip::launch(c.k.quantize_q8,
+                        {cdiv(static_cast<std::uint64_t>(nt) * ncols, 256), 1, 1}, {256, 1, 1}, 0, c.s,
+                        dx.p(), xq.p(), xd.p(), nt * ncols);
+            Buf ref(static_cast<std::size_t>(nt) * nrows * 4);
+            for (int tok = 0; tok < nt; ++tok)
+                gemvq1(c, QType::mxfp4, w, m.row_bytes, nrows,
+                       xq.p() + static_cast<std::uint64_t>(tok) * ncols,
+                       xd.p() + static_cast<std::uint64_t>(tok) * (ncols / 32) * 4,
+                       ref.p() + static_cast<std::uint64_t>(tok) * nrows * 4, ncols, 0);
+            const std::size_t packed_bytes = static_cast<std::size_t>(cdiv(nrows, 16) * 16) * m.row_bytes;
+            Buf wp(packed_bytes), got(static_cast<std::size_t>(nt) * nrows * 4);
+            hip::launch(c.k.pack_w16_mxfp4,
+                        {cdiv(nrows, 16) * static_cast<unsigned>(ncols / 256), 1, 1}, {256, 1, 1}, 0, c.s,
+                        w.p(), wp.p(), m.row_bytes, nrows);
+            hip::launch(c.k.gemvq_nt9r2w16p_mxfp4, {cdiv(nrows, 16), 1, 1}, {512, 1, 1}, 0, c.s,
+                        wp.p(), m.row_bytes, xq.p(), xd.p(), got.p(), ncols, nrows, 0, DevPtr{0});
+            c.sync();
+            const std::size_t count = static_cast<std::size_t>(nt) * nrows;
+            c.rep.add(cmpExact(std::string("packed NT9 matrix shape == canonical ") + name,
+                               got.down<float>(count), ref.down<float>(count), Kind::invariant));
+        }
     }
 
     // Direct real-model coverage for the opt-in gfx1151 output-head shape.

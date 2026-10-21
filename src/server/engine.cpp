@@ -1731,6 +1731,11 @@ void Engine::finishPrefill(Slot& sl) {
     sl.last_acc = 0;
     sl.last_row = 0;
     sl.logits_ok = true;
+    // The reversible packed verifier layout is global to the model.  Restrict
+    // it to the one-slot linear-MTP configuration, where no prefill can race a
+    // decode and every target verify has exactly drafts+1 rows.
+    if (opt_.parallel == 1 && opt_.use_mtp && opt_.tree_depth == 0)
+        m_.setDecodeWeightLayout(true);
     sl.td0 = Clock::now();
     sl.last_log_t = sl.td0;
     sl.last_log_n = 0;

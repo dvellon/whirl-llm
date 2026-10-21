@@ -171,6 +171,15 @@ void Model::gemvKernels(std::span<const Mat> ws, std::span<const DevPtr> ys, u32
         rows_per_block = 16;
         threads_per_block = 512;
     }
+    const bool packed_w16 = n == 9 && w.ty == GgmlType::mxfp4 && gemv_r[n] == 2 &&
+                            w.packed_w16 != 0 && envFlag("MXFP4_NT9_INPLACE", false) &&
+                            k.gemvq_nt9r2w16p_mxfp4 != nullptr;
+    if (packed_w16) {
+        f = k.gemvq_nt9r2w16p_mxfp4;
+        fg = k.gemvq_nt9r2w16p_mxfp4_g;
+        rows_per_block = 16;
+        threads_per_block = 512;
+    }
     if (n == 9 && w.ty == GgmlType::q6_k && w.ptr == output.ptr && gemv_r[n] == 2 &&
         envFlag("Q6K_HEAD_NT9_W16", false) && k.gemvq_nt9r2w16_q6_k != nullptr) {
         f = k.gemvq_nt9r2w16_q6_k;

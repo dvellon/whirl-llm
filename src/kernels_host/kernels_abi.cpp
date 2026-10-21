@@ -408,6 +408,10 @@ KernelTable KernelTable::load(const hip::Module& m, KvFormat kv) {
         k.gemvq_nt10r2w16_mxfp4_g = L.opt("ggemvq_nt10r2w16_mxfp4");
         k.gemvq_nt9r2w16_mxfp4 = L.opt("gemvq_nt9r2w16_mxfp4");
         k.gemvq_nt9r2w16_mxfp4_g = L.opt("ggemvq_nt9r2w16_mxfp4");
+        k.gemvq_nt9r2w16p_mxfp4 = L.opt("gemvq_nt9r2w16p_mxfp4");
+        k.gemvq_nt9r2w16p_mxfp4_g = L.opt("ggemvq_nt9r2w16p_mxfp4");
+        k.pack_w16_mxfp4 = L.opt("pack_w16_mxfp4");
+        k.unpack_w16_mxfp4 = L.opt("unpack_w16_mxfp4");
         k.gemvq_nt11r2w16_q6_k = L.opt("gemvq_nt11r2w16_q6_k");
         k.gemvq_nt11r2w16_q6_k_g = L.opt("ggemvq_nt11r2w16_q6_k");
         k.gemvq_nt10r2w16_q6_k = L.opt("gemvq_nt10r2w16_q6_k");
