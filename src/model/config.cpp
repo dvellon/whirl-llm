@@ -479,15 +479,14 @@ void DFlashConfig::validate(const Config& t, const gguf::File& f) const {
         if (!sel || sel->ne[0] != sel_rank || sel->ne[1] != t.n_vocab)
             bad(std::string(name) + " is not [rank, target vocabulary " + std::to_string(t.n_vocab) + "]");
     }
-    // FIX-K97 (FR-K97 P2-1): dflash_lattice decodes the two codebooks with one type flag (Q8_0 or f32) and one
-    // row size, so any other type (f16, k-quants) would be read as f32 -> garbage lattice and reads past the
-    // tensor. Require both to be f32 or both Q8_0 (same type, same shape -> same row bytes).
+    // dflash_lattice decodes f32, Q8_0, and Q4_K selector rows.  Both codebooks share one type flag and one row
+    // size, so require an identical supported type (same type, same shape -> same row bytes).
     const gguf::TensorInfo* sp = f.tensor("selector_predecessor.weight");
     const gguf::TensorInfo* ss = f.tensor("selector_successor.weight");
-    auto cb_ok = [](GgmlType ty) { return ty == GgmlType::f32 || ty == GgmlType::q8_0; };
+    auto cb_ok = [](GgmlType ty) { return ty == GgmlType::f32 || ty == GgmlType::q8_0 || ty == GgmlType::q4_k; };
     if (!cb_ok(sp->type) || !cb_ok(ss->type) || sp->type != ss->type)
         bad("selector codebooks are " + gguf::typeName(sp->type) + " / " + gguf::typeName(ss->type) +
-            "; the drafter lattice needs both f32 or both Q8_0");
+            "; the drafter lattice needs matching f32, Q8_0, or Q4_K codebooks");
 }
 
 std::string dflashIncompatible(const gguf::File& target, const gguf::File& draft) {

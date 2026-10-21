@@ -868,7 +868,7 @@ void testDFlashConfig() {
         msg = w.find("70008") != std::string::npos && w.find(std::to_string(whirl::kernels::kDFlashMaxKeys)) != std::string::npos;
     }
     check(msg, "DFlash2 config: the refusal names the keys needed and the limit");
-    // FIX-K97 (FR-K97 P2-1): dflash_lattice decodes f32 or Q8_0 codebooks with one type flag and one row size
+    // dflash_lattice decodes matching f32, Q8_0, or Q4_K codebooks with one type flag and one row size
     auto sel = [&](std::uint32_t ty, int ty2) {
         const auto im = dflashImage(64, 100, true, "dflash", ty, ty2).build();
         const gguf::File fs = gguf::File::parse(im);
@@ -886,13 +886,14 @@ void testDFlashConfig() {
     };
     check(sel(0, -1).first.empty(), "DFlash2 config: f32 selector codebooks accepted");
     check(sel(8, -1).first.empty(), "DFlash2 config: Q8_0 selector codebooks accepted");
+    check(sel(12, -1).first.empty(), "DFlash2 config: Q4_K selector codebooks accepted");
     const auto f16 = sel(1, -1);
-    check(f16.first == "DraftModelMismatch" && f16.second.find("f32 or both Q8_0") != std::string::npos,
+    check(f16.first == "DraftModelMismatch" && f16.second.find("matching f32, Q8_0, or Q4_K") != std::string::npos,
           "DFlash2 config: f16 selector codebooks rejected (" + f16.second + ")");
-    check(sel(12, -1).first == "DraftModelMismatch", "DFlash2 config: Q4_K selector codebooks rejected");
     check(sel(14, -1).first == "DraftModelMismatch", "DFlash2 config: Q6_K selector codebooks rejected");
     check(sel(8, 0).first == "DraftModelMismatch", "DFlash2 config: Q8_0 predecessor + f32 successor rejected");
     check(sel(0, 8).first == "DraftModelMismatch", "DFlash2 config: f32 predecessor + Q8_0 successor rejected");
+    check(sel(8, 12).first == "DraftModelMismatch", "DFlash2 config: Q8_0 predecessor + Q4_K successor rejected");
     check(sel(0, 1).first == "DraftModelMismatch", "DFlash2 config: f32 predecessor + f16 successor rejected");
 }
 

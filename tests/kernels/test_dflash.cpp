@@ -2,7 +2,7 @@
 // tools/dflash_ref/ref_drafter.py in whirl-cloud, i.e. llama.cpp's DFlash2):
 //   * dflash_conv: both sides, causal inside the block, grouped dynamic weights
 //   * dflash_topk: key order with ties to the smaller index, NaN never chosen, repeatable
-//   * dflash_lattice: f32 and Q8_0 codebooks, anchor row for position 0
+//   * dflash_lattice: f32, Q8_0, and Q4_K codebooks, anchor row for position 0
 //   * dflash_walk: same tokens as the CPU walk on the same lattice (p-min / n-min)
 //   * dflash_attn: drafter attention over the context ring + block, vs CPU
 //   * dflash_attn_long: the same past kDFlashAttnKeys keys (chunked); == dflash_attn bitwise on one chunk
@@ -239,17 +239,51 @@ void testDflash(Ctx& c) {
         std::vector<float> pdeq, ndeq;
         q8(prev, pq, pdeq);
         q8(next, nq, ndeq);
+        // Deterministic valid Q4_K rows plus an independent CPU decoder.  R is
+        // exactly one super-block, as in the published Q4 DFlash2 helper.
+        auto q4 = [&](int salt, std::vector<std::uint8_t>& blob, std::vector<float>& deq) {
+            blob.assign(static_cast<std::size_t>(V) * 144, 0);
+            deq.assign(static_cast<std::size_t>(V) * R, 0.f);
+            for (int row = 0; row < V; ++row) {
+                std::uint8_t* b = blob.data() + static_cast<std::size_t>(row) * 144;
+                const std::uint16_t dh = f2h(0.0125f + 0.0001f * static_cast<float>((row + salt) % 11));
+                const std::uint16_t mh = f2h(0.00625f + 0.0001f * static_cast<float>((row + 3 * salt) % 7));
+                std::memcpy(b, &dh, 2);
+                std::memcpy(b + 2, &mh, 2);
+                for (int i = 0; i < 12; ++i) b[4 + i] = static_cast<std::uint8_t>((row * 17 + i * 29 + salt) & 255);
+                for (int i = 0; i < 128; ++i) b[16 + i] = static_cast<std::uint8_t>((row * 31 + i * 13 + 5 * salt) & 255);
+                for (int j = 0; j < R; ++j) {
+                    const int j64 = j >> 6, in = j & 63, hi = in >> 5, l = in & 31, k = 2 * j64 + hi;
+                    int s, m;
+                    if (k < 4) {
+                        s = b[4 + k] & 63;
+                        m = b[8 + k] & 63;
+                    } else {
+                        s = (b[8 + k] & 0xF) | ((b[k] >> 6) << 4);
+                        m = (b[8 + k] >> 4) | ((b[4 + k] >> 6) << 4);
+                    }
+                    const std::uint8_t v = b[16 + 32 * j64 + l];
+                    deq[static_cast<std::size_t>(row) * R + j] =
+                        h2f(dh) * static_cast<float>(s) * static_cast<float>(hi ? v >> 4 : v & 0xF) - h2f(mh) * static_cast<float>(m);
+                }
+            }
+        };
+        std::vector<std::uint8_t> p4, n4;
+        std::vector<float> p4deq, n4deq;
+        q4(3, p4, p4deq);
+        q4(19, n4, n4deq);
         Buf dc(cand), du(unary), dg(gate), dlat(static_cast<std::size_t>(P) * K * K * 4);
         std::vector<float> lat_f32;
-        for (int mode = 0; mode < 2; ++mode) {
+        for (int mode = 0; mode < 3; ++mode) {
             const bool is_q8 = mode == 1;
-            Buf dp = is_q8 ? Buf(pq) : Buf(prev);
-            Buf dn = is_q8 ? Buf(nq) : Buf(next);
-            const std::uint64_t rb = is_q8 ? static_cast<std::uint64_t>(R / 32) * 34 : static_cast<std::uint64_t>(R) * 4;
-            const std::vector<float>& pv = is_q8 ? pdeq : prev;
-            const std::vector<float>& nv = is_q8 ? ndeq : next;
+            const bool is_q4 = mode == 2;
+            Buf dp = is_q8 ? Buf(pq) : is_q4 ? Buf(p4) : Buf(prev);
+            Buf dn = is_q8 ? Buf(nq) : is_q4 ? Buf(n4) : Buf(next);
+            const std::uint64_t rb = is_q8 ? static_cast<std::uint64_t>(R / 32) * 34 : is_q4 ? 144 : static_cast<std::uint64_t>(R) * 4;
+            const std::vector<float>& pv = is_q8 ? pdeq : is_q4 ? p4deq : prev;
+            const std::vector<float>& nv = is_q8 ? ndeq : is_q4 ? n4deq : next;
             hip::launch(c.k.dflash_lattice, {static_cast<unsigned>(P), static_cast<unsigned>(K), 1}, {static_cast<unsigned>(32 * K), 1, 1}, 0, c.s,
-                        dc.p(), du.p(), dg.p(), dp.p(), dn.p(), rb, is_q8 ? 1 : 0, R, K, anchor, dlat.p());
+                        dc.p(), du.p(), dg.p(), dp.p(), dn.p(), rb, mode, R, K, anchor, dlat.p());
             c.sync();
             std::vector<double> ref(static_cast<std::size_t>(P) * K * K), sc(ref.size());
             for (int p = 0; p < P; ++p)
@@ -270,9 +304,10 @@ void testDflash(Ctx& c) {
                     }
                 }
             const std::vector<float> got = dlat.down<float>(ref.size());
-            c.rep.add(cmpTol(std::string("dflash_lattice vs CPU (") + (is_q8 ? "Q8_0" : "f32") + " codebooks, anchor row at p = 0)", got, ref, sc,
+            c.rep.add(cmpTol(std::string("dflash_lattice vs CPU (") + (is_q8 ? "Q8_0" : is_q4 ? "Q4_K" : "f32") +
+                                 " codebooks, anchor row at p = 0)", got, ref, sc,
                              2e-6, 1e-6));
-            if (!is_q8) lat_f32 = got;
+            if (mode == 0) lat_f32 = got;
         }
         // walk: GPU == CPU on the same lattice, for a few p-min / n-min settings
         Buf dl(lat_f32), dout(static_cast<std::size_t>(1 + P) * 4);
