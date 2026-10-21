@@ -2,6 +2,44 @@
 
 This fork carries an opt-in Windows HIP performance stack for the Ryzen AI Max+ 395 / Radeon 8060S. The current reproducible point uses Swift-1.5 Qwen3.8 27B MXFP4, one slot, an 8,238-token prompt, and a forced 1,000-token response.
 
+## Experimental 8K / 512 result
+
+The linear-MTP verifier work on code commit
+`96b2321b` reached **70.73 output tok/s** on the Python coding task with an
+8,238-token prompt and a forced 512-token response. Prompt processing was
+560.48 tok/s. The run used 75 target-verification cycles, drafted 675 tokens,
+accepted 441 (65.3%), and emitted 6.88 output tokens per cycle. The saved
+response was coherent Python with SHA-256
+`da9c76d48258f51ed44a035d7289e399eb996db460d2a04823f5d64323497d26`.
+
+This is a different output length from the 8K / 1K point below and should be
+reported separately. It is also a `--fast` result: relaxed greedy acceptance
+can change output and its throughput is generation-path dependent. It is not
+an exact-decoding or universal model-speed claim.
+
+The relevant opt-ins were:
+
+```text
+WHIRL_MTP_DRAFTS=9
+WHIRL_MTP_Q8_EH=1
+WHIRL_RELAX_ALPHA=0.01
+WHIRL_NGRAM=0
+WHIRL_MXFP4_NT9_INPLACE=1
+WHIRL_MXFP4_NT9_INPLACE_ALL=1
+WHIRL_MXFP4_NT9_W16=1
+WHIRL_MXFP4_NT10_W16=1
+WHIRL_Q6K_HEAD_NT9_W16=1
+WHIRL_Q6K_HEAD_NT10_W16=1
+--fast -np 1 --ctx-per-slot 262144 --kv-ssd-mode off --kv-ram-mb 0
+```
+
+The server process ran at Windows `High` priority. The AC minimum processor
+state was temporarily set to 100% for the measured process lifetime and was
+restored to 0 afterward. Nine drafts beat eight on the 128-token screen;
+ten regressed because it falls outside the active packed-verifier shapes.
+Focused gfx1151 validation finished with 22/22 exact, 52/52 tolerance, and
+98/98 invariance checks passing.
+
 ## Current measured point
 
 | Task | Prefill | Decode | Prompt / output |
