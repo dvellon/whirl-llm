@@ -2,6 +2,12 @@
 
 The prompt files behind the decode numbers in [docs/benchmarks.md](../../docs/benchmarks.md#prompts).
 
+For the reproducible Radeon 8060S 8K/1K performance run, see
+[`gfx1151_public_8k.ps1`](gfx1151_public_8k.ps1) and the
+[`gfx1151` performance lab](../../docs/gfx1151-performance-lab.md). That harness
+records its exact source commit, hardware inventory, timings, logs, and output
+digests; its `--fast` result uses relaxed MTP acceptance and is reported as such.
+
 | File | Used for | Content |
 |---|---|---|
 | `prompts/coding_chat_zh.txt` | "coding chat (new text)" rows: 512 generated tokens, one 64-token warm-up request first | one Chinese coding question (write `dedup.py` with tests); the answer is all newly written, the prompt holds no code to copy. Written by us (Apache-2.0, as this repository) |
