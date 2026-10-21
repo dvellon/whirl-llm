@@ -17,9 +17,27 @@ The coding run accepted 821 of 1,602 MTP drafts over 178 target-verification cyc
 
 These tasks match the public 8K/1K/fresh-process/cache-off categories used by other public reports, but their exact original prompts were not available. This is protocol-equivalent evidence, not a claim of byte-identical reproduction or a universal record.
 
-## Reproduce
+## Build the measured configuration
 
-Build this branch using `build.bat`, download the model named below from the project's documented model source, and run:
+Install Visual Studio 2022 Build Tools with the C++ x64 workload, CMake,
+Ninja, and AMD HIP SDK 7.2. From a normal PowerShell prompt in a clean clone
+of this branch, build only the Radeon 8060S code object:
+
+```powershell
+.\build.bat Release `
+  -DWHIRL_WITH_HIP=ON `
+  -DWHIRL_GPU_ARCHS=gfx1151 `
+  "-DWHIRL_HIP_ROOT=C:\Program Files\AMD\ROCm\7.2"
+```
+
+The resulting binaries are under `build\Release`. The public number was
+measured with AMD driver `32.0.31041.1004`; record a different driver rather
+than silently comparing it as the same setup.
+
+## Reproduce the 8K/1K run
+
+Download `Swift-1.5-Qwen3.8-27B-MXFP4-A-outQ6_K.gguf` from the project's
+[documented model source](https://huggingface.co/tsaipifong/Swift-1.5-Qwen3.8-27b-MXFP4-GGUF), then run:
 
 ```powershell
 .\tools\bench\gfx1151_public_8k.ps1 `
@@ -28,6 +46,11 @@ Build this branch using `build.bat`, download the model named below from the pro
 ```
 
 The script refuses a dirty source tree, resolves the exact commit, calibrates both prompts to exactly 8,238 tokenizer-visible tokens in a disposable process, then starts a fresh server per measured task. It saves the response, timing JSON, SHA-256 output digest, stdout/stderr logs, source commit, hardware inventory, and complete summary under `whirl-gfx1151-results`.
+
+Publish the complete result directory when reporting a number. At minimum,
+retain `summary.json`, the per-task timing JSON, response digests, server logs,
+`source-commit.txt`, and hardware inventory. A screenshot or a lone tok/s value
+is not equivalent evidence.
 
 The active opt-ins are:
 
